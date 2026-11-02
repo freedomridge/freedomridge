@@ -771,6 +771,17 @@ export async function shareView(datasetId: number, viewId: number, isPublic: boo
     await ensureOk(res, 'Failed to update view sharing');
 }
 
+export async function createDataset(data: { name: string; description?: string }): Promise<Dataset> {
+    const res = await fetch(`${API_BASE}/datasets`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify(data),
+    });
+    await ensureOk(res, 'Failed to create dataset');
+    return res.json();
+}
+
 export async function getDatasets(): Promise<Dataset[]> {
     const res = await fetch(`${API_BASE}/datasets`);
     await ensureOk(res, 'Failed to fetch datasets');

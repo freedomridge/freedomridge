@@ -9,9 +9,13 @@ import { useState } from 'react';
 import { ProtectedRoute } from '@/components/ProtectedRoute';
 import { Header } from '@/components/header';
 import { DatasetDeletion } from '@/components/dataset-deletion';
+import { CreateDatasetModal } from '@/components/create-dataset-modal';
+import { useUser } from '@/contexts/UserContext';
 
 export default function Home() {
   const queryClient = useQueryClient();
+  const { user } = useUser();
+  const [creating, setCreating] = useState(false);
   const [deletingId, setDeletingId] = useState<number | null>(null);
   const [confirmDelete, setConfirmDelete] = useState<{ id: number; name: string } | null>(null);
 
@@ -84,10 +88,10 @@ export default function Home() {
               <h1 className="text-3xl font-bold text-white">Datasets</h1>
               <p className="text-zinc-400 mt-1">Manage and explore your computer vision data</p>
             </div>
-            <button className="inline-flex items-center justify-center rounded-md text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50 bg-cyan-600 text-white hover:bg-cyan-700 h-10 px-4 py-2 gap-2 shadow-lg shadow-cyan-900/20">
+            {user?.role === 'admin' && <button onClick={() => setCreating(true)} className="inline-flex items-center justify-center rounded-md text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50 bg-cyan-600 text-white hover:bg-cyan-700 h-10 px-4 py-2 gap-2 shadow-lg shadow-cyan-900/20">
               <Plus size={16} />
               New Dataset
-            </button>
+            </button>}
           </div>
 
           {isLoading ? (
@@ -170,15 +174,17 @@ export default function Home() {
                   <p className="text-zinc-400 max-w-sm mb-6">
                     Get started by creating your first dataset or ingesting sample data.
                   </p>
-                  <button className="inline-flex items-center justify-center rounded-md text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50 bg-cyan-600 text-white hover:bg-cyan-700 h-10 px-4 py-2 gap-2">
+                  {user?.role === 'admin' && <button onClick={() => setCreating(true)} className="inline-flex items-center justify-center rounded-md text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50 bg-cyan-600 text-white hover:bg-cyan-700 h-10 px-4 py-2 gap-2">
                     <Plus size={16} />
                     Create Dataset
-                  </button>
+                  </button>}
                 </div>
               )}
             </div>
           )}
         </main>
+
+        {creating && <CreateDatasetModal onClose={() => setCreating(false)} />}
 
         {/* Confirmation Modal */}
         {confirmDelete && (
