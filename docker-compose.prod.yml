@@ -1,0 +1,288 @@
+# Docker's json-file driver keeps every container's stdout forever by default; cap it per service
+#. 5 x 50 MB per container.
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "50m"
+    max-file: "5"
+
+services:
+  # PostgreSQL Database with PostGIS and pgvector
+  db:
+    logging: *default-logging
+    build:
+      context: .
+      dockerfile: Dockerfile.db
+    # Conservative production defaults for the 8 GiB demo host. Keep the
+    # connection ceiling large enough for four backend pools plus job workers.
+    shm_size: '1g'
+    command: postgres -c config_file=/etc/postgresql/postgresql.conf -c max_connections=250 -c shared_buffers=${POSTGRES_SHARED_BUFFERS:-1GB} -c effective_cache_size=${POSTGRES_EFFECTIVE_CACHE_SIZE:-4GB} -c work_mem=${POSTGRES_WORK_MEM:-16MB}
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-freedomridge}
+      # [PRODUCTION] No default — compose fails loudly if unset, so a cloud
+      # deploy can't silently run with the well-known 'password'.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set (no default in production)}
+      POSTGRES_DB: ${POSTGRES_DB:-freedomridge}
+    volumes:
+      - ${POSTGRES_VOLUME_PATH:-postgres_data}:/var/lib/postgresql/data
+      # schema.sql is the authoritative full schema, applied once at first init.
+      # (backend/db/migrations was previously mounted as a SUBDIR of
+      # docker-entrypoint-initdb.d, which Postgres init does not recurse into, so
+      # those files never ran. Dropped to avoid the misleading setup.)
+      - ./backend/db/schema.sql:/docker-entrypoint-initdb.d/01_schema.sql
+      - ./backend/db/postgresql.conf:/etc/postgresql/postgresql.conf
+    # No host port mapping: Postgres is reachable only on the internal
+    # freedomridge-network bridge (as db:5432). Publishing 5432 to 0.0.0.0 would expose
+    # the database to anything that can reach the host, leaving the cloud firewall
+    # (on AWS, the security group) as the only barrier.
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-freedomridge}" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - freedomridge-network
+
+  # Backend API (FastAPI)
+  backend:
+    logging: *default-logging
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-freedomridge}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}@db:5432/${POSTGRES_DB:-freedomridge}
+      FRIDGE_DATA_ROOT: ${FRIDGE_DATA_ROOT:-/data}
+      # Production gate: FRIDGE_ENV=production makes the backend refuse to boot
+      # unless STORAGE_ENCRYPTION_KEY is a real (non-default) value, so stored S3
+      # secrets are never encrypted under the public default key. The key has no
+      # default → compose fails loudly if it's missing.
+      FRIDGE_ENV: ${FRIDGE_ENV:-production}
+      FRIDGE_ADMIN_PASSWORD: ${FRIDGE_ADMIN_PASSWORD:?FRIDGE_ADMIN_PASSWORD must be set for production bootstrap}
+      HF_HOME: /cache/huggingface
+      OMP_NUM_THREADS: "2"
+      MKL_NUM_THREADS: "2"
+      STORAGE_ENCRYPTION_KEY: "${STORAGE_ENCRYPTION_KEY:?STORAGE_ENCRYPTION_KEY must be set in production (generate with: python -c 'import secrets;print(secrets.token_urlsafe(48))')}"
+      # Persistent on-disk caches (named volume below) so S3 downloads and grid
+      # heatmap composites survive restarts instead of refilling the container's
+      # ephemeral / and eventually ENOSPC'ing the root fs.
+      S3_LOCAL_CACHE_PATH: /cache/s3
+      # Media in S3 (s3:// sample paths): the bucket the backend may read, with the instance role.
+      # Unset, only local media under FRIDGE_DATA_ROOT is served.
+      STORAGE_TYPE: ${STORAGE_TYPE:-local}
+      S3_BUCKET: ${S3_BUCKET:-}
+      S3_REGION: ${S3_REGION:-us-east-1}
+      FRIDGE_COMPOSITE_CACHE_PATH: /cache/composite
+      # On-the-fly crop/thumbnail JPEGs (the grid requests a width per tile). Without this it
+      # defaults to /tmp on the ephemeral container layer, OUTSIDE the pruned freedomridge_cache volume,
+      # and grows unbounded during grid browsing -> ENOSPC. Keep it on /cache so the worker prunes it.
+      FRIDGE_CROP_CACHE_PATH: /cache/crop
+      # [PRODUCTION] Set to the real frontend origin(s). The browser must load
+      # the app from one of these — CSRF and CORS both key off it.
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:?Set ALLOWED_ORIGINS to the HTTPS public origin}
+      # Production nginx terminates TLS; development compose stays plain HTTP.
+      SESSION_COOKIE_SECURE: ${SESSION_COOKIE_SECURE:-true}
+      # Demo mode: enables public guest account creation on login page
+      DEMO_MODE: ${DEMO_MODE:-false}
+      # Public-demo guest limits (validated at startup; defaults match backend/public_settings.py).
+      FRIDGE_DEMO_ACCOUNT_CAP: ${FRIDGE_DEMO_ACCOUNT_CAP:-2000}
+      FRIDGE_DEMO_IP_HOURLY_LIMIT: ${FRIDGE_DEMO_IP_HOURLY_LIMIT:-5}
+      FRIDGE_DEMO_IP_LIVE_CAP: ${FRIDGE_DEMO_IP_LIVE_CAP:-10}
+      FRIDGE_DEMO_IP_ALLOWLIST: ${FRIDGE_DEMO_IP_ALLOWLIST:-}
+      FRIDGE_GUEST_STATEMENT_TIMEOUT_SECONDS: ${FRIDGE_GUEST_STATEMENT_TIMEOUT_SECONDS:-30}
+      FRIDGE_GUEST_CONCURRENCY: ${FRIDGE_GUEST_CONCURRENCY:-2}
+      FRIDGE_GUEST_VIEW_COUNT: ${FRIDGE_GUEST_VIEW_COUNT:-200}
+      FRIDGE_GUEST_VIEW_TOTAL_BYTES: ${FRIDGE_GUEST_VIEW_TOTAL_BYTES:-2097152}
+      FRIDGE_DB_ACQUIRE_TIMEOUT_SECONDS: ${FRIDGE_DB_ACQUIRE_TIMEOUT_SECONDS:-5}
+      # Media-cache byte budget; the backend tracks it on write and the worker prunes to it.
+      FRIDGE_CACHE_MAX_BYTES: ${FRIDGE_CACHE_MAX_BYTES:-10737418240}
+      # The login throttle reads X-Real-IP only from these peers. The API is reached only
+      # through nginx on the compose bridge (no host port below), so every peer here is a container.
+      FRIDGE_TRUSTED_PROXIES: ${FRIDGE_TRUSTED_PROXIES:-172.16.0.0/12,10.0.0.0/8,192.168.0.0/16}
+    volumes:
+      - ${DATA_VOLUME_PATH:-./data}:${FRIDGE_DATA_ROOT:-/data}:ro
+      - ${CACHE_VOLUME_PATH:-freedomridge_cache}:/cache
+    depends_on:
+      db:
+        condition: service_healthy
+    # No host port mapping: the API is reached only through nginx (which proxies
+    # to the `backend` service over the internal bridge). Publishing 8000 to the
+    # host lets clients hit FastAPI directly, bypassing nginx — which also lets
+    # them spoof X-Real-IP / X-Forwarded-For and defeat the login throttle.
+    restart: unless-stopped
+    networks:
+      - freedomridge-network
+
+  # Cache worker — hourly LRU pruning of disk caches (see Dockerfile.worker).
+  # Database upkeep runs in job-runner. Shares the cache volume with the backend.
+  worker:
+    logging: *default-logging
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-freedomridge}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}@db:5432/${POSTGRES_DB:-freedomridge}
+      # Cache prune targets + total budget (default 10 GiB). Keep this comfortably
+      # below the cache volume / EBS size (see ops/terraform cache volume).
+      FRIDGE_CACHE_PRUNE_DIRS: /cache/s3:/cache/composite:/cache/crop
+      FRIDGE_CACHE_MAX_BYTES: ${FRIDGE_CACHE_MAX_BYTES:-10737418240}
+    volumes:
+      - ${CACHE_VOLUME_PATH:-freedomridge_cache}:/cache
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - freedomridge-network
+
+  job-runner:
+    logging: *default-logging
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    command: python3 -m backend.job_service
+    init: true
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-freedomridge}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}@db:5432/${POSTGRES_DB:-freedomridge}
+      FRIDGE_ENV: ${FRIDGE_ENV:-production}
+      FRIDGE_DATA_ROOT: ${FRIDGE_DATA_ROOT:-/data}
+      DEMO_MODE: ${DEMO_MODE:-false}
+      JOB_WORKER_SLOTS: ${JOB_WORKER_SLOTS:-3}
+      JOB_POOL_MAX_SIZE: ${JOB_POOL_MAX_SIZE:-6}
+    volumes:
+      - ${DATA_VOLUME_PATH:-./data}:${FRIDGE_DATA_ROOT:-/data}:ro
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+    stop_grace_period: 30s
+    networks:
+      - freedomridge-network
+
+  # Scheduled logical DB backups (pg_dump) — the self-hosted / single-EC2 floor against data loss
+  # (nothing else snapshots the DB here). Terraform supplies BACKUP_S3_URI and an
+  # instance role for off-box copies. The application Backups card is separate.
+  backup:
+    logging: *default-logging
+    build:
+      context: .
+      dockerfile: Dockerfile.backup
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-freedomridge}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}@db:5432/${POSTGRES_DB:-freedomridge}
+      BACKUP_INTERVAL_SECONDS: ${BACKUP_INTERVAL_SECONDS:-86400}   # daily
+      BACKUP_KEEP: ${BACKUP_KEEP:-2}                                # retain the newest N local dumps
+      # Optional off-instance copy (RECOMMENDED — the local volume is lost on `docker compose down -v`
+      # or instance/EBS loss). e.g. BACKUP_S3_URI=s3://my-bucket/freedomridge-backups
+      BACKUP_S3_URI: ${BACKUP_S3_URI:-}
+      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-${S3_REGION:-us-east-1}}
+    volumes:
+      - ${BACKUP_VOLUME_PATH:-freedomridge_backups}:/backups
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - freedomridge-network
+
+  # Incremental UMAP projection — OPT-IN ONLY: starts only with `--profile umap`.
+  # Projects newly-ingested embeddings through the saved UMAP model(s) so new points
+  # appear on the embeddings plot without a refit. Direct DB access (no API auth); the
+  # fit that PRODUCES the models is run separately via `python -m fridge.umap_worker fit`.
+  umap-worker:
+    logging: *default-logging
+    profiles: ["umap"]
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    command: python3 scripts/umap_project_job.py
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-freedomridge}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}@db:5432/${POSTGRES_DB:-freedomridge}
+      FRIDGE_UMAP_MODEL_DIR: /models
+    volumes:
+      - umap_models:/models
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - freedomridge-network
+
+    # Frontend (Next.js)
+  frontend:
+    logging: *default-logging
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+      args:
+        NEXT_PUBLIC_MAPBOX_TOKEN: ${NEXT_PUBLIC_MAPBOX_TOKEN}
+        # Baked at BUILD time (standalone output resolves rewrites during next build).
+        FRIDGE_BACKEND_URL: http://backend:8000
+    environment:
+      # Next standalone otherwise binds to Docker's hostname and its localhost healthcheck fails.
+      HOSTNAME: 0.0.0.0
+      NEXT_PUBLIC_MAPBOX_TOKEN: ${NEXT_PUBLIC_MAPBOX_TOKEN}
+    depends_on:
+      - backend
+    restart: unless-stopped
+    networks:
+      - freedomridge-network
+
+    # Nginx Reverse Proxy
+  nginx:
+    logging: *default-logging
+    image: nginx:1.31-alpine@sha256:785835ea65db4bba6f021acc0f3be91b0fef76a53fe41f8588c6698d2aed0606
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    ports:
+      - "${HTTP_BIND:-0.0.0.0}:${HTTP_PORT:-80}:80"
+      - "${HTTPS_BIND:-0.0.0.0}:${HTTPS_PORT:-443}:443"
+    environment:
+      DOMAIN_NAME: ${DOMAIN_NAME:?Set DOMAIN_NAME to the public DNS hostname}
+      FRIDGE_DEMO_IP_ALLOWLIST: ${FRIDGE_DEMO_IP_ALLOWLIST:-}
+    command: /bin/sh /etc/nginx/fridge/render.sh
+    volumes:
+      - ${NGINX_CONFIG_TEMPLATE:-./nginx.conf}:/etc/nginx/nginx.conf.template:ro
+      - ./ops/nginx:/etc/nginx/fridge:ro
+      - ${TLS_STATE_PATH:-./ssl}/letsencrypt:/etc/letsencrypt:ro
+      - ${TLS_STATE_PATH:-./ssl}/webroot:/var/www/certbot:ro
+    depends_on:
+      backend:
+        condition: service_healthy
+      frontend:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - freedomridge-network
+
+  certbot:
+    logging: *default-logging
+    image: certbot/certbot:v5.9.0@sha256:bc93cb710b413e6b456d622f9b0133b3e109c0a78c2ed9976af43d209b0a1805
+    profiles: ["tls"]
+    environment:
+      DOMAIN_NAME: ${DOMAIN_NAME:?Set DOMAIN_NAME to the public DNS hostname}
+      LETSENCRYPT_EMAIL: ${LETSENCRYPT_EMAIL:?Set LETSENCRYPT_EMAIL for certificate notices}
+    volumes:
+      - ${TLS_STATE_PATH:-./ssl}/letsencrypt:/etc/letsencrypt
+      - ${TLS_STATE_PATH:-./ssl}/webroot:/var/www/certbot
+    networks:
+      - freedomridge-network
+
+volumes:
+  postgres_data:
+    driver: local
+  # Backend S3-download + heatmap-composite cache (persistent across restarts).
+  freedomridge_cache:
+    driver: local
+  # Scheduled pg_dump backups (separate from postgres_data so a DB-volume loss doesn't take the
+  # backups with it). For true off-instance durability also set BACKUP_S3_URI.
+  freedomridge_backups:
+    driver: local
+  # Saved UMAP models, shared between the fit and the (opt-in) umap-worker.
+  umap_models:
+    driver: local
+
+networks:
+  freedomridge-network:
+    driver: bridge

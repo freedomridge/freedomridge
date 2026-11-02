@@ -1,0 +1,53 @@
+# Frontend Dockerfile - Multi-stage build
+FROM node:26-alpine@sha256:c6ad9e9c1d80f6eb607c26b4b0a132ff7a2344fad1c78ea3baa2a7d4c8de6d94 AS builder
+
+WORKDIR /app
+
+# Copy package files
+COPY frontend/package*.json ./
+RUN npm ci
+
+# Copy source code
+COPY frontend/ ./
+
+# NEXT_PUBLIC_* vars are inlined into the client bundle at BUILD time, so they must be present
+# during `npm run build` — a runtime env var can't fix a value baked as `undefined`. Pass via
+# `--build-arg NEXT_PUBLIC_MAPBOX_TOKEN=...` (docker-compose.prod.yml forwards it).
+ARG NEXT_PUBLIC_MAPBOX_TOKEN
+ENV NEXT_PUBLIC_MAPBOX_TOKEN=$NEXT_PUBLIC_MAPBOX_TOKEN
+# The /api rewrite destination is resolved AT BUILD TIME (output: 'standalone' bakes
+# next.config rewrites into the routes manifest) — a runtime env would be inert.
+ARG FRIDGE_BACKEND_URL=http://backend:8000
+ENV FRIDGE_BACKEND_URL=$FRIDGE_BACKEND_URL
+
+# Build Next.js app
+RUN npm run build
+
+# Production image
+FROM node:26-alpine@sha256:c6ad9e9c1d80f6eb607c26b4b0a132ff7a2344fad1c78ea3baa2a7d4c8de6d94 AS runner
+
+WORKDIR /app
+
+# Copy necessary files from builder
+COPY --from=builder /app/public ./public
+COPY --from=builder /app/.next/standalone ./
+COPY --from=builder /app/.next/static ./.next/static
+
+# Create non-root user
+RUN addgroup -g 1001 -S nodejs && adduser -S nextjs -u 1001
+RUN chown -R nextjs:nodejs /app
+USER nextjs
+
+# Expose port
+EXPOSE 3000
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
+    CMD node -e "require('http').get('http://localhost:3000', (r) => {if (r.statusCode !== 200) throw new Error(r.statusCode)})"
+
+# Set production environment
+ENV NODE_ENV=production
+ENV PORT=3000
+
+# Start Next.js
+CMD ["node", "server.js"]

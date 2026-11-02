@@ -1,0 +1,16 @@
+# Pin the pg18 base so a rebuild does not silently change PostgreSQL/pgvector. Stay on Debian 12
+# (bookworm): a newer Debian brings a newer glibc, whose en_US.utf8 sort order may differ, so an
+# existing database's text indexes would need a REINDEX (PostgreSQL warns of a collation version mismatch).
+FROM pgvector/pgvector:pg18-bookworm@sha256:2358fcba361ed2233a5ed81b5fe4ca779ccb304120ce531a3bf51c0ed7e2bc11
+
+# The postgres:18 images default to /var/lib/postgresql/18/docker and refuse to start with a database
+# mounted at /var/lib/postgresql/data. Every compose file and procedure mounts it there, so keep it.
+ENV PGDATA=/var/lib/postgresql/data
+
+# Install PostGIS
+USER root
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+    postgresql-18-postgis-3 \
+    postgresql-18-postgis-3-scripts \
+    && rm -rf /var/lib/apt/lists/*

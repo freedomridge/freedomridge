@@ -1,0 +1,64 @@
+# Backend Dockerfile
+FROM ghcr.io/astral-sh/uv:0.13.6@sha256:af22a52f5eafef3d78e551599d405c02df61919d18028f0cea8eda93bc9986d0 AS uv
+FROM python:3.14-slim@sha256:cd89c30eda26ee911a4611b18680086e0ea42e6f5f8cbe653d07fa7958c9cec8
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    postgresql-client \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set working directory
+WORKDIR /app
+
+# Locked Python environment (pyproject.toml + uv.lock; see docs/DEPENDENCIES.md) in /opt/venv,
+# using the image's Python rather than a downloaded one.
+COPY --from=uv /uv /usr/local/bin/uv
+ENV UV_PROJECT_ENVIRONMENT=/opt/venv \
+    UV_PYTHON_DOWNLOADS=never \
+    UV_LINK_MODE=copy \
+    UV_COMPILE_BYTECODE=1 \
+    PATH=/opt/venv/bin:$PATH
+COPY pyproject.toml uv.lock .python-version /app/
+COPY python/pyproject.toml /app/python/pyproject.toml
+# Dependencies first for better caching. The cpu extra: CPU-only PyTorch for server-side CLIP,
+# without the multi-GB CUDA libraries.
+RUN uv sync --frozen --no-cache --no-default-groups --extra cpu --no-install-workspace
+
+# Copy backend code
+COPY VERSION /app/VERSION
+COPY backend /app/backend
+COPY python /app/python
+# Non-interactive admin password reset: docker compose exec backend python /app/reset_admin.py --password ...
+COPY reset_admin.py /app/reset_admin.py
+
+# Install Python SDK
+RUN uv sync --frozen --no-cache --no-default-groups --extra cpu
+
+# Create non-root user
+RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app
+
+# Pre-create the cache dirs owned by the runtime uid. The shared freedomridge_cache
+# named volume is created empty on first mount, inheriting ownership from the
+# image's /cache path — without this, /cache is root-owned and makedirs() at
+# import (backend/main.py) raises PermissionError, crashing every worker on boot.
+RUN mkdir -p /cache/s3 /cache/composite /cache/crop /cache/huggingface && chown -R appuser:appuser /cache
+
+USER appuser
+
+# Expose port
+EXPOSE 8000
+
+# Health check: /api/health is 503 while the database is behind or ahead of this code (pending or
+# unknown migrations, drifted functions), so a schema problem marks the container unhealthy.
+HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health').read()"
+
+# Run with gunicorn for production
+CMD ["gunicorn", "backend.main:app", \
+     "-w", "4", \
+     "-k", "uvicorn.workers.UvicornWorker", \
+     "--bind", "0.0.0.0:8000", \
+     "--timeout", "120", \
+     "--access-logfile", "-", \
+     "--error-logfile", "-"]

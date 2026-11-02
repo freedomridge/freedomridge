@@ -1,0 +1,175 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+*/lib/python*/  # Python lib directories only
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+venv/
+ENV/
+env/
+.venv
+.venv-import/
+
+# Frontend/Next.js
+/frontend/.next/
+/frontend/.next-*
+/frontend/out/
+/frontend/build
+/frontend/dist
+/frontend/node_modules/
+/frontend/.env*.local
+/frontend/npm-debug.log*
+/frontend/yarn-debug.log*
+/frontend/yarn-error.log*
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Database
+*.db
+!Dockerfile.db
+*.sqlite
+*.sqlite3
+backend.log
+
+# Environment
+.env
+.env.local
+.env.*.local
+.env.*
+!.env.example
+!.env.*.example
+
+# Data directories
+/data/
+/media/
+
+# Temporary files
+*.log
+*.tmp
+*.bak
+*.cache
+
+# Test coverage
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+
+# Documentation builds
+docs/_build/
+docs/_static/
+docs/_templates/
+
+# OS
+Thumbs.db
+.Spotlight-V100
+.Trashes
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Temporary root-level development/debugging scripts
+/check_*.py
+/verify_*.py
+/recompute_*.py
+/ingest_*.py
+
+# Keep example scripts
+!example_*.py
+
+# Keep scripts directory
+!/scripts/
+
+# Local AI-assistant instructions and settings
+.claude/
+.agents/
+.codex
+AGENTS.md
+CLAUDE.md
+
+# Local data symlink (-> your data drive); the /data/ pattern above only matches a real dir, not a symlink
+/data
+
+# Local scratch: saved curl cookies, ad-hoc debug/fix scripts, DB snapshots.
+# Keep one-off investigation scripts out of the repo (reset_admin.py is a real
+# tool and is tracked explicitly).
+cookies.txt
+/debug_*.py
+/fix_*.py
+/inspect_*.py
+/investigate_*.py
+/direct_db_check.py
+*.premigrate.bak
+
+# Backend log written by scripts/run_backend.sh (rotated: backend.log.1 …)
+logs/
+
+# Local configuration and secrets
+config.ini
+.env.production
+*.pem
+*.key
+
+# Database backups and model artifacts
+*.sql.gz
+*.dump
+backups/
+*.joblib
+*.pt
+*.pth
+*.onnx
+*.safetensors
+*.ckpt
+*.bin
+*.pkl
+*.pickle
+*.npy
+*.npz
+*.parquet
+*.h5
+*.hdf5
+*.tar.gz
+*.tgz
+*.zip
+
+# Local working notes and publishing configuration; never committed
+/.review/
+/.publish-private-terms
+# Credentials for the demo runner, at any depth.
+import.env
+*.env
+
+# Production ACME state (certificates, private keys, account credentials).
+/ssl/

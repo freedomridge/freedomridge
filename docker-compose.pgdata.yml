@@ -1,0 +1,15 @@
+# Opt-in: keep the database files in a host folder (e.g. on a separate data disk) instead of the
+# `postgres_data` named volume. Enable it in .env:
+#   COMPOSE_FILE=docker-compose.yml:docker-compose.pgdata.yml
+#   FRIDGE_PGDATA_DIR=/mnt/data/fridge/pgdata
+# The long `type: bind` syntax is load-bearing: unlike the short `host:container` form, Docker does not
+# create a missing source folder for it. So if the disk isn't mounted, the database refuses to start
+# instead of Docker creating an empty folder and Postgres initialising a brand-new EMPTY database.
+version: '3.8'
+
+services:
+  db:
+    volumes:
+      - type: bind
+        source: ${FRIDGE_PGDATA_DIR:?set FRIDGE_PGDATA_DIR to the database folder}
+        target: /var/lib/postgresql/data

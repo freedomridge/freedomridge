@@ -1,0 +1,349 @@
+# Freedom Ridge CI — validated locally by bootstrapping a fresh
+# postgis+pgvector DB from schema.sql and running every suite against it.
+#
+# Blocking jobs: lint (ruff+flake8), backend-tests (46 unit + 141 integration),
+# frontend (tsc + next build), e2e (14 Playwright tests; the map test skips
+# itself when the NEXT_PUBLIC_MAPBOX_TOKEN secret isn't configured),
+# quality (mypy + eslint, kept at zero findings),
+# db-recovery (migration runner + backup restore round-trip).
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.3
+        with:
+          python-version: '3.14'
+          activate-environment: true
+          enable-cache: true
+      # ruff and flake8 are pinned in pyproject.toml's dev group — ruff's format output is
+      # version-sensitive, so each bump arrives in a Dependabot pull request.
+      - run: uv sync --frozen --only-group dev
+      - name: ruff check
+        run: ruff check backend/ python/ scripts/ examples/
+      - name: ruff format check
+        # Enforces the formatting (incl. one-argument-per-line for wrapped
+        # calls/defs via the COM812 magic trailing comma). Run
+        # `ruff format backend/ python/ scripts/` locally to fix.
+        run: ruff format --check backend/ python/ scripts/ examples/
+      - name: flake8
+        run: flake8 backend/ python/ scripts/ examples/
+
+  example-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.3
+        with:
+          python-version: '3.14'
+          activate-environment: true
+          enable-cache: true
+      - name: Install offline example test dependencies
+        run: uv sync --frozen --extra cpu
+      - name: Standalone entry points without PYTHONPATH
+        run: env -u PYTHONPATH python -m pytest examples/test_review_regressions.py -k script_help -q
+      - name: Demo mappers, resume, runner and localhost range downloads
+        env:
+          PYTHONPATH: python:.
+          HF_HUB_OFFLINE: '1'
+          TRANSFORMERS_OFFLINE: '1'
+          OMP_NUM_THREADS: '4'
+        run: python -m pytest examples -q
+
+  backend-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.3
+        with:
+          python-version: '3.14'
+          activate-environment: true
+          enable-cache: true
+      - name: Start PostGIS + pgvector and load schema
+        # Build the SAME db image docker-compose runs (Dockerfile.db: pgvector/pgvector:pg18 +
+        # PostGIS), not upstream postgis/postgis + a runtime apt install of pgvector.
+        # That upstream tag is bullseye-based, and apt.postgresql.org dropped bullseye-pgdg
+        # (404) after Debian 11 went EOL — every job died at `apt-get update`. It was also a
+        # different pgvector/PostGIS build from the one dev and prod actually run.
+        # Wait with a real query over TCP, not `pg_isready` on the socket: the entrypoint's
+        # temporary init server answers on the socket BEFORE it has created the `freedomridge`
+        # database, and it never listens on TCP. The old runtime `apt-get install` hid that
+        # race behind ~15s of delay; without it, psql hit `database "freedomridge" does not exist`.
+        run: |
+          docker build -q -f Dockerfile.db -t freedomridge-ci-db .
+          docker run -d --name ci-db \
+            -e POSTGRES_USER=freedomridge -e POSTGRES_PASSWORD=password -e POSTGRES_DB=freedomridge \
+            -p 127.0.0.1:55494:5432 freedomridge-ci-db
+          timeout 90 bash -c 'until docker exec -e PGPASSWORD=password ci-db psql -h 127.0.0.1 -U freedomridge -d freedomridge -c "SELECT 1" >/dev/null 2>&1; do sleep 1; done'
+          docker exec -i ci-db psql -U freedomridge -d freedomridge -v ON_ERROR_STOP=1 -q < backend/db/schema.sql
+      - name: Install backend + SDK
+        # The lean server (no torch/transformers), as before, plus the test tools.
+        run: uv sync --frozen --no-default-groups --group dev
+      - name: Backend unit and PostgreSQL contract tests
+        env:
+          FRIDGE_TEST_POSTGRES_DSN: postgres://freedomridge:password@127.0.0.1:55494/freedomridge
+          FRIDGE_TEST_POSTGRES_CONTAINER: ci-db
+          FRIDGE_DB_CONTAINER: ci-db
+          FRIDGE_DB_USER: freedomridge
+        run: python -m pytest -q
+      - name: Start backend
+        env:
+          DATABASE_URL: postgres://freedomridge:password@127.0.0.1:55494/freedomridge
+          SESSION_COOKIE_SECURE: 'false'   # cookie must flow over plain HTTP in CI
+          STORAGE_ENCRYPTION_KEY: ci-only-not-a-secret
+        run: |
+          nohup python -m backend.launch -- python -m uvicorn backend.main:app --host 127.0.0.1 --port 8001 > backend.log 2>&1 &
+          timeout 60 bash -c 'until curl -sf http://127.0.0.1:8001/api/datasets >/dev/null; do sleep 1; done'
+      - name: Clear admin must_change_password for the SDK suites
+        # The SDK integration suites log in as the seeded admin and call the API directly;
+        # the server-side must_change_password gate 403s every non-exempt route until the
+        # password is changed. Clear the flag so the suites run as a normal post-first-login
+        # admin. The gate itself is covered by test_password_change_gate (unit) + the e2e modal.
+        # get_current_user reads the flag per-request from the DB, so this takes effect live.
+        run: docker exec ci-db psql -U freedomridge -d freedomridge -c "UPDATE users SET must_change_password = false WHERE username = 'admin';"
+      - name: Integration suites (self-creating + self-cleaning datasets)
+        env:
+          FRIDGE_TEST_URL: http://127.0.0.1:8001/api
+        run: |
+          python -m fridge.test_sdk
+          python -m fridge.test_integrity
+          python -m fridge.test_map_contract
+          python -m fridge.test_objects
+          python -m fridge.test_synth_integration
+      - name: Backend log
+        if: failure()
+        run: tail -150 backend.log || true
+
+  frontend:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 26
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+      - name: Runtime dependency audit
+        run: npm audit --omit=dev --audit-level=high
+      - name: TypeScript
+        run: npx tsc --noEmit
+      - name: Frontend unit tests
+        run: node --test tests/*.test.cjs
+      - name: Production build
+        run: npm run build
+
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.3
+        with:
+          python-version: '3.14'
+          activate-environment: true
+          enable-cache: true
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 26
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Start PostGIS + pgvector and load schema
+        run: |
+          docker build -q -f Dockerfile.db -t freedomridge-ci-db .
+          docker run -d --name ci-db \
+            -e POSTGRES_USER=freedomridge -e POSTGRES_PASSWORD=password -e POSTGRES_DB=freedomridge \
+            -p 5432:5432 freedomridge-ci-db
+          timeout 90 bash -c 'until docker exec -e PGPASSWORD=password ci-db psql -h 127.0.0.1 -U freedomridge -d freedomridge -c "SELECT 1" >/dev/null 2>&1; do sleep 1; done'
+          docker exec -i ci-db psql -U freedomridge -d freedomridge -v ON_ERROR_STOP=1 -q < backend/db/schema.sql
+      - name: Install + start backend
+        env:
+          DEMO_MODE: 'true'
+          DATABASE_URL: postgres://freedomridge:password@localhost:5432/freedomridge
+          SESSION_COOKIE_SECURE: 'false'
+          STORAGE_ENCRYPTION_KEY: ci-only-not-a-secret
+        run: |
+          uv sync --frozen --no-default-groups
+          nohup python -m backend.launch -- python -m uvicorn backend.main:app --host 127.0.0.1 --port 8000 > backend.log 2>&1 &
+          timeout 60 bash -c 'until curl -sf http://127.0.0.1:8000/api/datasets >/dev/null; do sleep 1; done'
+      - name: Install frontend + Playwright
+        working-directory: frontend
+        run: |
+          npm ci
+          npx playwright install --with-deps chromium
+      - name: Playwright tests
+        working-directory: frontend
+        env:
+          # Optional repo secret; without it the map spec skips itself.
+          NEXT_PUBLIC_MAPBOX_TOKEN: ${{ secrets.NEXT_PUBLIC_MAPBOX_TOKEN }}
+        run: npx playwright test
+      - name: Backend log
+        if: failure()
+        run: tail -150 backend.log || true
+      - uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          # Traces (trace: retain-on-failure), error-context snapshots, and
+          # screenshots all land in test-results/ — playwright-report/ only
+          # exists with the html reporter, which we don't use.
+          name: playwright-results
+          path: frontend/test-results/
+          retention-days: 7
+
+  db-recovery:
+    # BLOCKING: guards the disaster-recovery path, which no other job exercises.
+    # Both halves were broken in `main` with every other job green:
+    #   * the scheduled pg_dump produced dumps that restored NOTHING onto a compose-deployed box
+    #     (psql exits 0 after 158 errors), and
+    #   * scripts/apply_migrations.sh aborted part-way, so later migrations could never be applied
+    #     to an existing database.
+    # Neither is reachable by a unit test — they only fail against a real Postgres — so this job
+    # runs the real scripts against a real schema.sql database.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash   # bash -eo pipefail: a runner failure piped into tee fails the step
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        # for `python -m backend.schema_check` (asyncpg only) in the steps below
+        with:
+          python-version: '3.14'
+      - name: Start PostGIS + pgvector and load schema
+        # Same bootstrap as backend-tests: this is the state of a freshly deployed box, where
+        # docker-compose.prod.yml mounts schema.sql into the db container's initdb.
+        run: |
+          docker build -q -f Dockerfile.db -t freedomridge-ci-db .
+          docker run -d --name ci-db \
+            -e POSTGRES_USER=freedomridge -e POSTGRES_PASSWORD=password -e POSTGRES_DB=freedomridge \
+            -p 5432:5432 freedomridge-ci-db
+          timeout 90 bash -c 'until docker exec -e PGPASSWORD=password ci-db psql -h 127.0.0.1 -U freedomridge -d freedomridge -c "SELECT 1" >/dev/null 2>&1; do sleep 1; done'
+          docker exec -i ci-db psql -U freedomridge -d freedomridge -v ON_ERROR_STOP=1 -q < backend/db/schema.sql
+      - name: A fresh install has nothing to apply and is current
+        env:
+          FRIDGE_DB_CONTAINER: ci-db
+        run: |
+          pip install -q asyncpg
+          ./scripts/apply_migrations.sh
+          python3 -m backend.schema_check postgresql://freedomridge:password@127.0.0.1:5432/freedomridge
+      - name: A new migration applies once, is skipped after, and the code without it refuses the database
+        # The file and its ledger row commit together; the next run skips it via the ledger. Once the
+        # file is gone the database is newer than the code: the schema check (GET /api/health) and the
+        # runner must both refuse it, and the runner must apply nothing.
+        env:
+          FRIDGE_DB_CONTAINER: ci-db
+        run: |
+          printf 'ALTER TABLE samples ADD COLUMN ci_canary TEXT;\n' > backend/db/migrations/9001_ci_canary.sql
+          ./scripts/apply_migrations.sh | tee /tmp/first_run.log
+          grep -q "^Applying 9001_ci_canary.sql" /tmp/first_run.log
+          test "$(docker exec ci-db psql -U freedomridge -d freedomridge -Atc "SELECT count(*) FROM schema_migrations WHERE filename='9001_ci_canary.sql'")" = 1
+          ./scripts/apply_migrations.sh | tee /tmp/second_run.log
+          grep -q "Skipped 1 file(s) already recorded" /tmp/second_run.log
+          # Per-file lines only (the header says "Applying database migrations..."). Not `! grep`: bash -e ignores a negated command.
+          if grep -qE "^Applying [^ ]+\.sql" /tmp/second_run.log; then echo "second run re-applied a file"; exit 1; fi
+          rm backend/db/migrations/9001_ci_canary.sql
+          if python3 -m backend.schema_check postgresql://freedomridge:password@127.0.0.1:5432/freedomridge; then echo "a newer database must be reported"; exit 1; fi
+          if ./scripts/apply_migrations.sh 2>/tmp/refused.log; then echo "runner must refuse a newer database"; exit 1; fi
+          grep -q "does not have: 9001_ci_canary.sql" /tmp/refused.log
+          docker exec -i ci-db psql -U freedomridge -d freedomridge -v ON_ERROR_STOP=1 -q -c \
+            "ALTER TABLE samples DROP COLUMN ci_canary; DELETE FROM schema_migrations WHERE filename='9001_ci_canary.sql'"
+          python3 -m backend.schema_check postgresql://freedomridge:password@127.0.0.1:5432/freedomridge
+      - name: A migration file that fails is NOT recorded as applied
+        # A colliding first statement makes psql roll the whole file back; the runner must exit
+        # non-zero, record nothing, and leave the file's other statements unapplied (so the next run
+        # retries it instead of skipping it).
+        env:
+          FRIDGE_DB_CONTAINER: ci-db
+        run: |
+          printf 'CREATE INDEX idx_samples_dataset_id ON samples(dataset_id);\nALTER TABLE samples ADD COLUMN ci_canary TEXT;\n' > backend/db/migrations/9002_ci_collision.sql
+          if ./scripts/apply_migrations.sh; then echo "runner must fail on a rolled-back file"; exit 1; fi
+          rm backend/db/migrations/9002_ci_collision.sql
+          test "$(docker exec ci-db psql -U freedomridge -d freedomridge -Atc "SELECT count(*) FROM schema_migrations WHERE filename='9002_ci_collision.sql'")" = 0
+          test "$(docker exec ci-db psql -U freedomridge -d freedomridge -Atc "SELECT count(*) FROM information_schema.columns WHERE table_name='samples' AND column_name='ci_canary'")" = 0
+      - name: A downgraded function body is reported by the schema check and healed by the next run
+        env:
+          FRIDGE_DB_CONTAINER: ci-db
+        run: |
+          docker exec -i ci-db psql -U freedomridge -d freedomridge -v ON_ERROR_STOP=1 -q -c \
+            'CREATE OR REPLACE FUNCTION mark_dataset_stats_stale() RETURNS TRIGGER AS $f$ BEGIN RETURN NEW; END; $f$ LANGUAGE plpgsql'
+          if python3 -m backend.schema_check postgresql://freedomridge:password@127.0.0.1:5432/freedomridge; then echo "stale body must be reported"; exit 1; fi
+          ./scripts/apply_migrations.sh | tee /tmp/heal.log
+          grep -q "Re-applying function definitions" /tmp/heal.log
+          python3 -m backend.schema_check postgresql://freedomridge:password@127.0.0.1:5432/freedomridge
+      - name: A database not created from schema.sql is refused
+        env:
+          FRIDGE_DB_CONTAINER: ci-db
+        run: |
+          docker exec -i ci-db psql -U freedomridge -d freedomridge -v ON_ERROR_STOP=1 -q -c "DELETE FROM schema_migrations"
+          if python3 -m backend.schema_check postgresql://freedomridge:password@127.0.0.1:5432/freedomridge; then echo "a database without the baseline must be reported"; exit 1; fi
+          if ./scripts/apply_migrations.sh 2>/tmp/refused.log; then echo "runner must refuse it"; exit 1; fi
+          grep -q "not created from backend/db/schema.sql" /tmp/refused.log
+          docker exec -i ci-db psql -U freedomridge -d freedomridge -v ON_ERROR_STOP=1 -q -c \
+            "INSERT INTO schema_migrations (filename) VALUES ('0000_baseline.sql')"
+          python3 -m backend.schema_check postgresql://freedomridge:password@127.0.0.1:5432/freedomridge
+      - name: Backup round-trip restores every row
+        env:
+          FRIDGE_DB_CONTAINER: ci-db
+        run: ./scripts/test_backup_restore.sh
+
+  quality:
+    # BLOCKING: mypy (mypy.ini) + eslint must stay clean
+    # (frontend any/unused/require/img/hooks + backend/SDK mypy).
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.3
+        with:
+          python-version: '3.14'
+          activate-environment: true
+          enable-cache: true
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 26
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install the locked Python environment
+        run: uv sync --frozen --extra cpu
+      - name: mypy
+        # Pinned in pyproject.toml's dev group, so a newer mypy's added checks arrive in a
+        # Dependabot pull request instead of failing CI without a local repro.
+        run: mypy backend/ python/ examples/
+      - name: Python dependency audit
+        # Known vulnerabilities in any locked package (server, SDK, examples, dev tools). Each
+        # ignored ID is an accepted exception explained in docs/DEPENDENCIES.md ("Known audit
+        # exceptions"); a new advisory fails this step until it is fixed or accepted there.
+        run: |
+          uv export --frozen --extra cpu --all-groups --no-emit-workspace --no-hashes --format requirements-txt \
+            | sed 's/+cpu / /' > "$RUNNER_TEMP/requirements-audit.txt"
+          pip-audit --strict --no-deps --disable-pip -r "$RUNNER_TEMP/requirements-audit.txt" \
+            --ignore-vuln PYSEC-2025-217 --ignore-vuln PYSEC-2026-2288 --ignore-vuln PYSEC-2026-2289 \
+            --ignore-vuln PYSEC-2026-2290 --ignore-vuln PYSEC-2026-3929 --ignore-vuln PYSEC-2026-4174 \
+            --ignore-vuln PYSEC-2026-3447 --ignore-vuln GHSA-xmj3-9gf7-h52w
+      - name: eslint
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run lint

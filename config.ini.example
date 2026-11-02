@@ -1,0 +1,18 @@
+# Example Freedom Ridge Configuration File
+# Save as ~/.fridge/config.ini or specify path with FRIDGE_CONFIG env var
+
+[fridge]
+# S3 Configuration
+aws_access_key_id = YOUR_ACCESS_KEY_HERE
+aws_secret_access_key = YOUR_SECRET_KEY_HERE
+region = us-east-1
+s3_bucket = my-freedomridge-datasets
+s3_endpoint_url = 
+# Optional: Path to local mirror of S3 bucket for hybrid mode
+# s3_local_cache_path = /path/to/local/images
+
+# Or use the default AWS credentials format:
+# [default]
+# aws_access_key_id = YOUR_ACCESS_KEY_HERE
+# aws_secret_access_key = YOUR_SECRET_KEY_HERE
+# region = us-east-1

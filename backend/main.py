@@ -1,0 +1,1312 @@
+# Trigger reload, embeddings, auth
+import asyncio
+import math
+import os
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from email.utils import parsedate_to_datetime
+
+import asyncpg
+from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from starlette.background import BackgroundTask
+
+from . import backups, system_status  # system_status records at import when this process started and its commit
+from .api_errors import CodedHTTPException
+from .colormaps import COLORMAPS
+from .crypto import assert_secure_encryption_key, warn_insecure_session_cookie
+from .database import lifespan
+from .media_cache import read_cache, write_cache
+from .request_limits import RequestLimitsMiddleware
+from .routers import (
+    auth,
+    backup_settings,
+    concepts,
+    datasets,
+    embeddings,
+    hashes,
+    index_advisor,
+    jobs,
+    quality,
+    sampling,
+    schedules,
+    search,
+    storage,
+    tokens,
+    users,
+    versions,
+    views,
+)
+from .security import production
+
+# Fail fast in prod if the storage-secret encryption key is missing/default.
+# Local dev (FRIDGE_ENV=development) just logs a warning.
+assert_secure_encryption_key()
+# Loudly warn (never refuse) if a production deploy is emitting non-Secure session cookies.
+# Silent in dev — non-prod needs no TLS/certs and keeps working over plain http://localhost.
+warn_insecure_session_cookie()
+
+app = FastAPI(lifespan=lifespan)
+app.add_middleware(RequestLimitsMiddleware)
+
+
+@app.exception_handler(CodedHTTPException)
+async def coded_http_error(request: Request, exc: CodedHTTPException):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={'detail': exc.detail, 'code': exc.code},
+        headers=exc.headers,
+    )
+
+
+DATA_ROOT = os.getenv("FRIDGE_DATA_ROOT", os.path.join(os.getcwd(), "data"))
+# NOTE: there is deliberately NO `app.mount("/media", StaticFiles(DATA_ROOT))`.
+# A StaticFiles mount on /media served the entire data tree with NO auth, and
+# (because mounts are matched before routes) it shadowed the admin-gated
+# /media/s3 route below, turning that auth check into dead code. All local
+# images are served through the access-controlled /api/samples/{id}/media route,
+# which enforces check_dataset_access and confines reads to FRIDGE_DATA_ROOT.
+
+# CORS
+origins = os.getenv("ALLOWED_ORIGINS", "http://localhost:5173,http://localhost:3000").split(",")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization"],
+)
+
+# --- CSRF defense for cookie-authenticated requests ---------------------------
+# A session cookie is sent automatically by the browser on cross-site requests,
+# so a malicious page could drive state-changing calls on a logged-in user's
+# behalf (SameSite=Lax doesn't fully cover this). We require that unsafe-method
+# requests that carry a session cookie originate from an allowed Origin.
+#
+# Deliberately permissive where it must be, to avoid regressions:
+#   - Safe methods (GET/HEAD/OPTIONS) are never blocked (CORS preflight still works).
+#   - Bearer-token requests are exempt (no ambient cookie credential = no CSRF).
+#   - Requests with NO Origin header are allowed: that's non-browser clients
+#     (the Python SDK, curl) and same-origin server-proxied calls. Browsers
+#     always attach Origin on cross-site unsafe requests, which is exactly the
+#     case we want to block.
+_CSRF_SAFE_METHODS = {"GET", "HEAD", "OPTIONS", "TRACE"}
+# Normalize (strip a trailing slash) so a stray "https://app/" in ALLOWED_ORIGINS
+# vs the browser's "https://app" Origin doesn't silently 403 every write.
+_ALLOWED_ORIGINS = {o.strip().rstrip("/") for o in origins if o.strip()}
+_csrf_block_logged = False
+
+
+@app.middleware("http")
+async def csrf_origin_guard(request: Request, call_next):
+    if request.method not in _CSRF_SAFE_METHODS:
+        has_session_cookie = request.cookies.get("session_id") is not None
+        is_bearer = request.headers.get("Authorization", "").startswith("Bearer ")
+        if has_session_cookie and not is_bearer:
+            origin = request.headers.get("origin")
+            if origin is not None and origin.rstrip("/") not in _ALLOWED_ORIGINS:
+                global _csrf_block_logged
+                if not _csrf_block_logged:
+                    # Log once so an ALLOWED_ORIGINS misconfig (scheme/host/slash
+                    # mismatch) is diagnosable instead of a silent wall of 403s.
+                    _csrf_block_logged = True
+                    log.warning(
+                        "CSRF guard blocked Origin %r (not in ALLOWED_ORIGINS=%r). "
+                        "If legitimate, fix ALLOWED_ORIGINS to the exact scheme+host.",
+                        origin,
+                        sorted(_ALLOWED_ORIGINS),
+                    )
+                from fastapi.responses import JSONResponse
+
+                return JSONResponse(
+                    status_code=403,
+                    content={"detail": "CSRF check failed: origin not allowed"},
+                )
+    return await call_next(request)
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_error_handler(request: Request, exc: RequestValidationError):
+    """Report invalid values without echoing non-JSON inputs such as NaN or Infinity."""
+    errors = [{key: value for key, value in error.items() if key not in ('input', 'ctx')} for error in exc.errors()]
+    return JSONResponse(status_code=422, content={'detail': errors})
+
+
+@app.exception_handler(asyncpg.DataError)
+async def data_error_handler(request: Request, exc: asyncpg.DataError):
+    """A Postgres data exception (SQLSTATE class 22) or an argument asyncpg could not encode is
+    bad input — `GET /datasets/99999999999999` (beyond int32), a value its column cannot hold —
+    not a server fault. Those were 500s with an error_id.
+    400 with the first line of the reason; class-22 messages carry no row data (that is class 23,
+    integrity, which stays a 500)."""
+    from fastapi.responses import JSONResponse
+
+    logging.getLogger("fridge.errors").warning("bad input on %s %s: %s", request.method, request.url.path, exc)
+    reason = str(exc).splitlines()[0] if str(exc) else type(exc).__name__
+    return JSONResponse(status_code=400, content={"detail": f"Invalid input: {reason}"})
+
+
+@app.exception_handler(asyncpg.ObjectNotInPrerequisiteStateError)
+async def dataset_lifecycle_error(request: Request, exc: asyncpg.ObjectNotInPrerequisiteStateError):
+    # The same body a facet stream gives the fields it had not answered when the refusal came
+    # (datasets._refusal): require_current_map names the stale lasso's field and the map's
+    # current model, so the UI can drop that lasso instead of leaving every view of it failing.
+    return JSONResponse(status_code=409, content=datasets._refusal(exc))
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    """Turn unhandled errors into a diagnosable JSON 500 instead of the bare
+    "Internal Server Error" string. Clients (SDK/UI) surface ``detail``; the
+    error_id correlates the response with the server-side traceback. In
+    production the exception text is withheld (it can leak paths/internals) —
+    the error_id still links the report to the log line.
+    """
+    from fastapi.responses import JSONResponse
+
+    error_id = uuid.uuid4().hex[:12]
+    logging.getLogger("fridge.errors").error(
+        "unhandled error %s on %s %s",
+        error_id,
+        request.method,
+        request.url.path,
+        exc_info=exc,
+    )
+    # Both spellings, matching crypto.py's production gates — an operator who booted with
+    # FRIDGE_ENV=prod is in production and must not receive exception internals.
+    detail = "Internal server error" if production() else f"{type(exc).__name__}: {exc}"
+    # This handler runs in ServerErrorMiddleware, OUTSIDE CORSMiddleware — without the header
+    # a cross-origin browser client can't read the body and the whole point of the JSON is lost.
+    origin = request.headers.get("origin")
+    headers = (
+        {"Access-Control-Allow-Origin": origin, "Access-Control-Allow-Credentials": "true", "Vary": "Origin"}
+        if origin is not None and origin.rstrip("/") in _ALLOWED_ORIGINS
+        else None
+    )
+    return JSONResponse(
+        status_code=500,
+        content={"detail": f"{detail} [error_id={error_id}]", "error_id": error_id},
+        headers=headers,
+    )
+
+
+app.include_router(datasets.router, prefix="/api")
+app.include_router(search.router, prefix="/api")
+app.include_router(users.router, prefix="/api")
+app.include_router(views.router, prefix="/api")
+app.include_router(embeddings.router, prefix="/api")
+app.include_router(auth.router, prefix="/api")
+app.include_router(tokens.router, prefix="/api")
+app.include_router(storage.router)  # Note: storage router has its own /api prefix
+app.include_router(hashes.router, prefix="/api")
+app.include_router(versions.router, prefix="/api")
+app.include_router(sampling.router, prefix="/api")
+app.include_router(quality.router, prefix="/api")
+app.include_router(concepts.router, prefix="/api")
+app.include_router(jobs.router, prefix="/api")
+app.include_router(backup_settings.router, prefix="/api")
+app.include_router(schedules.router, prefix="/api")
+app.include_router(index_advisor.router, prefix="/api")
+
+
+@app.get("/api/health")
+async def health():
+    """Liveness + schema currency, with the running version. 200 {"status": "ok"} when every
+    migration file is recorded as applied, the database records none this code lacks, AND every function body matches
+    schema.sql; 503 {"status": "degraded", "pending_migrations": [...], "unknown_migrations": [...],
+    "stale_functions": [...]} otherwise — so the deploy checklist and a load-balancer health check
+    catch a backend serving a database that is behind (a missing migration, a downgraded function)
+    or ahead of the code (an older version started after an upgrade, a newer backup restored).
+    Unauthenticated; re-checks live on every call (running apply_migrations.sh needs no restart)."""
+    from .schema_check import pending_migrations, stale_functions, unknown_migrations
+    from .version import VERSION
+
+    pending = await pending_migrations(db)
+    unknown = await unknown_migrations(db)
+    stale = await stale_functions(db)
+    if pending or unknown or stale:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "degraded",
+                "version": VERSION,
+                "pending_migrations": pending,
+                "unknown_migrations": unknown,
+                "stale_functions": stale,
+            },
+        )
+    return {
+        "status": "ok",
+        "version": VERSION,
+        "pending_migrations": [],
+        "unknown_migrations": [],
+        "stale_functions": [],
+    }
+
+
+@app.get("/api/admin/status")
+async def admin_status(user: dict = Depends(auth.require_role("admin"))):
+    """Settings → System status, and the admin low-disk banner (backend/system_status.py)."""
+    return await system_status.collect(
+        db,
+        {"S3 image cache": S3_LOCAL_PATH, "Crop cache": CROP_CACHE_PATH, "Composite cache": COMPOSITE_CACHE_PATH},
+        backup_folder=backups.BACKUP_DIR,
+    )
+
+
+@app.get("/")
+async def root():
+    return {"message": "Freedom Ridge API is running (Python/FastAPI)"}
+
+
+@app.get("/api/config")
+async def get_config():
+    """Return public configuration for the frontend."""
+    return {"demo_mode": os.getenv("DEMO_MODE", "false").lower() == "true"}
+
+
+import mimetypes  # noqa: E402
+
+from fastapi.responses import FileResponse, Response  # noqa: E402
+
+# NOTE: the old unauthenticated `GET /files?path=` route was removed. It served
+# any file under FRIDGE_DATA_ROOT with no dataset-access check, bypassing the
+# media access-control hardening. Local images are served exclusively via the
+# access-checked /api/samples/{id}/media route.
+# S3 Proxy with local sync/cache
+from .storage import get_storage  # noqa: E402
+
+# Local path that mirrors S3 structure. If set:
+#   - Serves files from here instantly (no S3 hit)
+#   - Downloads from S3 are saved here, building up the mirror over time
+# If not set, falls back to a temp dir cache.
+S3_LOCAL_PATH = os.getenv("S3_LOCAL_CACHE_PATH", os.path.join(os.getenv("TMPDIR", "/tmp"), "freedomridge-s3-cache"))
+os.makedirs(S3_LOCAL_PATH, exist_ok=True)
+
+# Where composited heatmap-overlay PNGs (grid thumbnails) live. Separate from
+# S3_LOCAL_PATH so it can be pointed at a smaller/faster disk (composites are
+# cheap to regenerate — they're derived state, not source data).
+COMPOSITE_CACHE_PATH = os.getenv(
+    "FRIDGE_COMPOSITE_CACHE_PATH",
+    os.path.join(os.getenv("TMPDIR", "/tmp"), "freedomridge-composite-cache"),
+)
+os.makedirs(COMPOSITE_CACHE_PATH, exist_ok=True)
+
+# Where on-the-fly cropped/resized JPEGs (grid thumbnails, per-object crops) live.
+# Separate cache dir for the same reason as composites: derived state, cheap to
+# regenerate, may want its own disk.
+CROP_CACHE_PATH = os.getenv(
+    "FRIDGE_CROP_CACHE_PATH",
+    os.path.join(os.getenv("TMPDIR", "/tmp"), "freedomridge-crop-cache"),
+)
+os.makedirs(CROP_CACHE_PATH, exist_ok=True)
+
+
+_CACHE_MAX_BYTES = max(0, int(os.getenv("FRIDGE_CACHE_MAX_BYTES", str(10 * 1024**3))))
+
+
+def _write_media_cache(path: str, body: bytes) -> None:
+    write_cache(path, body, (CROP_CACHE_PATH, COMPOSITE_CACHE_PATH, S3_LOCAL_PATH), _CACHE_MAX_BYTES)
+
+
+_CACHE_WRITERS = ThreadPoolExecutor(max_workers=2, thread_name_prefix="media-cache-write")
+_CACHE_WRITE_SLOTS = threading.BoundedSemaphore(16)
+_pending_cache_writes: set[asyncio.Task] = set()
+
+
+async def _cache_media_later(path: str, body: bytes) -> None:
+    # Called after sending a response. Slow cache storage must not fill the
+    # serving executor or retain an unbounded queue of image bodies in memory.
+    if not _CACHE_WRITE_SLOTS.acquire(blocking=False):
+        return
+    try:
+        future = _CACHE_WRITERS.submit(_write_media_cache, path, body)
+    except Exception:
+        _CACHE_WRITE_SLOTS.release()
+        raise
+    # Cancellation of an HTTP background task cannot release a running writer's
+    # slot early: only completion of the actual thread may admit another body.
+    future.add_done_callback(lambda _: _CACHE_WRITE_SLOTS.release())
+    try:
+        await asyncio.wrap_future(future)
+    except Exception:
+        log.exception("Media cache-write failed")
+
+
+def _queue_media_cache(path: str, body: bytes) -> None:
+    # Internal S3 fetches feed renderers rather than returning a Response. Keep
+    # these best-effort fills detached too, with a bounded set of live tasks.
+    if len(_pending_cache_writes) >= 16:
+        return
+    task = asyncio.create_task(_cache_media_later(path, body))
+    _pending_cache_writes.add(task)
+    task.add_done_callback(_pending_cache_writes.discard)
+
+
+def _thumbnail_width(width: int | None) -> int | None:
+    if width is None:
+        return None
+    if not 1 <= width <= 4096:
+        raise HTTPException(400, "w must be in [1, 4096]")
+    # dataset-grid.tsx requests 256..1024 in 128px steps. Larger requests get
+    # the full image, which remains available without a width parameter.
+    return min(1024, max(256, math.ceil(width / 128) * 128)) if width <= 1024 else None
+
+
+def _overlay_range(value: float) -> float:
+    if not math.isfinite(value) or not -65535 <= value <= 65535:
+        raise HTTPException(400, "Overlay range must be finite and in [-65535, 65535]")
+    return round(value, 2) + 0.0
+
+
+@app.get("/media/s3/{key:path}")
+async def proxy_s3(key: str, request: Request):
+    """
+    Legacy S3 proxy (env-var credentials, env-var bucket, no per-dataset routing).
+
+    Kept so any pre-existing browser-cached or external links continue to work.
+    All NEW image URLs are issued via /api/samples/{id}/media which respects
+    per-dataset storage configs and access control.
+
+    Auth policy: requires ANY authenticated user. This route has no way to
+    know which dataset a key belongs to, so it can't enforce per-dataset
+    access — but requiring auth at least prevents a drive-by attacker who
+    guesses a key from bypassing the new media-access work entirely.
+    """
+    # Admin-only. This shim can't enforce per-dataset access (it has no dataset
+    # scope), so without a gate any authenticated user — including a guest — could
+    # read any object in the env-var bucket by key. The modern, access-checked
+    # route is /api/samples/{id}/media; the frontend uses only that. Restricting
+    # the shim to admins keeps old bookmarks working for operators without
+    # reopening the cross-dataset read hole.
+    from .routers.auth import get_current_user
+
+    _legacy_user = await get_current_user(request)  # Raises 401 if not logged in.
+    if _legacy_user.get("role") != "admin":
+        raise HTTPException(
+            status_code=403,
+            detail="Legacy media route is admin-only; use /api/samples/{id}/media",
+        )
+
+    # Reuse the same path-traversal guard as the modern route so a malicious
+    # key like `../../etc/passwd` can't escape the local cache directory.
+    _validate_s3_key(key)
+
+    local_path = os.path.join(S3_LOCAL_PATH, key)
+
+    # Serve from local mirror
+    cached = await asyncio.to_thread(_cached_media_response, request, local_path, key)
+    if cached is not None:
+        return cached
+
+    # Download from S3, save to local mirror, and serve. Boto3 is blocking, so
+    # run it in the default thread pool to keep the event loop responsive.
+    # This route is a deprecated compat shim — we log errors and return a
+    # single failure rather than mapping granular S3 error codes (the
+    # modern /api/samples/{id}/media route does that work properly).
+    import asyncio as _asyncio
+
+    storage = get_storage()
+    if not storage.s3_client:
+        raise HTTPException(status_code=500, detail="S3 not configured")
+
+    def _fetch():
+        resp = storage.s3_client.get_object(Bucket=storage.config.s3_bucket, Key=key)
+        return resp['Body'].read(), resp.get('ContentType', mimetypes.guess_type(key)[0] or 'application/octet-stream')
+
+    try:
+        body, content_type = await _asyncio.to_thread(_fetch)
+    except Exception as e:
+        log.error("legacy S3 proxy failed for %s: %s", key, e)
+        raise HTTPException(status_code=404, detail="File not found in S3")
+
+    return Response(
+        content=body,
+        background=BackgroundTask(_cache_media_later, local_path, body),
+        **_media_response_kwargs(content_type, body[:_MEDIA_HEAD_BYTES], key, **{"X-Cache": "MISS"}),
+    )
+
+
+# --- Sample-based media route ------------------------------------------------
+#
+# The canonical URL for serving a sample's image. Frontend uses
+#   <img src="/api/samples/{id}/media">
+# regardless of whether the underlying file is on disk or in S3, and regardless
+# of which storage config the dataset uses. The backend resolves all of that
+# from the sample → dataset → storage_config chain, with access checks.
+
+import logging  # noqa: E402
+import re  # noqa: E402
+import uuid  # noqa: E402
+
+from fastapi.responses import RedirectResponse  # noqa: E402
+
+from .access import check_dataset_access  # noqa: E402
+from .database import db  # noqa: E402
+from .routers.auth import get_optional_user  # noqa: E402
+from .storage import get_storage_for_s3_uri, is_bucket_authorized  # noqa: E402
+
+log = logging.getLogger("fridge.media")
+
+# Field name validator — must match samples.* column or metadata key. Same
+# pattern the rest of the codebase uses for safe identifiers.
+_SAFE_FIELD_RE = re.compile(r'^[a-zA-Z_][a-zA-Z0-9_]{0,62}$')
+
+
+def _parse_s3_path(s3_path: str) -> tuple[str, str]:
+    """`s3://bucket/key/with/slashes` -> ('bucket', 'key/with/slashes')."""
+    rest = s3_path[5:]  # strip "s3://"
+    if '/' not in rest:
+        return rest, ''
+    bucket, key = rest.split('/', 1)
+    return bucket, key
+
+
+def _validate_s3_key(key: str) -> None:
+    """Reject S3 keys that would escape the dataset-scoped cache directory.
+
+    The cache path is `S3_LOCAL_PATH/{dataset_id}/{key}`. A malicious DB value
+    like `s3://bucket/../../etc/passwd` would parse to key=`../../etc/passwd`
+    and os.path.join would happily let it traverse out. Reject anything with
+    a `..` segment, a leading `/`, or a NUL byte.
+
+    Raises HTTPException(400) on invalid keys so the caller sees the failure
+    clearly instead of silently serving the wrong file.
+    """
+    if not key:
+        raise HTTPException(status_code=400, detail="Empty S3 key")
+    if key.startswith('/') or '\x00' in key:
+        raise HTTPException(status_code=400, detail=f"Unsafe S3 key: {key}")
+    # Normalise path separators and check each segment
+    for segment in key.replace('\\', '/').split('/'):
+        if segment in ('..', '.'):
+            raise HTTPException(status_code=400, detail=f"Unsafe S3 key: {key}")
+
+
+def _validate_bucket(bucket: str) -> None:
+    """Reject bucket names that would escape the cache dir once interpolated
+    into `S3_LOCAL_PATH/{dataset_id}/{bucket}/{key}`. The bucket is now part of
+    the on-disk cache path (so two buckets with the same key don't collide), so
+    a malicious `s3://../key` must not be allowed to traverse out."""
+    if not bucket or bucket in ('..', '.') or '/' in bucket or '\\' in bucket or '\x00' in bucket:
+        raise HTTPException(status_code=400, detail=f"Unsafe bucket name: {bucket}")
+
+
+def _resolve_local_path(path: str) -> str:
+    """Resolve a local filepath for serving and confirm it stays inside the
+    configured FRIDGE_DATA_ROOT (same containment contract the /files route
+    enforces). Returns the resolved absolute path.
+
+    Freedom Ridge's schema allows absolute filepaths anywhere on disk in
+    principle, but the runtime policy is: local samples must live under
+    FRIDGE_DATA_ROOT. Anything else is either a data-entry bug or a
+    path-traversal attempt.
+
+    Relative filepaths are anchored to FRIDGE_DATA_ROOT (NOT the process CWD).
+    Ingest tools store relative paths for host/container portability (e.g. the
+    BDD100K example writes `bdd100k/100k_images/...`); without this join,
+    realpath() resolved them against the backend's CWD and every local image
+    404/403'd. The containment check below still blocks `../` traversal because
+    it runs after the join + realpath.
+    """
+    if not os.path.isabs(path):
+        path = os.path.join(DATA_ROOT, path)
+    resolved = os.path.realpath(path)
+    data_root = os.path.realpath(DATA_ROOT)
+    if resolved != data_root and not resolved.startswith(data_root + os.sep):
+        raise HTTPException(
+            status_code=403,
+            detail="Local filepath is outside FRIDGE_DATA_ROOT",
+        )
+    return resolved
+
+
+# --- Media content-type policy --------------------------------------------------
+#
+# Bytes served by the media routes are user-supplied (any power_user can ingest a
+# filepath / S3 key) and land on the app's OWN origin. Served under a type derived from
+# the filename or the S3 object's ContentType, an `.svg` or `.html` "sample" opened
+# directly (a pasted link, "open image in new tab") executes script with the viewer's
+# session — stored XSS, power_user -> admin.
+#
+# Policy: only known raster/video types are served inline. The type is the DECLARED one
+# when it is on that list; otherwise the file's own magic bytes decide (S3 objects
+# uploaded without a Content-Type come back as binary/octet-stream and must keep
+# rendering in <img>); anything else is a download under an opaque type. Every raw media
+# response also carries `nosniff` (the browser may not promote the type) and a sandbox
+# CSP (a direct navigation to it can never run script).
+_INLINE_MEDIA_TYPES = frozenset(
+    {
+        "image/jpeg",
+        "image/png",
+        "image/gif",
+        "image/webp",
+        "image/bmp",
+        "image/tiff",
+        "image/avif",
+        "image/heic",
+        "image/heif",
+        "image/x-icon",
+        "image/vnd.microsoft.icon",
+        "video/mp4",
+        "video/webm",
+        "video/quicktime",
+        "video/x-msvideo",
+        "video/mpeg",
+        "video/ogg",
+    },
+)
+_MEDIA_MAGIC = (
+    (b"\xff\xd8\xff", "image/jpeg"),
+    (b"\x89PNG\r\n\x1a\n", "image/png"),
+    (b"GIF87a", "image/gif"),
+    (b"GIF89a", "image/gif"),
+    (b"BM", "image/bmp"),
+    (b"II*\x00", "image/tiff"),
+    (b"MM\x00*", "image/tiff"),
+)
+_MEDIA_HEADERS = {"X-Content-Type-Options": "nosniff", "Content-Security-Policy": "sandbox"}
+_MEDIA_HEAD_BYTES = 16
+_SAFE_FILENAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def _sniff_media_type(head: bytes) -> str | None:
+    """Image/video type from the leading bytes, or None if they are not a known raster/video."""
+    for magic, media_type in _MEDIA_MAGIC:
+        if head.startswith(magic):
+            return media_type
+    if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        return "image/webp"
+    if head[4:8] == b"ftyp":
+        return "video/mp4"  # ISO base media (MP4 / MOV / HEIC) — all inline-safe
+    return None
+
+
+def _inline_media_type(declared: str | None, head: bytes) -> str | None:
+    """The type a media response may be served inline as, or None (-> opaque download)."""
+    declared_type = (declared or "").split(";", 1)[0].strip().lower()
+    if declared_type in _INLINE_MEDIA_TYPES:
+        return declared_type
+    return _sniff_media_type(head)
+
+
+def _media_response_kwargs(declared: str | None, head: bytes, filename: str, **extra_headers: str) -> dict:
+    """media_type + headers for a raw media response (FileResponse or Response)."""
+    headers = dict(_MEDIA_HEADERS, **extra_headers)
+    media_type = _inline_media_type(declared, head)
+    if media_type is None:
+        media_type = "application/octet-stream"
+        safe_name = _SAFE_FILENAME_RE.sub("_", os.path.basename(filename)) or "file"
+        headers["Content-Disposition"] = f'attachment; filename="{safe_name}"'
+    return {"media_type": media_type, "headers": headers}
+
+
+# Full-size media (the sample modal's image) went out with an ETag but no Cache-Control, and a
+# revalidation with that ETag re-sent the whole file (thumbnails were
+# already immutable-cached). `private`: media is behind login, shared caches must not keep it.
+# An hour like the overlay composites, then a cheap 304 revalidation — the URL is per-sample, not
+# per-content, so it can't be `immutable`.
+_FULL_MEDIA_CACHE_CONTROL = "private, max-age=3600"
+
+
+def _is_not_modified(request: Request, headers) -> bool:
+    """True when the client's copy is current: If-None-Match names this ETag (weak compare), or —
+    only without If-None-Match, per RFC 9110 — If-Modified-Since is at or after Last-Modified."""
+    if_none_match = request.headers.get("if-none-match")
+    etag = headers.get("etag")
+    if if_none_match is not None:
+        if not etag:
+            return False
+        wanted = {t.strip().removeprefix("W/") for t in if_none_match.split(",")}
+        return "*" in wanted or etag.removeprefix("W/") in wanted
+    if_modified_since = request.headers.get("if-modified-since")
+    last_modified = headers.get("last-modified")
+    if if_modified_since and last_modified:
+        try:
+            return parsedate_to_datetime(last_modified) <= parsedate_to_datetime(if_modified_since)
+        except (TypeError, ValueError):
+            return False
+    return False
+
+
+def _full_media_file_response(request: Request, path: str, **kwargs) -> Response:
+    """FileResponse for full-size media with Cache-Control, answering a matching revalidation with
+    304 and no body (Starlette's FileResponse sets ETag/Last-Modified but never answers 304)."""
+    response = FileResponse(path, stat_result=os.stat(path), **kwargs)
+    if _is_not_modified(request, response.headers):
+        keep = ("etag", "last-modified", "cache-control")
+        return Response(status_code=304, headers={k: v for k, v in response.headers.items() if k in keep})
+    return response
+
+
+def _media_head(path: str) -> bytes:
+    with open(path, "rb") as f:
+        return f.read(_MEDIA_HEAD_BYTES)
+
+
+class _CachedFileResponse(FileResponse):
+    """Hold the cache inode across eviction, preserving streaming and HTTP ranges."""
+
+    def __init__(self, cached_file, **kwargs):
+        self.cached_file = cached_file
+        super().__init__(f'/dev/fd/{cached_file.fileno()}', stat_result=os.fstat(cached_file.fileno()), **kwargs)
+
+    async def __call__(self, scope, receive, send):
+        try:
+            # A server-side pathsend could open the fd path after we close it. Use
+            # FileResponse's ordinary streaming/range handling while the inode is pinned.
+            extensions = {k: v for k, v in scope.get('extensions', {}).items() if k != 'http.response.pathsend'}
+            scope = {**scope, 'extensions': extensions}
+            await super().__call__(scope, receive, send)
+        finally:
+            self.cached_file.close()
+
+
+def _cached_media_response(request: Request, path: str, key: str) -> Response | None:
+    """Open before eviction while retaining full-media revalidation and range support."""
+    try:
+        cached = open(path, 'rb')
+    except FileNotFoundError:
+        return None
+    try:
+        head = cached.read(_MEDIA_HEAD_BYTES)
+        cached.seek(0)
+        response = _CachedFileResponse(
+            cached,
+            **_media_response_kwargs(
+                mimetypes.guess_type(key)[0],
+                head,
+                key,
+                **{"X-Cache": "HIT", "Cache-Control": _FULL_MEDIA_CACHE_CONTROL},
+            ),
+        )
+        if _is_not_modified(request, response.headers):
+            cached.close()
+            keep = ('etag', 'last-modified', 'cache-control')
+            return Response(status_code=304, headers={k: v for k, v in response.headers.items() if k in keep})
+        return response
+    except BaseException:
+        cached.close()
+        raise
+
+
+def _build_media_path_sql(field: str, versioned: bool = False) -> str:
+    """Build SQL to select a media path for a sample.
+
+    Accepts either a simple field name (e.g. `filepath`, `thumbnail_path`) or a
+    dotted JSONB path (e.g. `<heatmap_name>.map_path` → `metadata->'<heatmap_name>'->>'map_path'`).
+    Dotted paths let callers point at nested media inside structured metadata
+    (heatmaps, segmentation masks, etc.) without exposing generic JSON-path queries.
+
+    Every segment is validated against `_SAFE_FIELD_RE` (same identifier rules used
+    elsewhere in the codebase), so the composed SQL string contains only vetted names.
+    Raises HTTPException(400) on malformed field references.
+    """
+    segments = field.split(".")
+    for seg in segments:
+        if not _SAFE_FIELD_RE.match(seg):
+            raise HTTPException(status_code=400, detail=f"Invalid field name: {field}")
+
+    source = "samples"
+    if versioned:
+        source = """(SELECT v.sample_id AS id, v.filepath, v.metadata, d.dataset_id
+                     FROM version_snapshots v JOIN dataset_versions d ON d.id = v.version_id
+                     WHERE v.version_id = $2 AND d.include_metadata) samples"""
+    if field == "filepath":
+        return f"SELECT dataset_id, filepath AS path FROM {source} WHERE id = $1"
+
+    # Nested JSONB: intermediate segments use `->` (returns jsonb), final uses `->>`
+    # (returns text). e.g. metadata->'<key>'->>'map_path'
+    if len(segments) == 1:
+        expr = f"metadata->>'{segments[0]}'"
+    else:
+        path = "".join(f"->'{s}'" for s in segments[:-1])
+        expr = f"metadata{path}->>'{segments[-1]}'"
+
+    return f"SELECT dataset_id, {expr} AS path FROM {source} WHERE id = $1"
+
+
+async def _fetch_media_bytes(dataset_id: int, path: str) -> tuple[bytes, str]:
+    """Fetch the raw bytes for a resolved media path.
+
+    Handles the same three path shapes as the main serve_sample_media route
+    (local, s3, http) but always returns bytes — used by the overlay branch,
+    which needs to hand the image to PIL for compositing. The non-overlay
+    branch still uses FileResponse for zero-copy sendfile() on local files.
+
+    HTTP URLs are rejected here because composite math against a remote image
+    would mean proxying arbitrary internet content just to blend it locally.
+    External-URL samples don't have overlays in any realistic pipeline.
+    """
+    if path.startswith(("http://", "https://")):
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot composite an overlay on an external-URL media source",
+        )
+
+    if not path.startswith("s3://"):
+        resolved = _resolve_local_path(path)
+        if not os.path.exists(resolved):
+            raise HTTPException(status_code=404, detail="File not found on disk")
+        with open(resolved, "rb") as f:
+            body = f.read()
+        return body, mimetypes.guess_type(resolved)[0] or "application/octet-stream"
+
+    bucket, key = _parse_s3_path(path)
+    if not bucket or not key:
+        raise HTTPException(status_code=500, detail=f"Malformed s3 path: {path}")
+    _validate_s3_key(key)
+    _validate_bucket(bucket)
+
+    # SSRF / confused-deputy guard: only fetch buckets this dataset is authorized
+    # for. Without this, a user who can set a sample's media path could point it
+    # at s3://arbitrary-bucket/key and the server would fetch it with our IAM creds.
+    if not await is_bucket_authorized(dataset_id, bucket):
+        raise HTTPException(status_code=403, detail="Bucket not authorized for this dataset")
+
+    # Cache path includes the bucket so the same key in two different buckets
+    # (a realistic multi-bucket dataset: images in one, masks/overlays in
+    # another) can't collide and serve each other's bytes.
+    cached_path = os.path.join(S3_LOCAL_PATH, str(dataset_id), bucket, key)
+    cached_body = await asyncio.to_thread(read_cache, cached_path)
+    if cached_body is not None:
+        return cached_body, mimetypes.guess_type(key)[0] or "application/octet-stream"
+
+    backend = await get_storage_for_s3_uri(dataset_id, bucket)
+    if not backend.s3_client:
+        raise HTTPException(status_code=500, detail="S3 backend not configured for this dataset")
+
+    def _fetch_blocking():
+        resp = backend.s3_client.get_object(Bucket=bucket, Key=key)
+        data = resp["Body"].read()
+        ct = resp.get("ContentType") or mimetypes.guess_type(key)[0] or "application/octet-stream"
+        return data, ct
+
+    try:
+        body, content_type = await asyncio.to_thread(_fetch_blocking)
+    except Exception as e:
+        # Mirror the error mapping used by the main route so admins can tell
+        # missing-key from denied-credentials from unreachable-backend.
+        try:
+            from botocore.exceptions import ClientError
+        except ImportError:
+            ClientError = ()  # type: ignore
+        if isinstance(e, ClientError):
+            code = e.response.get("Error", {}).get("Code", "")
+            if code in ("NoSuchKey", "404"):
+                raise HTTPException(status_code=404, detail=f"S3 key not found: {bucket}/{key}")
+            if code in ("AccessDenied", "403"):
+                log.error("S3 AccessDenied fetching %s/%s with config for dataset %s", bucket, key, dataset_id)
+                raise HTTPException(status_code=500, detail="Storage backend denied access (check credentials)")
+            log.error("S3 ClientError (%s) fetching %s/%s: %s", code, bucket, key, e)
+            raise HTTPException(status_code=500, detail=f"S3 error: {code}")
+        log.error("S3 fetch failed for %s/%s: %s", bucket, key, e)
+        raise HTTPException(status_code=502, detail="Storage backend unreachable")
+
+    _queue_media_cache(cached_path, body)
+
+    return body, content_type
+
+
+async def _serve_composite(
+    sample_id: int,
+    dataset_id: int,
+    base_path: str,
+    overlay_field: str,
+    colormap_override: str | None,
+    alpha: float,
+    range_start_override: float | None = None,
+    range_end_override: float | None = None,
+    width: int | None = None,
+    version_id: int | None = None,
+) -> Response:
+    """Fetch base + heatmap, paint the colormap, return the composited PNG.
+
+    Cache layout: ``COMPOSITE_CACHE_PATH/{dataset_id}/{sample_id}/{overlay}-{colormap}-a{alpha}-r{range}.png``.
+    Range, colormap, alpha and width are canonicalized before rendering/keying.
+    Writes evict oldest cached files to stay within the shared byte budget;
+    the hourly cleanup also prunes idle caches.
+
+    Range and colormap are read from the heatmap's own metadata dict (the shape
+    the SDK/migration writes: ``{type, map_path, range, colormap?}``). An
+    explicit ``?colormap=`` query param overrides the metadata default.
+    """
+    # Read the heatmap metadata dict. The field must be a top-level metadata key.
+    if not _SAFE_FIELD_RE.match(overlay_field):
+        raise HTTPException(status_code=400, detail=f"Invalid overlay field: {overlay_field}")
+    width = _thumbnail_width(width)
+
+    if version_id is None:
+        row = await db.fetchrow(
+            f"SELECT metadata->'{overlay_field}' AS hm FROM samples WHERE id = $1",
+            sample_id,
+        )
+    else:
+        row = await db.fetchrow(
+            f"SELECT metadata->'{overlay_field}' AS hm FROM version_snapshots WHERE sample_id = $1 AND version_id = $2",
+            sample_id,
+            version_id,
+        )
+    if not row or row["hm"] is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Sample {sample_id} has no heatmap in metadata.{overlay_field}",
+        )
+    hm = row["hm"]
+    # asyncpg's jsonb codec already decodes to dict — but guard if something
+    # slipped through as raw text.
+    if isinstance(hm, str):
+        import json as _json
+
+        try:
+            hm = _json.loads(hm)
+        except Exception:
+            raise HTTPException(status_code=500, detail=f"metadata.{overlay_field} is not valid JSON")
+    if not isinstance(hm, dict) or hm.get("type") != "heatmap":
+        raise HTTPException(
+            status_code=400,
+            detail=f"metadata.{overlay_field} is not a heatmap (missing type='heatmap')",
+        )
+    map_path = hm.get("map_path")
+    rng = hm.get("range")
+    if not map_path or not isinstance(rng, list) or len(rng) != 2:
+        raise HTTPException(
+            status_code=400,
+            detail=f"metadata.{overlay_field} is missing map_path or range",
+        )
+    colormap = (colormap_override or hm.get("colormap") or "viridis").strip().lower()
+    if colormap not in COLORMAPS:
+        colormap = "viridis"
+    if not math.isfinite(alpha) or not 0 <= alpha <= 1:
+        raise HTTPException(400, "alpha must be in [0, 1]")
+    alpha = round(alpha, 2) + 0.0
+    # Preserve the order of range — `[start, end]` where start > end is a
+    # legitimate way to invert the colormap without remapping colours. UI config
+    # overrides (range_*_override) take precedence over the metadata range.
+    range_start = range_start_override if range_start_override is not None else float(rng[0])
+    range_end = range_end_override if range_end_override is not None else float(rng[1])
+
+    range_start = _overlay_range(range_start)
+    range_end = _overlay_range(range_end)
+
+    # Cache key: include every input that affects the output. The path escape
+    # checks (dataset_id is int, sample_id is int, overlay_field matches
+    # _SAFE_FIELD_RE, colormap is alphanumeric) keep the filename safe.
+    import hashlib as _hl
+
+    safe_colormap = colormap
+    # Fold a hash of map_path into the key so that re-pointing a heatmap (editing
+    # metadata.{overlay}.map_path) busts the cache instead of serving the old
+    # composite forever. (Overwriting the PNG *in place* at the same map_path is
+    # not covered here — keep heatmap object keys content-addressed/immutable.)
+    # usedforsecurity=False: this is a cache-key digest, not a security hash —
+    # without it md5 raises on FIPS-mode hosts.
+    mp_hash = _hl.md5(f"{base_path}|{map_path}".encode(), usedforsecurity=False).hexdigest()[:16]
+    # Grid tiles pass ?w= and get a resized JPEG (a full-res PNG composite is 5-10MB/tile
+    # — the problem plain tiles had before they were resized too); the modal omits w and gets the
+    # full-res PNG. Width is baked into the cache name so the two don't collide.
+    base_name = f"{overlay_field}-{safe_colormap}-a{alpha:.2f}-r{range_start:.2f}_{range_end:.2f}-m{mp_hash}"
+    if width is not None:
+        cache_name = f"{base_name}-w{width}.jpg"
+        media_type = "image/jpeg"
+    else:
+        cache_name = f"{base_name}.png"
+        media_type = "image/png"
+    cache_dir = os.path.join(COMPOSITE_CACHE_PATH, str(dataset_id), str(sample_id))
+    cache_path = os.path.join(cache_dir, cache_name)
+    # Bounded browser caching only (no immutable): the URL doesn't encode
+    # map_path, so an unbounded browser cache would keep serving a stale
+    # composite after a heatmap re-point even though mp_hash busts the disk key.
+    composite_headers = {"Cache-Control": "private, max-age=3600", "X-Overlay": overlay_field}
+    cached = await asyncio.to_thread(read_cache, cache_path)
+    if cached is not None:
+        return Response(
+            content=cached,
+            media_type=media_type,
+            headers={**composite_headers, "X-Cache": "HIT"},
+        )
+
+    # Cache miss — fetch base + overlay bytes and composite.
+    base_bytes, _ = await _fetch_media_bytes(dataset_id, base_path)
+    hm_bytes, _ = await _fetch_media_bytes(dataset_id, map_path)
+
+    # PIL + numpy composite is synchronous; run it off the event loop.
+    from .compositing import composite_heatmap
+
+    def _composite():
+        out = composite_heatmap(base_bytes, hm_bytes, range_start, range_end, colormap, alpha)
+        if width is None:
+            return out
+        # Tile request: downscale the composited image and re-encode as JPEG (alpha is
+        # already flattened by the composite, so JPEG is lossless-enough for a thumbnail).
+        import io as _io
+
+        from PIL import Image
+
+        img = Image.open(_io.BytesIO(out)).convert("RGB")
+        if img.width > width:
+            new_height = max(1, round(img.height * width / img.width))
+            img = img.resize((width, new_height), Image.Resampling.LANCZOS)
+        buf = _io.BytesIO()
+        img.save(buf, format="JPEG", quality=85)
+        return buf.getvalue()
+
+    try:
+        composed = await asyncio.to_thread(_composite)
+    except Exception as e:
+        log.error("Composite failed for sample %s overlay %s: %s", sample_id, overlay_field, e)
+        raise HTTPException(status_code=500, detail=f"Composite failed: {e}")
+
+    return Response(
+        content=composed,
+        background=BackgroundTask(_cache_media_later, cache_path, composed),
+        media_type=media_type,
+        headers={**composite_headers, "X-Cache": "MISS"},
+    )
+
+
+def _parse_crop_spec(spec: str) -> tuple[float, float, float, float]:
+    """Parse a `crop=x,y,w,h` query value into floats."""
+    parts = spec.split(",")
+    if len(parts) != 4:
+        raise HTTPException(status_code=400, detail="crop must be 'x,y,w,h' or '1'")
+    try:
+        x, y, w, h = (float(p) for p in parts)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="crop coordinates must be numbers")
+    if not all(math.isfinite(v) for v in (x, y, w, h)):
+        raise HTTPException(400, "crop coordinates must be finite")
+    if w <= 0 or h <= 0:
+        raise HTTPException(status_code=400, detail="crop width and height must be positive")
+    return x, y, w, h
+
+
+def _crop_pixels(body: bytes, bbox: tuple[float, float, float, float]) -> tuple[int, int, int, int]:
+    import io
+
+    from PIL import Image
+
+    with Image.open(io.BytesIO(body)) as image:
+        iw, ih = image.size
+    x, y, w, h = bbox
+    if max(bbox) <= 2.0:
+        x, y, w, h = x * iw, y * ih, w * iw, h * ih
+    left, top = int(max(0, min(iw, x))), int(max(0, min(ih, y)))
+    right, bottom = int(max(0, min(iw, x + w))), int(max(0, min(ih, y + h)))
+    if right <= left or bottom <= top:
+        raise HTTPException(400, "crop region is empty after clamping to image bounds")
+    return left, top, right, bottom
+
+
+async def _serve_crop_resize(
+    sample_id: int,
+    dataset_id: int,
+    path: str,
+    field: str,
+    crop: str | None,
+    width: int | None,
+    version_id: int | None = None,
+) -> Response:
+    """Serve a cropped and/or width-resized JPEG of a sample's image.
+
+    Shares the storage + security path with the main route via
+    `_fetch_media_bytes` (so the S3 authorization, SSRF and path-traversal guards
+    all apply, and external http(s) URLs are rejected the same way overlay
+    compositing rejects them — we can't crop a 302 redirect). The result is cached
+    content-addressed under `CROP_CACHE_PATH` and returned with a long-lived,
+    immutable `Cache-Control` so a grid of thumbnails hits the browser/CDN cache
+    instead of re-deriving on every scroll.
+
+    `crop='x,y,w,h'` crops an explicit box; `crop='1'` (or `'meta'`) reads
+    `metadata.crop_bbox` — the per-object box stamped by the object-dataset
+    producer. Box coordinates follow the same normalized-vs-pixel rule as the SDK
+    `to_patches()` and the frontend renderer: all values <= 2.0 are treated as
+    normalized [0, 1]. `w` resizes so the output width is `w` (height scales,
+    never upscales past the source).
+    """
+    if path.startswith(("http://", "https://")):
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot crop/resize an external-URL media source (use s3:// or a local path)",
+        )
+    width = _thumbnail_width(width)
+
+    bbox: tuple[float, float, float, float] | None = None
+    if crop is not None:
+        if crop in ("1", "meta"):
+            if version_id is None:
+                mrow = await db.fetchrow("SELECT metadata FROM samples WHERE id = $1", sample_id)
+            else:
+                mrow = await db.fetchrow(
+                    "SELECT metadata FROM version_snapshots WHERE sample_id = $1 AND version_id = $2",
+                    sample_id,
+                    version_id,
+                )
+            meta = (mrow["metadata"] if mrow else None) or {}
+            if isinstance(meta, str):
+                import json as _json
+
+                meta = _json.loads(meta)
+            cb = meta.get("crop_bbox")
+            if not cb or len(cb) != 4:
+                raise HTTPException(status_code=400, detail="Sample has no crop_bbox in metadata")
+            bbox = _parse_crop_spec(",".join(str(v) for v in cb))
+        else:
+            bbox = _parse_crop_spec(crop)
+
+    # Resolve/clamp pixels only on misses. Preserve the coordinate mode in the
+    # key, including at the normalized/pixel boundary, without reading the source.
+    cache_bbox = None if bbox is None else (max(bbox) <= 2.0, tuple(round(v, 4) + 0.0 for v in bbox))
+
+    import hashlib as _hl
+
+    # Fold a hash of the resolved media path into the key (mirroring mp_hash in
+    # _serve_composite): re-pointing a sample's filepath/media field must bust
+    # the thumbnail, not serve the old image's crop forever. Since the digest is
+    # also the ETag and the on-disk name, server and browser caches bust together.
+    p_hash = _hl.md5(path.encode(), usedforsecurity=False).hexdigest()[:8]
+    cache_key = f"{field}|crop={cache_bbox}|w={width}|p={p_hash}"
+    digest = _hl.md5(cache_key.encode(), usedforsecurity=False).hexdigest()
+    cache_dir = os.path.join(CROP_CACHE_PATH, str(dataset_id), str(sample_id))
+    cache_path = os.path.join(cache_dir, f"{digest}.jpg")
+    headers = {
+        # private, not public: these bytes are dataset-ACL'd — only the user's own
+        # browser may treat them as immutable. nginx still caches (session-keyed,
+        # short TTL) because its media locations ignore upstream Cache-Control.
+        "Cache-Control": "private, max-age=31536000, immutable",
+        "ETag": f'"{digest}"',
+    }
+
+    cached = await asyncio.to_thread(read_cache, cache_path)
+    if cached is not None:
+        return Response(
+            content=cached,
+            media_type="image/jpeg",
+            headers={**headers, "X-Cache": "HIT"},
+        )
+
+    body, _content_type = await _fetch_media_bytes(dataset_id, path)
+    if bbox is not None:
+        bbox = await asyncio.to_thread(_crop_pixels, body, bbox)
+
+    def _render() -> bytes:
+        import io as _io
+
+        from PIL import Image
+
+        img = Image.open(_io.BytesIO(body)).convert("RGB")
+        if bbox is not None:
+            img = img.crop(bbox)
+        if width is not None and img.width > width:
+            new_height = max(1, round(img.height * width / img.width))
+            img = img.resize((width, new_height), Image.Resampling.LANCZOS)
+        buf = _io.BytesIO()
+        img.save(buf, format="JPEG", quality=85)
+        return buf.getvalue()
+
+    try:
+        rendered = await asyncio.to_thread(_render)
+    except Exception as e:
+        log.error("Crop/resize failed for sample %s (field=%s): %s", sample_id, field, e)
+        if type(e).__name__ == "UnidentifiedImageError":
+            # PIL's message embeds "<_io.BytesIO object at 0x…>" — say what is wrong instead
+            # (a .log registered as a sample's filepath).
+            raise HTTPException(status_code=415, detail="This sample's file is not an image the server can read")
+        raise HTTPException(status_code=400, detail=f"Crop/resize failed: {e}")
+
+    return Response(
+        content=rendered,
+        background=BackgroundTask(_cache_media_later, cache_path, rendered),
+        media_type="image/jpeg",
+        headers={**headers, "X-Cache": "MISS"},
+    )
+
+
+@app.get("/api/samples/{sample_id}/media")
+async def serve_sample_media(
+    sample_id: int,
+    request: Request,
+    field: str = "filepath",
+    overlay: str | None = None,
+    colormap: str | None = None,
+    alpha: float = 0.6,
+    range_start: float | None = None,
+    range_end: float | None = None,
+    crop: str | None = None,
+    w: int | None = None,
+    version_id: int | None = None,
+):
+    """
+    Serve image bytes for a sample's media field.
+
+    The default `field=filepath` serves the primary image. Custom media fields
+    can be looked up from `samples.metadata`, including nested values via a dotted
+    path (e.g. `?field=<heatmap_name>.map_path` → `metadata->'<heatmap_name>'->>'map_path'`).
+    All paths route through the per-dataset storage backend with access control.
+
+    If `overlay` is set, the base image is composited with the named heatmap
+    before being returned — used by the grid view to avoid running a canvas
+    per cell. Composites are cached on disk under `COMPOSITE_CACHE_PATH`.
+    `colormap` optionally overrides the colormap stored in the heatmap's metadata;
+    `alpha` controls overlay opacity at nonzero pixels.
+
+    Supported value formats in the resolved field:
+      - s3://bucket/key       → fetched via dataset's storage backend, cached
+      - /absolute/local/path  → served from disk
+      - http(s)://...         → 302 redirect (external URL, frontend follows)
+    """
+    sql = _build_media_path_sql(field, versioned=version_id is not None)
+    media_args = [sample_id] if version_id is None else [sample_id, version_id]
+    row = await db.fetchrow(sql, *media_args)
+    if not row:
+        raise HTTPException(status_code=404, detail="Sample not found")
+
+    dataset_id = row['dataset_id']
+    path = row['path']
+    if not path:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Sample {sample_id} has no value for field '{field}'",
+        )
+
+    user = await get_optional_user(request)
+    await check_dataset_access(dataset_id, user)
+
+    if overlay is not None:
+        # Overlay branch: composite and return (bypasses the FileResponse
+        # fast-path because we're synthesizing a derived image).
+        if not 0.0 <= alpha <= 1.0:
+            raise HTTPException(status_code=400, detail="alpha must be in [0, 1]")
+        return await _serve_composite(
+            sample_id=sample_id,
+            dataset_id=dataset_id,
+            base_path=path,
+            overlay_field=overlay,
+            colormap_override=colormap,
+            alpha=alpha,
+            range_start_override=range_start,
+            range_end_override=range_end,
+            width=w,
+            version_id=version_id,
+        )
+
+    # The grid always supplies a thumbnail width, including for external media.
+    # Keep the existing redirect contract: let the browser scale the original,
+    # without fetching arbitrary URLs on the backend. Crops still require a
+    # local/S3 source and are rejected by _serve_crop_resize below.
+    if path.startswith(('http://', 'https://')) and crop is None:
+        return RedirectResponse(url=path)
+
+    if crop is not None or w is not None:
+        # Crop/resize branch: derive a JPEG (per-object crop and/or a thumbnail)
+        # instead of serving the source bytes. Routed through _fetch_media_bytes,
+        # so it inherits the same storage backend + access guards as the S3 path.
+        return await _serve_crop_resize(
+            sample_id=sample_id,
+            dataset_id=dataset_id,
+            path=path,
+            field=field,
+            crop=crop,
+            width=w,
+            version_id=version_id,
+        )
+
+    # Local path → serve from disk, but only if the resolved realpath stays
+    # inside FRIDGE_DATA_ROOT. Blocks `../`-style traversal out of the data dir
+    # even if the DB has a malicious filepath (e.g. `/etc/passwd`).
+    if not path.startswith('s3://'):
+        resolved = _resolve_local_path(path)
+        if not os.path.exists(resolved):
+            raise HTTPException(status_code=404, detail="File not found on disk")
+        return _full_media_file_response(
+            request,
+            resolved,
+            **_media_response_kwargs(
+                mimetypes.guess_type(resolved)[0],
+                _media_head(resolved),
+                resolved,
+                **{"Cache-Control": _FULL_MEDIA_CACHE_CONTROL},
+            ),
+        )
+
+    # S3 path: scope the local cache by dataset_id AND bucket so the same key in
+    # two different buckets (multi-bucket dataset) can't collide and serve each
+    # other's bytes. The dropped legacy unscoped-by-bucket fallback had exactly
+    # that collision risk; cache is derived state, so re-fetching is harmless.
+    bucket, key = _parse_s3_path(path)
+    if not bucket or not key:
+        raise HTTPException(status_code=500, detail=f"Malformed s3 path: {path}")
+    # Reject keys/buckets that would escape S3_LOCAL_PATH/{dataset_id}/{bucket}/ via `..`.
+    _validate_s3_key(key)
+    _validate_bucket(bucket)
+
+    # SSRF / confused-deputy guard: only fetch buckets this dataset is authorized
+    # for. Without this, a user who can set a sample's media path could point it
+    # at s3://arbitrary-bucket/key and the server would fetch it with our IAM creds.
+    if not await is_bucket_authorized(dataset_id, bucket):
+        raise HTTPException(status_code=403, detail="Bucket not authorized for this dataset")
+
+    cached_path = os.path.join(S3_LOCAL_PATH, str(dataset_id), bucket, key)
+    cached = await asyncio.to_thread(_cached_media_response, request, cached_path, key)
+    if cached is not None:
+        return cached
+
+    # Bucket-aware routing: multi-bucket datasets (e.g. primary images in one
+    # bucket, annotation overlays in another with different IAM) work because
+    # we resolve credentials by the bucket in the s3:// path first, falling
+    # back to the dataset's default config only if no per-bucket config exists.
+    backend = await get_storage_for_s3_uri(dataset_id, bucket)
+    if not backend.s3_client:
+        raise HTTPException(status_code=500, detail="S3 backend not configured for this dataset")
+
+    # IMPORTANT: boto3 is synchronous. Calling it directly from an async def
+    # handler blocks the event loop, which serialises every concurrent image
+    # request to one-at-a-time. With a grid firing 100+ thumbnails in parallel
+    # that produces multi-second latencies on the tail requests. Run the
+    # blocking work in the default thread pool so requests actually parallelise.
+    def _fetch_blocking():
+        resp = backend.s3_client.get_object(Bucket=bucket, Key=key)
+        data = resp['Body'].read()
+        ct = resp.get('ContentType') or mimetypes.guess_type(key)[0] or 'application/octet-stream'
+        return data, ct
+
+    try:
+        body, content_type = await asyncio.to_thread(_fetch_blocking)
+    except Exception as e:
+        # Map S3 / boto3 errors to meaningful HTTP statuses instead of
+        # collapsing everything to 404. Admins tailing logs need to
+        # distinguish "key actually missing" (data bug) from "credentials
+        # are wrong" (config bug) from "network is down" (infra problem).
+        try:
+            from botocore.exceptions import ClientError
+        except ImportError:
+            ClientError = ()  # type: ignore  # fallthrough if boto3 isn't installed
+        if isinstance(e, ClientError):
+            code = e.response.get("Error", {}).get("Code", "")
+            if code in ("NoSuchKey", "404"):
+                raise HTTPException(status_code=404, detail=f"S3 key not found: {bucket}/{key}")
+            if code in ("AccessDenied", "403"):
+                # Surface as 500 — it's a server-side credential/bucket-policy
+                # bug, not a client auth problem. The caller already passed
+                # our own access-control check.
+                log.error("S3 AccessDenied fetching %s/%s with config for dataset %s", bucket, key, dataset_id)
+                raise HTTPException(status_code=500, detail="Storage backend denied access (check credentials)")
+            log.error("S3 ClientError (%s) fetching %s/%s: %s", code, bucket, key, e)
+            raise HTTPException(status_code=500, detail=f"S3 error: {code}")
+        # Network, DNS, timeout, etc.
+        log.error("S3 fetch failed for %s/%s: %s", bucket, key, e)
+        raise HTTPException(status_code=502, detail="Storage backend unreachable")
+
+    return Response(
+        content=body,
+        background=BackgroundTask(_cache_media_later, cached_path, body),
+        **_media_response_kwargs(
+            content_type,
+            body[:_MEDIA_HEAD_BYTES],
+            key,
+            **{"X-Cache": "MISS", "Cache-Control": _FULL_MEDIA_CACHE_CONTROL},
+        ),
+    )

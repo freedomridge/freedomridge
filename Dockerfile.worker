@@ -1,0 +1,46 @@
+# Worker Dockerfile - runs background jobs
+FROM ghcr.io/astral-sh/uv:0.13.6@sha256:af22a52f5eafef3d78e551599d405c02df61919d18028f0cea8eda93bc9986d0 AS uv
+FROM python:3.14-slim@sha256:cd89c30eda26ee911a4611b18680086e0ea42e6f5f8cbe653d07fa7958c9cec8
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    gcc \
+    postgresql-client \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set working directory
+WORKDIR /app
+
+# Locked Python environment (pyproject.toml + uv.lock; see docs/DEPENDENCIES.md) in /opt/venv,
+# using the image's Python rather than a downloaded one.
+COPY --from=uv /uv /usr/local/bin/uv
+ENV UV_PROJECT_ENVIRONMENT=/opt/venv \
+    UV_PYTHON_DOWNLOADS=never \
+    UV_LINK_MODE=copy \
+    UV_COMPILE_BYTECODE=1 \
+    PATH=/opt/venv/bin:$PATH
+COPY pyproject.toml uv.lock .python-version /app/
+COPY python/pyproject.toml /app/python/pyproject.toml
+RUN uv sync --frozen --no-cache --no-default-groups --no-install-workspace
+
+# Copy backend code and scripts
+COPY VERSION /app/VERSION
+COPY backend /app/backend
+COPY python /app/python
+COPY scripts /app/scripts
+
+# Install Python SDK
+RUN uv sync --frozen --no-cache --no-default-groups
+
+# Pre-create the shared freedomridge_cache dirs owned by uid 1000 so that whichever
+# container (backend uid 1000, or this root worker) first mounts the empty named
+# volume, it initializes as uid-1000-owned — the backend must be able to write it.
+# The worker runs as root and can write a uid-1000-owned tree fine.
+RUN mkdir -p /cache/s3 /cache/composite /cache/crop && chown -R 1000:1000 /cache
+
+# Prune disk caches on an hourly loop. Database upkeep uses backend.job_service. Deliberately NOT system cron:
+# cron jobs run with a stripped environment and would NOT see DATABASE_URL (set
+# via docker-compose `environment:`), so they'd connect to the wrong DB / fail.
+# A plain loop inherits the container env, runs in the foreground, and logs to
+# stdout (visible via `docker logs`).
+CMD ["sh", "-c", "while true; do echo \"[worker] tick $(date -u +%FT%TZ)\"; python3 /app/scripts/prune_cache.py || echo '[worker] prune failed'; sleep 3600; done"]

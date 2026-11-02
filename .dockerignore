@@ -1,0 +1,94 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+.venv/
+ENV/
+env/
+*.egg-info/
+
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.next/
+frontend/.next*
+**/CLAUDE.md
+**/AGENTS.md
+out/
+build/
+dist/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Logs
+*.log
+logs/
+backend.log
+
+# Database
+*.db
+*.sqlite
+
+# Test
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Documentation
+docs/_build/
+
+# Data (don't copy data into images)
+data/
+*.tar.gz
+*.zip
+
+# Git
+.git/
+.gitignore
+
+# Development scripts
+check_*.py
+debug_*.py
+verify_*.py
+fix_*.py
+inspect_*.py
+investigate_*.py
+migrate_*.py
+reset_*.py
+!reset_admin.py
+setup_*.py
+create_test_*.py
+direct_db_*.py
+ingest_*.py
+recompute_*.py
+cookies.txt
+
+# Local working notes (never part of a build context)
+.review/
+
+# Production ACME state and local importer environment
+ssl/
+.venv-import/
+ops/terraform/.terraform/
+ops/terraform/*.tfstate*
+ops/terraform/*.tfvars
+ops/terraform/*.tfplan

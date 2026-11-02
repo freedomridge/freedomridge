@@ -1,0 +1,9 @@
+[Unit]
+Description=Renew Freedom Ridge TLS certificates and reload nginx
+Requires=docker.service
+After=docker.service network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/ubuntu/app
+ExecStart=/bin/bash /home/ubuntu/app/ops/tls/renew.sh

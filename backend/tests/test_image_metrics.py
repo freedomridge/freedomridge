@@ -1,0 +1,54 @@
+"""The SDK's per-image statistic helpers must be correct on known inputs.
+
+These are the module-level pure functions behind Dataset.compute_metadata() (width/
+height/aspect/megapixels/file size) and the new compute_metrics() fields (saturation,
+exposure clipping). PIL + numpy only — deliberately no cv2, so they run in CI's lean
+env. Synthetic images with known properties make the expected values exact.
+"""
+
+import numpy as np
+from fridge.core.dataset import _exposure_clipping, _media_metadata, _saturation
+from PIL import Image
+
+
+def test_media_metadata_dimensions_and_aspect(tmp_path):
+    f = tmp_path / "img.png"
+    Image.new("RGB", (200, 100)).save(f)
+    with Image.open(f) as img:
+        meta = _media_metadata(img, str(f))
+    assert meta["width"] == 200
+    assert meta["height"] == 100
+    assert meta["aspect_ratio"] == 2.0
+    assert meta["megapixels"] == 0.02
+    assert meta["file_size_bytes"] == f.stat().st_size
+
+
+def test_media_metadata_remote_path_omits_file_size():
+    meta = _media_metadata(Image.new("RGB", (64, 64)), "s3://bucket/key.jpg")
+    assert "file_size_bytes" not in meta
+    assert meta["width"] == 64
+
+
+def test_saturation_extremes():
+    vivid = Image.new("RGB", (32, 32), (255, 0, 0))  # pure red — fully saturated
+    gray = Image.new("RGB", (32, 32), (128, 128, 128))  # no chroma at all
+    assert _saturation(vivid) == 255.0
+    assert _saturation(gray) == 0.0
+
+
+def test_exposure_clipping_black_white_and_mid():
+    black = Image.new("L", (32, 32), 0)
+    white = Image.new("L", (32, 32), 255)
+    mid = Image.new("L", (32, 32), 128)
+    assert _exposure_clipping(black) == (100.0, 0.0)
+    assert _exposure_clipping(white) == (0.0, 100.0)
+    assert _exposure_clipping(mid) == (0.0, 0.0)
+
+
+def test_exposure_clipping_partial():
+    # Top half crushed to black, bottom half mid-gray → exactly 50% underexposed.
+    arr = np.full((32, 32), 128, dtype=np.uint8)
+    arr[:16, :] = 0
+    under, over = _exposure_clipping(Image.fromarray(arr, mode="L"))
+    assert under == 50.0
+    assert over == 0.0

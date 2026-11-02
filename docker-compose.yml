@@ -1,0 +1,62 @@
+version: '3.8'
+
+services:
+  db:
+    # Names the local build of Dockerfile.db (PostgreSQL 18, PostGIS, pgvector). No registry has an image
+    # by this name, so Compose builds it rather than pulling another one.
+    image: freedomridge-db:pg18
+    container_name: ${FRIDGE_DB_CONTAINER:-freedomridge-db}
+    environment:
+      POSTGRES_USER: freedomridge
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: freedomridge
+    ports:
+      - "${FRIDGE_DB_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./backend/db/schema.sql:/docker-entrypoint-initdb.d/schema.sql
+      - ./backend/db/postgresql.conf:/etc/postgresql/postgresql.conf
+    build:
+      context: .
+      dockerfile: Dockerfile.db
+    shm_size: '1g'
+    restart: always
+    # The trailing -c overrides the file's max_connections=100. The backend runs 4
+    # uvicorn workers, each with an asyncpg pool of up to DB_POOL_MAX_SIZE (50), so it
+    # can demand up to 200 connections; at 100 a heavy run (e.g. a UMAP coordinate
+    # upload during a sync) exhausts the ceiling ("too many clients already"). 250
+    # matches docker-compose.prod.yml and leaves headroom for direct-DB jobs + psql.
+    command: postgres -c config_file=/etc/postgresql/postgresql.conf -c max_connections=250
+
+  # Disk-cache pruning only; database maintenance runs in job-runner.
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    container_name: ${FRIDGE_WORKER_CONTAINER:-freedomridge-worker}
+    environment:
+      DATABASE_URL: postgres://freedomridge:password@db:5432/freedomridge
+    depends_on:
+      - db
+    restart: always
+
+  job-runner:
+    profiles: ["jobs"]
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    command: python3 -m backend.job_service
+    init: true
+    environment:
+      DATABASE_URL: postgres://freedomridge:password@db:5432/freedomridge
+      JOB_WORKER_SLOTS: ${JOB_WORKER_SLOTS:-3}
+      JOB_POOL_MAX_SIZE: ${JOB_POOL_MAX_SIZE:-6}
+    volumes:
+      - ./backend:/app/backend:ro
+    depends_on:
+      - db
+    restart: unless-stopped
+    stop_grace_period: 30s
+
+volumes:
+  postgres_data:

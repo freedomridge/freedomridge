@@ -1,0 +1,89 @@
+# Freedom Ridge's Python environment: the API server, the SDK (python/), the example
+# importers and the dev tools, locked together in uv.lock. See docs/DEPENDENCIES.md.
+#
+#   uv sync --extra cuda    # NVIDIA GPU (driver 560 or newer)
+#   uv sync --extra cpu     # no GPU; what Docker and CI install
+#
+# Always pass one of the two extras: they choose which PyTorch build is installed.
+[project]
+name = "freedomridge-app"
+version = "1.0.0"
+requires-python = ">=3.12"
+dependencies = [
+    # API server
+    "fastapi",
+    "anyio",
+    "uvicorn[standard]",
+    "gunicorn",
+    "asyncpg",
+    "pydantic",
+    "pydantic-settings",
+    "aiofiles",
+    "bcrypt",
+    "numpy",
+    "Pillow",
+    "umap-learn",
+    "boto3",
+    "httpx",
+    "cryptography",
+    # Python SDK (python/)
+    "freedomridge",
+]
+
+# Server-side CLIP (text search, reverse image search). Kept out of the base dependencies so
+# the core server runs without ML; the backend Docker image installs the cpu extra.
+[project.optional-dependencies]
+cpu = ["torch>=2.9", "transformers>=4.57.1,<5"]
+cuda = ["torch>=2.9", "transformers>=4.57.1,<5"]
+
+[dependency-groups]
+# Example importers (examples/): the SDK with every optional feature plus their own needs.
+examples = [
+    "freedomridge[all]",
+    "imagehash",
+    "joblib",
+    "rasterio",
+    "python-dotenv>=1.0,<2",
+    "tqdm",
+]
+dev = [
+    "pytest",
+    "pytest-asyncio",
+    # backend/tests/test_sdk_hashes.py runs the SDK's hash backfill; CI's backend job installs
+    # only this group.
+    "imagehash",
+    # Exact pins: a newer linter or type checker can fail CI, so each bump arrives as its own
+    # Dependabot pull request for CI to check.
+    "ruff==0.17.3",
+    "flake8==7.5.0",
+    "mypy==2.4.1",
+    "pip-audit",
+]
+
+[tool.uv]
+package = false
+required-version = ">=0.11"
+default-groups = ["examples", "dev"]
+conflicts = [[{ extra = "cpu" }, { extra = "cuda" }]]
+
+[tool.uv.workspace]
+members = ["python"]
+
+[tool.uv.sources]
+freedomridge = { workspace = true }
+torch = [
+    { index = "pytorch-cpu", extra = "cpu" },
+    { index = "pytorch-cuda", extra = "cuda" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+# CUDA 12.6 builds run on NVIDIA driver 560+, but stop at PyTorch 2.14. PyTorch 2.15 and later
+# ship only CUDA 13 builds (cu132), which need driver 580+; see docs/DEPENDENCIES.md before switching.
+[[tool.uv.index]]
+name = "pytorch-cuda"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true

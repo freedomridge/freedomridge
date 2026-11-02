@@ -1,0 +1,26 @@
+# Project Python lint rules (ruff: E, F, I, TCH @ line 120).
+# Fully clean — no rule ignores beyond
+# the standard __init__.py re-export allowance. Enforced by the blocking CI
+# lint job; keep it green.
+line-length = 120
+extend-exclude = ["frontend", "docs"]
+
+[lint]
+# COM812 (missing-trailing-comma) is the enforcement half of our one-argument-
+# per-line rule: it adds the magic trailing comma to every multi-line call/def,
+# which the formatter then keeps exploded one-per-line (never the unreadable
+# "several args sharing a wrapped line" layout). CI also runs `ruff format
+# --check`, so both halves are gated. (Ruff prints a "may conflict with the
+# formatter" notice for COM812 — harmless here: the fixed point is stable, see
+# the idempotency note. We intentionally keep it.)
+select = ["E", "F", "I", "TCH", "COM812"]
+
+[lint.per-file-ignores]
+"__init__.py" = ["F401"]
+
+[format]
+# Quotes preserved (the burn-down didn't churn string literals). The default
+# magic-trailing-comma behavior is ON, which — together with COM812 above —
+# forces multi-line calls/defs to one-argument-per-line. Run
+# `ruff format backend/ python/ scripts/` to reformat.
+quote-style = "preserve"

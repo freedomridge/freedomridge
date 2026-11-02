@@ -1,0 +1,21 @@
+# Project flake8 settings (max-line 120). The
+# only ignores are E203/W503, the standard
+# Black/ruff-format-vs-pycodestyle disagreements (slice-colon spacing, line
+# break before binary operator), NOT debt. The code is ruff-formatted; these
+# keep flake8 from fighting the formatter. Enforced by the blocking CI lint job.
+[flake8]
+max-line-length = 120
+extend-ignore = E203, W503
+exclude =
+    .git,
+    __pycache__,
+    .venv,
+    venv,
+    node_modules,
+    frontend,
+    build,
+    dist,
+    .mypy_cache,
+    .ruff_cache
+per-file-ignores =
+    __init__.py:F401

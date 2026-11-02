@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=84.2.1"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "freedomridge"
+version = "1.0.0"
+license = "MIT"
+description = "Python SDK for Freedom Ridge Dataset Explorer"
+dependencies = [
+    "requests",
+    "numpy",
+    "Pillow",
+    "tqdm",
+]
+
+[project.optional-dependencies]
+# CLIP embeddings + UMAP visualization (compute_embeddings / compute_visualization).
+# joblib: save/load the fitted UMAP model (save_model_path / project_pending).
+# psutil: RAM-aware auto fit-size (optional; falls back to /proc/meminfo).
+embeddings = ["sentence-transformers", "umap-learn", "joblib", "psutil"]
+# Patch embeddings (compute_patch_embeddings)
+patch-embeddings = ["torch", "transformers>=4.57.1,<5"]
+# Image quality metrics (compute_metrics)
+metrics = ["opencv-python-headless"]
+# Perceptual hashing (compute_hashes)
+hashes = ["imagehash"]
+# Quality scoring + embedding dedup (compute_uniqueness/representativeness/find_unique/find_duplicates)
+quality = ["scikit-learn"]
+# Everything
+all = [
+    "sentence-transformers",
+    "umap-learn",
+    "joblib",
+    "psutil",
+    "torch",
+    "transformers>=4.57.1,<5",
+    "opencv-python-headless",
+    "imagehash",
+    "scikit-learn",
+]
+
+[tool.setuptools.packages.find]
+include = ["fridge*"]
