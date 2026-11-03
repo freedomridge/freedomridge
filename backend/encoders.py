@@ -112,7 +112,7 @@ def has_image_tower(registered_model: Optional[str]) -> bool:
 def _encode_sync(prompt: str, checkpoint: str) -> List[float]:
     try:
         import torch
-        from transformers import CLIPTextModelWithProjection, CLIPTokenizerFast
+        from transformers import CLIPTextConfig, CLIPTextModelWithProjection, CLIPTokenizerFast
     except ImportError:
         raise HTTPException(
             status_code=501,
@@ -128,7 +128,11 @@ def _encode_sync(prompt: str, checkpoint: str) -> List[float]:
         cached = _cache.get(checkpoint)
     if cached is None:
         tokenizer = CLIPTokenizerFast.from_pretrained(checkpoint)
-        model = CLIPTextModelWithProjection.from_pretrained(checkpoint).eval()
+        # Transformers 4.57 can resolve a tower's config_class to the full
+        # CLIPConfig, which has no hidden_size. Select the text config explicitly
+        # while still loading the pretrained tower AND its projection weights.
+        config = CLIPTextConfig.from_pretrained(checkpoint)
+        model = CLIPTextModelWithProjection.from_pretrained(checkpoint, config=config).eval()
         with _lock:
             cached = _cache.setdefault(checkpoint, (tokenizer, model))
     tokenizer, model = cached
@@ -147,7 +151,7 @@ async def encode_text(prompt: str, registered_model: Optional[str] = None) -> Li
 def _encode_image_sync(image_bytes: bytes, checkpoint: str) -> List[float]:
     try:
         import torch
-        from transformers import CLIPImageProcessor, CLIPVisionModelWithProjection
+        from transformers import CLIPImageProcessor, CLIPVisionConfig, CLIPVisionModelWithProjection
     except ImportError:
         raise HTTPException(
             status_code=501,
@@ -163,7 +167,9 @@ def _encode_image_sync(image_bytes: bytes, checkpoint: str) -> List[float]:
         cached = _image_cache.get(checkpoint)
     if cached is None:
         processor = CLIPImageProcessor.from_pretrained(checkpoint)
-        model = CLIPVisionModelWithProjection.from_pretrained(checkpoint).eval()
+        # As with text, do not let from_pretrained infer the full CLIPConfig.
+        config = CLIPVisionConfig.from_pretrained(checkpoint)
+        model = CLIPVisionModelWithProjection.from_pretrained(checkpoint, config=config).eval()
         with _lock:
             cached = _image_cache.setdefault(checkpoint, (processor, model))
     processor, model = cached
