@@ -148,6 +148,17 @@ test('value-search typing is debounced and changing the query cancels an in-flig
 
 test('changing draft filters restarts a pending value search instead of leaving a stuck spinner', async ({ page }) => {
     await withColors(async datasetId => {
+        // media_type shows checkboxes only once its values are known complete. On a new dataset, two
+        // sidebar requests at once (the dev server mounts the page twice) can leave the page's answer
+        // incomplete, a search box instead: ask first, so the page's requests read the cached answer.
+        const cookie = await adminLogin();
+        const sidebarFilter = { logic: 'AND', filters: [{ field: 'media_type', operator: '!=', value: 'object' }] };
+        await expect.poll(async () => {
+            const fields = await apiFetch(cookie, `/datasets/${datasetId}/field-stats`, {
+                method: 'POST', body: JSON.stringify({ filters: sidebarFilter }),
+            });
+            return fields.find((field: { name: string }) => field.name === 'media_type')?.values_complete;
+        }).toBe(true);
         await incompleteColorPreview(page, datasetId, ['red'], 'enum');
         let requests = 0;
         await page.route(`**/fields/color/autocomplete`, async route => {
