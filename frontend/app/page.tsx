@@ -88,7 +88,10 @@ export default function Home() {
               <h1 className="text-3xl font-bold text-white">Datasets</h1>
               <p className="text-zinc-400 mt-1">Manage and explore your computer vision data</p>
             </div>
-            {user?.role === 'admin' && <button onClick={() => setCreating(true)} className="inline-flex items-center justify-center rounded-md text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50 bg-cyan-600 text-white hover:bg-cyan-700 h-10 px-4 py-2 gap-2 shadow-lg shadow-cyan-900/20">
+            {user?.role === 'admin' && <button
+              onClick={() => setCreating(true)}
+              className="inline-flex items-center justify-center rounded-md text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50 bg-cyan-600 text-white hover:bg-cyan-700 h-10 px-4 py-2 gap-2 shadow-lg shadow-cyan-900/20"
+            >
               <Plus size={16} />
               New Dataset
             </button>}
@@ -174,7 +177,10 @@ export default function Home() {
                   <p className="text-zinc-400 max-w-sm mb-6">
                     Get started by creating your first dataset or ingesting sample data.
                   </p>
-                  {user?.role === 'admin' && <button onClick={() => setCreating(true)} className="inline-flex items-center justify-center rounded-md text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50 bg-cyan-600 text-white hover:bg-cyan-700 h-10 px-4 py-2 gap-2">
+                  {user?.role === 'admin' && <button
+                    onClick={() => setCreating(true)}
+                    className="inline-flex items-center justify-center rounded-md text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50 bg-cyan-600 text-white hover:bg-cyan-700 h-10 px-4 py-2 gap-2"
+                  >
                     <Plus size={16} />
                     Create Dataset
                   </button>}

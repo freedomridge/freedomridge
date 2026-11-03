@@ -1,15 +1,15 @@
 // Run with: node --test tests/create-dataset.test.cjs
-/* eslint-disable @typescript-eslint/no-require-imports -- Transpile the local API module for Node. */
+/* eslint-disable @typescript-eslint/no-require-imports -- Transpile the real API module for Node tests. */
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const { test } = require('node:test');
 const ts = require('typescript');
 
 require.extensions['.ts'] = (module, filename) => {
-    const { outputText } = ts.transpileModule(fs.readFileSync(filename, 'utf8'), {
-        compilerOptions: { module: ts.ModuleKind.CommonJS },
-    });
-    module._compile(outputText, filename);
+    const source = ts.transpileModule(fs.readFileSync(filename, 'utf8'), {
+        compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 }, fileName: filename,
+    }).outputText;
+    module._compile(source, filename);
 };
 const { createDataset } = require('../lib/api.ts');
 

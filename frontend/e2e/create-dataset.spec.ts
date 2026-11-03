@@ -1,46 +1,57 @@
 import { test, expect } from '@playwright/test';
+import { adminLogin, apiFetch, deleteDatasetAndWait } from './api';
 import { AUTH_STATE } from './helpers';
 
 test.use({ storageState: AUTH_STATE });
 
-for (const button of ['Create Dataset', 'New Dataset']) {
-    test(`${button} opens a working creation form and refreshes the list`, async ({ page }) => {
-        let created = false;
-        let attempts = 0;
-        const dataset = {
-            id: 987654, name: 'My dataset', description: 'Test description',
-            created_at: new Date().toISOString(), is_global: false,
-        };
-        await page.route('**/api/datasets', async route => {
-            if (route.request().method() === 'POST') {
-                attempts++;
-                expect(route.request().postDataJSON()).toEqual({ name: dataset.name, description: dataset.description });
-                if (attempts === 1) {
-                    await route.fulfill({ status: 400, json: { detail: 'Dataset with this name already exists' } });
-                    return;
-                }
-                created = true;
-                await route.fulfill({ json: dataset });
-            } else {
-                await route.fulfill({ json: created ? [dataset] : [] });
-            }
-        });
-        await page.route('**/api/datasets/987654/versions', route => route.fulfill({ json: [] }));
+test('New Dataset creates a private dataset and shows the duplicate-name error', async ({ page }) => {
+    const cookie = await adminLogin();
+    const stamp = Date.now();
+    const taken = await apiFetch(cookie, '/datasets', {
+        method: 'POST',
+        body: JSON.stringify({ name: `e2e-create-taken-${stamp}` }),
+    });
+    const name = `e2e-create-${stamp}`;
+    try {
         await page.goto('/');
-        await page.getByRole('button', { name: button, exact: true }).click();
+        await page.getByRole('button', { name: 'New Dataset', exact: true }).click();
         const dialog = page.getByRole('dialog');
+        const nameInput = dialog.getByLabel('Name', { exact: true });
         const submit = dialog.getByRole('button', { name: 'Create Dataset', exact: true });
+        await expect(nameInput).toBeFocused();
         await expect(submit).toBeDisabled();
-        await dialog.getByLabel('Name', { exact: true }).fill('   ');
+        await nameInput.fill('   ');
         await expect(submit).toBeDisabled();
-        await dialog.getByLabel('Name', { exact: true }).fill(' My dataset ');
-        await dialog.getByLabel('Description (optional)').fill(dataset.description);
+
+        await nameInput.fill(` ${taken.name} `);
         await submit.click();
         await expect(dialog.getByRole('alert')).toHaveText('Dataset with this name already exists');
-        await expect(dialog.getByLabel('Name', { exact: true })).toHaveValue(' My dataset ');
+        await expect(nameInput).toHaveValue(` ${taken.name} `);
+
+        await nameInput.fill(` ${name} `);
+        await dialog.getByLabel('Description (optional)').fill('Created by the e2e suite');
         await submit.click();
         await expect(dialog).toBeHidden();
-        await expect(page.getByRole('heading', { name: dataset.name, exact: true })).toBeVisible();
-        expect(attempts).toBe(2);
-    });
-}
+        await expect(page.getByRole('heading', { name, exact: true })).toBeVisible();
+
+        const datasets: Array<{ name: string; description: string | null; is_global: boolean }> =
+            await apiFetch(cookie, '/datasets');
+        expect(datasets.find(dataset => dataset.name === name))
+            .toMatchObject({ description: 'Created by the e2e suite', is_global: false });
+    } finally {
+        const datasets: Array<{ id: number; name: string }> = await apiFetch(cookie, '/datasets');
+        const created = datasets.find(dataset => dataset.name === name);
+        if (created) await deleteDatasetAndWait(cookie, created.id);
+        await deleteDatasetAndWait(cookie, taken.id);
+    }
+});
+
+test('the empty-state Create Dataset button opens the same form', async ({ page }) => {
+    // The suite's fixture dataset always exists, so stub an empty list to reach the empty state.
+    await page.route('**/api/datasets', route => route.fulfill({ json: [] }));
+    await page.goto('/');
+    await page.getByRole('button', { name: 'Create Dataset', exact: true }).click();
+    const dialog = page.getByRole('dialog');
+    await expect(dialog.getByRole('heading', { name: 'Create Dataset', exact: true })).toBeVisible();
+    await expect(dialog.getByLabel('Name', { exact: true })).toBeFocused();
+});
