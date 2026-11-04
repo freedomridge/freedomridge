@@ -24,13 +24,18 @@ postgres = pytest.mark.skipif(
 @postgres
 @pytest.mark.parametrize('delay', ['notification_cleanup', 'loop_dispatch'])
 def test_completed_units_keep_their_results_and_lease_during_dispatch_delays(registry_database, monkeypatch, delay):
+    # Each delay outlasts the unit deadline, and the three together outlast the lease, so the job only succeeds
+    # if a late deadline spares completed units and renewals continue. Budgets of 1 s and more, not 0.15 s: a
+    # healthy unit has to tolerate a main-thread pause (a GC pass late in a full suite) after it starts.
+    unit_seconds, delay_seconds, lease_seconds = 1, 2, 4
+
     async def scenario(database):
         class SlowCancellation(asyncio.Event):
             async def wait(self):
                 try:
                     return await super().wait()
                 except asyncio.CancelledError:
-                    await asyncio.sleep(0.3)
+                    await asyncio.sleep(delay_seconds)
                     raise
 
         class DelayedMonitor(job_heartbeat.LeaseMonitor):
@@ -45,7 +50,7 @@ def test_completed_units_keep_their_results_and_lease_during_dispatch_delays(reg
         async def handler(job):
             unit = job['checkpoint'].get('unit', 0) + 1
             if delay == 'loop_dispatch':
-                asyncio.get_running_loop().call_soon(time.sleep, 0.3)
+                asyncio.get_running_loop().call_soon(time.sleep, delay_seconds)
 
             async def publish(connection):
                 await connection.execute('INSERT INTO deadline_effects VALUES ($1)', unit)
@@ -56,11 +61,11 @@ def test_completed_units_keep_their_results_and_lease_during_dispatch_delays(reg
         worker = await make_worker(
             database,
             {'example': handler},
-            lease_seconds=0.8,
+            lease_seconds=lease_seconds,
             heartbeat_seconds=0.05,
-            policies={'example': job_queue.JobPolicy(max_unit_seconds=0.15)},
+            policies={'example': job_queue.JobPolicy(max_unit_seconds=unit_seconds)},
         )
-        assert await asyncio.wait_for(worker.run_once(), 5)
+        assert await asyncio.wait_for(worker.run_once(), 30)
         row = await database.fetchrow('SELECT * FROM jobs WHERE id=$1', submitted['id'])
         assert row['state'] == 'succeeded', dict(row)
         assert row['checkpoint'] == {'unit': 3}
