@@ -126,7 +126,7 @@ def test_retention_keeps_the_newest_verified_dumps_and_touches_nothing_else(tmp_
     old = [make_backup(tmp_path, f'2026101{day}T020000Z') for day in range(1, 5)]
     unverified = make_backup(tmp_path, '20261009T020000Z', verified=False)
     without_manifest = tmp_path / 'freedomridge_20261001T020000Z.sql.gz'
-    other = tmp_path / 'aurora_20261016T164042Z.sql.gz'
+    other = tmp_path / 'other_20261016T164042Z.sql.gz'
     for path in (without_manifest, other):
         path.write_bytes(b'x')
 

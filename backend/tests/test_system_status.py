@@ -199,7 +199,7 @@ def test_the_newest_verified_dump_is_latest_and_everything_else_is_not_counted(t
     _dump(tmp_path, newest, size=700, migrations_applied=102)
     _dump(tmp_path, NOW - timedelta(hours=1), manifest=False)  # by hand, or a run still going
     _dump(tmp_path, NOW - timedelta(hours=2), verified=False)
-    _dump(tmp_path, NOW - timedelta(hours=3), prefix="aurora", manifest=False)
+    _dump(tmp_path, NOW - timedelta(hours=3), prefix="other", manifest=False)
     corrupt = _dump(tmp_path, NOW - timedelta(hours=4), manifest=False)
     (tmp_path / f"{corrupt.name}.manifest.json").write_text("{not json")
     (tmp_path / f"freedomridge_{_stamp(NOW)}.sql.gz.manifest.json").write_text(json.dumps({"verified": True}))

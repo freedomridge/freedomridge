@@ -52,7 +52,7 @@ while true; do
             fi
         fi
         # Retention: delete all but the newest $KEEP local dumps. Failure here is non-fatal.
-        ls -1t "${BACKUP_DIR}"/freedomridge_*.sql.gz "${BACKUP_DIR}"/aurora_*.sql.gz 2>/dev/null | tail -n +"$((KEEP + 1))" | while read -r old; do
+        ls -1t "${BACKUP_DIR}"/freedomridge_*.sql.gz 2>/dev/null | tail -n +"$((KEEP + 1))" | while read -r old; do
             rm -f "$old" && echo "[backup] pruned ${old}"
         done
     else
