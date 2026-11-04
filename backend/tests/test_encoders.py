@@ -111,8 +111,10 @@ def test_real_towers_match_full_clip_checkpoint(tmp_path, monkeypatch):
     with torch.no_grad():
         expected_text = model.get_text_features(**text_inputs)[0].tolist()
         expected_image = model.get_image_features(**image_inputs)[0].tolist()
-    assert encoders._encode_sync('a mountain', str(tmp_path)) == pytest.approx(expected_text)
-    assert encoders._encode_image_sync(buffer.getvalue(), str(tmp_path)) == pytest.approx(expected_image)
+    # The towers and CLIPModel compute the same values through separate modules, so float noise
+    # varies by CPU (3.6e-7 relative locally, just over the default 1e-6 on a CI runner).
+    assert encoders._encode_sync('a mountain', str(tmp_path)) == pytest.approx(expected_text, abs=1e-5)
+    assert encoders._encode_image_sync(buffer.getvalue(), str(tmp_path)) == pytest.approx(expected_image, abs=1e-5)
     # Each tower loaded with its own config, not the parent CLIPConfig.
     assert type(encoders._cache[str(tmp_path)][1].config) is transformers.CLIPTextConfig
     assert type(encoders._image_cache[str(tmp_path)][1].config) is transformers.CLIPVisionConfig
