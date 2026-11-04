@@ -11,6 +11,7 @@ import requests
 
 from .client import get_client
 from .sample import Sample
+from .version_view import VersionView
 from .view import Condition, DatasetView, SampleQuery, parse_query_string
 
 # `field__op=value` suffixes accepted by Dataset.filter(), mapped to the wire operator that
@@ -1181,6 +1182,36 @@ class Dataset:
             version_id = match[0]['id']
 
         return self.client.get_current_diff(self._id, version_id)
+
+    def version(self, version_name: Optional[str] = None, version_id: Optional[int] = None) -> VersionView:
+        """A read-only, queryable view of a version (snapshot): count, distinct, filter, iterate.
+
+        Queries run server-side against the version's stored data, like a DatasetView on the live
+        dataset. With no argument, the newest version.
+
+        Args:
+            version_name: Version name (e.g., "v1.8")
+            version_id: Or version ID directly
+
+        Example:
+            v = dataset.version("v1.8")
+            v.count_values("split")
+            v.filter(F("split").is_in(["train", "val"])).select_fields(["source_id"]).distinct("source_id")
+        """
+        versions = self.list_versions()
+        if version_id is not None:
+            match = [v for v in versions if v['id'] == version_id]
+            label = f"id {version_id}"
+        elif version_name is not None:
+            match = [v for v in versions if v['name'] == version_name]
+            label = f"'{version_name}'"
+        else:
+            match, label = versions[:1], "(newest)"
+        if not match:
+            raise ValueError(f"Version {label} not found")
+        if match[0].get('include_metadata') is False:
+            raise ValueError(f"Version '{match[0]['name']}' is hash-only and has no sample data to query")
+        return VersionView(self, match[0])
 
     def checkout(self, version_name: Optional[str] = None, version_id: Optional[int] = None):
         """Iterate over the samples as they were at a specific version.

@@ -1553,6 +1553,36 @@ class Client:
         _raise_for_status(resp)
         return resp.json()
 
+    def query_version_samples(
+        self,
+        dataset_id,
+        version_id,
+        filters=None,
+        fields=None,
+        limit=1000,
+        after_id=None,
+    ) -> list:
+        """One page of a version's samples matching ``filters`` (id order, keyset-paged by ``after_id``).
+
+        ``fields`` limits what the server reads; None returns whole rows.
+        """
+        payload = {"filters": filters, "fields": fields, "limit": limit, "after_id": after_id}
+        resp = self.session.post(
+            f"{self.base_url}/datasets/{dataset_id}/versions/{version_id}/samples/query",
+            json=payload,
+        )
+        _raise_for_status(resp)
+        return resp.json()["items"]
+
+    def aggregate_version(self, dataset_id, version_id, aggregations, filters=None):
+        """Like ``aggregate`` but over a version's stored samples. Returns one result dict per aggregation."""
+        resp = self.session.post(
+            f"{self.base_url}/datasets/{dataset_id}/versions/{version_id}/aggregate",
+            json={"aggregations": aggregations, "filters": filters},
+        )
+        _raise_for_status(resp)
+        return resp.json().get("results", [])
+
     # --- Embeddings ---
 
     def get_embedding_fields(self, dataset_id) -> list:

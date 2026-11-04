@@ -19,6 +19,7 @@ from .core.labels import (
 )
 from .core.objects import objects_from_cuboids
 from .core.sample import Sample
+from .core.version_view import VersionReadOnlyError, VersionView
 from .core.view import (
     Condition,
     DatasetView,
@@ -38,6 +39,8 @@ __all__ = [
     'Dataset',
     'Sample',
     'DatasetView',
+    'VersionView',
+    'VersionReadOnlyError',
     'Job',
     'JobError',
     'JobFailed',

@@ -1,7 +1,8 @@
 """Dataset versioning — create snapshots, view history, compare diffs."""
 
+import json
 import secrets
-from typing import Optional
+from typing import Any, Optional
 
 import asyncpg
 from fastapi import APIRouter, Depends, HTTPException
@@ -12,8 +13,17 @@ from ..database import db
 from ..diskspace import estimate_snapshot_bytes, require_free_space
 from ..field_registry import REQUEST_FULL_REFRESH, _value_names, lock_field_lifecycle
 from ..label_fields import DISCOVERY_TYPES, label_context
+from ..request_limits import guest_heavy
 from ..validation import clean_name
 from .auth import require_role
+from .datasets import (
+    AggregationSpec,
+    _derived_field,
+    _validate_field_name,
+    build_sample_query_parts,
+    get_dataset_array_columns,
+    run_aggregations,
+)
 
 # Router-level dependency → every endpoint under /datasets/{id}/versions/*
 # automatically enforces access control. One line, impossible to forget on
@@ -575,6 +585,31 @@ async def get_version(id: int, version_id: int):
     return result
 
 
+def _attach_location(data: dict) -> None:
+    """Replace a row's lon/lat columns with the GeoJSON-style ``location`` the samples endpoints return."""
+    if data.get('lon') is not None and data.get('lat') is not None:
+        data['location'] = {"type": "Point", "coordinates": [data['lon'], data['lat']]}
+    else:
+        data['location'] = None
+    data.pop('lon', None)
+    data.pop('lat', None)
+    if data.get('heading') is not None and data.get('location'):
+        data['location']['heading'] = data['heading']
+
+
+def _full_snapshot_item(row, version_id: int) -> dict:
+    """One stored version row in the samples-endpoint shape, with the version's metadata, tags and arrays."""
+    data = dict(row)
+    if data['metadata'] is None or data['filepath'] is None:
+        raise HTTPException(status_code=400, detail="This older version did not capture historical sample data")
+    data['version_id'] = version_id
+    data['media_type'] = data.get('media_type') or 'unknown'
+    data.update({name: value for name, value in (data.get('array_fields') or {}).items() if name not in data})
+    _attach_location(data)
+    # filepath stays raw — see /api/samples/{id}/media for image fetching.
+    return data
+
+
 @router.get("/{version_id}/samples")
 async def get_version_samples(
     id: int,
@@ -649,25 +684,7 @@ async def get_version_samples(
             *args,
         )
 
-        items = []
-        for row in rows:
-            data = dict(row)
-            if data['metadata'] is None or data['filepath'] is None:
-                raise HTTPException(status_code=400, detail="This older version did not capture historical sample data")
-            data['version_id'] = version_id
-            data['media_type'] = data.get('media_type') or 'unknown'
-            data.update({name: value for name, value in (data.get('array_fields') or {}).items() if name not in data})
-            # Build location
-            if data.get('lon') is not None and data.get('lat') is not None:
-                data['location'] = {"type": "Point", "coordinates": [data['lon'], data['lat']]}
-            else:
-                data['location'] = None
-            data.pop('lon', None)
-            data.pop('lat', None)
-            if data.get('heading') is not None and data.get('location'):
-                data['location']['heading'] = data['heading']
-            # filepath stays raw — see /api/samples/{id}/media for image fetching.
-            items.append(data)
+        items = [_full_snapshot_item(row, version_id) for row in rows]
 
         return {"items": items, "total": total, "snapshot_format": version['snapshot_format']}
     else:
@@ -679,6 +696,161 @@ async def get_version_samples(
             *args,
         )
         return {"sample_ids": [r['sample_id'] for r in rows], "total": total}
+
+
+# Samples-endpoint operators that read live tables (duplicates, concept scores, parent/object links) a
+# version does not snapshot. Refused rather than answered from today's data.
+_LIVE_ONLY_FILTER_OPS = frozenset(
+    {
+        'collapse_duplicates',
+        'concept_select',
+        'concept_exclude',
+        'concept_present',
+        'cg_self',
+        'parent_matches',
+        'has_matching_object',
+    },
+)
+_VERSION_COLUMN_FIELDS = ('filepath', 'media_type', 'tags', 'created_at', 'last_modified_at')
+
+
+def _reject_live_only_filters(node: Any) -> None:
+    if not isinstance(node, dict):
+        return
+    for child in node.get('filters') or []:
+        _reject_live_only_filters(child)
+    if 'field' not in node:
+        return
+    operator = str(node.get('operator', '=')).lower()
+    field = node['field']
+    derived = isinstance(field, str) and field != 'location' and _derived_field(field) is not None
+    if operator in _LIVE_ONLY_FILTER_OPS or derived:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Filter on {field!r} ({operator}) reads live data that a version does not store",
+        )
+
+
+async def _queryable_version(id: int, version_id: int) -> None:
+    """404 unless the version belongs to this dataset; 400 if it kept no sample data (hash-only)."""
+    version = await get_version(id, version_id)
+    if version['include_metadata'] is False:
+        raise HTTPException(status_code=400, detail="Hash-only versions have no historical sample data")
+
+
+async def _version_query(id: int, version_id: int, filters: Optional[dict]) -> tuple[str, str, list, list]:
+    """(WITH clause, WHERE clause, args, stored array columns) to query a version's rows like the live table.
+
+    The WITH clause names a CTE ``samples`` holding the version's rows under the live column names, so
+    the live filter compiler and aggregations run on it unchanged: ``id`` is the sample id,
+    ``dataset_id`` the dataset, and each registered array field is rebuilt from the snapshot's
+    ``array_fields_snapshot`` (NULL where the version never recorded it). The CTE is referenced once per
+    statement, so PostgreSQL inlines it and only computes the columns a query touches.
+    """
+    await _queryable_version(id, version_id)
+    if filters:
+        _reject_live_only_filters(filters)
+    array_columns = await get_dataset_array_columns(id)
+    stored = [c for c in sorted(array_columns & await get_array_columns()) if c != 'tags']
+    rebuilt = ''.join(
+        f", CASE WHEN jsonb_typeof(v.array_fields_snapshot->'{c}') = 'array' "
+        f"THEN ARRAY(SELECT jsonb_array_elements_text(v.array_fields_snapshot->'{c}')) END AS {c}"
+        for c in stored
+    )
+    with_clause = (
+        f"WITH samples AS (SELECT v.sample_id AS id, {int(id)} AS dataset_id, v.filepath, v.metadata, v.tags, "
+        f"v.media_type, v.location, v.heading, v.created_at, v.last_modified_at, v.array_fields_snapshot{rebuilt} "
+        f"FROM version_snapshots v WHERE v.version_id = {int(version_id)}) "
+    )
+    where, args, _ = build_sample_query_parts(
+        id,
+        filters=json.dumps(filters) if filters else None,
+        array_columns=array_columns,
+    )
+    return with_clause, where, args, stored
+
+
+class VersionAggregateRequest(BaseModel):
+    aggregations: list[AggregationSpec]
+    filters: Optional[dict[str, Any]] = None
+
+
+@router.post("/{version_id}/aggregate")
+@guest_heavy
+async def aggregate_version(id: int, version_id: int, request: VersionAggregateRequest):
+    """Aggregate a version's stored samples, optionally filtered; same specs and results as
+    ``POST /datasets/{id}/aggregate``, computed in the database against the version."""
+    with_clause, where, args, _ = await _version_query(id, version_id, request.filters)
+    return await run_aggregations(id, request.aggregations, where, args, with_clause)
+
+
+class VersionSamplesQueryRequest(BaseModel):
+    filters: Optional[dict[str, Any]] = None
+    fields: Optional[list[str]] = None  # None = whole rows; else only these (id is always returned)
+    limit: int = 1000
+    after_id: Optional[int] = None  # keyset cursor: rows with id > after_id, ordered by id
+
+
+@router.post("/{version_id}/samples/query")
+@guest_heavy
+async def query_version_samples(id: int, version_id: int, request: VersionSamplesQueryRequest):
+    """A page of a version's samples matching ``filters``, as they were at the version, ordered by id.
+
+    ``fields`` limits the columns read: native columns, registered array fields, or metadata keys
+    (a key absent from a sample's stored metadata is absent from its ``metadata``).
+    """
+    if not 1 <= request.limit <= 10000 or (request.after_id is not None and request.after_id < 0):
+        raise HTTPException(status_code=400, detail="Invalid snapshot pagination")
+    with_clause, where, args, stored = await _version_query(id, version_id, request.filters)
+    if request.after_id is not None:
+        args.append(request.after_id)
+        where += f" AND id > ${len(args)}"
+    args.append(request.limit)
+    paging = f"ORDER BY id LIMIT ${len(args)}"
+
+    if request.fields is None:
+        columns = (
+            "id, filepath, metadata, tags, media_type, array_fields_snapshot AS array_fields, "
+            "ST_X(location::geometry) AS lon, ST_Y(location::geometry) AS lat, heading, created_at, last_modified_at"
+        )
+    else:
+        select = ['id', '(metadata IS NULL OR filepath IS NULL) AS incomplete']
+        metadata_keys = []
+        for field in dict.fromkeys(request.fields):
+            if field == 'location':
+                select += ['ST_X(location::geometry) AS lon', 'ST_Y(location::geometry) AS lat', 'heading']
+            elif field == 'heading':
+                select.append('heading')
+            elif field == 'metadata':
+                select.append('metadata')
+            elif field in _VERSION_COLUMN_FIELDS or field in stored:
+                select.append(field)
+            elif field != 'id':
+                metadata_keys.append(_validate_field_name(field.split('.')[0]))
+        if metadata_keys:
+            args.append(list(dict.fromkeys(metadata_keys)))
+            select.append(
+                "(SELECT COALESCE(jsonb_object_agg(e.key, e.value), '{}'::jsonb) FROM jsonb_each(metadata) e "
+                f"WHERE e.key = ANY(${len(args)}::text[])) AS metadata",
+            )
+        columns = ', '.join(dict.fromkeys(select))
+
+    rows = await db.fetch(f"{with_clause}SELECT {columns} FROM samples {where} {paging}", *args)
+
+    if request.fields is None:
+        return {"items": [_full_snapshot_item(row, version_id) for row in rows]}
+    items = []
+    for row in rows:
+        data = dict(row)
+        if data.pop('incomplete'):
+            raise HTTPException(status_code=400, detail="This older version did not capture historical sample data")
+        data['version_id'] = version_id
+        if 'media_type' in data:
+            data['media_type'] = data['media_type'] or 'unknown'
+        if 'lon' in data:
+            _attach_location(data)
+        items.append(data)
+    return {"items": items}
 
 
 @router.delete("/{version_id}", dependencies=[Depends(require_role("power_user"))])

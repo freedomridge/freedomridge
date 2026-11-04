@@ -1339,6 +1339,32 @@ for sample in dataset.checkout(version_name="v1.0"):
     print(sample.filepath, sample.metadata.get("reviewed"))
 ```
 
+### Query a Version (`dataset.version()`)
+
+`dataset.version(name)` (no argument: the newest version) returns a **read-only**
+`VersionView` that is queried like a `DatasetView`, but always against the version's
+stored data. Every query runs in the database, so a multi-million-sample version is
+never pulled to the client.
+
+```python
+from fridge import F
+
+v = dataset.version("v1.8")
+v.count()                       # samples in the version
+v.distinct("source_id")         # distinct metadata values
+v.count_values("split")         # {"train": ..., "val": ...}
+split = v.filter(F("split").is_in(["train", "val"]))   # same filter DSL; chainable
+for sample in split.select_fields(["source_id", "category"]):
+    print(sample.id, sample.metadata)  # only those fields are read
+```
+
+Supported: `filter`/`match`/`exclude`, `select_fields`, `limit`, `iter_samples`, `first`,
+`count`, `distinct`, `count_values`, `aggregate` (same specs as `DatasetView.aggregate`).
+Samples come back in id order. Writes (`tag_samples`, `set_values`, ...) raise
+`VersionReadOnlyError`; sorting, `skip`, histograms and similarity are not supported on a version
+(`NotImplementedError`). Filters that read live data a version does not store (embedding or hash
+presence, concept scores, duplicate collapsing, parent/object links) are rejected with a 400.
+
 In Dataset Settings → Versions, choose **Browse snapshot** to inspect saved samples,
 search their paths/tags/metadata, and view their annotations. Images, masks, heatmaps,
 and display settings come from the selected version. Diff links open the saved state
@@ -1803,6 +1829,7 @@ class Dataset:
     def version_status() -> dict
     def diff(version_name: str = None, version_id: int = None) -> dict   # version vs current
     def checkout(version_name: str = None, version_id: int = None) -> Iterator[Sample]  # snapshot samples
+    def version(version_name: str = None, version_id: int = None) -> VersionView  # queryable, read-only
     def revert(version_name: str = None, version_id: int = None, restore_deleted: bool = False,
                exact_membership: bool = False) -> dict
 ```

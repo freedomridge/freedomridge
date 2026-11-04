@@ -7270,13 +7270,27 @@ async def aggregate(id: int, request: AggregateRequest):
         array_columns=await get_dataset_array_columns(id),
         numeric_indexed_fields=await get_promoted_numeric_fields(id) if filters_json else None,
     )
+    return await run_aggregations(id, request.aggregations, where_clause, base_args)
 
+
+async def run_aggregations(
+    id: int,
+    aggregations: List[AggregationSpec],
+    where_clause: str,
+    base_args: list,
+    with_clause: str = "",
+) -> dict:
+    """Run aggregations over `samples` (or, given `with_clause`, a CTE named `samples`).
+
+    `with_clause` is a leading ``WITH samples AS (...)`` that stands in for the table, which is how
+    a version's stored rows are aggregated with the live dataset's SQL.
+    """
     results = []
-    for spec in request.aggregations:
+    for spec in aggregations:
         op, field = spec.op, spec.field
 
         if op == "count":
-            n = await db.fetchval(f"SELECT count(*) FROM samples {where_clause}", *base_args)
+            n = await db.fetchval(f"{with_clause}SELECT count(*) FROM samples {where_clause}", *base_args)
             results.append({"op": op, "field": field, "value": int(n or 0)})
 
         elif op in ("sum", "mean", "std", "min", "max", "bounds"):
@@ -7285,7 +7299,7 @@ async def aggregate(id: int, request: AggregateRequest):
             expr = _agg_numeric_expr(field)
             if op == "bounds":
                 r = await db.fetchrow(
-                    f"SELECT min({expr}) AS mn, max({expr}) AS mx FROM samples {where_clause}",
+                    f"{with_clause}SELECT min({expr}) AS mn, max({expr}) AS mx FROM samples {where_clause}",
                     *base_args,
                 )
                 lo = float(r['mn']) if r and r['mn'] is not None else None
@@ -7294,7 +7308,7 @@ async def aggregate(id: int, request: AggregateRequest):
             else:
                 fn = {"sum": "sum", "mean": "avg", "std": "stddev_samp", "min": "min", "max": "max"}[op]
                 v = await db.fetchval(
-                    f"SELECT {fn}({expr}) FROM samples {where_clause}",
+                    f"{with_clause}SELECT {fn}({expr}) FROM samples {where_clause}",
                     *base_args,
                 )
                 results.append({"op": op, "field": field, "value": float(v) if v is not None else None})
@@ -7304,7 +7318,7 @@ async def aggregate(id: int, request: AggregateRequest):
             expr = _agg_numeric_expr(field)
             args = list(base_args) + [qs]
             r = await db.fetchval(
-                f"SELECT percentile_cont(${len(args)}::double precision[]) "
+                f"{with_clause}SELECT percentile_cont(${len(args)}::double precision[]) "
                 f"WITHIN GROUP (ORDER BY {expr}) FROM samples {where_clause}",
                 *args,
             )
@@ -7319,7 +7333,7 @@ async def aggregate(id: int, request: AggregateRequest):
                 limit_sql = f" LIMIT ${len(args)}"
             if op == "count_values":
                 rows = await db.fetch(
-                    f"SELECT v AS value, count(*) AS count FROM "
+                    f"{with_clause}SELECT v AS value, count(*) AS count FROM "
                     f"(SELECT {value_expr} AS v FROM samples {where_clause}) sub "
                     f"WHERE v IS NOT NULL GROUP BY v ORDER BY count DESC{limit_sql}",
                     *args,
@@ -7329,7 +7343,7 @@ async def aggregate(id: int, request: AggregateRequest):
                 )
             elif op == "distinct":
                 rows = await db.fetch(
-                    f"SELECT DISTINCT v AS value FROM "
+                    f"{with_clause}SELECT DISTINCT v AS value FROM "
                     f"(SELECT {value_expr} AS v FROM samples {where_clause}) sub "
                     f"WHERE v IS NOT NULL ORDER BY value{limit_sql}",
                     *args,
@@ -7337,7 +7351,7 @@ async def aggregate(id: int, request: AggregateRequest):
                 results.append({"op": op, "field": field, "value": [r['value'] for r in rows]})
             else:  # values — every value, not deduped (unlike distinct)
                 rows = await db.fetch(
-                    f"SELECT v AS value FROM "
+                    f"{with_clause}SELECT v AS value FROM "
                     f"(SELECT {value_expr} AS v FROM samples {where_clause}) sub "
                     f"WHERE v IS NOT NULL ORDER BY value{limit_sql}",
                     *args,

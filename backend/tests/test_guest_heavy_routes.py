@@ -23,6 +23,8 @@ HEAVY_ROUTES = {
     ('GET', '/api/datasets/{id}/histogram'),
     ('GET', '/api/datasets/{id}/histogram/preview'),
     ('POST', '/api/datasets/{id}/aggregate'),
+    ('POST', '/api/datasets/{id}/versions/{version_id}/aggregate'),
+    ('POST', '/api/datasets/{id}/versions/{version_id}/samples/query'),
     ('GET', '/api/datasets/{id}/map_points'),
     ('POST', '/api/datasets/{id}/map_points'),
     ('POST', '/api/datasets/{id}/map_extent'),
