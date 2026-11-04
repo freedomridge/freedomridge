@@ -12,7 +12,7 @@ import requests
 from .client import get_client
 from .sample import Sample
 from .version_view import VersionView
-from .view import Condition, DatasetView, SampleQuery, parse_query_string
+from .view import Condition, DatasetView, SampleQuery, filters_from_view_stages, parse_query_string
 
 # `field__op=value` suffixes accepted by Dataset.filter(), mapped to the wire operator that
 # backend/routers/datasets.py's parse_filter_node actually implements.
@@ -979,6 +979,38 @@ class Dataset:
     def list_views(self) -> list:
         """List all saved views for this dataset."""
         return self.client.list_views(self._id)
+
+    def load_view(self, name: str) -> DatasetView:
+        """Load a saved view as a DatasetView: the samples the app shows for it.
+
+        The view is the AND of the saved stages' filters, exactly as the app combines them, so the
+        result supports the usual operations (``len``, ``filter``, iteration, ``tag_samples``,
+        aggregations, ...). It is the saved *definition*, so it follows the dataset as samples change.
+
+        Raises:
+            ValueError: no saved view has that name, or the view has a stage that can't be reproduced
+                faithfully (see ``fridge.core.view.filters_from_view_stages``).
+
+        Example:
+            subset = dataset.load_view("evaluation subset")
+            print(len(subset))
+            for sample in subset.filter(dataset.samples.split == "val"):
+                ...
+        """
+        views = self.list_views()
+        matches = [v for v in views if v.get("name") == name]
+        if not matches:
+            known = sorted(str(v.get("name")) for v in views)
+            raise ValueError(f"No saved view named {name!r} on dataset {self.name!r}; saved views: {known}")
+        content = matches[0].get("content") or {}
+        if "viewStages" in content:
+            filters = filters_from_view_stages(name, content["viewStages"])
+        elif isinstance(content.get("filters"), dict):
+            # Views saved before stages existed keep only the compiled filter.
+            filters = content["filters"] or None
+        else:
+            raise ValueError(f"Saved view {name!r} has neither viewStages nor filters")
+        return DatasetView(self, filters)
 
     def delete_view(self, view_id: int) -> dict:
         """Delete a saved view by ID."""
