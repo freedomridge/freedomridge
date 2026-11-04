@@ -58,13 +58,15 @@ jobs:
         run: uv sync --frozen --extra cpu
       - name: Standalone entry points without PYTHONPATH
         run: env -u PYTHONPATH python -m pytest examples/test_review_regressions.py -k script_help -q
-      - name: Demo mappers, resume, runner and localhost range downloads
+      - name: Demo mappers, resume, runner, localhost range downloads and CLIP encoders
         env:
           PYTHONPATH: python:.
           HF_HUB_OFFLINE: '1'
           TRANSFORMERS_OFFLINE: '1'
           OMP_NUM_THREADS: '4'
-        run: python -m pytest examples -q
+        # This job has the ML extras: exercise real CLIP tower loading offline,
+        # in addition to the mocked regressions in the lean backend job.
+        run: python -m pytest examples backend/tests/test_encoders.py -q
 
   backend-tests:
     runs-on: ubuntu-latest
