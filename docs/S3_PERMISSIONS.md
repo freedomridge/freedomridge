@@ -21,17 +21,23 @@ allowance; see the limits table in [Deploy to AWS](DEPLOY_TO_AWS.md#10-public-de
 ## S3
 
 A sample whose filepath is `s3://BUCKET/KEY` is fetched by the backend. For each
-request it chooses credentials in this order:
+request it chooses among the storage configurations that cover BUCKET (their bucket
+name is BUCKET, or one of their bucket patterns matches it) and that the sample's
+dataset may use, in this order:
 
-1. a storage configuration whose bucket name is BUCKET, or whose bucket patterns
-   match it;
-2. the dataset's own storage configuration;
-3. the default storage configuration;
-4. the environment variables below.
+1. the dataset's own storage configuration;
+2. a configuration limited to chosen datasets, this one among them;
+3. a configuration that serves all datasets.
 
-The backend refuses a bucket that is not named by one of these, so a sample path
-cannot make the server read an arbitrary bucket with its credentials. The app only
-reads dataset buckets; it never writes or deletes objects in them.
+Among equally specific configurations, an exact bucket name beats a pattern, then the
+oldest wins. When no configuration covers BUCKET, the environment variables below
+serve their own bucket, but only for a dataset that has no storage configuration of
+its own while no default configuration exists.
+
+The backend refuses any other bucket, so a sample path cannot make the server read
+an arbitrary bucket with its credentials. The app only reads dataset buckets; it
+never writes or deletes objects in them. Adding, changing, limiting or deleting a
+configuration applies to every backend worker on its next request.
 
 ### Settings → Storage Configuration
 
@@ -45,6 +51,14 @@ that key with your backups, or restored configurations cannot be decrypted.
 region when allowed. A dataset uses a particular configuration when it is created
 or updated with its `storage_config_id`; otherwise the bucket-name match or the
 default applies.
+
+**Datasets** chooses which datasets may use a configuration. **All datasets** is the
+default, and the only choice for the default configuration. **Only these datasets**
+limits it to the ticked datasets: every other dataset is refused its buckets, even
+ones its bucket patterns match, and with none ticked it serves no dataset. Through the
+API this is `restricted` with `dataset_ids`. A limited configuration can only become a
+dataset's own `storage_config_id` once it lists that dataset, and it can't drop a
+dataset that uses it that way.
 
 `docker-compose.prod.yml` passes only `STORAGE_TYPE`, `S3_BUCKET` and `S3_REGION`
 from `.env` (below). The AWS deployment sets them to its media bucket, which the

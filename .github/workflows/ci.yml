@@ -262,7 +262,8 @@ jobs:
           grep -q "^Applying 9001_ci_canary.sql" /tmp/first_run.log
           test "$(docker exec ci-db psql -U freedomridge -d freedomridge -Atc "SELECT count(*) FROM schema_migrations WHERE filename='9001_ci_canary.sql'")" = 1
           ./scripts/apply_migrations.sh | tee /tmp/second_run.log
-          grep -q "Skipped 1 file(s) already recorded" /tmp/second_run.log
+          # Every file is skipped: the canary and each real migration schema.sql already records.
+          grep -q "Skipped $(ls backend/db/migrations/*.sql | wc -l) file(s) already recorded" /tmp/second_run.log
           # Per-file lines only (the header says "Applying database migrations..."). Not `! grep`: bash -e ignores a negated command.
           if grep -qE "^Applying [^ ]+\.sql" /tmp/second_run.log; then echo "second run re-applied a file"; exit 1; fi
           rm backend/db/migrations/9001_ci_canary.sql
@@ -298,12 +299,14 @@ jobs:
         env:
           FRIDGE_DB_CONTAINER: ci-db
         run: |
+          # Keep the ledger (the baseline and every migration schema.sql records) to put back afterwards.
+          recorded=$(docker exec ci-db psql -U freedomridge -d freedomridge -Atc "SELECT string_agg(quote_literal(filename), ',') FROM schema_migrations")
           docker exec -i ci-db psql -U freedomridge -d freedomridge -v ON_ERROR_STOP=1 -q -c "DELETE FROM schema_migrations"
           if python3 -m backend.schema_check postgresql://freedomridge:password@127.0.0.1:5432/freedomridge; then echo "a database without the baseline must be reported"; exit 1; fi
           if ./scripts/apply_migrations.sh 2>/tmp/refused.log; then echo "runner must refuse it"; exit 1; fi
           grep -q "not created from backend/db/schema.sql" /tmp/refused.log
           docker exec -i ci-db psql -U freedomridge -d freedomridge -v ON_ERROR_STOP=1 -q -c \
-            "INSERT INTO schema_migrations (filename) VALUES ('0000_baseline.sql')"
+            "INSERT INTO schema_migrations (filename) SELECT unnest(ARRAY[$recorded])"
           python3 -m backend.schema_check postgresql://freedomridge:password@127.0.0.1:5432/freedomridge
       - name: Backup round-trip restores every row
         env:

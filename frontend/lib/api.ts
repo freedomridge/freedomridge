@@ -1782,6 +1782,9 @@ export interface StorageConfig {
     is_default: boolean;
     bucket_patterns: string[];
     created_at: string;
+    // false: serves every dataset. true: serves only dataset_ids.
+    restricted: boolean;
+    dataset_ids: number[];
 }
 
 export interface StorageConfigCreate {
@@ -1795,6 +1798,8 @@ export interface StorageConfigCreate {
     is_public_bucket?: boolean;
     is_default?: boolean;
     bucket_patterns?: string[];
+    restricted?: boolean;
+    dataset_ids?: number[];
 }
 
 export interface TestConnectionResult {

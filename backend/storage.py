@@ -1,9 +1,9 @@
 import configparser
 import fnmatch
 import os
-import time
+from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, NamedTuple, Optional
 
 if TYPE_CHECKING:
     from mypy_boto3_s3.client import S3Client
@@ -18,14 +18,6 @@ except ImportError:
     HAS_BOTO3 = False
     boto3 = None  # type: ignore[assignment]  # sentinel when boto3 absent; S3 paths check storage_type first
     Config = None  # type: ignore[assignment,misc]  # same optional-dependency sentinel
-
-
-# How long a per-dataset StorageBackend stays in `_storage_cache` before being
-# rebuilt from the DB. Explicit `invalidate_storage_cache(config_id)` calls from
-# the storage router make admin updates instant; this TTL is just a safety net
-# for multi-worker drift and direct DB edits. 15 min keeps DB+decrypt overhead
-# negligible while bounding staleness on credential rotations.
-STORAGE_CONFIG_CACHE_TTL = 15 * 60
 
 
 class StorageConfig:
@@ -289,58 +281,75 @@ def get_storage() -> StorageBackend:
     return storage
 
 
-# --- Per-dataset storage backend lookup ---
+# --- Per-dataset storage routing ---
 #
-# Two-tier fallback:
-#   1. dataset.storage_config_id set → use that storage_configs row
-#   2. else fall back to is_default=TRUE storage_configs row
-#   3. else fall back to env-var global singleton
+# Which credentials serve s3://{bucket}/... for a dataset is decided on every request from the
+# storage_configs table (a handful of rows), so a config added, changed, restricted or deleted through
+# one backend worker applies on every worker at once. Only the S3 client is cached, one per config, and
+# it is rebuilt when the row's updated_at changes (a trigger bumps it on every UPDATE).
 #
-# Cached for STORAGE_CONFIG_CACHE_TTL to avoid rebuilding boto3 clients
-# (DB query + Fernet decrypt + boto3 init) on every image request.
-
-# Cache: storage_config_id -> (StorageBackend, created_at_epoch_seconds)
-_storage_cache: dict[int, tuple[StorageBackend, float]] = {}
-
-# Cache: bucket_name -> (config_id or None, created_at). Lets the hot
-# image-fetch path skip the storage_configs SELECT when the same bucket is
-# hit repeatedly. A None config_id caches "no matching row" so we don't
-# re-query for buckets the system doesn't know about either. Flushed on any
-# storage_configs mutation via invalidate_bucket_route_cache().
-_bucket_route_cache: dict[str, tuple[Optional[int], float]] = {}
+# A config serves every dataset unless it is restricted; then it serves only the datasets listed in
+# storage_config_datasets.
 
 
-def invalidate_storage_cache(config_id: int) -> None:
-    """Drop a cached StorageBackend so the next request rebuilds from DB.
+class StorageRoute(NamedTuple):
+    """The credentials that serve a bucket for a dataset: a storage_configs row, or the env-var backend."""
 
-    Called by the storage router whenever a config row is updated or deleted,
-    so credential rotations take effect immediately for *this* worker. Other
-    workers will pick up the change at most STORAGE_CONFIG_CACHE_TTL later.
+    config_id: Optional[int]  # None: the env-var backend (`storage`)
+    updated_at: Optional[datetime]
+
+
+ENV_ROUTE = StorageRoute(None, None)
+
+# config id -> (backend, the row's updated_at when it was built)
+_backend_cache: dict[int, tuple[StorageBackend, datetime]] = {}
+
+_ROUTE_SQL = """
+    SELECT c.id, c.bucket_name, c.bucket_patterns, c.is_default, c.restricted, c.updated_at,
+           c.id = (SELECT storage_config_id FROM datasets WHERE id = $1) AS assigned,
+           s.dataset_id IS NOT NULL AS listed
+    FROM storage_configs c
+    LEFT JOIN storage_config_datasets s ON s.storage_config_id = c.id AND s.dataset_id = $1
+"""
+
+
+def _covers(row: Any, bucket: str) -> bool:
+    return row['bucket_name'] == bucket or any(fnmatch.fnmatchcase(bucket, p) for p in row['bucket_patterns'] or [])
+
+
+async def route_s3_bucket(dataset_id: int, bucket: str) -> Optional[StorageRoute]:
+    """Which credentials serve s3://{bucket}/... for this dataset, or None when it may not read the bucket.
+
+    This is the SSRF / confused-deputy guard as well as the router: a user who can set a sample's media
+    path must not be able to make the server fetch an arbitrary bucket with stored credentials.
+
+    Candidates are the configs that cover the bucket (its bucket_name, or a bucket_patterns glob) and
+    that this dataset may use (unrestricted, or restricted with the dataset listed). The most specific
+    wins: the dataset's own config (datasets.storage_config_id), then a restricted config listing it,
+    then one serving every dataset; an exact bucket_name beats a pattern; then the oldest. With no
+    candidate, the env-var backend serves its own bucket, but only to a dataset that has neither a
+    config of its own nor a default config to fall back to.
     """
-    _storage_cache.pop(config_id, None)
+    from .database import db
+
+    rows = await db.fetch(_ROUTE_SQL, dataset_id)
+    usable = [r for r in rows if _covers(r, bucket) and (not r['restricted'] or r['listed'])]
+    if usable:
+        best = min(usable, key=lambda r: (not r['assigned'], not r['restricted'], r['bucket_name'] != bucket, r['id']))
+        return StorageRoute(best['id'], best['updated_at'])
+    if any(r['assigned'] or r['is_default'] for r in rows):
+        return None
+    return ENV_ROUTE if storage.config.s3_bucket == bucket else None
 
 
-def invalidate_bucket_route_cache() -> None:
-    """Wipe the bucket_name -> config_id cache.
-
-    Called whenever a storage_configs row is created, updated, or deleted.
-    Any of those can change which row a given bucket routes to (new exact
-    match, changed bucket_name, added/removed pattern), and we don't know
-    from one row's id which buckets were affected — simpler to flush.
-    """
-    _bucket_route_cache.clear()
-
-
-async def _backend_from_config_id(config_id: int) -> Optional[StorageBackend]:
-    """Build (or fetch from cache) a StorageBackend for a given storage_configs.id.
-
-    Returns None if the row no longer exists (caller falls back further).
-    """
-    cached = _storage_cache.get(config_id)
-    if cached is not None:
-        backend, created_at = cached
-        if time.time() - created_at < STORAGE_CONFIG_CACHE_TTL:
-            return backend
+async def backend_for_route(route: StorageRoute) -> Optional[StorageBackend]:
+    """The StorageBackend for a route just chosen by route_s3_bucket (one cached S3 client per config,
+    rebuilt when the row's updated_at changes), or None if the config was deleted in between."""
+    if route.config_id is None:
+        return storage
+    cached = _backend_cache.get(route.config_id)
+    if cached is not None and cached[1] == route.updated_at:
+        return cached[0]
 
     # Avoid module-load-time circular import: db is a runtime singleton.
     from .crypto import decrypt_secret
@@ -348,150 +357,16 @@ async def _backend_from_config_id(config_id: int) -> Optional[StorageBackend]:
 
     row = await db.fetchrow(
         """
-        SELECT id, bucket_name, region, access_key_id, secret_access_key_encrypted,
-               endpoint_url, is_public_bucket
-        FROM storage_configs
-        WHERE id = $1
+        SELECT bucket_name, region, access_key_id, secret_access_key_encrypted, endpoint_url,
+               is_public_bucket, updated_at
+        FROM storage_configs WHERE id = $1
         """,
-        config_id,
+        route.config_id,
     )
-    if not row:
+    if row is None:
         return None
-
     secret_enc = row['secret_access_key_encrypted']
     secret = decrypt_secret(secret_enc) if secret_enc else None
-
-    config = StorageConfig.from_db_row(dict(row), secret)
-    backend = StorageBackend(config=config)
-    _storage_cache[config_id] = (backend, time.time())
+    backend = StorageBackend(config=StorageConfig.from_db_row(dict(row), secret))
+    _backend_cache[route.config_id] = (backend, row['updated_at'])
     return backend
-
-
-async def _backend_from_bucket(bucket: str) -> Optional[StorageBackend]:
-    """Find a StorageBackend whose configured bucket_name matches `bucket`.
-
-    Resolution order for `bucket`:
-      1. Exact match on storage_configs.bucket_name (indexed).
-      2. Glob match against any row's bucket_patterns (fnmatch, e.g. "client-*").
-
-    Result is memoized in _bucket_route_cache so repeated image requests for
-    the same bucket skip the DB entirely. Cache is flushed whenever any
-    storage_configs row is written (see invalidate_bucket_route_cache).
-    """
-    cached = _bucket_route_cache.get(bucket)
-    if cached is not None:
-        cfg_id, created_at = cached
-        if time.time() - created_at < STORAGE_CONFIG_CACHE_TTL:
-            if cfg_id is None:
-                return None
-            return await _backend_from_config_id(cfg_id)
-
-    from .database import db
-
-    # 1. Exact bucket_name match — cheap, uses idx_storage_configs_bucket_name.
-    row = await db.fetchrow(
-        "SELECT id FROM storage_configs WHERE bucket_name = $1 ORDER BY id LIMIT 1",
-        bucket,
-    )
-    config_id: Optional[int] = row['id'] if row else None
-
-    # 2. Pattern fallback. We do glob matching in Python (fnmatch) rather than
-    #    SQL LIKE so users can type familiar wildcards ("*", "?") instead of
-    #    SQL syntax. storage_configs is tiny (one row per bucket config), so
-    #    scanning rows with non-empty patterns is effectively free.
-    if config_id is None:
-        pattern_rows = await db.fetch(
-            "SELECT id, bucket_patterns FROM storage_configs WHERE array_length(bucket_patterns, 1) > 0 ORDER BY id",
-        )
-        for r in pattern_rows:
-            for pat in r['bucket_patterns'] or []:
-                if fnmatch.fnmatchcase(bucket, pat):
-                    config_id = r['id']
-                    break
-            if config_id is not None:
-                break
-
-    _bucket_route_cache[bucket] = (config_id, time.time())
-    if config_id is None:
-        return None
-    return await _backend_from_config_id(config_id)
-
-
-async def get_storage_for_s3_uri(dataset_id: int, bucket: str) -> StorageBackend:
-    """Route an `s3://{bucket}/...` fetch to the right credentials.
-
-    Lookup chain (first match wins):
-      1. storage_configs row with `bucket_name = bucket` (exact match)
-      2. dataset's `storage_config_id` (may legitimately have creds that cover
-         multiple buckets under one IAM role)
-      3. `is_default = TRUE` storage_config
-      4. env-var global singleton (pre-existing behavior)
-
-    The bucket-first ordering is what makes multi-bucket datasets work: a user
-    configures one storage_config per bucket, and every s3:// path auto-routes
-    to the credentials for that bucket without touching the dataset config.
-    """
-    backend = await _backend_from_bucket(bucket)
-    if backend is not None:
-        return backend
-    return await get_storage_for_dataset(dataset_id)
-
-
-async def is_bucket_authorized(dataset_id: int, bucket: str) -> bool:
-    """Whether `dataset_id` may fetch from `bucket`.
-
-    Authorized iff the bucket is explicitly configured (an exact `bucket_name`
-    or a `bucket_patterns` glob), OR it is the bucket named on the storage config
-    that serves this dataset (its own config, the default, or the env-var global).
-
-    This blocks the confused-deputy / SSRF case: a user who can set a sample's
-    media path to ``s3://some-other-bucket/key`` would otherwise make the server
-    fetch it with our default IAM credentials via the fallback chain.
-    """
-    if not bucket:
-        return False
-    # Explicitly configured for this exact bucket or a matching glob pattern.
-    if await _backend_from_bucket(bucket) is not None:
-        return True
-    # Otherwise it must be the bucket the dataset's resolved backend is for.
-    backend = await get_storage_for_dataset(dataset_id)
-    return bool(backend and backend.config and backend.config.s3_bucket == bucket)
-
-
-async def get_storage_for_dataset(dataset_id: int) -> StorageBackend:
-    """Return the StorageBackend that should serve media for `dataset_id`.
-
-    Used as the fallback when no bucket-specific match exists, and for callers
-    that genuinely just want "this dataset's default storage" (e.g., uploads
-    that will go into the dataset's primary bucket).
-
-    Lookup chain:
-      1. datasets.storage_config_id → that storage_configs row (cached)
-      2. is_default=TRUE storage_configs row (cached)
-      3. env-var global singleton (today's behavior, preserved for backward compat)
-    """
-    from .database import db
-
-    ds = await db.fetchrow(
-        "SELECT storage_config_id FROM datasets WHERE id = $1",
-        dataset_id,
-    )
-    if not ds:
-        # Caller (the proxy) already verified the sample exists; if the dataset
-        # vanished between lookups, fall back rather than 500.
-        return storage
-
-    config_id = ds['storage_config_id']
-    if config_id is not None:
-        backend = await _backend_from_config_id(config_id)
-        if backend is not None:
-            return backend
-        # Config FK was set but the row is gone — try default instead.
-
-    default_row = await db.fetchrow("SELECT id FROM storage_configs WHERE is_default = TRUE LIMIT 1")
-    if default_row is not None:
-        backend = await _backend_from_config_id(default_row['id'])
-        if backend is not None:
-            return backend
-
-    return storage

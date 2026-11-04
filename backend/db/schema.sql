@@ -1235,7 +1235,19 @@ CREATE TABLE IF NOT EXISTS storage_configs (
     is_default BOOLEAN DEFAULT FALSE,
     bucket_patterns TEXT[] NOT NULL DEFAULT '{}',
     created_by_user_id INTEGER REFERENCES users(id),
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    -- FALSE: serves every dataset. TRUE: serves only the datasets in storage_config_datasets.
+    restricted BOOLEAN NOT NULL DEFAULT FALSE,
+    -- Bumped on every UPDATE (trigger below): workers rebuild their cached S3 client when it changes.
+    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now(),
+    -- The default serves datasets without a config of their own, so it can't be restricted.
+    CONSTRAINT storage_configs_default_not_restricted CHECK (NOT (is_default AND restricted))
+);
+-- The datasets a restricted storage config serves.
+CREATE TABLE IF NOT EXISTS storage_config_datasets (
+    storage_config_id INTEGER NOT NULL REFERENCES storage_configs(id) ON DELETE CASCADE,
+    dataset_id INTEGER NOT NULL REFERENCES datasets(id) ON DELETE CASCADE,
+    PRIMARY KEY (storage_config_id, dataset_id)
 );
 -- Used by the sample-media proxy to find the right credentials for an
 -- s3://bucket/key path (bucket-first routing for multi-bucket datasets).
@@ -1267,6 +1279,20 @@ CREATE TRIGGER trigger_single_default_storage
     FOR EACH ROW
     WHEN (NEW.is_default = true)
     EXECUTE FUNCTION ensure_single_default_storage();
+
+CREATE OR REPLACE FUNCTION storage_configs_touch_updated_at()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.updated_at := clock_timestamp();
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trigger_storage_configs_touch_updated_at ON storage_configs;
+CREATE TRIGGER trigger_storage_configs_touch_updated_at
+    BEFORE UPDATE ON storage_configs
+    FOR EACH ROW
+    EXECUTE FUNCTION storage_configs_touch_updated_at();
 
 -- Add FK from datasets.storage_config_id → storage_configs.id (deferred from datasets table
 -- declaration above because storage_configs is declared later in this file).
@@ -2360,5 +2386,6 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
     applied_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now()
 );
 INSERT INTO schema_migrations (filename) VALUES
-    ('0000_baseline.sql')
+    ('0000_baseline.sql'),
+    ('0001_storage_config_dataset_scope.sql')
 ON CONFLICT (filename) DO NOTHING;

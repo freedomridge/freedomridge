@@ -185,9 +185,38 @@ _DATASET_SELECT = (
 )
 
 
+async def _require_storage_config_serves(storage_config_id: int, dataset_id: Optional[int]) -> None:
+    """A dataset's own storage config must serve it: a restricted config serves only the datasets it lists."""
+    row = await db.fetchrow(
+        """
+        SELECT name, restricted, EXISTS (
+            SELECT 1 FROM storage_config_datasets WHERE storage_config_id = $1 AND dataset_id = $2
+        ) AS listed
+        FROM storage_configs WHERE id = $1
+        """,
+        storage_config_id,
+        dataset_id,
+    )
+    if row is None or not row['restricted'] or row['listed']:
+        return  # an unknown id is refused by the foreign key
+    if dataset_id is None:
+        detail = (
+            f"Storage config '{row['name']}' only serves the datasets it lists. Create the dataset without it, "
+            "add the dataset to the config under Settings → Storage, then assign it."
+        )
+    else:
+        detail = (
+            f"Storage config '{row['name']}' only serves the datasets it lists, and this isn't one. "
+            "Add the dataset to it under Settings → Storage first."
+        )
+    raise HTTPException(status_code=400, detail=detail)
+
+
 @router.post("/datasets", response_model=Dataset)
 async def create_dataset(dataset: DatasetCreate, user: dict = Depends(require_role("admin"))):
     dataset.name = await _clean_dataset_name(dataset.name)
+    if dataset.storage_config_id is not None:
+        await _require_storage_config_serves(dataset.storage_config_id, None)
     query = f"""
         INSERT INTO datasets (name, description, media_fields, storage_config_id, owner_id, is_global)
         VALUES ($1, $2, $3, $4, $5, $6)
@@ -335,6 +364,7 @@ async def update_dataset(id: int, dataset: DatasetUpdate, user: dict = Depends(r
         if dataset.storage_config_id is None:
             fields.append("storage_config_id = NULL")
         else:
+            await _require_storage_config_serves(dataset.storage_config_id, id)
             fields.append(f"storage_config_id = ${idx}")
             values.append(dataset.storage_config_id)
             idx += 1

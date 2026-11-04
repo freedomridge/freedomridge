@@ -11,6 +11,7 @@ import {
     updateStorageConfig,
     deleteStorageConfig,
     testStorageConnection,
+    getDatasets,
     StorageConfig,
     StorageConfigCreate,
     TestConnectionResult
@@ -30,6 +31,9 @@ interface StorageFormData {
     // Comma-separated glob patterns typed into the form, e.g. "client-*, logs-2025-??".
     // Split/trimmed into an array before hitting the API.
     bucket_patterns: string;
+    // false: every dataset can use this config. true: only dataset_ids.
+    restricted: boolean;
+    dataset_ids: number[];
 }
 
 const initialFormData: StorageFormData = {
@@ -42,6 +46,8 @@ const initialFormData: StorageFormData = {
     is_public_bucket: false,
     is_default: false,
     bucket_patterns: '',
+    restricted: false,
+    dataset_ids: [],
 };
 
 export default function StorageSettingsPage() {
@@ -52,6 +58,7 @@ export default function StorageSettingsPage() {
     const [formData, setFormData] = useState<StorageFormData>(initialFormData);
     const [testResult, setTestResult] = useState<TestConnectionResult | null>(null);
     const [testingId, setTestingId] = useState<number | null>(null);
+    const [datasetFilter, setDatasetFilter] = useState('');
 
     // Check if user is admin
     const isAdmin = user?.role === 'admin';
@@ -61,6 +68,22 @@ export default function StorageSettingsPage() {
         queryKey: ['storage-configs'],
         queryFn: getStorageConfigs,
         enabled: isAdmin,
+    });
+
+    // Datasets, to pick which ones a limited config serves and to name them on each config
+    const { data: datasets, error: datasetsError } = useQuery({
+        queryKey: ['datasets'],
+        queryFn: getDatasets,
+        enabled: isAdmin,
+    });
+    const datasetNames = new Map((datasets ?? []).map(d => [d.id, d.name]));
+    const filteredDatasets = (datasets ?? []).filter(d =>
+        d.name.toLowerCase().includes(datasetFilter.trim().toLowerCase()));
+    const toggleDataset = (id: number) => setFormData({
+        ...formData,
+        dataset_ids: formData.dataset_ids.includes(id)
+            ? formData.dataset_ids.filter(existing => existing !== id)
+            : [...formData.dataset_ids, id],
     });
 
     // Create mutation
@@ -117,6 +140,8 @@ export default function StorageSettingsPage() {
             is_public_bucket: formData.is_public_bucket,
             is_default: formData.is_default,
             bucket_patterns: patterns,
+            restricted: formData.restricted,
+            dataset_ids: formData.restricted ? formData.dataset_ids : [],
         };
 
         if (!formData.is_public_bucket) {
@@ -144,6 +169,8 @@ export default function StorageSettingsPage() {
             is_public_bucket: config.is_public_bucket,
             is_default: config.is_default,
             bucket_patterns: (config.bucket_patterns || []).join(', '),
+            restricted: config.restricted,
+            dataset_ids: config.dataset_ids || [],
         });
         setShowForm(true);
     };
@@ -159,6 +186,7 @@ export default function StorageSettingsPage() {
         setEditingId(null);
         setFormData(initialFormData);
         setTestResult(null);
+        setDatasetFilter('');
     };
 
     if (!isAdmin) {
@@ -284,8 +312,10 @@ export default function StorageSettingsPage() {
                                     <p className="text-xs text-zinc-500 mt-1">
                                         Comma-separated glob patterns for other buckets these credentials can access.
                                         Use <code className="font-mono text-zinc-400">*</code> to match any characters,
-                                        <code className="font-mono text-zinc-400"> ?</code> for one. An exact
-                                        <code className="font-mono text-zinc-400"> Bucket Name</code> match always wins over patterns.
+                                        <code className="font-mono text-zinc-400"> ?</code> for one. When several configs
+                                        cover a bucket, a dataset uses its own config first, then one limited to it, then
+                                        one serving all datasets; among those, an exact
+                                        <code className="font-mono text-zinc-400"> Bucket Name</code> match wins over patterns.
                                     </p>
                                 </div>
 
@@ -333,17 +363,91 @@ export default function StorageSettingsPage() {
                                     </div>
                                 )}
 
+                                {/* Which datasets may use these credentials */}
+                                <fieldset data-testid="storage-dataset-scope">
+                                    <legend className="block text-sm font-medium text-zinc-300 mb-2">Datasets</legend>
+                                    <div className="flex flex-wrap gap-4">
+                                        <label className="flex items-center gap-2 text-sm text-zinc-300">
+                                            <input
+                                                type="radio"
+                                                name="dataset_scope"
+                                                checked={!formData.restricted}
+                                                onChange={() => setFormData({ ...formData, restricted: false })}
+                                                className="w-4 h-4 border-zinc-600 bg-zinc-800 text-cyan-500 focus:ring-cyan-500"
+                                            />
+                                            All datasets
+                                        </label>
+                                        <label className={`flex items-center gap-2 text-sm ${formData.is_default ? 'text-zinc-500' : 'text-zinc-300'}`}>
+                                            <input
+                                                type="radio"
+                                                name="dataset_scope"
+                                                checked={formData.restricted}
+                                                disabled={formData.is_default}
+                                                onChange={() => setFormData({ ...formData, restricted: true })}
+                                                className="w-4 h-4 border-zinc-600 bg-zinc-800 text-cyan-500 focus:ring-cyan-500"
+                                            />
+                                            Only these datasets
+                                        </label>
+                                    </div>
+                                    <p className="text-xs text-zinc-500 mt-1">
+                                        {formData.is_default
+                                            ? "The default storage replaces the server's environment credentials for every dataset, so it can't be limited."
+                                            : formData.restricted
+                                                ? 'Only the datasets checked below can load media through these credentials.'
+                                                : 'Every dataset can load media from these buckets through these credentials.'}
+                                    </p>
+                                    {formData.restricted && (
+                                        <div className="mt-2 p-3 bg-zinc-800/50 rounded-lg border border-zinc-700">
+                                            <input
+                                                type="text"
+                                                value={datasetFilter}
+                                                onChange={(e) => setDatasetFilter(e.target.value)}
+                                                placeholder="Filter datasets"
+                                                className="w-full mb-2 px-3 py-1.5 bg-zinc-800 border border-zinc-700 rounded-lg text-sm text-white placeholder-zinc-500 focus:outline-none focus:border-cyan-500"
+                                            />
+                                            <div className="max-h-48 overflow-y-auto space-y-1">
+                                                {datasetsError ? (
+                                                    <p className="text-sm text-red-400">
+                                                        Couldn&apos;t load datasets: {(datasetsError as Error).message}
+                                                    </p>
+                                                ) : !datasets ? (
+                                                    <p className="text-sm text-zinc-500">Loading datasets…</p>
+                                                ) : filteredDatasets.length === 0 ? (
+                                                    <p className="text-sm text-zinc-500">No datasets match.</p>
+                                                ) : filteredDatasets.map(d => (
+                                                    <label key={d.id} className="flex items-center gap-2 text-sm text-zinc-300">
+                                                        <input
+                                                            type="checkbox"
+                                                            checked={formData.dataset_ids.includes(d.id)}
+                                                            onChange={() => toggleDataset(d.id)}
+                                                            className="w-4 h-4 rounded border-zinc-600 bg-zinc-800 text-cyan-500 focus:ring-cyan-500"
+                                                        />
+                                                        {d.name}
+                                                    </label>
+                                                ))}
+                                            </div>
+                                            {formData.dataset_ids.length === 0 && (
+                                                <p className="text-xs text-amber-400 mt-2">
+                                                    No datasets selected: these credentials won&apos;t serve any dataset.
+                                                </p>
+                                            )}
+                                        </div>
+                                    )}
+                                </fieldset>
+
                                 {/* Default toggle */}
                                 <div className="flex items-center gap-3">
                                     <input
                                         type="checkbox"
                                         id="is_default"
                                         checked={formData.is_default}
+                                        disabled={formData.restricted}
                                         onChange={(e) => setFormData({ ...formData, is_default: e.target.checked })}
                                         className="w-4 h-4 rounded border-zinc-600 bg-zinc-800 text-cyan-500 focus:ring-cyan-500"
                                     />
-                                    <label htmlFor="is_default" className="text-sm text-zinc-300">
+                                    <label htmlFor="is_default" className={`text-sm ${formData.restricted ? 'text-zinc-500' : 'text-zinc-300'}`}>
                                         Set as default storage
+                                        {formData.restricted && ' (only a config serving all datasets can be the default)'}
                                     </label>
                                 </div>
 
@@ -452,6 +556,13 @@ export default function StorageSettingsPage() {
                                                         ))}
                                                     </div>
                                                 )}
+                                                <p className="text-zinc-500 text-xs mt-1" data-testid="storage-config-datasets">
+                                                    Datasets: {!config.restricted
+                                                        ? 'all'
+                                                        : config.dataset_ids.length === 0
+                                                            ? 'none (serves no dataset)'
+                                                            : config.dataset_ids.map(id => datasetNames.get(id) ?? `#${id}`).join(', ')}
+                                                </p>
                                                 {config.access_key_id && (
                                                     <p className="text-zinc-500 text-xs mt-1">
                                                         Access Key: {config.access_key_id}
@@ -473,6 +584,7 @@ export default function StorageSettingsPage() {
                                             </button>
                                             <button
                                                 onClick={() => handleEdit(config)}
+                                                aria-label={`Edit ${config.name}`}
                                                 className="p-2 hover:bg-zinc-700 rounded-lg transition-colors text-zinc-400 hover:text-white"
                                             >
                                                 <Edit2 className="w-4 h-4" />
