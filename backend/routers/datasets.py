@@ -5063,6 +5063,14 @@ async def list_samples_post(id: int, request: SamplesRequest):
         return await _list_samples_post(id, request)
 
 
+def _slim_metadata_select(keys_param: int) -> str:
+    """Select clause for the slim path's requested metadata keys, bound as one text[] parameter."""
+    return (
+        f"COALESCE((SELECT jsonb_object_agg(key, metadata->key) FROM unnest(${keys_param}::text[]) AS key "
+        f"WHERE metadata ? key), '{{}}'::jsonb) AS metadata"
+    )
+
+
 async def _list_samples_post(id: int, request: SamplesRequest):
     # Check dataset exists
     dataset = await db.fetchrow("SELECT id FROM datasets WHERE id = $1", id)
@@ -5220,23 +5228,29 @@ async def _list_samples_post(id: int, request: SamplesRequest):
                 if subfield in array_cols:
                     # Native array column requested with metadata. prefix — select directly
                     select_parts.append(subfield)
-                elif subfield.replace('_', '').replace('-', '').isalnum():
+                elif subfield:
                     metadata_subfields.append(subfield)
 
-        # Build minimal metadata extraction
+        # Build minimal metadata extraction. The keys are one bound text[] parameter, so any key
+        # works (including ones with ':' like 'percent_CROP:CORN', which used to be silently
+        # dropped), and `metadata->key` keeps each value's JSON type where `->>` turned numbers,
+        # booleans and lists into strings. Keys a sample doesn't have are left out, as in a full row.
+        select_args: list = []
         if metadata_subfields and 'metadata' not in select_parts:
-            parts = ', '.join(f"'{sf}', metadata->>'{sf}'" for sf in metadata_subfields)
-            select_parts.append(f"jsonb_build_object({parts}) as metadata")
+            select_parts.append(_slim_metadata_select(arg_idx))
+            select_args = [metadata_subfields]
+        limit_idx = arg_idx + len(select_args)
 
         select_clause = ', '.join(select_parts)
         if request.after_id is not None:
-            query = f"SELECT {select_clause} FROM samples {where_clause} {order_by} LIMIT ${arg_idx}"
-            query_params = args + [request.limit]
+            query = f"SELECT {select_clause} FROM samples {where_clause} {order_by} LIMIT ${limit_idx}"
+            query_params = args + select_args + [request.limit]
         else:
             query = (
-                f"SELECT {select_clause} FROM samples {where_clause} {order_by} LIMIT ${arg_idx} OFFSET ${arg_idx + 1}"
+                f"SELECT {select_clause} FROM samples {where_clause} {order_by} "
+                f"LIMIT ${limit_idx} OFFSET ${limit_idx + 1}"
             )
-            query_params = args + [request.limit, request.offset]
+            query_params = args + select_args + [request.limit, request.offset]
         try:
             rows = await db.fetch(query, *query_params)
         except asyncpg.ObjectNotInPrerequisiteStateError:
