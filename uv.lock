@@ -885,7 +885,7 @@ wheels = [
 
 [[package]]
 name = "freedomridge"
-version = "1.0.0"
+version = "1.1.0"
 source = { editable = "python" }
 dependencies = [
     { name = "numpy" },
@@ -961,7 +961,7 @@ provides-extras = ["embeddings", "patch-embeddings", "metrics", "hashes", "quali
 
 [[package]]
 name = "freedomridge-app"
-version = "1.0.0"
+version = "1.1.0"
 source = { virtual = "." }
 default-groups = ["dev", "examples"]
 dependencies = [

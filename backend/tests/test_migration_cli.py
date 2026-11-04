@@ -23,14 +23,18 @@ requires_postgres = pytest.mark.skipif(
 
 
 def runner_tree(tmp_path, migrations):
-    """A copy of the runner whose backend/db/migrations holds `migrations` (name -> SQL), so a test
-    can give it work without touching the checkout."""
+    """A copy of the runner and the checkout's migrations, plus `migrations` (name -> SQL), so a test
+    can give it work without touching the checkout. schema.sql records every real migration, so the
+    copy needs them too, or the runner would see a database newer than its code. Test files use 9xxx
+    numbers so they never collide with a real migration."""
     tree = tmp_path / 'tree'
     (tree / 'scripts').mkdir(parents=True)
     for name in ('apply_migrations.sh', 'psql_url.py', 'db_test_safety.py'):
         shutil.copy(ROOT / 'scripts' / name, tree / 'scripts' / name)
     (tree / 'backend/db/migrations').mkdir(parents=True)
     shutil.copy(ROOT / 'backend/db/functions.sql', tree / 'backend/db/functions.sql')
+    for real in (ROOT / 'backend/db/migrations').glob('*.sql'):
+        shutil.copy(real, tree / 'backend/db/migrations' / real.name)
     for name, sql in migrations.items():
         (tree / 'backend/db/migrations' / name).write_text(sql)
     return tree
@@ -159,7 +163,7 @@ def test_url_argument_overrides_environment_and_container_target(tmp_path, resto
     (ambient, intended), sql, _, _ = restore_databases
     for name in (ambient, intended):
         sql(name, (ROOT / 'backend/db/schema.sql').read_text())
-    tree = runner_tree(tmp_path, {'0001_marker.sql': 'CREATE TABLE ci_marker (id INTEGER);\n'})
+    tree = runner_tree(tmp_path, {'9001_marker.sql': 'CREATE TABLE ci_marker (id INTEGER);\n'})
     parsed = urlparse(os.environ['FRIDGE_TEST_POSTGRES_DSN'])
     url = parsed._replace(path=f'/{intended}').geturl()
     args = ['--database-url', url] if spelling == 'split' else [f'--database-url={url}']
@@ -176,7 +180,7 @@ def test_url_argument_overrides_environment_and_container_target(tmp_path, resto
     )
     assert result.returncode == 0, result.stdout + result.stderr
     assert sql(ambient, "SELECT to_regclass('ci_marker')") == ''
-    assert sql(intended, "SELECT count(*) FROM schema_migrations WHERE filename='0001_marker.sql'") == '1'
+    assert sql(intended, "SELECT count(*) FROM schema_migrations WHERE filename='9001_marker.sql'") == '1'
     assert sql(intended, "SELECT to_regclass('ci_marker')") == 'ci_marker'
     calls = (Path(os.environ['PATH'].split(os.pathsep)[0]) / 'psql-argv.log').read_text()
     assert url not in calls
@@ -189,7 +193,7 @@ def test_container_mode_does_not_inherit_client_pgoptions(tmp_path, restore_data
     (target, _), sql, _, _ = restore_databases
     sql(target, (ROOT / 'backend/db/schema.sql').read_text())
     # Would fail under the client's search_path (nowhere to create it) and statement_timeout (1 ms).
-    tree = runner_tree(tmp_path, {'0001_marker.sql': 'CREATE TABLE ci_marker (id INTEGER);\nSELECT pg_sleep(0.05);\n'})
+    tree = runner_tree(tmp_path, {'9001_marker.sql': 'CREATE TABLE ci_marker (id INTEGER);\nSELECT pg_sleep(0.05);\n'})
     result = subprocess.run(
         ['bash', str(tree / 'scripts/apply_migrations.sh')],
         cwd=tree,
@@ -211,7 +215,7 @@ def test_container_mode_does_not_inherit_client_pgoptions(tmp_path, restore_data
 def test_runner_refuses_a_newer_database_and_one_not_created_from_schema_sql(tmp_path, restore_databases):
     (target, _), sql, _, _ = restore_databases
     sql(target, (ROOT / 'backend/db/schema.sql').read_text())
-    tree = runner_tree(tmp_path, {'0001_marker.sql': 'CREATE TABLE ci_marker (id INTEGER);\n'})
+    tree = runner_tree(tmp_path, {'9001_marker.sql': 'CREATE TABLE ci_marker (id INTEGER);\n'})
 
     def run():
         return subprocess.run(
@@ -222,9 +226,9 @@ def test_runner_refuses_a_newer_database_and_one_not_created_from_schema_sql(tmp
             text=True,
         )
 
-    sql(target, "INSERT INTO schema_migrations (filename) VALUES ('0002_newer.sql')")
+    sql(target, "INSERT INTO schema_migrations (filename) VALUES ('9002_newer.sql')")
     result = run()
-    assert result.returncode != 0 and 'does not have: 0002_newer.sql' in result.stderr, result.stdout + result.stderr
+    assert result.returncode != 0 and 'does not have: 9002_newer.sql' in result.stderr, result.stdout + result.stderr
     assert sql(target, "SELECT to_regclass('ci_marker')") == ''
 
     sql(target, 'DELETE FROM schema_migrations')

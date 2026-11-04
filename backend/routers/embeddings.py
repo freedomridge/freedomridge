@@ -11,7 +11,7 @@ from typing import Any, Dict, List, Optional, Set
 import asyncpg
 import numpy as np
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
-from pydantic import BaseModel, FiniteFloat, model_validator
+from pydantic import BaseModel, Field, FiniteFloat, model_validator
 
 from ..access import require_dataset_access
 from ..api_errors import CodedHTTPException
@@ -1573,6 +1573,9 @@ async def get_patch_scales(id: int, field_name: str = "clip"):
 # page and scale the per-request CPU and memory cost with it.
 _MAX_VECTOR_PAGE = 50_000
 
+# Upper bound on the sample ids named in ONE /vectors/by-ids request (the response is ids x fields vectors).
+_MAX_VECTOR_BY_IDS = 10_000
+
 
 def _vectors_to_matrix(rows) -> tuple[np.ndarray, np.ndarray]:
     """Parse a /vectors page into (int32 ids, float32 [n, dim] matrix).
@@ -1718,6 +1721,41 @@ async def get_vectors(
     if response_format == "binary":
         return await asyncio.to_thread(_vectors_binary_response, rows, total)
     return await asyncio.to_thread(_vectors_json_response, rows, total)
+
+
+class VectorsByIdsRequest(BaseModel):
+    sample_ids: List[int] = Field(..., max_length=_MAX_VECTOR_BY_IDS)
+    field_names: List[str] = Field(..., min_length=1)
+
+
+@router.post("/vectors/by-ids")
+@guest_heavy
+async def get_vectors_by_ids(id: int, request: VectorsByIdsRequest):
+    """Raw vectors for specific samples and fields, in one request.
+
+    The read side `GET /vectors` can't serve: that pages a whole field, so copying a handful of samples
+    between datasets (`Dataset.add_samples_from`) would have meant walking every vector in the field.
+    Scoped to dataset `id`, so a foreign sample_id returns nothing instead of leaking another dataset's
+    vectors. A sample without a requested field simply has no row for it.
+    """
+    rows = await db.fetch(
+        """
+        SELECT e.sample_id, e.field_name, e.vector
+        FROM embeddings e JOIN samples s ON e.sample_id = s.id
+        WHERE s.dataset_id = $1 AND e.sample_id = ANY($2) AND e.field_name = ANY($3)
+        ORDER BY e.sample_id, e.field_name
+        """,
+        id,
+        request.sample_ids,
+        request.field_names,
+    )
+    items = await asyncio.to_thread(
+        lambda: [
+            {"sample_id": r['sample_id'], "field_name": r['field_name'], "vector": _parse_vector(r['vector'])}
+            for r in rows
+        ],
+    )
+    return {"items": items}
 
 
 # --- Coordinate upload (for SDK UMAP results) ---

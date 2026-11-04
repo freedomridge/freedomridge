@@ -185,9 +185,38 @@ _DATASET_SELECT = (
 )
 
 
+async def _require_storage_config_serves(storage_config_id: int, dataset_id: Optional[int]) -> None:
+    """A dataset's own storage config must serve it: a restricted config serves only the datasets it lists."""
+    row = await db.fetchrow(
+        """
+        SELECT name, restricted, EXISTS (
+            SELECT 1 FROM storage_config_datasets WHERE storage_config_id = $1 AND dataset_id = $2
+        ) AS listed
+        FROM storage_configs WHERE id = $1
+        """,
+        storage_config_id,
+        dataset_id,
+    )
+    if row is None or not row['restricted'] or row['listed']:
+        return  # an unknown id is refused by the foreign key
+    if dataset_id is None:
+        detail = (
+            f"Storage config '{row['name']}' only serves the datasets it lists. Create the dataset without it, "
+            "add the dataset to the config under Settings → Storage, then assign it."
+        )
+    else:
+        detail = (
+            f"Storage config '{row['name']}' only serves the datasets it lists, and this isn't one. "
+            "Add the dataset to it under Settings → Storage first."
+        )
+    raise HTTPException(status_code=400, detail=detail)
+
+
 @router.post("/datasets", response_model=Dataset)
 async def create_dataset(dataset: DatasetCreate, user: dict = Depends(require_role("admin"))):
     dataset.name = await _clean_dataset_name(dataset.name)
+    if dataset.storage_config_id is not None:
+        await _require_storage_config_serves(dataset.storage_config_id, None)
     query = f"""
         INSERT INTO datasets (name, description, media_fields, storage_config_id, owner_id, is_global)
         VALUES ($1, $2, $3, $4, $5, $6)
@@ -335,6 +364,7 @@ async def update_dataset(id: int, dataset: DatasetUpdate, user: dict = Depends(r
         if dataset.storage_config_id is None:
             fields.append("storage_config_id = NULL")
         else:
+            await _require_storage_config_serves(dataset.storage_config_id, id)
             fields.append(f"storage_config_id = ${idx}")
             values.append(dataset.storage_config_id)
             idx += 1
@@ -3252,58 +3282,55 @@ def _derived_field(field: str) -> Optional[tuple[str, str]]:
 
 @router.get("/datasets/{id}/missing", dependencies=[Depends(require_dataset_access)])
 @guest_heavy
-async def dataset_missing(id: int, kind: str, field: Optional[str] = None, limit: int = 1000, offset: int = 0):
+async def dataset_missing(
+    id: int,
+    kind: str,
+    field: Optional[str] = None,
+    limit: int = 1000,
+    offset: int = 0,
+    after_id: Optional[int] = None,
+):
     """Samples that still LACK a derived artifact, for resumable backfill.
 
     kind='embedding'|'hash' (needs ?field=) or 'location'. Returns
     {items:[{id, filepath}], total}. Backfill pattern: page, fill each batch (which
     drops those rows from the result), repeat until empty.
+
+    ``after_id`` is an id cursor: only samples with ``id > after_id`` are listed, in id order, so a
+    walk that passes the last id it saw advances past samples it could not fill (an unreadable image
+    stays missing and would otherwise be returned again forever). ``total`` always counts every
+    missing sample, whatever the cursor.
     """
     limit = max(1, min(limit, 10000))
     offset = max(0, offset)
 
     if kind == "location":
-        rows = await db.fetch(
-            """
-            SELECT s.id, s.filepath FROM samples s
-            WHERE s.dataset_id = $1 AND s.location IS NULL
-            ORDER BY s.id LIMIT $2 OFFSET $3
-        """,
-            id,
-            limit,
-            offset,
-        )
-        total = await db.fetchval("SELECT count(*) FROM samples WHERE dataset_id = $1 AND location IS NULL", id) or 0
+        missing_sql = "s.dataset_id = $1 AND s.location IS NULL"
+        args: list[Any] = [id]
     elif kind in _MISSING_TABLES:
         if not field:
             raise HTTPException(status_code=422, detail=f"kind='{kind}' requires a ?field= parameter")
         table = _MISSING_TABLES[kind]  # whitelisted table name (NOT user input)
-        rows = await db.fetch(
-            f"""
-            SELECT s.id, s.filepath FROM samples s
-            WHERE s.dataset_id = $1
-              AND NOT EXISTS (SELECT 1 FROM {table} t WHERE t.sample_id = s.id AND t.field_name = $2)
-            ORDER BY s.id LIMIT $3 OFFSET $4
-        """,
-            id,
-            field,
-            limit,
-            offset,
+        missing_sql = (
+            f"s.dataset_id = $1 AND NOT EXISTS (SELECT 1 FROM {table} t WHERE t.sample_id = s.id AND t.field_name = $2)"
         )
-        total = (
-            await db.fetchval(
-                f"""
-            SELECT count(*) FROM samples s
-            WHERE s.dataset_id = $1
-              AND NOT EXISTS (SELECT 1 FROM {table} t WHERE t.sample_id = s.id AND t.field_name = $2)
-        """,
-                id,
-                field,
-            )
-            or 0
-        )
+        args = [id, field]
     else:
         raise HTTPException(status_code=422, detail="kind must be 'embedding', 'hash', or 'location'")
+
+    page_sql = missing_sql
+    page_args = list(args)
+    if after_id is not None:
+        page_args.append(after_id)
+        page_sql += f" AND s.id > ${len(page_args)}"
+    rows = await db.fetch(
+        f"SELECT s.id, s.filepath FROM samples s WHERE {page_sql} "
+        f"ORDER BY s.id LIMIT ${len(page_args) + 1} OFFSET ${len(page_args) + 2}",
+        *page_args,
+        limit,
+        offset,
+    )
+    total = await db.fetchval(f"SELECT count(*) FROM samples s WHERE {missing_sql}", *args) or 0
 
     return {"items": [{"id": r['id'], "filepath": r['filepath']} for r in rows], "total": total}
 
@@ -5066,6 +5093,14 @@ async def list_samples_post(id: int, request: SamplesRequest):
         return await _list_samples_post(id, request)
 
 
+def _slim_metadata_select(keys_param: int) -> str:
+    """Select clause for the slim path's requested metadata keys, bound as one text[] parameter."""
+    return (
+        f"COALESCE((SELECT jsonb_object_agg(key, metadata->key) FROM unnest(${keys_param}::text[]) AS key "
+        f"WHERE metadata ? key), '{{}}'::jsonb) AS metadata"
+    )
+
+
 async def _list_samples_post(id: int, request: SamplesRequest):
     # Check dataset exists
     dataset = await db.fetchrow("SELECT id FROM datasets WHERE id = $1", id)
@@ -5223,23 +5258,29 @@ async def _list_samples_post(id: int, request: SamplesRequest):
                 if subfield in array_cols:
                     # Native array column requested with metadata. prefix — select directly
                     select_parts.append(subfield)
-                elif subfield.replace('_', '').replace('-', '').isalnum():
+                elif subfield:
                     metadata_subfields.append(subfield)
 
-        # Build minimal metadata extraction
+        # Build minimal metadata extraction. The keys are one bound text[] parameter, so any key
+        # works (including ones with ':' like 'percent_CROP:CORN', which used to be silently
+        # dropped), and `metadata->key` keeps each value's JSON type where `->>` turned numbers,
+        # booleans and lists into strings. Keys a sample doesn't have are left out, as in a full row.
+        select_args: list = []
         if metadata_subfields and 'metadata' not in select_parts:
-            parts = ', '.join(f"'{sf}', metadata->>'{sf}'" for sf in metadata_subfields)
-            select_parts.append(f"jsonb_build_object({parts}) as metadata")
+            select_parts.append(_slim_metadata_select(arg_idx))
+            select_args = [metadata_subfields]
+        limit_idx = arg_idx + len(select_args)
 
         select_clause = ', '.join(select_parts)
         if request.after_id is not None:
-            query = f"SELECT {select_clause} FROM samples {where_clause} {order_by} LIMIT ${arg_idx}"
-            query_params = args + [request.limit]
+            query = f"SELECT {select_clause} FROM samples {where_clause} {order_by} LIMIT ${limit_idx}"
+            query_params = args + select_args + [request.limit]
         else:
             query = (
-                f"SELECT {select_clause} FROM samples {where_clause} {order_by} LIMIT ${arg_idx} OFFSET ${arg_idx + 1}"
+                f"SELECT {select_clause} FROM samples {where_clause} {order_by} "
+                f"LIMIT ${limit_idx} OFFSET ${limit_idx + 1}"
             )
-            query_params = args + [request.limit, request.offset]
+            query_params = args + select_args + [request.limit, request.offset]
         try:
             rows = await db.fetch(query, *query_params)
         except asyncpg.ObjectNotInPrerequisiteStateError:
@@ -7259,13 +7300,27 @@ async def aggregate(id: int, request: AggregateRequest):
         array_columns=await get_dataset_array_columns(id),
         numeric_indexed_fields=await get_promoted_numeric_fields(id) if filters_json else None,
     )
+    return await run_aggregations(id, request.aggregations, where_clause, base_args)
 
+
+async def run_aggregations(
+    id: int,
+    aggregations: List[AggregationSpec],
+    where_clause: str,
+    base_args: list,
+    with_clause: str = "",
+) -> dict:
+    """Run aggregations over `samples` (or, given `with_clause`, a CTE named `samples`).
+
+    `with_clause` is a leading ``WITH samples AS (...)`` that stands in for the table, which is how
+    a version's stored rows are aggregated with the live dataset's SQL.
+    """
     results = []
-    for spec in request.aggregations:
+    for spec in aggregations:
         op, field = spec.op, spec.field
 
         if op == "count":
-            n = await db.fetchval(f"SELECT count(*) FROM samples {where_clause}", *base_args)
+            n = await db.fetchval(f"{with_clause}SELECT count(*) FROM samples {where_clause}", *base_args)
             results.append({"op": op, "field": field, "value": int(n or 0)})
 
         elif op in ("sum", "mean", "std", "min", "max", "bounds"):
@@ -7274,7 +7329,7 @@ async def aggregate(id: int, request: AggregateRequest):
             expr = _agg_numeric_expr(field)
             if op == "bounds":
                 r = await db.fetchrow(
-                    f"SELECT min({expr}) AS mn, max({expr}) AS mx FROM samples {where_clause}",
+                    f"{with_clause}SELECT min({expr}) AS mn, max({expr}) AS mx FROM samples {where_clause}",
                     *base_args,
                 )
                 lo = float(r['mn']) if r and r['mn'] is not None else None
@@ -7283,7 +7338,7 @@ async def aggregate(id: int, request: AggregateRequest):
             else:
                 fn = {"sum": "sum", "mean": "avg", "std": "stddev_samp", "min": "min", "max": "max"}[op]
                 v = await db.fetchval(
-                    f"SELECT {fn}({expr}) FROM samples {where_clause}",
+                    f"{with_clause}SELECT {fn}({expr}) FROM samples {where_clause}",
                     *base_args,
                 )
                 results.append({"op": op, "field": field, "value": float(v) if v is not None else None})
@@ -7293,7 +7348,7 @@ async def aggregate(id: int, request: AggregateRequest):
             expr = _agg_numeric_expr(field)
             args = list(base_args) + [qs]
             r = await db.fetchval(
-                f"SELECT percentile_cont(${len(args)}::double precision[]) "
+                f"{with_clause}SELECT percentile_cont(${len(args)}::double precision[]) "
                 f"WITHIN GROUP (ORDER BY {expr}) FROM samples {where_clause}",
                 *args,
             )
@@ -7308,7 +7363,7 @@ async def aggregate(id: int, request: AggregateRequest):
                 limit_sql = f" LIMIT ${len(args)}"
             if op == "count_values":
                 rows = await db.fetch(
-                    f"SELECT v AS value, count(*) AS count FROM "
+                    f"{with_clause}SELECT v AS value, count(*) AS count FROM "
                     f"(SELECT {value_expr} AS v FROM samples {where_clause}) sub "
                     f"WHERE v IS NOT NULL GROUP BY v ORDER BY count DESC{limit_sql}",
                     *args,
@@ -7318,7 +7373,7 @@ async def aggregate(id: int, request: AggregateRequest):
                 )
             elif op == "distinct":
                 rows = await db.fetch(
-                    f"SELECT DISTINCT v AS value FROM "
+                    f"{with_clause}SELECT DISTINCT v AS value FROM "
                     f"(SELECT {value_expr} AS v FROM samples {where_clause}) sub "
                     f"WHERE v IS NOT NULL ORDER BY value{limit_sql}",
                     *args,
@@ -7326,7 +7381,7 @@ async def aggregate(id: int, request: AggregateRequest):
                 results.append({"op": op, "field": field, "value": [r['value'] for r in rows]})
             else:  # values — every value, not deduped (unlike distinct)
                 rows = await db.fetch(
-                    f"SELECT v AS value FROM "
+                    f"{with_clause}SELECT v AS value FROM "
                     f"(SELECT {value_expr} AS v FROM samples {where_clause}) sub "
                     f"WHERE v IS NOT NULL ORDER BY value{limit_sql}",
                     *args,

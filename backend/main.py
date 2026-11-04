@@ -447,7 +447,7 @@ from fastapi.responses import RedirectResponse  # noqa: E402
 from .access import check_dataset_access  # noqa: E402
 from .database import db  # noqa: E402
 from .routers.auth import get_optional_user  # noqa: E402
-from .storage import get_storage_for_s3_uri, is_bucket_authorized  # noqa: E402
+from .storage import backend_for_route, route_s3_bucket  # noqa: E402
 
 log = logging.getLogger("fridge.media")
 
@@ -764,7 +764,8 @@ async def _fetch_media_bytes(dataset_id: int, path: str) -> tuple[bytes, str]:
     # SSRF / confused-deputy guard: only fetch buckets this dataset is authorized
     # for. Without this, a user who can set a sample's media path could point it
     # at s3://arbitrary-bucket/key and the server would fetch it with our IAM creds.
-    if not await is_bucket_authorized(dataset_id, bucket):
+    route = await route_s3_bucket(dataset_id, bucket)
+    if route is None:
         raise HTTPException(status_code=403, detail="Bucket not authorized for this dataset")
 
     # Cache path includes the bucket so the same key in two different buckets
@@ -775,8 +776,8 @@ async def _fetch_media_bytes(dataset_id: int, path: str) -> tuple[bytes, str]:
     if cached_body is not None:
         return cached_body, mimetypes.guess_type(key)[0] or "application/octet-stream"
 
-    backend = await get_storage_for_s3_uri(dataset_id, bucket)
-    if not backend.s3_client:
+    backend = await backend_for_route(route)
+    if backend is None or not backend.s3_client:
         raise HTTPException(status_code=500, detail="S3 backend not configured for this dataset")
 
     def _fetch_blocking():
@@ -1246,7 +1247,8 @@ async def serve_sample_media(
     # SSRF / confused-deputy guard: only fetch buckets this dataset is authorized
     # for. Without this, a user who can set a sample's media path could point it
     # at s3://arbitrary-bucket/key and the server would fetch it with our IAM creds.
-    if not await is_bucket_authorized(dataset_id, bucket):
+    route = await route_s3_bucket(dataset_id, bucket)
+    if route is None:
         raise HTTPException(status_code=403, detail="Bucket not authorized for this dataset")
 
     cached_path = os.path.join(S3_LOCAL_PATH, str(dataset_id), bucket, key)
@@ -1256,10 +1258,10 @@ async def serve_sample_media(
 
     # Bucket-aware routing: multi-bucket datasets (e.g. primary images in one
     # bucket, annotation overlays in another with different IAM) work because
-    # we resolve credentials by the bucket in the s3:// path first, falling
-    # back to the dataset's default config only if no per-bucket config exists.
-    backend = await get_storage_for_s3_uri(dataset_id, bucket)
-    if not backend.s3_client:
+    # route_s3_bucket picks credentials by the bucket in the s3:// path, among
+    # the storage configs this dataset may use.
+    backend = await backend_for_route(route)
+    if backend is None or not backend.s3_client:
         raise HTTPException(status_code=500, detail="S3 backend not configured for this dataset")
 
     # IMPORTANT: boto3 is synchronous. Calling it directly from an async def

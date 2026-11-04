@@ -1,5 +1,5 @@
 from .core.client import connect, get_client
-from .core.dataset import Dataset
+from .core.dataset import Dataset, compute_image_metrics
 from .core.geometry3d import Calibration
 from .core.job import Job, JobCancelled, JobError, JobFailed, JobTimeout
 from .core.labels import (
@@ -19,6 +19,7 @@ from .core.labels import (
 )
 from .core.objects import objects_from_cuboids
 from .core.sample import Sample
+from .core.version_view import VersionReadOnlyError, VersionView
 from .core.view import (
     Condition,
     DatasetView,
@@ -38,11 +39,15 @@ __all__ = [
     'Dataset',
     'Sample',
     'DatasetView',
+    'VersionView',
+    'VersionReadOnlyError',
     'Job',
     'JobError',
     'JobFailed',
     'JobCancelled',
     'JobTimeout',
+    # Image metrics
+    'compute_image_metrics',
     # Query building
     'SampleQuery',
     'Condition',

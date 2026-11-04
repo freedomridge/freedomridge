@@ -6,7 +6,7 @@ Requires the storage_configs table (see schema migration below).
 """
 
 from datetime import datetime
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
@@ -44,6 +44,9 @@ class StorageConfigCreate(BaseModel):
     # ["client-*", "logs-2025-??"]. Matched with fnmatch when the literal
     # bucket_name lookup misses.
     bucket_patterns: List[str] = []
+    # False: the config serves every dataset. True: only the datasets in dataset_ids.
+    restricted: bool = False
+    dataset_ids: List[int] = []
 
 
 class StorageConfigUpdate(BaseModel):
@@ -56,6 +59,9 @@ class StorageConfigUpdate(BaseModel):
     is_public_bucket: Optional[bool] = None
     is_default: Optional[bool] = None
     bucket_patterns: Optional[List[str]] = None
+    restricted: Optional[bool] = None
+    # Replaces the list. Omitted: a restricted config keeps its list; switching to unrestricted clears it.
+    dataset_ids: Optional[List[int]] = None
 
 
 class StorageConfigResponse(BaseModel):
@@ -70,6 +76,8 @@ class StorageConfigResponse(BaseModel):
     is_default: bool
     bucket_patterns: List[str] = []
     created_at: datetime
+    restricted: bool = False
+    dataset_ids: List[int] = []
 
     class Config:
         from_attributes = True
@@ -107,7 +115,12 @@ def _clean_patterns(patterns: Optional[List[str]]) -> List[str]:
     return out
 
 
-def _row_to_response(row) -> StorageConfigResponse:
+_RESPONSE_COLUMNS = """id, name, storage_type, bucket_name, region,
+               access_key_id, endpoint_url, is_public_bucket,
+               is_default, bucket_patterns, created_at, restricted"""
+
+
+def _row_to_response(row, dataset_ids: List[int]) -> StorageConfigResponse:
     return StorageConfigResponse(
         id=row["id"],
         name=row["name"],
@@ -120,7 +133,74 @@ def _row_to_response(row) -> StorageConfigResponse:
         is_default=row["is_default"],
         bucket_patterns=list(row["bucket_patterns"] or []),
         created_at=row["created_at"],
+        restricted=row["restricted"],
+        dataset_ids=dataset_ids,
     )
+
+
+async def _dataset_ids(connection, config_ids: List[int]) -> Dict[int, List[int]]:
+    """The datasets each restricted config serves, by config id."""
+    rows = await connection.fetch(
+        """
+        SELECT storage_config_id, array_agg(dataset_id ORDER BY dataset_id) AS ids
+        FROM storage_config_datasets WHERE storage_config_id = ANY($1::int[])
+        GROUP BY storage_config_id
+        """,
+        config_ids,
+    )
+    return {row["storage_config_id"]: list(row["ids"]) for row in rows}
+
+
+async def _check_scope(
+    connection,
+    config_id: Optional[int],
+    is_default: bool,
+    restricted: bool,
+    dataset_ids: List[int],
+) -> None:
+    """Refuse a dataset scope the media proxy couldn't honour as written."""
+    if not restricted:
+        if dataset_ids:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="dataset_ids only apply to a restricted config; an unrestricted config serves every dataset",
+            )
+        return
+    if is_default:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="The default storage config can't be restricted: "
+            "it serves every dataset without a config of its own",
+        )
+    found = await connection.fetch("SELECT id FROM datasets WHERE id = ANY($1::int[])", dataset_ids)
+    missing = sorted(set(dataset_ids) - {row["id"] for row in found})
+    if missing:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Unknown dataset ids: {missing}")
+    if config_id is not None:
+        # A dataset assigned this config (datasets.storage_config_id) must stay on its list, or its own
+        # storage config would stop serving it.
+        unlisted = await connection.fetch(
+            "SELECT name FROM datasets WHERE storage_config_id = $1 AND NOT (id = ANY($2::int[])) ORDER BY name",
+            config_id,
+            dataset_ids,
+        )
+        if unlisted:
+            names = ", ".join(row["name"] for row in unlisted)
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"These datasets use this storage config as their own, so it must list them: {names}. "
+                "Add them, or assign them another config first.",
+            )
+
+
+async def _set_dataset_ids(connection, config_id: int, restricted: bool, dataset_ids: List[int]) -> None:
+    await connection.execute("DELETE FROM storage_config_datasets WHERE storage_config_id = $1", config_id)
+    if restricted and dataset_ids:
+        await connection.execute(
+            "INSERT INTO storage_config_datasets (storage_config_id, dataset_id) SELECT $1, unnest($2::int[])",
+            config_id,
+            dataset_ids,
+        )
 
 
 async def require_admin(user: dict = Depends(get_current_user)):
@@ -137,14 +217,13 @@ async def require_admin(user: dict = Depends(get_current_user)):
 
 @router.get("/configs", response_model=List[StorageConfigResponse])
 async def list_storage_configs(user: dict = Depends(require_admin)):
-    rows = await db.fetch("""
-        SELECT id, name, storage_type, bucket_name, region,
-               access_key_id, endpoint_url, is_public_bucket,
-               is_default, bucket_patterns, created_at
+    rows = await db.fetch(f"""
+        SELECT {_RESPONSE_COLUMNS}
         FROM storage_configs
         ORDER BY is_default DESC, name
     """)
-    return [_row_to_response(row) for row in rows]
+    scopes = await _dataset_ids(db, [row["id"] for row in rows])
+    return [_row_to_response(row, scopes.get(row["id"], [])) for row in rows]
 
 
 @router.post("/configs", response_model=StorageConfigResponse, status_code=status.HTTP_201_CREATED)
@@ -153,36 +232,36 @@ async def create_storage_config(
     user: dict = Depends(require_admin),
 ):
     encrypted_secret = encrypt_secret(config.secret_access_key) if config.secret_access_key else None
+    dataset_ids = sorted(set(config.dataset_ids))
     try:
-        row = await db.fetchrow(
-            """
-            INSERT INTO storage_configs
-                (name, storage_type, bucket_name, region, access_key_id,
-                 secret_access_key_encrypted, endpoint_url, is_public_bucket,
-                 is_default, bucket_patterns, created_by_user_id)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-            RETURNING id, name, storage_type, bucket_name, region,
-                      access_key_id, endpoint_url, is_public_bucket,
-                      is_default, bucket_patterns, created_at
-        """,
-            config.name,
-            config.storage_type,
-            config.bucket_name,
-            config.region,
-            config.access_key_id,
-            encrypted_secret,
-            config.endpoint_url,
-            config.is_public_bucket,
-            config.is_default,
-            _clean_patterns(config.bucket_patterns),
-            user.get("id"),
-        )
-        # New patterns may widen bucket routing; drop the bucket cache so the
-        # next image request re-resolves.
-        from ..storage import invalidate_bucket_route_cache
-
-        invalidate_bucket_route_cache()
-        return _row_to_response(row)
+        async with db.pool.acquire() as connection, connection.transaction():
+            await _check_scope(connection, None, config.is_default, config.restricted, dataset_ids)
+            row = await connection.fetchrow(
+                f"""
+                INSERT INTO storage_configs
+                    (name, storage_type, bucket_name, region, access_key_id,
+                     secret_access_key_encrypted, endpoint_url, is_public_bucket,
+                     is_default, bucket_patterns, created_by_user_id, restricted)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                RETURNING {_RESPONSE_COLUMNS}
+            """,
+                config.name,
+                config.storage_type,
+                config.bucket_name,
+                config.region,
+                config.access_key_id,
+                encrypted_secret,
+                config.endpoint_url,
+                config.is_public_bucket,
+                config.is_default,
+                _clean_patterns(config.bucket_patterns),
+                user.get("id"),
+                config.restricted,
+            )
+            await _set_dataset_ids(connection, row["id"], config.restricted, dataset_ids)
+        return _row_to_response(row, dataset_ids)
+    except HTTPException:
+        raise
     except Exception as e:
         if "unique" in str(e).lower():
             raise HTTPException(
@@ -210,6 +289,7 @@ async def update_storage_config(
         ("endpoint_url", "endpoint_url"),
         ("is_public_bucket", "is_public_bucket"),
         ("is_default", "is_default"),
+        ("restricted", "restricted"),
     ]:
         val = getattr(config, field)
         if val is not None:
@@ -227,31 +307,43 @@ async def update_storage_config(
         values.append(_clean_patterns(config.bucket_patterns))
         idx += 1
 
-    if not updates:
+    if not updates and config.dataset_ids is None:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No fields to update")
 
-    values.append(config_id)
-    row = await db.fetchrow(
-        f"""
-        UPDATE storage_configs
-        SET {', '.join(updates)}
-        WHERE id = ${idx}
-        RETURNING id, name, storage_type, bucket_name, region,
-                  access_key_id, endpoint_url, is_public_bucket,
-                  is_default, bucket_patterns, created_at
-    """,
-        *values,
-    )
+    async with db.pool.acquire() as connection, connection.transaction():
+        current = await connection.fetchrow(
+            "SELECT is_default, restricted FROM storage_configs WHERE id = $1 FOR UPDATE",
+            config_id,
+        )
+        if not current:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Storage config {config_id} not found")
+        restricted = current["restricted"] if config.restricted is None else config.restricted
+        is_default = bool(current["is_default"]) if config.is_default is None else config.is_default
+        if config.dataset_ids is not None:
+            dataset_ids = sorted(set(config.dataset_ids))
+        elif restricted:
+            dataset_ids = (await _dataset_ids(connection, [config_id])).get(config_id, [])
+        else:
+            dataset_ids = []
+        await _check_scope(connection, config_id, is_default, restricted, dataset_ids)
 
-    if not row:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Storage config {config_id} not found")
-    # Drop the cached boto3 client so the next request uses fresh credentials,
-    # and flush bucket-name routing since patterns or bucket_name may have changed.
-    from ..storage import invalidate_bucket_route_cache, invalidate_storage_cache
-
-    invalidate_storage_cache(config_id)
-    invalidate_bucket_route_cache()
-    return _row_to_response(row)
+        if updates:
+            values.append(config_id)
+            row = await connection.fetchrow(
+                f"""
+                UPDATE storage_configs
+                SET {', '.join(updates)}
+                WHERE id = ${idx}
+                RETURNING {_RESPONSE_COLUMNS}
+            """,
+                *values,
+            )
+        else:
+            row = await connection.fetchrow(f"SELECT {_RESPONSE_COLUMNS} FROM storage_configs WHERE id = $1", config_id)
+        await _set_dataset_ids(connection, config_id, restricted, dataset_ids)
+    # Media requests re-read storage_configs on every request, and each worker rebuilds its cached S3
+    # client when updated_at changes, so this applies on every worker without an explicit flush.
+    return _row_to_response(row, dataset_ids)
 
 
 @router.delete("/configs/{config_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -270,12 +362,9 @@ async def delete_storage_config(config_id: int, user: dict = Depends(require_adm
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Cannot delete the default storage config. Mark another config as default first.",
         )
+    # Datasets that referenced this config FK-cascade to NULL, and its dataset list is deleted with it.
+    # Media requests re-read storage_configs, so every worker stops using it at once.
     await db.execute("DELETE FROM storage_configs WHERE id = $1", config_id)
-    # Datasets that referenced this config FK-cascade to NULL; drop our caches too.
-    from ..storage import invalidate_bucket_route_cache, invalidate_storage_cache
-
-    invalidate_storage_cache(config_id)
-    invalidate_bucket_route_cache()
 
 
 @router.post("/configs/{config_id}/test", response_model=TestConnectionResponse)
@@ -345,16 +434,8 @@ async def test_storage_connection(config_id: int, user: dict = Depends(require_a
 
 @router.get("/configs/{config_id}", response_model=StorageConfigResponse)
 async def get_storage_config(config_id: int, user: dict = Depends(require_admin)):
-    row = await db.fetchrow(
-        """
-        SELECT id, name, storage_type, bucket_name, region,
-               access_key_id, endpoint_url, is_public_bucket,
-               is_default, bucket_patterns, created_at
-        FROM storage_configs WHERE id = $1
-    """,
-        config_id,
-    )
+    row = await db.fetchrow(f"SELECT {_RESPONSE_COLUMNS} FROM storage_configs WHERE id = $1", config_id)
 
     if not row:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Storage config {config_id} not found")
-    return _row_to_response(row)
+    return _row_to_response(row, (await _dataset_ids(db, [config_id])).get(config_id, []))

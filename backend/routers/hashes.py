@@ -105,6 +105,39 @@ async def export_hashes(
     }
 
 
+# Upper bound on the sample ids named in ONE /by-ids request.
+_MAX_HASHES_BY_IDS = 10_000
+
+
+class HashesByIdsRequest(BaseModel):
+    sample_ids: List[int] = Field(..., max_length=_MAX_HASHES_BY_IDS)
+    field_names: List[str] = Field(..., min_length=1)
+
+
+@router.post("/by-ids")
+@guest_heavy
+async def hashes_by_ids(id: int, request: HashesByIdsRequest):
+    """Hashes for specific samples and fields. `GET /export` pages a whole field; this is the lookup
+    for copying a subset (`Dataset.add_samples_from`). Scoped to dataset `id`."""
+    rows = await db.fetch(
+        """
+        SELECT h.sample_id, h.field_name, h.hash_hex
+        FROM sample_hashes h
+        JOIN samples s ON s.id = h.sample_id
+        WHERE s.dataset_id = $1 AND h.sample_id = ANY($2) AND h.field_name = ANY($3)
+        ORDER BY h.sample_id, h.field_name
+        """,
+        id,
+        request.sample_ids,
+        request.field_names,
+    )
+    return {
+        "items": [
+            {"sample_id": r['sample_id'], "field_name": r['field_name'], "hash_hex": r['hash_hex']} for r in rows
+        ],
+    }
+
+
 class HashStatsRequest(BaseModel):
     field_name: Optional[str] = None
     filters: Optional[Dict[str, Any]] = None

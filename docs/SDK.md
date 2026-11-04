@@ -45,6 +45,11 @@ fridge.connect("http://localhost:8000/api", api_token="<your-token>")
 fridge.connect()
 ```
 
+Requests time out after `(10, 300)` seconds by default (connect, read). Pass `timeout=` to change
+it, for example for large uploads over a slow link or long statistics refreshes:
+`fridge.connect(url, api_token=..., timeout=(120, 1800))`. It takes a number or a
+`(connect, read)` tuple.
+
 **Username/password (interactive use)** — logs in with a session cookie:
 
 ```python
@@ -980,6 +985,12 @@ dataset.clear_field("scratch_field")
 preds = [Sample("/img1.jpg", metadata={"predictions": Detections([...])}), ...]
 dataset.merge_samples(preds, key_field="filepath")   # source values win
 dataset.merge_samples(preds, key_field="source_id", fields=["predictions"], skip_existing=True)
+
+# merge_samples never ADDS samples. To copy samples between datasets (metadata, tags, location,
+# heading, array fields, embeddings, hashes), adding the ones the target lacks:
+target.add_samples_from(source.filter(split="eval"))          # a view, or a whole Dataset
+target.add_samples_from(source.filter(source_id__in=ids), embedding_fields=["dinov3"], hash_fields=[])
+# Matches by filepath; samples already in the target are left untouched. Streams in batches.
 ```
 
 ## Geospatial filtering
@@ -1166,6 +1177,10 @@ ds.compute_metrics()   # brightness / blurriness / contrast / entropy / salt_and
                        # saturation / pct_underexposed / pct_overexposed
 ```
 
+To compute the same metrics for one PIL image yourself (for example before upload), use
+`fridge.compute_image_metrics(img)`. It returns the dict of eight floats that `compute_metrics()`
+stores per sample, and needs the same optional dependencies (`pip install "freedomridge[all]"`).
+
 ## Array Fields (Dynamic Tag-Like Fields)
 
 Freedom Ridge supports creating any number of tag-like array fields beyond the built-in `tags`. These are stored as native PostgreSQL `TEXT[]` columns with GIN indexes — same performance as tags.
@@ -1334,6 +1349,32 @@ Hash-only versions cannot be checked out or browsed.
 for sample in dataset.checkout(version_name="v1.0"):
     print(sample.filepath, sample.metadata.get("reviewed"))
 ```
+
+### Query a Version (`dataset.version()`)
+
+`dataset.version(name)` (no argument: the newest version) returns a **read-only**
+`VersionView` that is queried like a `DatasetView`, but always against the version's
+stored data. Every query runs in the database, so a multi-million-sample version is
+never pulled to the client.
+
+```python
+from fridge import F
+
+v = dataset.version("v1.8")
+v.count()                       # samples in the version
+v.distinct("source_id")         # distinct metadata values
+v.count_values("split")         # {"train": ..., "val": ...}
+split = v.filter(F("split").is_in(["train", "val"]))   # same filter DSL; chainable
+for sample in split.select_fields(["source_id", "category"]):
+    print(sample.id, sample.metadata)  # only those fields are read
+```
+
+Supported: `filter`/`match`/`exclude`, `select_fields`, `limit`, `iter_samples`, `first`,
+`count`, `distinct`, `count_values`, `aggregate` (same specs as `DatasetView.aggregate`).
+Samples come back in id order. Writes (`tag_samples`, `set_values`, ...) raise
+`VersionReadOnlyError`; sorting, `skip`, histograms and similarity are not supported on a version
+(`NotImplementedError`). Filters that read live data a version does not store (embedding or hash
+presence, concept scores, duplicate collapsing, parent/object links) are rejected with a 400.
 
 In Dataset Settings → Versions, choose **Browse snapshot** to inspect saved samples,
 search their paths/tags/metadata, and view their annotations. Images, masks, heatmaps,
@@ -1778,6 +1819,7 @@ class Dataset:
     def clone_field(field_name, new_name, *, wait=True, timeout=1800) -> dict | Job
     def clear_field(field_name, *, wait=True, timeout=1800) -> dict | Job
     def merge_samples(source, key_field="filepath", fields=None, skip_existing=False) -> int
+    def add_samples_from(source, *, embedding_fields=None, hash_fields=None, batch_size=500) -> dict  # {"seen","added","skipped"}
 
     # Embeddings & visualization
     # Both return {"total", "written", "dropped", "dropped_sample_ids"}
@@ -1799,6 +1841,7 @@ class Dataset:
     def version_status() -> dict
     def diff(version_name: str = None, version_id: int = None) -> dict   # version vs current
     def checkout(version_name: str = None, version_id: int = None) -> Iterator[Sample]  # snapshot samples
+    def version(version_name: str = None, version_id: int = None) -> VersionView  # queryable, read-only
     def revert(version_name: str = None, version_id: int = None, restore_deleted: bool = False,
                exact_membership: bool = False) -> dict
 ```

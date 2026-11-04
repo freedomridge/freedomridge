@@ -1,4 +1,4 @@
-"""Run with FRIDGE_TEST_POSTGRES_SOCKET pointing to an isolated PostgreSQL/PostGIS server."""
+"""Run with FRIDGE_TEST_POSTGRES_DSN and FRIDGE_TEST_POSTGRES_CONTAINER (a disposable PostGIS server)."""
 
 import asyncio
 import os
@@ -15,21 +15,15 @@ from backend.database import Database, init_connection
 from backend.routers import datasets, versions
 from backend.schema_check import function_statements
 
-pytestmark = pytest.mark.skipif(
-    not (os.getenv('FRIDGE_TEST_POSTGRES_SOCKET') or os.getenv('FRIDGE_TEST_POSTGRES_DSN')),
-    reason='Requires an isolated PostgreSQL/PostGIS test server',
-)
+# Only the DSN that conftest verified against the disposable container: no other way to name a server.
+pytestmark = pytest.mark.skipif(not os.getenv('FRIDGE_TEST_POSTGRES_DSN'), reason='Disposable PostgreSQL required')
 
 
 @pytest.fixture
 def snapshot_database(monkeypatch):
     def run(scenario):
         async def execute():
-            connection_args = (
-                {'dsn': os.environ['FRIDGE_TEST_POSTGRES_DSN']}
-                if os.getenv('FRIDGE_TEST_POSTGRES_DSN')
-                else {'host': os.environ['FRIDGE_TEST_POSTGRES_SOCKET'], 'user': 'postgres', 'database': 'postgres'}
-            )
+            connection_args = {'dsn': os.environ['FRIDGE_TEST_POSTGRES_DSN']}
             admin = await asyncpg.connect(**connection_args)
             namespace = 'snapshot_test_' + uuid.uuid4().hex
             database = Database()
@@ -350,5 +344,149 @@ def test_snapshot_settings_conflict_is_retryable(snapshot_database, monkeypatch)
         monkeypatch.setattr(versions, '_snapshot_arrays', read_arrays)
         version_id = await snapshot('during-settings-change')
         assert (await versions.get_version(1, version_id))['dataset_snapshot']['name'] == 'renamed'
+
+    snapshot_database(scenario)
+
+
+async def add_training_samples(database):
+    await database.execute(
+        "INSERT INTO dataset_fields (dataset_id, field_name, field_type, origin) "
+        "VALUES (1, 'inferred_tags', 'list', 'native_array')",
+    )
+    for path, split, crop, accepted in (
+        ('a.jpg', 'train', 'corn', 'yes'),
+        ('b.jpg', 'train', 'soy', 'no'),
+        ('c.jpg', 'val', 'corn', 'yes'),
+        ('d.jpg', 'test', 'soy', 'yes'),
+    ):
+        await database.execute(
+            """INSERT INTO samples (dataset_id, filepath, media_type, metadata, tags, inferred_tags, location)
+               VALUES (1, $1, 'image', jsonb_build_object('split', $2::text, 'category', $3::text,
+                                                          'source_id', 'm-' || $2::text, 'big', 'x'),
+                       ARRAY['t'], ARRAY[$4::text], ST_SetSRID(ST_MakePoint(1, 2), 4326))""",
+            path,
+            split,
+            crop,
+            accepted,
+        )
+
+
+def aggregate_request(*specs, filters=None):
+    return versions.VersionAggregateRequest(
+        aggregations=[datasets.AggregationSpec(field=field, op=op) for field, op in specs],
+        filters=filters,
+    )
+
+
+def test_version_aggregates_are_computed_from_the_snapshot(snapshot_database):
+    async def scenario(database):
+        await add_training_samples(database)
+        version_id = await snapshot('v1')
+        await database.execute("UPDATE samples SET metadata = metadata || '{\"split\": \"gone\"}'")
+        await database.execute("DELETE FROM samples WHERE filepath = 'a.jpg'")
+        await database.execute(
+            "INSERT INTO samples (dataset_id, filepath, media_type, metadata) VALUES (1, 'new.jpg', 'image', '{}')",
+        )
+
+        specs = (('id', 'count'), ('split', 'count_values'), ('source_id', 'distinct'))
+        counts, split_counts, source_ids = (await versions.aggregate_version(1, version_id, aggregate_request(*specs)))[
+            'results'
+        ]
+        assert counts['value'] == 4
+        assert {row['value']: row['count'] for row in split_counts['value']} == {'train': 2, 'val': 1, 'test': 1}
+        assert source_ids['value'] == ['m-test', 'm-train', 'm-val']
+
+        in_train_or_val = {'field': 'split', 'operator': 'in', 'value': ['train', 'val']}
+        filtered = await versions.aggregate_version(
+            1,
+            version_id,
+            aggregate_request(('id', 'count'), ('category', 'count_values'), filters=in_train_or_val),
+        )
+        assert filtered['results'][0]['value'] == 3
+        assert {row['value']: row['count'] for row in filtered['results'][1]['value']} == {'corn': 2, 'soy': 1}
+
+        # Array fields are rebuilt from the snapshot, and native columns filter too.
+        accepted = await versions.aggregate_version(
+            1,
+            version_id,
+            aggregate_request(('id', 'count'), filters={'field': 'inferred_tags', 'operator': 'in', 'value': ['yes']}),
+        )
+        assert accepted['results'][0]['value'] == 3
+        located = await versions.aggregate_version(
+            1,
+            version_id,
+            aggregate_request(('id', 'count'), filters={'field': 'location', 'operator': 'exists'}),
+        )
+        assert located['results'][0]['value'] == 4
+
+    snapshot_database(scenario)
+
+
+def test_version_sample_query_filters_projects_and_pages(snapshot_database):
+    async def scenario(database):
+        await add_training_samples(database)
+        version_id = await snapshot('v1')
+        await database.execute("UPDATE samples SET metadata = metadata || '{\"split\": \"gone\"}'")
+        in_train_or_val = {'field': 'split', 'operator': 'in', 'value': ['train', 'val']}
+
+        def query(**kwargs):
+            return versions.query_version_samples(1, version_id, versions.VersionSamplesQueryRequest(**kwargs))
+
+        everything = (await query(filters=in_train_or_val))['items']
+        assert [item['filepath'] for item in everything] == ['a.jpg', 'b.jpg', 'c.jpg']
+        assert everything[0]['metadata']['split'] == 'train' and everything[0]['version_id'] == version_id
+        assert everything[0]['location']['coordinates'] == [1.0, 2.0]
+
+        slim = (await query(filters=in_train_or_val, fields=['split', 'inferred_tags', 'filepath']))['items']
+        assert slim[1] == {
+            'id': everything[1]['id'],
+            'version_id': version_id,
+            'filepath': 'b.jpg',
+            'inferred_tags': ['no'],
+            'metadata': {'split': 'train'},
+        }
+        assert (await query(fields=['nonexistent']))['items'][0]['metadata'] == {}
+
+        first = (await query(filters=in_train_or_val, limit=2))['items']
+        rest = (await query(filters=in_train_or_val, limit=2, after_id=first[-1]['id']))['items']
+        assert [item['filepath'] for item in first + rest] == ['a.jpg', 'b.jpg', 'c.jpg']
+
+    snapshot_database(scenario)
+
+
+def test_version_queries_refuse_what_a_version_cannot_answer(snapshot_database):
+    async def scenario(database):
+        await add_training_samples(database)
+        version_id = await snapshot('v1')
+        hash_only = (await versions.create_version(1, versions.CreateVersionRequest(name='h', include_metadata=False)))[
+            'id'
+        ]
+        count = aggregate_request(('id', 'count'))
+
+        with pytest.raises(HTTPException) as error:
+            await versions.aggregate_version(2, version_id, count)  # another dataset's version
+        assert error.value.status_code == 404
+        with pytest.raises(HTTPException) as error:
+            await versions.aggregate_version(1, hash_only, count)
+        assert error.value.status_code == 400
+        for node in (
+            {'field': 'id', 'operator': 'collapse_duplicates', 'value': {}},
+            {'field': 'embeddings.clip', 'operator': 'exists'},
+            {'logic': 'AND', 'filters': [{'field': 'hashes.phash', 'operator': 'not_exists'}]},
+        ):
+            with pytest.raises(HTTPException) as error:
+                await versions.aggregate_version(1, version_id, aggregate_request(('id', 'count'), filters=node))
+            assert error.value.status_code == 400 and 'live data' in error.value.detail
+        with pytest.raises(HTTPException) as error:
+            await versions.query_version_samples(
+                1,
+                version_id,
+                versions.VersionSamplesQueryRequest(fields=["x'; DROP TABLE samples; --"]),
+            )
+        assert error.value.status_code == 400
+        with pytest.raises(HTTPException) as error:
+            await versions.query_version_samples(1, version_id, versions.VersionSamplesQueryRequest(limit=0))
+        assert error.value.status_code == 400
+        assert (await versions.aggregate_version(1, version_id, count))['results'][0]['value'] == 4
 
     snapshot_database(scenario)

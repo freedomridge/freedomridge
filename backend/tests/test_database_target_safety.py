@@ -181,6 +181,39 @@ asyncpg.connect = _connect
         assert not events.exists() or 'pg_control_system()' not in events.read_text()
 
 
+@pytest.mark.parametrize('database_url', [None, 'postgres://freedomridge:password@localhost:5432/freedomridge'])
+def test_unit_only_session_cannot_reach_the_dev_database(tmp_path, database_url):
+    # No disposable server named: whether DATABASE_URL is unset (the backend then defaults to the local
+    # dev database) or the shell exports the dev one, every backend module must see a closed port instead.
+    child = tmp_path / 'isolated'
+    child.mkdir()
+    (child / 'conftest.py').write_text((ROOT / 'backend/tests/conftest.py').read_text())
+    (child / 'test_probe.py').write_text(
+        'import asyncio, asyncpg, pytest\n'
+        'from backend import database, init_db, job_service\n'
+        'def test_probe():\n'
+        '    assert database.DATABASE_URL == init_db.DATABASE_URL == job_service.DATABASE_URL\n'
+        "    assert '127.0.0.1:1/' in database.DATABASE_URL\n"
+        '    with pytest.raises(OSError):\n'
+        '        asyncio.run(asyncpg.connect(database.DATABASE_URL, timeout=5))\n',
+    )
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if key not in ('FRIDGE_TEST_POSTGRES_DSN', 'FRIDGE_TEST_POSTGRES_CONTAINER', 'DATABASE_URL')
+    }
+    env['PYTHONPATH'] = str(ROOT) + os.pathsep + os.environ.get('PYTHONPATH', '')
+    if database_url:
+        env['DATABASE_URL'] = database_url
+    result = subprocess.run(
+        [sys.executable, '-m', 'pytest', '-q', '-p', 'no:cacheprovider', '--confcutdir', str(child), str(child)],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 @pytest.mark.parametrize('spelling', ['split', 'equals', 'env'])
 @pytest.mark.parametrize(
     'url',

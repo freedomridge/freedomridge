@@ -4,13 +4,15 @@ import os
 import re
 import warnings
 from itertools import islice
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
 
 import requests
 
 from .client import get_client
 from .sample import Sample
-from .view import Condition, DatasetView, SampleQuery, parse_query_string
+from .version_view import VersionView
+from .view import Condition, DatasetView, SampleQuery, filters_from_view_stages, parse_query_string
 
 # `field__op=value` suffixes accepted by Dataset.filter(), mapped to the wire operator that
 # backend/routers/datasets.py's parse_filter_node actually implements.
@@ -336,6 +338,69 @@ def _exposure_clipping(gray):
     return float((g <= 5).mean() * 100.0), float((g >= 250).mean() * 100.0)
 
 
+def _require_metric_dependencies():
+    try:
+        import cv2  # noqa: F401
+        import numpy  # noqa: F401
+        from PIL import ImageStat  # noqa: F401
+    except ImportError:
+        raise ImportError(
+            "Please install: pip install opencv-python-headless numpy Pillow  (or: pip install \"freedomridge[all]\")",
+        )
+
+
+def compute_image_metrics(img):
+    """Image-quality metrics for one PIL image, exactly as ``Dataset.compute_metrics`` stores them.
+
+    Returns a dict with the keys ``brightness``, ``blurriness``, ``contrast``, ``entropy``,
+    ``salt_and_pepper``, ``saturation``, ``pct_underexposed`` and ``pct_overexposed`` (all floats).
+    A non-RGB image is converted to RGB first. Use this to compute the same metrics before upload.
+
+    Requires ``opencv-python-headless``, ``numpy`` and ``Pillow`` (``pip install "freedomridge[all]"``).
+    """
+    _require_metric_dependencies()
+    import cv2
+    import numpy as np
+    from PIL import ImageStat
+
+    if img.mode != "RGB":
+        img = img.convert("RGB")
+    gray = img.convert("L")
+
+    stat = ImageStat.Stat(img)
+    try:
+        r, g, b = stat.mean
+    except ValueError:
+        r = g = b = stat.mean[0]
+    brightness = float(np.sqrt(0.241 * r * r + 0.691 * g * g + 0.068 * b * b))
+
+    blurriness = float(cv2.Laplacian(np.array(gray), cv2.CV_64F).var())
+
+    hist, _ = np.histogram(cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR), bins=256, range=(0, 256))
+    contrast = float(np.max(np.where(hist > 0)) - np.min(np.where(hist > 0)))
+
+    gray_pixels = np.array(gray)
+    salt = gray_pixels >= 244
+    pepper = gray_pixels <= 10
+    kernel = np.ones((2, 2), np.uint8)
+    salt_open = cv2.morphologyEx(salt.astype(np.uint8), cv2.MORPH_OPEN, kernel)
+    pepper_open = cv2.morphologyEx(pepper.astype(np.uint8), cv2.MORPH_OPEN, kernel)
+    isolated = np.sum(salt & ~salt_open.astype(np.uint8)) + np.sum(pepper & ~pepper_open.astype(np.uint8))
+    salt_and_pepper = float(isolated / gray_pixels.size * 100)
+
+    under, over = _exposure_clipping(gray)
+    return {
+        "brightness": brightness,
+        "blurriness": blurriness,
+        "contrast": contrast,
+        "entropy": float(img.entropy()),
+        "salt_and_pepper": salt_and_pepper,
+        "saturation": _saturation(img),
+        "pct_underexposed": under,
+        "pct_overexposed": over,
+    }
+
+
 def _default_s3_image_loader():
     """Returns a callable that downloads images from S3 or local paths.
 
@@ -646,8 +711,11 @@ class Dataset:
         sample._dataset = self
         if row.get("location"):
             sample.location = row["location"]
-        if row.get("heading") is not None:
-            sample.heading = row["heading"]
+        heading = row.get("heading")
+        if heading is None and isinstance(row.get("location"), dict):
+            heading = row["location"].get("heading")  # the samples endpoints nest it in location
+        if heading is not None:
+            sample.heading = heading
         # Populate array fields (uses the cached names — no extra network call)
         for af in self._array_field_names:
             if af != 'tags' and af in row:
@@ -834,9 +902,115 @@ class Dataset:
         print(f"merge_samples: merged into {n} samples")
         return n
 
+    def add_samples_from(self, source, *, embedding_fields=None, hash_fields=None, batch_size: int = 500) -> dict:
+        """Copy samples from ``source`` into this dataset, adding the ones that aren't here.
+
+        Unlike ``merge_samples`` (which only merges metadata into samples that already exist), this
+        inserts missing samples with everything they carry: metadata, tags, location, heading, array
+        fields, embeddings and hashes. A sample is matched by ``filepath``; one that already exists in
+        this dataset is left exactly as it is (nothing is overwritten, merged or re-embedded).
+
+        Runs client-side in a stream: it pages the source in ``batch_size`` samples, fetches only those
+        samples' vectors and hashes, and writes each batch before reading the next, so memory stays
+        bounded however large the source is. Interrupted? Run it again; samples already copied are
+        skipped.
+
+        Args:
+            source: a Dataset (copy everything) or a DatasetView (copy just that selection). The source
+                may live on a different Freedom Ridge instance.
+            embedding_fields: embedding fields to copy (default: every stored field, patch embeddings
+                included; ``[]`` for none).
+            hash_fields: hash fields to copy (default: all; ``[]`` for none).
+            batch_size: samples per request.
+
+        Returns:
+            dict: ``{"seen": n, "added": n, "skipped": n}`` (``skipped`` = already in this dataset).
+
+        Example:
+            target.add_samples_from(source.filter(split="eval"))
+            # select by a metadata key:
+            target.add_samples_from(source.filter(source_id__in=source_ids))
+        """
+        view = source.all() if isinstance(source, Dataset) else source
+        src = view._dataset
+        if src.client.base_url == self.client.base_url and src.id == self._id:
+            raise ValueError("source and target are the same dataset")
+        if batch_size < 1:
+            raise ValueError("batch_size must be at least 1")
+
+        stored_embeddings = [f['field_name'] for f in src.client.get_embedding_field_inventory(src.id)]
+        embeddings = stored_embeddings if embedding_fields is None else list(embedding_fields)
+        stored_hashes = src.client.get_hash_fields(src.id)
+        hashes = stored_hashes if hash_fields is None else list(hash_fields)
+        for kind, wanted, stored in (("embedding", embeddings, stored_embeddings), ("hash", hashes, stored_hashes)):
+            missing = sorted(set(wanted) - set(stored))
+            if missing:
+                raise ValueError(f"source dataset '{src.name}' has no {kind} field(s) {missing}")
+
+        # Listing the source's array fields also registers them, so iterating it returns their values.
+        array_names = [name for name in src.list_array_fields() if name != 'tags']
+        if array_names:
+            existing = set(self.list_array_fields())
+            for name in array_names:
+                if name not in existing:
+                    self.create_array_field(name)
+
+        seen = added = skipped = 0
+        samples = view.iter_samples(batch_size=batch_size)
+        while batch := list(islice(samples, batch_size)):
+            ids = [sample.id for sample in batch]
+            vectors = src.client.get_vectors_by_ids(src.id, ids, embeddings) if embeddings else {}
+            hash_values = src.client.get_hashes_by_ids(src.id, ids, hashes) if hashes else {}
+            rows = []
+            for sample in batch:
+                row = sample.to_dict()
+                row["embeddings"] = vectors.get(sample.id)
+                row["hashes"] = hash_values.get(sample.id)
+                rows.append(row)
+            result = self.client.add_samples(self._id, rows, on_duplicate='skip')
+            seen += len(batch)
+            added += len(result.get("ids", []))
+            skipped += result.get("skipped", 0)
+        if added:
+            self._dirty = True
+        print(f"add_samples_from: {added} added, {skipped} already present ({seen} read from '{src.name}')")
+        return {"seen": seen, "added": added, "skipped": skipped}
+
     def list_views(self) -> list:
         """List all saved views for this dataset."""
         return self.client.list_views(self._id)
+
+    def load_view(self, name: str) -> DatasetView:
+        """Load a saved view as a DatasetView: the samples the app shows for it.
+
+        The view is the AND of the saved stages' filters, exactly as the app combines them, so the
+        result supports the usual operations (``len``, ``filter``, iteration, ``tag_samples``,
+        aggregations, ...). It is the saved *definition*, so it follows the dataset as samples change.
+
+        Raises:
+            ValueError: no saved view has that name, or the view has a stage that can't be reproduced
+                faithfully (see ``fridge.core.view.filters_from_view_stages``).
+
+        Example:
+            subset = dataset.load_view("evaluation subset")
+            print(len(subset))
+            for sample in subset.filter(dataset.samples.split == "val"):
+                ...
+        """
+        views = self.list_views()
+        matches = [v for v in views if v.get("name") == name]
+        if not matches:
+            known = sorted(str(v.get("name")) for v in views)
+            raise ValueError(f"No saved view named {name!r} on dataset {self.name!r}; saved views: {known}")
+        content = matches[0].get("content") or {}
+        if "viewStages" in content:
+            filters = filters_from_view_stages(name, content["viewStages"])
+        elif isinstance(content.get("filters"), dict):
+            # Views saved before stages existed keep only the compiled filter.
+            filters = content["filters"] or None
+        else:
+            raise ValueError(f"Saved view {name!r} has neither viewStages nor filters")
+        return DatasetView(self, filters)
 
     def delete_view(self, view_id: int) -> dict:
         """Delete a saved view by ID."""
@@ -1117,6 +1291,36 @@ class Dataset:
             version_id = match[0]['id']
 
         return self.client.get_current_diff(self._id, version_id)
+
+    def version(self, version_name: Optional[str] = None, version_id: Optional[int] = None) -> VersionView:
+        """A read-only, queryable view of a version (snapshot): count, distinct, filter, iterate.
+
+        Queries run server-side against the version's stored data, like a DatasetView on the live
+        dataset. With no argument, the newest version.
+
+        Args:
+            version_name: Version name (e.g., "v1.8")
+            version_id: Or version ID directly
+
+        Example:
+            v = dataset.version("v1.8")
+            v.count_values("split")
+            v.filter(F("split").is_in(["train", "val"])).select_fields(["source_id"]).distinct("source_id")
+        """
+        versions = self.list_versions()
+        if version_id is not None:
+            match = [v for v in versions if v['id'] == version_id]
+            label = f"id {version_id}"
+        elif version_name is not None:
+            match = [v for v in versions if v['name'] == version_name]
+            label = f"'{version_name}'"
+        else:
+            match, label = versions[:1], "(newest)"
+        if not match:
+            raise ValueError(f"Version {label} not found")
+        if match[0].get('include_metadata') is False:
+            raise ValueError(f"Version '{match[0]['name']}' is hash-only and has no sample data to query")
+        return VersionView(self, match[0])
 
     def checkout(self, version_name: Optional[str] = None, version_id: Optional[int] = None):
         """Iterate over the samples as they were at a specific version.
@@ -1547,47 +1751,9 @@ class Dataset:
             # Custom loader for local files:
             dataset.compute_metrics(image_loader=lambda p: Image.open(p))
         """
-        try:
-            import cv2
-            import numpy as np
-            from PIL import ImageStat
-        except ImportError:
-            raise ImportError(
-                "Please install: pip install opencv-python-headless numpy Pillow  "
-                "(or: pip install \"freedomridge[all]\")",
-            )
-
+        _require_metric_dependencies()
         if image_loader is None:
             image_loader = _default_s3_image_loader()
-
-        def _brightness(img):
-            stat = ImageStat.Stat(img)
-            try:
-                r, g, b = stat.mean
-            except ValueError:
-                r = g = b = stat.mean[0]
-            return float(np.sqrt(0.241 * r * r + 0.691 * g * g + 0.068 * b * b))
-
-        def _blurriness(gray):
-            lap = cv2.Laplacian(np.array(gray), cv2.CV_64F)
-            return float(lap.var())
-
-        def _contrast(img):
-            hist, _ = np.histogram(cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR), bins=256, range=(0, 256))
-            return float(np.max(np.where(hist > 0)) - np.min(np.where(hist > 0)))
-
-        def _entropy(img):
-            return float(img.entropy())
-
-        def _salt_and_pepper(gray):
-            g = np.array(gray)
-            salt = g >= 244
-            pepper = g <= 10
-            k = np.ones((2, 2), np.uint8)
-            s_open = cv2.morphologyEx(salt.astype(np.uint8), cv2.MORPH_OPEN, k)
-            p_open = cv2.morphologyEx(pepper.astype(np.uint8), cv2.MORPH_OPEN, k)
-            isolated = np.sum(salt & ~s_open.astype(np.uint8)) + np.sum(pepper & ~p_open.astype(np.uint8))
-            return float(isolated / g.size * 100)
 
         processed = 0
         skipped = 0
@@ -1616,18 +1782,7 @@ class Dataset:
                 errors += 1
                 continue
 
-            gray = img.convert("L")
-            under, over = _exposure_clipping(gray)
-            pending[sample.id] = {
-                "brightness": _brightness(img),
-                "blurriness": _blurriness(gray),
-                "contrast": _contrast(img),
-                "entropy": _entropy(img),
-                "salt_and_pepper": _salt_and_pepper(gray),
-                "saturation": _saturation(img),
-                "pct_underexposed": under,
-                "pct_overexposed": over,
-            }
+            pending[sample.id] = compute_image_metrics(img)
             processed += 1
             if len(pending) >= batch_size:
                 _flush()
@@ -1644,8 +1799,9 @@ class Dataset:
         image_loader=None,
         batch_size=50,
         force_register=False,
+        skip_existing=False,
     ):
-        """Compute CLIP embeddings for every sample and upload them.
+        """Compute CLIP embeddings for every sample (or just those lacking the field) and upload them.
 
         Loads each image, encodes a batch through the model, and uploads the
         vectors. All requests go through the authenticated SDK client, so this
@@ -1662,6 +1818,11 @@ class Dataset:
                 warning and the old registration stands, so text search keeps using the old
                 text tower against the vectors you just wrote.
             batch_size: images encoded/uploaded per batch (default: 50).
+            skip_existing: embed only samples that have no ``field_name`` vector yet (listed by the
+                server via ``missing('embedding', field_name)``), e.g. a nightly run after new samples
+                were added. Default False re-embeds every sample and overwrites existing vectors,
+                which is what a model change needs. Existing vectors are not checked against
+                ``model_name``, so do not use it to switch models on a field.
 
         Returns:
             Counts for total, written and dropped embeddings, plus dropped_sample_ids.
@@ -1713,7 +1874,23 @@ class Dataset:
             batch_imgs = []
             batch_ids = []
 
-        for sample in self.iter_samples(progress=True, batch_size=1000):
+        def missing_samples():
+            """Samples lacking field_name, paged by id cursor so ones that fail to load are not re-listed."""
+            after_id = None
+            while True:
+                page = self.missing("embedding", field=field_name, limit=1000, after_id=after_id)
+                if after_id is None:
+                    print(f"{page['total']} samples lack '{field_name}'")
+                if not page["items"]:
+                    return
+                yield from (SimpleNamespace(**item) for item in page["items"])
+                after_id = page["items"][-1]["id"]
+
+        if skip_existing:
+            samples = missing_samples()
+        else:
+            samples = self.iter_samples(progress=True, batch_size=1000)
+        for sample in samples:
             try:
                 img = image_loader(sample.filepath)
                 if img is None:
@@ -2435,14 +2612,15 @@ class Dataset:
         uploader still needs to fill (and powers an "N of M" signal)."""
         return self.client.get_coverage(self._id)
 
-    def missing(self, kind, field=None, limit=1000, offset=0):
+    def missing(self, kind, field=None, limit=1000, offset=0, after_id=None):
         """Samples still lacking a derived artifact, for resumable backfill.
 
         kind='embedding'|'hash' (needs field=) or 'location'. Returns
         {items:[{id, filepath}], total}. Page, fill each batch (which drops those rows
-        from the result), repeat until empty.
+        from the result), repeat until empty. Pass after_id=<last id seen> to walk
+        forward by id instead, skipping samples that could not be filled.
         """
-        return self.client.get_missing(self._id, kind, field=field, limit=limit, offset=offset)
+        return self.client.get_missing(self._id, kind, field=field, limit=limit, offset=offset, after_id=after_id)
 
     def project_pending(self, field_name, model=None, batch=5000):
         """Project samples that still lack 2D coords for ``field_name`` through a

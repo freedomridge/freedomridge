@@ -23,6 +23,8 @@ HEAVY_ROUTES = {
     ('GET', '/api/datasets/{id}/histogram'),
     ('GET', '/api/datasets/{id}/histogram/preview'),
     ('POST', '/api/datasets/{id}/aggregate'),
+    ('POST', '/api/datasets/{id}/versions/{version_id}/aggregate'),
+    ('POST', '/api/datasets/{id}/versions/{version_id}/samples/query'),
     ('GET', '/api/datasets/{id}/map_points'),
     ('POST', '/api/datasets/{id}/map_points'),
     ('POST', '/api/datasets/{id}/map_extent'),
@@ -33,7 +35,9 @@ HEAVY_ROUTES = {
     ('POST', '/api/datasets/{id}/embeddings/lookup'),
     ('POST', '/api/datasets/{id}/embeddings/lookup-patches'),
     ('GET', '/api/datasets/{id}/embeddings/vectors'),  # paginated vector export
+    ('POST', '/api/datasets/{id}/embeddings/vectors/by-ids'),  # vector lookup for a sample subset
     ('GET', '/api/datasets/{id}/hashes/export'),
+    ('POST', '/api/datasets/{id}/hashes/by-ids'),
     ('GET', '/api/datasets/{id}/hashes/stats'),
     ('POST', '/api/datasets/{id}/hashes/stats'),
     ('POST', '/api/datasets/{id}/hashes/duplicates'),

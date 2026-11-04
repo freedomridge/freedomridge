@@ -724,6 +724,14 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+CREATE OR REPLACE FUNCTION storage_configs_touch_updated_at()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.updated_at := clock_timestamp();
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
 CREATE OR REPLACE FUNCTION initialize_job_controls()
 RETURNS TRIGGER AS $$
 BEGIN

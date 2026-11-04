@@ -121,8 +121,11 @@ class Sample:
             sample.distance = item["distance"]
         if item.get("location"):
             sample.location = item["location"]
-        if item.get("heading") is not None:
-            sample.heading = item["heading"]
+        heading = item.get("heading")
+        if heading is None and isinstance(item.get("location"), dict):
+            heading = item["location"].get("heading")  # the samples endpoints nest it in location
+        if heading is not None:
+            sample.heading = heading
         # Dynamic array columns (inferred_tags, …) arrive as top-level keys.
         for af in cls._known_array_fields:
             if af != 'tags' and af in item and af not in sample.array_fields:

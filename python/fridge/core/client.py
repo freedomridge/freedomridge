@@ -628,6 +628,22 @@ class Client:
             return _decode_vectors_binary(resp.content)
         return resp.json()
 
+    def get_vectors_by_ids(self, dataset_id, sample_ids, field_names) -> dict:
+        """Raw vectors for specific samples: ``{sample_id: {field_name: vector}}``.
+
+        Samples (or fields) with no stored vector are absent from the result. At most 10,000 sample ids
+        per request; the caller batches.
+        """
+        resp = self.session.post(
+            f"{self.base_url}/datasets/{dataset_id}/embeddings/vectors/by-ids",
+            json={"sample_ids": list(sample_ids), "field_names": list(field_names)},
+        )
+        _raise_for_status(resp)
+        out: dict = {}
+        for item in resp.json()["items"]:
+            out.setdefault(item["sample_id"], {})[item["field_name"]] = item["vector"]
+        return out
+
     def upload_coordinates(self, dataset_id, field_name, coordinates, batch_size=5000, model_id=None):
         """Upload 2D layout coordinates in batches, independently of vector storage.
 
@@ -1285,6 +1301,21 @@ class Client:
         _raise_for_status(resp)
         return resp.json()
 
+    def get_hashes_by_ids(self, dataset_id, sample_ids, field_names) -> dict:
+        """Stored hashes for specific samples: ``{sample_id: {field_name: hash_hex}}``.
+
+        The subset counterpart to ``export_hashes``. At most 10,000 sample ids per request.
+        """
+        resp = self.session.post(
+            f"{self.base_url}/datasets/{dataset_id}/hashes/by-ids",
+            json={"sample_ids": list(sample_ids), "field_names": list(field_names)},
+        )
+        _raise_for_status(resp)
+        out: dict = {}
+        for item in resp.json()["items"]:
+            out.setdefault(item["sample_id"], {})[item["field_name"]] = item["hash_hex"]
+        return out
+
     def lookup_samples(self, dataset_id, field: str, values: list) -> dict:
         """Fast bulk lookup: metadata field values -> sample IDs.
 
@@ -1553,6 +1584,36 @@ class Client:
         _raise_for_status(resp)
         return resp.json()
 
+    def query_version_samples(
+        self,
+        dataset_id,
+        version_id,
+        filters=None,
+        fields=None,
+        limit=1000,
+        after_id=None,
+    ) -> list:
+        """One page of a version's samples matching ``filters`` (id order, keyset-paged by ``after_id``).
+
+        ``fields`` limits what the server reads; None returns whole rows.
+        """
+        payload = {"filters": filters, "fields": fields, "limit": limit, "after_id": after_id}
+        resp = self.session.post(
+            f"{self.base_url}/datasets/{dataset_id}/versions/{version_id}/samples/query",
+            json=payload,
+        )
+        _raise_for_status(resp)
+        return resp.json()["items"]
+
+    def aggregate_version(self, dataset_id, version_id, aggregations, filters=None):
+        """Like ``aggregate`` but over a version's stored samples. Returns one result dict per aggregation."""
+        resp = self.session.post(
+            f"{self.base_url}/datasets/{dataset_id}/versions/{version_id}/aggregate",
+            json={"aggregations": aggregations, "filters": filters},
+        )
+        _raise_for_status(resp)
+        return resp.json().get("results", [])
+
     # --- Embeddings ---
 
     def get_embedding_fields(self, dataset_id) -> list:
@@ -1567,10 +1628,12 @@ class Client:
         _raise_for_status(resp)
         return resp.json()
 
-    def get_missing(self, dataset_id, kind, field=None, limit=1000, offset=0) -> dict:
+    def get_missing(self, dataset_id, kind, field=None, limit=1000, offset=0, after_id=None) -> dict:
         """Samples lacking a derived artifact (kind='embedding'|'hash'|'location').
-        Returns {items: [{id, filepath}], total}."""
+        Returns {items: [{id, filepath}], total}. after_id lists only samples with id > after_id."""
         params = {"kind": kind, "limit": limit, "offset": offset}
+        if after_id is not None:
+            params["after_id"] = after_id
         if field is not None:
             params["field"] = field
         resp = self.session.get(f"{self.base_url}/datasets/{dataset_id}/missing", params=params)
@@ -1769,7 +1832,7 @@ class Client:
 _client = None
 
 
-def connect(url=None, api_token=None):
+def connect(url=None, api_token=None, timeout=None):
     """Configure the global Freedom Ridge client.
 
     Args:
@@ -1777,6 +1840,12 @@ def connect(url=None, api_token=None):
             ``http://localhost:8000/api``.
         api_token: Optional API token (Bearer). Falls back to
             ``$FRIDGE_API_TOKEN``. When set, no ``login()`` is needed.
+        timeout: Default timeout for every request, in seconds: a number or a
+            ``(connect, read)`` tuple, as ``Client`` accepts. ``None`` (the default)
+            keeps ``DEFAULT_TIMEOUT``, ``(10, 300)``. Raise it for large uploads over a
+            slow link (the request body is sent under the connect timeout) or long
+            server-side work, e.g. ``timeout=(120, 1800)``. A call that passes its own
+            timeout keeps it.
 
     Example:
         import fridge
@@ -1786,7 +1855,7 @@ def connect(url=None, api_token=None):
         fridge.get_client().login("user", "pass")
     """
     global _client
-    _client = Client(url, api_token=api_token)
+    _client = Client(url, api_token=api_token, timeout=DEFAULT_TIMEOUT if timeout is None else timeout)
     return _client
 
 

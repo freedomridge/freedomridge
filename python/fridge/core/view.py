@@ -199,6 +199,57 @@ def geo_within(polygon, field: str = "location") -> 'Condition':
     return Condition(field, "geo_polygon", [list(p) for p in polygon])
 
 
+# The stage types the app saves (frontend/lib/api.ts ViewStage). Every one carries the filter it ADDS;
+# `metadata` is display-only state (counts, labels, which panel made the stage) and not part of the query.
+_VIEW_STAGE_TYPES = ('filter', 'selection', 'map_region', 'similarity')
+
+
+def _holds_operator(node: Any, operator: str) -> bool:
+    """Does a filter tree use ``operator`` anywhere, including inside operator values (cg_self, ...)?"""
+    if isinstance(node, dict):
+        return node.get("operator") == operator or any(_holds_operator(v, operator) for v in node.values())
+    if isinstance(node, list):
+        return any(_holds_operator(v, operator) for v in node)
+    return False
+
+
+def filters_from_view_stages(view_name: str, stages: Any) -> Optional[Dict[str, Any]]:
+    """The filter the app applies for a saved view's ``viewStages``.
+
+    The app's global filter is the AND of the stages' filters, in order (FilterContext.globalFilters),
+    and the stage filters are the same filter dicts ``DatasetView`` sends to the server, so they pass
+    through verbatim, with no per-operator translation to drift out of step with the app.
+
+    Returns ``None`` for no stages (every sample). Raises ``ValueError``, naming the stage, for a stage
+    that can't be turned into a faithful filter, rather than dropping it and returning too many samples:
+    an unknown stage type, a stage without a filter, or a temporary selection (``in_selection``, a
+    server-side token that expires after 2 hours, so it would silently match nothing).
+
+    Note: a ``similarity`` stage keeps the matches as a filter, but not their rank order, which the app
+    only uses to sort its grid. Sort the view yourself (``sort_by_similarity``) if you need the order.
+    """
+    if not isinstance(stages, list):
+        raise ValueError(f"Saved view {view_name!r}: viewStages must be a list, got {type(stages).__name__}")
+    filters = []
+    for index, stage in enumerate(stages):
+        label = f"Saved view {view_name!r}, stage {index}"
+        if not isinstance(stage, dict):
+            raise ValueError(f"{label}: expected an object, got {type(stage).__name__}")
+        label += f" ({stage.get('type')!r}: {stage.get('description')!r})"
+        if stage.get("type") not in _VIEW_STAGE_TYPES:
+            raise ValueError(f"{label}: unsupported stage type; supported types are {list(_VIEW_STAGE_TYPES)}")
+        stage_filter = stage.get("filter")
+        if not isinstance(stage_filter, dict) or not stage_filter:
+            raise ValueError(f"{label}: the stage has no filter")
+        if _holds_operator(stage_filter, "in_selection"):
+            raise ValueError(
+                f"{label}: refers to a temporary selection (in_selection), a server-side token that expires "
+                "after 2 hours and would match nothing; it can't be reproduced. Re-save the view without it.",
+            )
+        filters.append(stage_filter)
+    return {"logic": "AND", "filters": filters} if filters else None
+
+
 class SampleQuery:
     """
     Query builder that provides attribute access for building conditions.
