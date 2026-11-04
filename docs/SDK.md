@@ -2052,6 +2052,18 @@ This will:
 3. Upload patch embeddings (stored as `clip_patch_2x2_r0c0`, `clip_patch_4x4_r3c2`, etc.)
 4. Run UMAP reduction so patches appear in the embeddings panel
 
+Patch search compares the selected patch with every patch at that scale. To make it an index
+search, give each tile position its own HNSW index, once per scale (16 for `4x4`). Patch search
+and find-unlabeled use them once every position of the scale has one; until then they rank every
+patch exactly, which takes seconds on a large dataset. Each index takes about as much disk as its
+vectors, and covers every dataset with that field.
+
+```python
+for r in range(4):
+    for c in range(4):
+        dataset.build_ann_index(f"clip_patch_4x4_r{r}c{c}")
+```
+
 ### Patch Similarity Search (SDK)
 
 ```python
