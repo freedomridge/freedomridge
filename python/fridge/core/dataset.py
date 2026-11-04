@@ -4,6 +4,7 @@ import os
 import re
 import warnings
 from itertools import islice
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
 
 import requests
@@ -1658,8 +1659,9 @@ class Dataset:
         image_loader=None,
         batch_size=50,
         force_register=False,
+        skip_existing=False,
     ):
-        """Compute CLIP embeddings for every sample and upload them.
+        """Compute CLIP embeddings for every sample (or just those lacking the field) and upload them.
 
         Loads each image, encodes a batch through the model, and uploads the
         vectors. All requests go through the authenticated SDK client, so this
@@ -1676,6 +1678,11 @@ class Dataset:
                 warning and the old registration stands, so text search keeps using the old
                 text tower against the vectors you just wrote.
             batch_size: images encoded/uploaded per batch (default: 50).
+            skip_existing: embed only samples that have no ``field_name`` vector yet (listed by the
+                server via ``missing('embedding', field_name)``), e.g. a nightly run after new samples
+                were added. Default False re-embeds every sample and overwrites existing vectors,
+                which is what a model change needs. Existing vectors are not checked against
+                ``model_name``, so do not use it to switch models on a field.
 
         Returns:
             Counts for total, written and dropped embeddings, plus dropped_sample_ids.
@@ -1727,7 +1734,23 @@ class Dataset:
             batch_imgs = []
             batch_ids = []
 
-        for sample in self.iter_samples(progress=True, batch_size=1000):
+        def missing_samples():
+            """Samples lacking field_name, paged by id cursor so ones that fail to load are not re-listed."""
+            after_id = None
+            while True:
+                page = self.missing("embedding", field=field_name, limit=1000, after_id=after_id)
+                if after_id is None:
+                    print(f"{page['total']} samples lack '{field_name}'")
+                if not page["items"]:
+                    return
+                yield from (SimpleNamespace(**item) for item in page["items"])
+                after_id = page["items"][-1]["id"]
+
+        if skip_existing:
+            samples = missing_samples()
+        else:
+            samples = self.iter_samples(progress=True, batch_size=1000)
+        for sample in samples:
             try:
                 img = image_loader(sample.filepath)
                 if img is None:
@@ -2449,14 +2472,15 @@ class Dataset:
         uploader still needs to fill (and powers an "N of M" signal)."""
         return self.client.get_coverage(self._id)
 
-    def missing(self, kind, field=None, limit=1000, offset=0):
+    def missing(self, kind, field=None, limit=1000, offset=0, after_id=None):
         """Samples still lacking a derived artifact, for resumable backfill.
 
         kind='embedding'|'hash' (needs field=) or 'location'. Returns
         {items:[{id, filepath}], total}. Page, fill each batch (which drops those rows
-        from the result), repeat until empty.
+        from the result), repeat until empty. Pass after_id=<last id seen> to walk
+        forward by id instead, skipping samples that could not be filled.
         """
-        return self.client.get_missing(self._id, kind, field=field, limit=limit, offset=offset)
+        return self.client.get_missing(self._id, kind, field=field, limit=limit, offset=offset, after_id=after_id)
 
     def project_pending(self, field_name, model=None, batch=5000):
         """Project samples that still lack 2D coords for ``field_name`` through a

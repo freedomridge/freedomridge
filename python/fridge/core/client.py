@@ -1567,10 +1567,12 @@ class Client:
         _raise_for_status(resp)
         return resp.json()
 
-    def get_missing(self, dataset_id, kind, field=None, limit=1000, offset=0) -> dict:
+    def get_missing(self, dataset_id, kind, field=None, limit=1000, offset=0, after_id=None) -> dict:
         """Samples lacking a derived artifact (kind='embedding'|'hash'|'location').
-        Returns {items: [{id, filepath}], total}."""
+        Returns {items: [{id, filepath}], total}. after_id lists only samples with id > after_id."""
         params = {"kind": kind, "limit": limit, "offset": offset}
+        if after_id is not None:
+            params["after_id"] = after_id
         if field is not None:
             params["field"] = field
         resp = self.session.get(f"{self.base_url}/datasets/{dataset_id}/missing", params=params)

@@ -3252,58 +3252,55 @@ def _derived_field(field: str) -> Optional[tuple[str, str]]:
 
 @router.get("/datasets/{id}/missing", dependencies=[Depends(require_dataset_access)])
 @guest_heavy
-async def dataset_missing(id: int, kind: str, field: Optional[str] = None, limit: int = 1000, offset: int = 0):
+async def dataset_missing(
+    id: int,
+    kind: str,
+    field: Optional[str] = None,
+    limit: int = 1000,
+    offset: int = 0,
+    after_id: Optional[int] = None,
+):
     """Samples that still LACK a derived artifact, for resumable backfill.
 
     kind='embedding'|'hash' (needs ?field=) or 'location'. Returns
     {items:[{id, filepath}], total}. Backfill pattern: page, fill each batch (which
     drops those rows from the result), repeat until empty.
+
+    ``after_id`` is an id cursor: only samples with ``id > after_id`` are listed, in id order, so a
+    walk that passes the last id it saw advances past samples it could not fill (an unreadable image
+    stays missing and would otherwise be returned again forever). ``total`` always counts every
+    missing sample, whatever the cursor.
     """
     limit = max(1, min(limit, 10000))
     offset = max(0, offset)
 
     if kind == "location":
-        rows = await db.fetch(
-            """
-            SELECT s.id, s.filepath FROM samples s
-            WHERE s.dataset_id = $1 AND s.location IS NULL
-            ORDER BY s.id LIMIT $2 OFFSET $3
-        """,
-            id,
-            limit,
-            offset,
-        )
-        total = await db.fetchval("SELECT count(*) FROM samples WHERE dataset_id = $1 AND location IS NULL", id) or 0
+        missing_sql = "s.dataset_id = $1 AND s.location IS NULL"
+        args: list[Any] = [id]
     elif kind in _MISSING_TABLES:
         if not field:
             raise HTTPException(status_code=422, detail=f"kind='{kind}' requires a ?field= parameter")
         table = _MISSING_TABLES[kind]  # whitelisted table name (NOT user input)
-        rows = await db.fetch(
-            f"""
-            SELECT s.id, s.filepath FROM samples s
-            WHERE s.dataset_id = $1
-              AND NOT EXISTS (SELECT 1 FROM {table} t WHERE t.sample_id = s.id AND t.field_name = $2)
-            ORDER BY s.id LIMIT $3 OFFSET $4
-        """,
-            id,
-            field,
-            limit,
-            offset,
+        missing_sql = (
+            f"s.dataset_id = $1 AND NOT EXISTS (SELECT 1 FROM {table} t WHERE t.sample_id = s.id AND t.field_name = $2)"
         )
-        total = (
-            await db.fetchval(
-                f"""
-            SELECT count(*) FROM samples s
-            WHERE s.dataset_id = $1
-              AND NOT EXISTS (SELECT 1 FROM {table} t WHERE t.sample_id = s.id AND t.field_name = $2)
-        """,
-                id,
-                field,
-            )
-            or 0
-        )
+        args = [id, field]
     else:
         raise HTTPException(status_code=422, detail="kind must be 'embedding', 'hash', or 'location'")
+
+    page_sql = missing_sql
+    page_args = list(args)
+    if after_id is not None:
+        page_args.append(after_id)
+        page_sql += f" AND s.id > ${len(page_args)}"
+    rows = await db.fetch(
+        f"SELECT s.id, s.filepath FROM samples s WHERE {page_sql} "
+        f"ORDER BY s.id LIMIT ${len(page_args) + 1} OFFSET ${len(page_args) + 2}",
+        *page_args,
+        limit,
+        offset,
+    )
+    total = await db.fetchval(f"SELECT count(*) FROM samples s WHERE {missing_sql}", *args) or 0
 
     return {"items": [{"id": r['id'], "filepath": r['filepath']} for r in rows], "total": total}
 
