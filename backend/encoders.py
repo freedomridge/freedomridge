@@ -128,9 +128,9 @@ def _encode_sync(prompt: str, checkpoint: str) -> List[float]:
         cached = _cache.get(checkpoint)
     if cached is None:
         tokenizer = CLIPTokenizerFast.from_pretrained(checkpoint)
-        # Transformers 4.57 can resolve a tower's config_class to the full
-        # CLIPConfig, which has no hidden_size. Select the text config explicitly
-        # while still loading the pretrained tower AND its projection weights.
+        # Pass the tower's own config. transformers 4.57 takes each class's config_class from
+        # its `config:` annotation in cls.__dict__, which Python 3.14's lazy annotations leave
+        # empty, so the towers inherit the full CLIPConfig and loading fails (no hidden_size).
         config = CLIPTextConfig.from_pretrained(checkpoint)
         model = CLIPTextModelWithProjection.from_pretrained(checkpoint, config=config).eval()
         with _lock:

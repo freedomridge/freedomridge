@@ -57,10 +57,11 @@ async def test_explicit_tower_config_and_cached_projected_embedding(monkeypatch,
             },
         ),
     )
-    encode = encoders.encode_text if tower == 'text' else encoders.encode_image
-    query = 'a mountain' if tower == 'text' else image_bytes()
     for _ in range(2):
-        assert await encode(query, 'clip-ViT-L-14') == [0.25, -0.5]
+        if tower == 'text':
+            assert await encoders.encode_text('a mountain', 'clip-ViT-L-14') == [0.25, -0.5]
+        else:
+            assert await encoders.encode_image(image_bytes(), 'clip-ViT-L-14') == [0.25, -0.5]
     checkpoint = 'openai/clip-vit-large-patch14'
     config_class.from_pretrained.assert_called_once_with(checkpoint)
     model_class.from_pretrained.assert_called_once_with(checkpoint, config=config)
@@ -69,7 +70,7 @@ async def test_explicit_tower_config_and_cached_projected_embedding(monkeypatch,
 
 
 def test_real_towers_match_full_clip_checkpoint(tmp_path, monkeypatch):
-    """With ML extras installed, check actual config extraction and projection weights."""
+    """With ML extras installed, check actual config extraction, projection weights and image preprocessing."""
     torch = pytest.importorskip('torch')
     transformers = pytest.importorskip('transformers')
     config = transformers.CLIPConfig(
@@ -94,20 +95,24 @@ def test_real_towers_match_full_clip_checkpoint(tmp_path, monkeypatch):
     )
     model = transformers.CLIPModel(config).eval()
     model.save_pretrained(tmp_path)
+    # A real saved processor, so the server's own resize/crop/normalize path runs.
+    processor = transformers.CLIPImageProcessor(size={'shortest_edge': 8}, crop_size={'height': 8, 'width': 8})
+    processor.save_pretrained(tmp_path)
+    image = Image.new('RGB', (12, 10), (200, 30, 30))
+    buffer = io.BytesIO()
+    image.save(buffer, format='PNG')
     text_inputs = {'input_ids': torch.tensor([[1, 3, 2]])}
-    image_inputs = {'pixel_values': torch.zeros(1, 3, 8, 8)}
+    image_inputs = processor(images=image, return_tensors='pt')
     monkeypatch.setattr(
         transformers.CLIPTokenizerFast,
         'from_pretrained',
         lambda *args: lambda *args, **kwargs: text_inputs,
     )
-    monkeypatch.setattr(
-        transformers.CLIPImageProcessor,
-        'from_pretrained',
-        lambda *args: lambda *args, **kwargs: image_inputs,
-    )
     with torch.no_grad():
         expected_text = model.get_text_features(**text_inputs)[0].tolist()
         expected_image = model.get_image_features(**image_inputs)[0].tolist()
     assert encoders._encode_sync('a mountain', str(tmp_path)) == pytest.approx(expected_text)
-    assert encoders._encode_image_sync(image_bytes(), str(tmp_path)) == pytest.approx(expected_image)
+    assert encoders._encode_image_sync(buffer.getvalue(), str(tmp_path)) == pytest.approx(expected_image)
+    # Each tower loaded with its own config, not the parent CLIPConfig.
+    assert type(encoders._cache[str(tmp_path)][1].config) is transformers.CLIPTextConfig
+    assert type(encoders._image_cache[str(tmp_path)][1].config) is transformers.CLIPVisionConfig
