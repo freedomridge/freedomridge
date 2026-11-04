@@ -4,6 +4,51 @@ Freedom Ridge has one version for the server, the web app and the Python SDK (th
 file), following [Semantic Versioning](https://semver.org). A release lists **upgrade notes** when
 it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
 
+## 1.2.0 (2026-11-04)
+
+### Added
+
+- SDK: `dataset.delete_embeddings(field, sample_ids)` and `view.delete_embeddings(field)` delete one
+  embedding field's vectors for chosen samples, and `dataset.delete_embedding_field(field)` deletes
+  them for every sample, as resumable background jobs (`POST /datasets/{id}/embeddings/{field}/delete`,
+  administrators only). Samples, metadata, the field's map, model record and search index stay. The
+  cleared samples are listed by `missing("embedding", field=...)` for a refill. A view without a filter
+  and a filter whose conditions have no value are refused rather than taken as every sample.
+- SDK: `compute_embeddings(model_source="huggingface")` computes embeddings with a Hugging Face image
+  model such as DINOv3 (`facebook/dinov3-vitl16-pretrain-sat493m`), using the model's own preprocessing
+  and its pooled output. Install the `huggingface-embeddings` extra, which adds torchvision.
+- The Docker deployment guide has a **Sizing** section: disk per sample, vector and search-index entry,
+  RAM for search and for the job runner, and where heavy computation runs.
+- `CLAUDE.md`, the known-issues list and three design records are now part of the published source.
+
+### Changed
+
+- Patch search and find-unlabeled use one search index per tile position once every position of the
+  scale has one (`build_ann_index("clip_patch_4x4_r0c0")` and so on, 16 for `4x4`). On a 41,620-image
+  dataset a search took 40–120 ms instead of 1–1.5 s; on a small server it was 15–30 s before. Results
+  are approximate, like similarity search (top-50 recall about 0.99). Without the indexes, every patch
+  is ranked exactly, as before.
+- `fridge.compute_image_metrics()` and `compute_metrics()` are about 2.4× faster. The values are
+  identical.
+- Uploading vectors of another dimension to a field that has no vectors left but still has its search
+  index is refused with 422 naming the index, instead of failing with a server error.
+- Backup retention prunes only `freedomridge_*.sql.gz` dumps.
+- Upgrading: how to clear Docker's old build cache after an upgrade.
+
+### Fixed
+
+- A new user's home page stayed blank after the required password change until the page was reloaded.
+
+### Upgrade notes
+
+- No database migration.
+- For fast patch search, build the per-position indexes once per patch scale after upgrading, for
+  example for `4x4`:
+  `python -c 'from fridge import Dataset, connect; connect(); ds = Dataset.from_id(DATASET_ID); [print(ds.build_ann_index(f"clip_patch_4x4_r{r}c{c}")) for r in range(4) for c in range(4)]'`
+  (`Dataset.from_id`, because `Dataset("name")` creates a dataset whose name is mistyped).
+  Each index takes about as much disk as its vectors and covers every dataset with that field; on a
+  workstation each took about 18 s for 55,000 vectors.
+
 ## 1.1.0 (2026-11-04)
 
 ### Added
