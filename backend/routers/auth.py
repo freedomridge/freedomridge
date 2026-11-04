@@ -243,18 +243,27 @@ async def get_optional_user(request: Request) -> Optional[dict]:
     valid auth is present. Used by endpoints that allow unauthenticated access
     in some cases (e.g., the sample media proxy for global datasets).
 
-    Any 401 — no cookie, OR an expired/invalid session or token — degrades to
-    anonymous (returns None) so a stale cookie doesn't hard-fail public/global
-    datasets and force a logout. Only a 403 (inactive account) is propagated.
+    A 401 from no credentials, or from an expired/invalid session cookie, degrades
+    to anonymous (returns None) so a stale cookie doesn't hard-fail public/global
+    datasets and force a logout. An invalid or expired Bearer token is NOT
+    degraded: the client explicitly presented a credential, and serving it as
+    anonymous makes a script with a bad token see empty results instead of an
+    error. A 403 (inactive account) is always propagated.
     """
     try:
         return await get_current_user(request)
     except HTTPException as e:
-        # Any failed/absent authentication → anonymous. Propagate 403 (e.g.
-        # inactive account), which is an authorization decision, not "who are you".
-        if e.status_code == 401:
+        # Propagate 403 (e.g. inactive account), which is an authorization decision,
+        # not "who are you".
+        if e.status_code == 401 and not _has_bearer_token(request):
             return None
         raise
+
+
+def _has_bearer_token(request: Request) -> bool:
+    """Whether the request presents an API token (the same check get_current_user makes)."""
+    auth_header = request.headers.get("Authorization")
+    return bool(auth_header and auth_header.startswith("Bearer "))
 
 
 def get_allowed_roles(required_role: str) -> list[str]:
