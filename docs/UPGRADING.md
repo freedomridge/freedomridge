@@ -41,6 +41,11 @@ From the checkout the server runs, with `docker-compose.prod.yml`:
 
 Machines that use the Python SDK should install it from the same release.
 
+Each build leaves layers in Docker's build cache, which Docker trims once it passes its
+garbage-collection limits (`docker buildx inspect` shows them). To free the disk space sooner, run
+`docker builder prune --filter until=24h` soon after an upgrade. It removes what only earlier
+builds used and keeps the new build's cache, so the next upgrade still builds quickly.
+
 ## Going back
 
 Stop the services and restore the backup from step 2 into an empty database
