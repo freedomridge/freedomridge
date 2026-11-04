@@ -371,8 +371,8 @@ async def resume_bulk_job(job_id: UUID, user: dict = Depends(get_current_user)):
     if job['kind'] != bulk_jobs.KIND:
         raise HTTPException(400, 'This job does not support bulk resume')
     operation = await db.fetchval("SELECT args->>'operation' FROM jobs WHERE id=$1", job_id)
-    if operation == 'delete' and user['role'] != 'admin':
-        raise HTTPException(403, 'Only an administrator can resume sample deletion')
+    if operation in ('delete', 'delete_embeddings') and user['role'] != 'admin':
+        raise HTTPException(403, 'Only an administrator can resume a deletion')
     try:
         return await bulk_jobs.resume(db.pool, job_id)
     except QueueBusy as error:

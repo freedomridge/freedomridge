@@ -17,6 +17,8 @@ from .job import Job
 # Generous read timeout because some endpoints (large queries, histograms)
 # are slow on multi-million-row datasets; override per-Client if needed.
 DEFAULT_TIMEOUT = (10, 300)
+# Ids per delete_embeddings request; matches the server's target-staging batch.
+DELETE_EMBEDDINGS_IDS_PER_REQUEST = 50000
 
 
 def _decode_vectors_binary(buf: bytes) -> Dict[str, Any]:
@@ -1009,6 +1011,59 @@ class Client:
             timeout=(10, 30),
         )
         return self._bulk_result(response, wait=wait, timeout=timeout)
+
+    def delete_embeddings(
+        self,
+        dataset_id,
+        field_name,
+        sample_ids=None,
+        *,
+        filters=None,
+        selection_token=None,
+        excluded_ids=None,
+        wait=True,
+        timeout=1800,
+    ):
+        """Delete one embedding field's vectors for a target (admin only).
+
+        ``sample_ids`` are sent DELETE_EMBEDDINGS_IDS_PER_REQUEST at a time, each as its own server job run to
+        completion before the next; the result is ``{'deleted': n}`` over all of them. With more than one
+        request ``wait=False`` is refused, because there is no single job to return. Without ``sample_ids``,
+        ``filters`` or ``selection_token`` the call raises; ``filters={}`` targets every sample of the dataset.
+        """
+        url = f'{self.base_url}/datasets/{dataset_id}/embeddings/{field_name}/delete'
+        if sample_ids is None and filters is None and selection_token is None:
+            raise ValueError('Give sample_ids, filters or selection_token (filters={} for every sample)')
+        if sample_ids is not None and (filters is not None or selection_token is not None):
+            raise ValueError('Give either sample_ids or filters/selection_token, not both')
+        sample_ids = [int(sample_id) for sample_id in sample_ids or []]
+        if not sample_ids and filters is None and selection_token is None:
+            return {'deleted': 0}  # an empty id list selects nothing
+        chunks = [
+            sample_ids[start : start + DELETE_EMBEDDINGS_IDS_PER_REQUEST]
+            for start in range(0, len(sample_ids), DELETE_EMBEDDINGS_IDS_PER_REQUEST)
+        ] or [[]]
+        if len(chunks) > 1 and not wait:
+            raise ValueError(
+                f'{len(sample_ids)} sample_ids need {len(chunks)} requests, which wait=False cannot return as one '
+                'Job; use wait=True, or call delete_embeddings with at most '
+                f'{DELETE_EMBEDDINGS_IDS_PER_REQUEST} ids per call',
+            )
+        deleted = 0
+        for chunk in chunks:
+            payload = {
+                'sample_ids': chunk,
+                # The ids are the exact membership: the target filter is only for an id-free request.
+                'filters': None if chunk else filters,
+                'selection_token': selection_token,
+                'excluded_ids': excluded_ids or [],
+            }
+            response = self.session.post(url, json=payload, timeout=(10, 30))
+            result = self._bulk_result(response, wait=wait, timeout=timeout)
+            if len(chunks) == 1:
+                return result
+            deleted += result['deleted']
+        return {'deleted': deleted}
 
     def resume_bulk_job(self, job_id, *, wait=True, timeout=1800):
         response = self.session.post(f'{self.base_url}/jobs/{job_id}/resume', timeout=(10, 30))

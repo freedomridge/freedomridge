@@ -1163,6 +1163,16 @@ Tag and metadata targets accept `sample_ids`, `selection_token`, `excluded_ids`,
 and a frozen `filters` object; `{}` explicitly selects the dataset. Delete requires
 one of these targets and uses the same administrator policy as single delete.
 
+`POST /datasets/{id}/embeddings/{field}/delete` takes the same target and administrator policy and
+submits a `bulk_mutation` job with operation `delete_embeddings`, whose result is `{deleted: n}`. Each unit
+locks its samples `FOR NO KEY UPDATE`, takes the lifecycle gate and the dataset rank fence (20261020)
+shared like sample deletion, and deletes the field's rows from `embeddings`; coordinates, projection
+queue, rank rows and counts follow by cascade and trigger. Nothing else is removed, also when the field is
+emptied: its `embedding_map_state` and `embedding_viz_meta` rows stay. Only `filters: {}` selects the whole
+field: a non-empty filter that compiles to match every sample (its conditions have no value, so
+`parse_filter_node` gives `TRUE`) is refused with 400. Resuming it requires an administrator, like sample
+deletion.
+
 Submission polls the lifecycle gate for up to two seconds before capturing the maximum
 committed sample ID. Ingest allocates IDs under the shared gate, so submission waits
 briefly for an uncommitted low-ID writer, then returns a retryable 409 if it is still

@@ -1,5 +1,6 @@
 """Finite view mutations. A cancelled job retains its committed prefix and frozen target."""
 
+import re
 from contextlib import suppress
 from datetime import datetime
 
@@ -22,6 +23,22 @@ BATCH_SIZE = 1000
 STAGE_BATCH_SIZE = 50000
 POLICY = job_queue.JobPolicy(max_unit_seconds=15, max_failures=5, retry_seconds=2)
 _SAMPLE_IDS = range(-(2**31), 2**31)
+
+
+def _count_key(operation):
+    return {'delete': 'deleted_count', 'delete_embeddings': 'deleted'}.get(operation, 'updated_count')
+
+
+def _matches_every_sample(predicate):
+    """True when a compiled filter cannot exclude a sample. parse_filter_node compiles a condition it can't
+    apply (an empty group, a comparison without a value) to TRUE, so a filter of only such conditions, or an
+    OR with one of them, targets the whole dataset. Compiled filters contain no other TRUE."""
+    previous = None
+    while predicate != previous:
+        previous = predicate
+        predicate = re.sub(r'\(\s*TRUE\s*\)', 'TRUE', predicate)
+        predicate = re.sub(r'\bTRUE\s+AND\s+TRUE\b', 'TRUE', predicate)
+    return predicate.strip() == 'TRUE' or re.search(r'\bTRUE\s+OR\b|\bOR\s+TRUE\b', predicate) is not None
 
 
 def _require_sample_ids(values):
@@ -130,6 +147,13 @@ async def submit(pool, dataset_id, user_id, operation, payload):
         else ('TRUE', 1)
     )
     predicate = predicate.replace("AND rs.created_at > statement_timestamp() - interval '2 hours'", '')
+    if operation == 'delete_embeddings' and payload.get('filters') and _matches_every_sample(predicate):
+        # Only filters == {} deletes a whole field (delete_embedding_field); a filter is never a silent everything.
+        raise HTTPException(
+            400,
+            'The filter has a condition without a value, so it would select every sample. Complete the filter, '
+            'or delete the whole field with filters {} (delete_embedding_field)',
+        )
     try:
         async with job_queue._transaction(pool) as connection:
             # Serialize with index builds and reverts before taking the lifecycle gate.
@@ -197,7 +221,7 @@ async def submit(pool, dataset_id, user_id, operation, payload):
                     or id_filter
                     or updates is not None
                     or (
-                        operation in ('set', 'tag', 'delete')
+                        operation in ('set', 'tag', 'delete', 'delete_embeddings')
                         and payload.get('filters') is None
                         and not payload.get('selection_token')
                     ),
@@ -323,6 +347,14 @@ async def _mutate(connection, job, ids, removed_fields):
         removed_fields.update(key for row in removed for key in row['metadata'])
         await invalidate_values(connection, dataset_id, names)
         return len(removed)
+    if operation == 'delete_embeddings':
+        # Cascades remove the vectors' coordinates and queued projections; triggers keep map rank rows and counts.
+        status = await connection.execute(
+            'DELETE FROM embeddings WHERE field_name=$1 AND sample_id=ANY($2::int[])',
+            request['field_name'],
+            ids,
+        )
+        return int(status.split()[-1])
     if operation == 'tag':
         col = request['field_name'].replace('"', '""')
         status = await connection.execute(
@@ -501,7 +533,7 @@ def handler(pool):
 
             count = checkpoint.get('affected', 0)
             operation = request['operation']
-            result = {'deleted_count' if operation == 'delete' else 'updated_count': count}
+            result = {_count_key(operation): count}
             if operation in ('set', 'tag'):
                 result['message'] = f"Updated {request.get('field_name', 'metadata')} for {count} samples"
             if operation == 'rename':
@@ -523,17 +555,15 @@ def handler(pool):
                 )
         checkpoint.update(cursor=ids[-1], examined=checkpoint.get('examined', 0) + len(ids), last_unit_rows=len(ids))
 
-        progress = {
-            'deleted_count' if request['operation'] == 'delete' else 'updated_count': checkpoint.get('affected', 0),
-        }
+        progress = {_count_key(request['operation']): checkpoint.get('affected', 0)}
 
         async def publish(connection):
             if not await connection.fetchval('SELECT pg_try_advisory_xact_lock_shared(20261016,$1)', job['dataset_id']):
                 raise job_queue.QueueContended('Waiting for field definitions')
-            # Deleted samples cascade to map coordinates, whose triggers take the per-dataset rank
+            # Deleted samples and vectors cascade to map coordinates, whose triggers take the per-dataset rank
             # fence (20261020) shared. Take it first, as they would: a full rank rebuild holds
             # 20261016 shared and then 20261020 exclusive, so waiting inside the cascade can deadlock.
-            if request['operation'] == 'delete' and not await connection.fetchval(
+            if request['operation'] in ('delete', 'delete_embeddings') and not await connection.fetchval(
                 'SELECT pg_try_advisory_xact_lock_shared(20261020,$1)',
                 job['dataset_id'],
             ):
@@ -557,7 +587,7 @@ def handler(pool):
             # PostgreSQL rechecks row predicates after waiting for a concurrent updater.
             # Nonmatches never get row locks (and never dirty their heap pages). Only delete changes
             # a key: edits leave FK writers (embeddings, hashes, scores) for matching rows unblocked.
-            lock = 'FOR UPDATE' if request['operation'] == 'delete' else 'FOR NO KEY UPDATE'
+            lock = 'FOR UPDATE' if request['operation'] == 'delete' else 'FOR NO KEY UPDATE'  # vectors keep sample keys
             selected = await connection.fetch(f'SELECT id FROM samples WHERE {where} ORDER BY id {lock}', *args)
             # Re-evaluate subqueries in a fresh snapshot too, retaining only locked rows.
             args[n - 2] = [row['id'] for row in selected]
@@ -569,7 +599,7 @@ def handler(pool):
             if removed_fields:
                 checkpoint['removed_fields'] = sorted(removed_fields)
             checkpoint['affected'] = checkpoint.get('affected', 0) + affected
-            progress['deleted_count' if request['operation'] == 'delete' else 'updated_count'] = checkpoint['affected']
+            progress[_count_key(request['operation'])] = checkpoint['affected']
 
         return StepResult(
             checkpoint=checkpoint,

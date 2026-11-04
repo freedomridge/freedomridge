@@ -825,6 +825,34 @@ class Dataset:
         target = sample_ids._bulk_target() if hasattr(sample_ids, '_bulk_target') else {'sample_ids': sample_ids}
         return self.client.bulk_delete_samples(self._id, wait=wait, timeout=timeout, **target)
 
+    def delete_embeddings(self, field, sample_ids, *, wait=True, timeout=1800):
+        """Delete the vectors of embedding field ``field`` for ``sample_ids`` in resumable chunks (admin only).
+        Samples and their metadata are untouched; the cleared samples are listed by
+        ``missing('embedding', field=field)`` and vectors of the same dimension can be uploaded again.
+
+        ``sample_ids``: a list of ids (sent in requests of 50,000) or a view. Use ``delete_embedding_field``
+        for every sample. With wait=True returns ``{'deleted': n}``; with wait=False the Job (one request's
+        worth of ids at most).
+        """
+        if sample_ids is None:
+            raise TypeError(
+                'delete_embeddings needs sample_ids (a list or a view); '
+                'use delete_embedding_field to delete the whole field',
+            )
+        if hasattr(sample_ids, '_bulk_target'):
+            if sample_ids._dataset.id != self._id:
+                raise ValueError(
+                    f'The view belongs to dataset {sample_ids._dataset.id}, not to this dataset ({self._id})',
+                )
+            return sample_ids.delete_embeddings(field, wait=wait, timeout=timeout)
+        return self.client.delete_embeddings(self._id, field, sample_ids, wait=wait, timeout=timeout)
+
+    def delete_embedding_field(self, field, *, wait=True, timeout=1800):
+        """Delete the vectors of embedding field ``field`` for every sample of the dataset (admin only).
+        Only the vectors go: map state, the field's model record and ANN index stay. Returns ``{'deleted': n}``,
+        or the Job with wait=False."""
+        return self.client.delete_embeddings(self._id, field, filters={}, wait=wait, timeout=timeout)
+
     def delete_sample(self, sample_id: int) -> dict:
         """Delete a sample from this dataset."""
         return self.client.delete_sample(self._id, sample_id)

@@ -27,6 +27,7 @@ from ..coordinates import (
 from ..database import db
 from ..diskspace import COORDINATE_ROW_BYTES, INGEST_ROW_BYTES, estimate_viz_rank_bytes, require_free_space
 from ..field_registry import lock_field_lifecycle, map_swap_holder, map_swap_refusal
+from ..index_jobs import ann_index_name
 from ..map_artifacts import LocalArtifactStore
 from ..request_limits import guest_heavy
 from .auth import require_role
@@ -255,6 +256,27 @@ async def validate_embedding_dims(field_dims: Dict[str, Set[int]]) -> None:
             "SELECT vector_dims(vector) FROM embeddings WHERE field_name = $1 AND vector IS NOT NULL LIMIT 1",
             field_name,
         )
+        if established is None:
+            # No vectors remain (a new field, or every vector was deleted), but a per-field ANN index keeps the
+            # dimension it was built for and rejects any other on insert.
+            indexed = await db.fetchval(
+                """SELECT substring(pg_get_indexdef(i.indexrelid) from 'vector\\((\\d+)\\)')::int
+                   FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid JOIN pg_am am ON am.oid = c.relam
+                   WHERE i.indrelid = 'embeddings'::regclass AND am.amname = 'hnsw'
+                     AND position($1 in pg_get_indexdef(i.indexrelid)) > 0
+                   LIMIT 1""",
+                f"field_name = '{field_name}'",
+            )
+            if indexed is not None and indexed != incoming:
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        f"Embedding dimension mismatch for field '{field_name}': got {incoming}, but the field's "
+                        f"ANN index ({ann_index_name(field_name)}) was built for {indexed}-d vectors and no vectors "
+                        f"remain to show the field's dimension. Remove the index (Indexes panel, admin) before "
+                        f"uploading {incoming}-d vectors, or use a distinct field_name."
+                    ),
+                )
         if established is not None and established != incoming:
             raise HTTPException(
                 status_code=422,
