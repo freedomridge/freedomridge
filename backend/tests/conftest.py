@@ -11,6 +11,8 @@ import pytest
 from scripts.db_test_safety import UnsafeTestDatabase, endpoint, require_container, require_test_url
 
 IDENTITY_SQL = 'SELECT system_identifier FROM pg_control_system()'
+# Where the backend points in a unit-only run: a local port nothing listens on, so a connection fails at once.
+UNIT_ONLY_DATABASE_URL = 'postgres://fridge-unit-tests:unused@127.0.0.1:1/no_database'
 _patch = pytest.MonkeyPatch()
 
 
@@ -35,7 +37,11 @@ def pytest_sessionstart(session):
     dsn = os.getenv('FRIDGE_TEST_POSTGRES_DSN')
     container = os.getenv('FRIDGE_TEST_POSTGRES_CONTAINER')
     if not dsn and not container:
-        return  # Unit-only runs need no PostgreSQL server.
+        # Unit-only runs need no PostgreSQL server, and must not reach one: the backend's default
+        # DATABASE_URL is the local dev database (localhost:5432), as may be a DATABASE_URL in the shell.
+        # Backend modules capture this at import time, so pin it before collection.
+        _patch.setenv('DATABASE_URL', UNIT_ONLY_DATABASE_URL)
+        return
     try:
         if not dsn or not container:
             raise UnsafeTestDatabase('supply both FRIDGE_TEST_POSTGRES_DSN and FRIDGE_TEST_POSTGRES_CONTAINER')

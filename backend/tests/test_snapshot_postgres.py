@@ -1,4 +1,4 @@
-"""Run with FRIDGE_TEST_POSTGRES_SOCKET pointing to an isolated PostgreSQL/PostGIS server."""
+"""Run with FRIDGE_TEST_POSTGRES_DSN and FRIDGE_TEST_POSTGRES_CONTAINER (a disposable PostGIS server)."""
 
 import asyncio
 import os
@@ -15,21 +15,15 @@ from backend.database import Database, init_connection
 from backend.routers import datasets, versions
 from backend.schema_check import function_statements
 
-pytestmark = pytest.mark.skipif(
-    not (os.getenv('FRIDGE_TEST_POSTGRES_SOCKET') or os.getenv('FRIDGE_TEST_POSTGRES_DSN')),
-    reason='Requires an isolated PostgreSQL/PostGIS test server',
-)
+# Only the DSN that conftest verified against the disposable container: no other way to name a server.
+pytestmark = pytest.mark.skipif(not os.getenv('FRIDGE_TEST_POSTGRES_DSN'), reason='Disposable PostgreSQL required')
 
 
 @pytest.fixture
 def snapshot_database(monkeypatch):
     def run(scenario):
         async def execute():
-            connection_args = (
-                {'dsn': os.environ['FRIDGE_TEST_POSTGRES_DSN']}
-                if os.getenv('FRIDGE_TEST_POSTGRES_DSN')
-                else {'host': os.environ['FRIDGE_TEST_POSTGRES_SOCKET'], 'user': 'postgres', 'database': 'postgres'}
-            )
+            connection_args = {'dsn': os.environ['FRIDGE_TEST_POSTGRES_DSN']}
             admin = await asyncpg.connect(**connection_args)
             namespace = 'snapshot_test_' + uuid.uuid4().hex
             database = Database()
