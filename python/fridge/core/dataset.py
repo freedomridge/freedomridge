@@ -336,6 +336,69 @@ def _exposure_clipping(gray):
     return float((g <= 5).mean() * 100.0), float((g >= 250).mean() * 100.0)
 
 
+def _require_metric_dependencies():
+    try:
+        import cv2  # noqa: F401
+        import numpy  # noqa: F401
+        from PIL import ImageStat  # noqa: F401
+    except ImportError:
+        raise ImportError(
+            "Please install: pip install opencv-python-headless numpy Pillow  (or: pip install \"freedomridge[all]\")",
+        )
+
+
+def compute_image_metrics(img):
+    """Image-quality metrics for one PIL image, exactly as ``Dataset.compute_metrics`` stores them.
+
+    Returns a dict with the keys ``brightness``, ``blurriness``, ``contrast``, ``entropy``,
+    ``salt_and_pepper``, ``saturation``, ``pct_underexposed`` and ``pct_overexposed`` (all floats).
+    A non-RGB image is converted to RGB first. Use this to compute the same metrics before upload.
+
+    Requires ``opencv-python-headless``, ``numpy`` and ``Pillow`` (``pip install "freedomridge[all]"``).
+    """
+    _require_metric_dependencies()
+    import cv2
+    import numpy as np
+    from PIL import ImageStat
+
+    if img.mode != "RGB":
+        img = img.convert("RGB")
+    gray = img.convert("L")
+
+    stat = ImageStat.Stat(img)
+    try:
+        r, g, b = stat.mean
+    except ValueError:
+        r = g = b = stat.mean[0]
+    brightness = float(np.sqrt(0.241 * r * r + 0.691 * g * g + 0.068 * b * b))
+
+    blurriness = float(cv2.Laplacian(np.array(gray), cv2.CV_64F).var())
+
+    hist, _ = np.histogram(cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR), bins=256, range=(0, 256))
+    contrast = float(np.max(np.where(hist > 0)) - np.min(np.where(hist > 0)))
+
+    gray_pixels = np.array(gray)
+    salt = gray_pixels >= 244
+    pepper = gray_pixels <= 10
+    kernel = np.ones((2, 2), np.uint8)
+    salt_open = cv2.morphologyEx(salt.astype(np.uint8), cv2.MORPH_OPEN, kernel)
+    pepper_open = cv2.morphologyEx(pepper.astype(np.uint8), cv2.MORPH_OPEN, kernel)
+    isolated = np.sum(salt & ~salt_open.astype(np.uint8)) + np.sum(pepper & ~pepper_open.astype(np.uint8))
+    salt_and_pepper = float(isolated / gray_pixels.size * 100)
+
+    under, over = _exposure_clipping(gray)
+    return {
+        "brightness": brightness,
+        "blurriness": blurriness,
+        "contrast": contrast,
+        "entropy": float(img.entropy()),
+        "salt_and_pepper": salt_and_pepper,
+        "saturation": _saturation(img),
+        "pct_underexposed": under,
+        "pct_overexposed": over,
+    }
+
+
 def _default_s3_image_loader():
     """Returns a callable that downloads images from S3 or local paths.
 
@@ -1547,47 +1610,9 @@ class Dataset:
             # Custom loader for local files:
             dataset.compute_metrics(image_loader=lambda p: Image.open(p))
         """
-        try:
-            import cv2
-            import numpy as np
-            from PIL import ImageStat
-        except ImportError:
-            raise ImportError(
-                "Please install: pip install opencv-python-headless numpy Pillow  "
-                "(or: pip install \"freedomridge[all]\")",
-            )
-
+        _require_metric_dependencies()
         if image_loader is None:
             image_loader = _default_s3_image_loader()
-
-        def _brightness(img):
-            stat = ImageStat.Stat(img)
-            try:
-                r, g, b = stat.mean
-            except ValueError:
-                r = g = b = stat.mean[0]
-            return float(np.sqrt(0.241 * r * r + 0.691 * g * g + 0.068 * b * b))
-
-        def _blurriness(gray):
-            lap = cv2.Laplacian(np.array(gray), cv2.CV_64F)
-            return float(lap.var())
-
-        def _contrast(img):
-            hist, _ = np.histogram(cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR), bins=256, range=(0, 256))
-            return float(np.max(np.where(hist > 0)) - np.min(np.where(hist > 0)))
-
-        def _entropy(img):
-            return float(img.entropy())
-
-        def _salt_and_pepper(gray):
-            g = np.array(gray)
-            salt = g >= 244
-            pepper = g <= 10
-            k = np.ones((2, 2), np.uint8)
-            s_open = cv2.morphologyEx(salt.astype(np.uint8), cv2.MORPH_OPEN, k)
-            p_open = cv2.morphologyEx(pepper.astype(np.uint8), cv2.MORPH_OPEN, k)
-            isolated = np.sum(salt & ~s_open.astype(np.uint8)) + np.sum(pepper & ~p_open.astype(np.uint8))
-            return float(isolated / g.size * 100)
 
         processed = 0
         skipped = 0
@@ -1616,18 +1641,7 @@ class Dataset:
                 errors += 1
                 continue
 
-            gray = img.convert("L")
-            under, over = _exposure_clipping(gray)
-            pending[sample.id] = {
-                "brightness": _brightness(img),
-                "blurriness": _blurriness(gray),
-                "contrast": _contrast(img),
-                "entropy": _entropy(img),
-                "salt_and_pepper": _salt_and_pepper(gray),
-                "saturation": _saturation(img),
-                "pct_underexposed": under,
-                "pct_overexposed": over,
-            }
+            pending[sample.id] = compute_image_metrics(img)
             processed += 1
             if len(pending) >= batch_size:
                 _flush()

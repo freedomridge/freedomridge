@@ -1166,6 +1166,10 @@ ds.compute_metrics()   # brightness / blurriness / contrast / entropy / salt_and
                        # saturation / pct_underexposed / pct_overexposed
 ```
 
+To compute the same metrics for one PIL image yourself (for example before upload), use
+`fridge.compute_image_metrics(img)`. It returns the dict of eight floats that `compute_metrics()`
+stores per sample, and needs the same optional dependencies (`pip install "freedomridge[all]"`).
+
 ## Array Fields (Dynamic Tag-Like Fields)
 
 Freedom Ridge supports creating any number of tag-like array fields beyond the built-in `tags`. These are stored as native PostgreSQL `TEXT[]` columns with GIN indexes — same performance as tags.

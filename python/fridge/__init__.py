@@ -1,5 +1,5 @@
 from .core.client import connect, get_client
-from .core.dataset import Dataset
+from .core.dataset import Dataset, compute_image_metrics
 from .core.geometry3d import Calibration
 from .core.job import Job, JobCancelled, JobError, JobFailed, JobTimeout
 from .core.labels import (
@@ -43,6 +43,8 @@ __all__ = [
     'JobFailed',
     'JobCancelled',
     'JobTimeout',
+    # Image metrics
+    'compute_image_metrics',
     # Query building
     'SampleQuery',
     'Condition',
