@@ -54,6 +54,7 @@ from ..request_limits import guest_heavy
 from ..security import private_guest, production
 from ..validation import clean_name, clean_tags
 from .auth import get_current_user, get_optional_user, require_role
+from .embeddings import _validate_field_name as is_embedding_field_name
 from .embeddings import validate_embedding_dims
 
 router = APIRouter()
@@ -6625,6 +6626,30 @@ async def bulk_delete_samples(id: int, request: BulkTargetRequest, user: dict = 
     if not request.sample_ids and not request.selection_token and request.filters is None:
         raise HTTPException(400, 'Provide sample_ids, selection_token, or filters ({} for all samples)')
     return await _bulk_response(id, user, 'delete', request.model_dump())
+
+
+@router.post('/datasets/{id}/embeddings/{field_name}/delete', dependencies=[Depends(require_dataset_access)])
+async def bulk_delete_embeddings(
+    id: int,
+    field_name: str,
+    request: BulkTargetRequest,
+    user: dict = Depends(require_role('admin')),
+):
+    """Delete one embedding field's vectors for a captured target, as a resumable bulk job.
+
+    The target is the one bulk sample deletion takes: ``sample_ids``, a ``selection_token`` or ``filters``
+    (``{}`` for every sample of the dataset). Samples and their metadata are untouched. Re-uploading vectors
+    of the field's dimension afterwards is accepted and they are queued for map projection.
+
+    Nothing else changes, also when every vector of the field is deleted: the dataset's map state and map point
+    counts for the field stay. If the field is refilled by a different model under the same name, re-fit the
+    map or use a new field name. The field-global model record and ANN index stay too; see docs/SDK.md.
+    """
+    if not is_embedding_field_name(field_name):
+        raise HTTPException(status_code=400, detail=f"Invalid embedding field name: {field_name!r}")
+    if not request.sample_ids and not request.selection_token and request.filters is None:
+        raise HTTPException(400, 'Provide sample_ids, selection_token, or filters ({} for all samples)')
+    return await _bulk_response(id, user, 'delete_embeddings', {**request.model_dump(), 'field_name': field_name})
 
 
 class BulkTagRequest(BulkTargetRequest):

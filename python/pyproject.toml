@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "freedomridge"
-version = "1.1.0"
+version = "1.2.0"
 license = "MIT"
 description = "Python SDK for Freedom Ridge Dataset Explorer"
 dependencies = [
@@ -19,6 +19,9 @@ dependencies = [
 # joblib: save/load the fitted UMAP model (save_model_path / project_pending).
 # psutil: RAM-aware auto fit-size (optional; falls back to /proc/meminfo).
 embeddings = ["sentence-transformers", "umap-learn", "joblib", "psutil"]
+# Transformers image models for compute_embeddings(model_source="huggingface"), e.g. DINOv3.
+# torchvision: their fast image processors need it (DINOv3 has no other kind).
+huggingface-embeddings = ["torch", "torchvision", "transformers>=4.57.1,<5"]
 # Patch embeddings (compute_patch_embeddings)
 patch-embeddings = ["torch", "transformers>=4.57.1,<5"]
 # Image quality metrics (compute_metrics)
@@ -34,6 +37,7 @@ all = [
     "joblib",
     "psutil",
     "torch",
+    "torchvision",
     "transformers>=4.57.1,<5",
     "opencv-python-headless",
     "imagehash",

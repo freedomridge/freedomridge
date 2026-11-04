@@ -47,7 +47,7 @@ def run_tests():
 
     # Clean up any leftover test datasets
     for d in client.get_datasets():
-        if d['name'] in ('sdk-test', 'sdk-test-sort', 'sdk-test-ann', 'sdk-test-ver'):
+        if d['name'] in ('sdk-test', 'sdk-test-sort', 'sdk-test-ann', 'sdk-test-ver', 'sdk-test-delemb'):
             client.delete_dataset(d['id'])
 
     ds = Dataset('sdk-test')
@@ -1858,6 +1858,140 @@ def run_tests():
     @test("filtered search: cleanup")
     def _():
         client.delete_dataset(ds_ann._id)
+
+    _()
+
+    # --- DELETE EMBEDDINGS ---
+    # One field's vectors are deleted for chosen samples (in several requests), the cleared samples are listed
+    # as missing, new vectors are accepted, queued for projection, found by search and scored by uniqueness.
+    print("\n--- Delete embeddings ---")
+
+    ds_del = Dataset('sdk-test-delemb')
+    n_del = 300
+    del_field = 'delemb'
+    del_ids: list = []
+    del_chosen: list = []
+
+    def _del_vectors(ids, sign):
+        import random
+
+        rnd = random.Random(11)
+        return [
+            {
+                'sample_id': sid,
+                'field_name': del_field,
+                'vector': [sign * (1.0 + rnd.random() * 0.1)] + [rnd.random() * 0.1 for _ in range(7)],
+            }
+            for sid in ids
+        ]
+
+    def _del_missing_ids():
+        ids: list = []
+        after = None
+        while True:
+            page = ds_del.missing('embedding', field=del_field, limit=50, after_id=after)
+            if not page['items']:
+                return ids
+            ids.extend(item['id'] for item in page['items'])
+            after = ids[-1]
+
+    @test("delete embeddings: seed vectors, map coordinates and the ANN index")
+    def _():
+        result = ds_del.add_samples(
+            [
+                Sample(filepath=f's3://test/del_{i}.jpg', metadata={'grp': i % 3, 'uniqueness_delemb': 0.5})
+                for i in range(n_del)
+            ],
+        )
+        del_ids.extend(result['ids'])
+        del_chosen.extend(del_ids[:120])
+        client.upload_embeddings(ds_del._id, _del_vectors(del_ids, 1.0))
+        client.upload_coordinates(
+            ds_del._id,
+            del_field,
+            [{'sample_id': sid, 'x': float(i), 'y': float(i % 7)} for i, sid in enumerate(del_ids)],
+        )
+        client.recompute_viz_rank(ds_del._id, del_field, full=True)
+        ds_del.build_ann_index(del_field)
+
+    _()
+
+    @test("delete_embeddings(ids) in several requests reports the count and lists exactly those samples as missing")
+    def _():
+        from fridge.core import client as client_module
+
+        per_request = client_module.DELETE_EMBEDDINGS_IDS_PER_REQUEST
+        client_module.DELETE_EMBEDDINGS_IDS_PER_REQUEST = 50
+        try:
+            result = ds_del.delete_embeddings(del_field, del_chosen)
+        finally:
+            client_module.DELETE_EMBEDDINGS_IDS_PER_REQUEST = per_request
+        assert result == {'deleted': 120}, result
+        assert ds_del.missing('embedding', field=del_field)['total'] == 120
+        assert _del_missing_ids() == sorted(del_chosen)
+        again = ds_del.delete_embeddings(del_field, del_chosen)
+        assert again == {'deleted': 0}, f"deleting again is a no-op: {again}"
+        # Sample metadata is untouched, and only the chosen samples lost their map position.
+        assert len(ds_del.filter(uniqueness_delemb=0.5)) == n_del, "metadata of every sample is untouched"
+        located = client.lookup_embedding_coordinates(ds_del._id, del_ids, field=del_field)['points']
+        assert len(located) == n_del - 120, f"{len(located)} positions remain"
+
+    _()
+
+    @test("re-uploaded vectors are queued for projection, found by search, and scored by uniqueness")
+    def _():
+        client.upload_embeddings(ds_del._id, _del_vectors(del_chosen, -1.0))
+        assert ds_del.missing('embedding', field=del_field)['total'] == 0
+        pending = client.get_vectors(ds_del._id, field_name=del_field, limit=1000, pending_only=True)['items']
+        assert sorted(item['sample_id'] for item in pending) == sorted(del_chosen), "only the new vectors are pending"
+        assert not client.lookup_embedding_coordinates(ds_del._id, del_chosen, field=del_field)['points']
+        probe = _del_vectors(del_chosen[:1], -1.0)[0]['vector']
+        new_side = client.similarity_search(ds_del._id, vector=probe, field_name=del_field, limit=120)
+        assert sorted(r['id'] if isinstance(r, dict) else r.id for r in new_side) == sorted(del_chosen)
+        old_probe = _del_vectors(del_ids[-1:], 1.0)[0]['vector']
+        old_side = client.similarity_search(ds_del._id, vector=old_probe, field_name=del_field, limit=180)
+        assert sorted(r['id'] if isinstance(r, dict) else r.id for r in old_side) == sorted(del_ids[120:]), (
+            "the deleted vectors must not be found"
+        )
+        scored = ds_del.compute_uniqueness(del_field, k=3, metadata_field='uniq_delemb')
+        assert scored['count'] == n_del, scored
+
+    _()
+
+    @test("DatasetView.delete_embeddings deletes the vectors of the view's samples")
+    def _():
+        group = ds_del.filter(grp=1)
+        expected = len(group)
+        assert expected > 0
+        assert group.delete_embeddings(del_field) == {'deleted': expected}
+        assert ds_del.missing('embedding', field=del_field)['total'] == expected
+        job = ds_del.filter(grp=2).delete_embeddings(del_field, wait=False)
+        assert job.wait()['deleted'] == len(ds_del.filter(grp=2))
+
+    _()
+
+    @test("whole-field delete clears every vector; the field's dimension stays tied to its ANN index")
+    def _():
+        result = ds_del.delete_embedding_field(del_field)
+        assert result == {'deleted': 100}, f"groups 1 and 2 were already deleted: {result}"
+        assert ds_del.missing('embedding', field=del_field)['total'] == n_del
+        try:
+            client.upload_embeddings(
+                ds_del._id,
+                [{'sample_id': del_ids[0], 'field_name': del_field, 'vector': [1.0] * 4}],
+            )
+        except Exception as error:
+            assert 'ANN index' in str(error), error
+        else:
+            raise AssertionError("a vector of another dimension must be refused while the ANN index exists")
+        client.upload_embeddings(ds_del._id, _del_vectors(del_ids, 1.0))
+        assert ds_del.missing('embedding', field=del_field)['total'] == 0
+
+    _()
+
+    @test("delete embeddings: cleanup")
+    def _():
+        client.delete_dataset(ds_del._id)
 
     _()
 

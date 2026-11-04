@@ -12,6 +12,7 @@ from urllib.parse import urlparse
 import httpx
 from fastapi import APIRouter, HTTPException, Request
 
+from .. import index_jobs
 from ..access import check_dataset_access
 from ..database import db
 from ..encoders import encode_image, encode_text, has_image_tower, has_text_tower
@@ -38,6 +39,8 @@ _DATA_URL_RE = re.compile(r"^data:image/[\w.+-]+;base64,", re.IGNORECASE)
 _PATCH_RC_RE = re.compile(r'_r(\d+)c(\d+)$')
 # Full patch field_name -> grid scale + position, e.g. clip_patch_8x8_r2c3.
 _PATCH_SCALE_RC_RE = re.compile(r'_patch_(\d+)x(\d+)_r(\d+)c(\d+)$')
+# A field name that is safe to write into SQL as a literal (index builds refuse any other name).
+_SAFE_FIELD_NAME = re.compile(r'^[a-zA-Z0-9_]+$')
 
 
 def _tile_rect(field_name: str):
@@ -450,6 +453,81 @@ async def search_by_image(req: ImageSearchRequest, request: Request):
     return await vector_search(search_req, request)
 
 
+def _indexed_grid(base_field: str, scale: str, indexed: set[str]) -> list[str] | None:
+    """Every position field of the scale's grid ({base}_patch_{scale}_r{row}c{col}), or None
+    unless each one has its own HNSW index. A grid with more positions than there are indexed
+    fields can't be fully indexed, so it is never spelled out."""
+    rows, cols = (int(x) for x in scale.split('x'))
+    if rows * cols > len(indexed):
+        return None
+    fields = [f"{base_field}_patch_{scale}_r{row}c{col}" for row in range(rows) for col in range(cols)]
+    return fields if all(field in indexed for field in fields) else None
+
+
+async def _nearest_patches(
+    conn,
+    *,
+    fields: list[str] | None,
+    like_pattern: str,
+    dim: int,
+    where_clause: str,
+    args: list[Any],
+    limit: int,
+    limit_param: str,
+    per_image: int,
+):
+    """The nearest patches to the vector in $1, at most `per_image` per image, nearest first,
+    `limit` rows. `where_clause` filters embeddings `e` joined to samples `s`.
+
+    `fields` (or None) are the patch position fields to search, each with its own HNSW index.
+    Then each position's index finds its `limit` nearest patches and those are merged. Merging
+    loses nothing: a patch that makes the result has fewer than `limit` nearer patches at its own
+    position, because each of them is on a different image whose best patch ranks ahead of it.
+    The answer is as approximate as each index's search, as in vector_search. Without indexes
+    (or for limit > 1000, beyond hnsw.ef_search), every patch matching `like_pattern` is ranked
+    exactly.
+    """
+    indexed = bool(fields) and limit <= 1000 and all(_SAFE_FIELD_NAME.match(f) for f in fields or ())
+    if indexed:
+        dist = f"(e.vector::vector({dim}) <=> $1::vector({dim}))"
+        distances = "\nUNION ALL\n".join(
+            f"""(SELECT e.sample_id, e.field_name, {dist} AS distance
+                 FROM embeddings e JOIN samples s ON e.sample_id = s.id
+                 WHERE e.field_name = '{field}' AND {where_clause}
+                 ORDER BY {dist} LIMIT {limit_param})"""
+            for field in fields or ()
+        )
+    else:
+        args = [*args, like_pattern]
+        distances = f"""SELECT e.sample_id, e.field_name, (e.vector <=> $1) AS distance
+            FROM embeddings e JOIN samples s ON e.sample_id = s.id
+            WHERE {where_clause} AND e.field_name LIKE ${len(args)}"""
+    query = f"""
+        WITH distances AS ({distances}),
+        ranked AS (
+            SELECT *, ROW_NUMBER() OVER (PARTITION BY sample_id ORDER BY distance) as rn
+            FROM distances
+        )
+        SELECT r.sample_id, r.field_name, r.distance,
+               s.filepath, s.metadata, s.media_type, s.tags,
+               ST_AsGeoJSON(s.location)::json as location
+        FROM ranked r
+        JOIN samples s ON r.sample_id = s.id
+        WHERE r.rn <= {per_image}
+        ORDER BY r.distance ASC
+        LIMIT {limit_param}
+    """
+    async with conn.transaction():
+        if indexed:
+            # As in vector_search: ef_search >= limit, and an iterative scan so filters applied
+            # after the index (the dataset, the user's filters) still leave `limit` rows.
+            await conn.execute("SELECT '[0]'::vector(1)")
+            await conn.execute(f"SET LOCAL hnsw.ef_search = {min(1000, max(limit * 2, 100))}")
+            await conn.execute("SET LOCAL hnsw.iterative_scan = relaxed_order")
+            await conn.execute(f"SET LOCAL hnsw.max_scan_tuples = {_HNSW_MAX_SCAN_TUPLES}")
+        return await conn.fetch(query, *args)
+
+
 @router.post("/search/patches")
 @guest_heavy
 async def patch_search(req: PatchSearchRequest, request: Request):
@@ -470,7 +548,7 @@ async def patch_search(req: PatchSearchRequest, request: Request):
     # treatment as the vector_search seed lookups above.
     vector_row = await db.fetchrow(
         """
-        SELECT e.vector FROM embeddings e JOIN samples s ON e.sample_id = s.id
+        SELECT e.vector, vector_dims(e.vector) AS dim FROM embeddings e JOIN samples s ON e.sample_id = s.id
         WHERE e.sample_id = $1 AND e.field_name = $2 AND s.dataset_id = $3
     """,
         req.sample_id,
@@ -484,18 +562,14 @@ async def patch_search(req: PatchSearchRequest, request: Request):
         )
     vector_str = vector_row['vector']
 
-    # Match all patches at the same scale: field_name LIKE 'clip_patch_4x4_%'
-    scale_pattern = f"{req.field_name}_patch_{req.patch_scale}_%"
-
     # Exclude only the exact query patch (same sample + same position), not the whole sample.
     # Other patches on the same image are valid results.
-    args = [vector_str, req.limit, req.dataset_id, scale_pattern, req.sample_id, query_field]
+    args: list[Any] = [vector_str, req.limit, req.dataset_id, req.sample_id, query_field]
     conditions = [
         "s.dataset_id = $3",
-        "e.field_name LIKE $4",
-        "NOT (e.sample_id = $5 AND e.field_name = $6)",
+        "NOT (e.sample_id = $4 AND e.field_name = $5)",
     ]
-    arg_idx = 7
+    arg_idx = 6
 
     if req.filters:
         from .datasets import (
@@ -522,31 +596,21 @@ async def patch_search(req: PatchSearchRequest, request: Request):
 
     where_clause = " AND ".join(conditions)
 
-    # Find best matching patch per sample (compute distance once, rank, join)
-    rows = await db.fetch(
-        f"""
-        WITH distances AS (
-            SELECT e.sample_id, e.field_name,
-                   (e.vector <=> $1) as distance
-            FROM embeddings e
-            JOIN samples s ON e.sample_id = s.id
-            WHERE {where_clause}
-        ),
-        ranked AS (
-            SELECT *, ROW_NUMBER() OVER (PARTITION BY sample_id ORDER BY distance) as rn
-            FROM distances
+    # Best matching patch per image, among all patches at the same scale.
+    dim = vector_row['dim']
+    async with db.pool.acquire() as conn:
+        indexed = await index_jobs.cosine_hnsw_fields(conn, dim) if dim else set()
+        rows = await _nearest_patches(
+            conn,
+            fields=_indexed_grid(req.field_name, req.patch_scale, indexed),
+            like_pattern=f"{req.field_name}_patch_{req.patch_scale}_%",
+            dim=dim,
+            where_clause=where_clause,
+            args=args,
+            limit=req.limit,
+            limit_param="$2",
+            per_image=1,
         )
-        SELECT r.sample_id, r.field_name, r.distance,
-               s.filepath, s.metadata, s.media_type, s.tags,
-               ST_AsGeoJSON(s.location)::json as location
-        FROM ranked r
-        JOIN samples s ON r.sample_id = s.id
-        WHERE r.rn = 1
-        ORDER BY r.distance ASC
-        LIMIT $2
-    """,
-        *args,
-    )
 
     # Parse row/col from field_name like "clip_patch_4x4_r2c3"
     results = []
@@ -579,15 +643,16 @@ async def object_to_patch_search(req: ObjectToPatchSearchRequest, request: Reque
     Object crops (clip_obj) and patch tiles ({base}_patch_NxN_*) are the same CLIP space, so
     the object's vector probes the tiles directly. We take the best few tiles per parent
     image, then keep the best tile whose region does NOT overlap (IoU > threshold) an existing
-    object box on that same parent — the uncovered, unlabeled candidate. Exact scan over the
-    patch space (the LIKE-all-positions pattern can't use a per-field HNSW), like /search/patches.
+    object box on that same parent — the uncovered, unlabeled candidate. Searched like
+    /search/patches: one indexed search per tile position when every position of the searched
+    scales has its HNSW index, otherwise an exact scan over the patch space.
     """
     user = await get_optional_user(request)
     await check_dataset_access(req.dataset_id, user)
 
     seed = await db.fetchrow(
         """
-        SELECT e.vector FROM embeddings e JOIN samples s ON e.sample_id = s.id
+        SELECT e.vector, vector_dims(e.vector) AS dim FROM embeddings e JOIN samples s ON e.sample_id = s.id
         WHERE e.sample_id = $1 AND e.field_name = 'clip_obj' AND s.dataset_id = $2
         """,
         req.object_sample_id,
@@ -608,9 +673,9 @@ async def object_to_patch_search(req: ObjectToPatchSearchRequest, request: Reque
         patch_pattern = f"{req.base_field}_patch_{req.patch_scale}_%"
     else:
         patch_pattern = f"{req.base_field}_patch_%"
-    args: list[Any] = [vector_str, req.dataset_id, patch_pattern]
-    conditions = ["s.dataset_id = $2", "e.field_name LIKE $3"]
-    arg_idx = 4
+    args: list[Any] = [vector_str, req.dataset_id]
+    conditions = ["s.dataset_id = $2"]
+    arg_idx = 3
     if req.filters:
         from .datasets import (
             SAMPLES_JOIN_FIELD_MAPPING,
@@ -631,32 +696,41 @@ async def object_to_patch_search(req: ObjectToPatchSearchRequest, request: Reque
         if filter_sql and filter_sql != "TRUE":
             conditions.append(filter_sql)
     where_clause = " AND ".join(conditions)
-    args.append(max(req.limit * 4, 50))
+    candidate_limit = max(req.limit * 4, 50)
+    args.append(candidate_limit)
     limit_param = f"${arg_idx}"
 
-    rows = await db.fetch(
-        f"""
-        WITH distances AS (
-            SELECT e.sample_id, e.field_name, (e.vector <=> $1) as distance
-            FROM embeddings e
-            JOIN samples s ON e.sample_id = s.id
-            WHERE {where_clause}
-        ),
-        ranked AS (
-            SELECT *, ROW_NUMBER() OVER (PARTITION BY sample_id ORDER BY distance) as rn
-            FROM distances
+    dim = seed['dim']
+    async with db.pool.acquire() as conn:
+        indexed = await index_jobs.cosine_hnsw_fields(conn, dim) if dim else set()
+        fields: list[str] | None = None
+        if req.patch_scale:
+            fields = _indexed_grid(req.base_field, req.patch_scale, indexed)
+        elif any(field.startswith(f"{req.base_field}_patch_") for field in indexed):
+            # All scales: the dataset's own tile fields decide, so a scale without indexes is
+            # never skipped (it sends the search to the exact scan instead).
+            present = [
+                r['field_name']
+                for r in await conn.fetch(
+                    "SELECT DISTINCT e.field_name FROM embeddings e JOIN samples s ON e.sample_id = s.id "
+                    "WHERE s.dataset_id = $1 AND e.field_name LIKE $2",
+                    req.dataset_id,
+                    patch_pattern,
+                )
+            ]
+            fields = present if present and all(field in indexed for field in present) else None
+        # The best 3 tiles per parent image, so a covered best tile still leaves candidates.
+        rows = await _nearest_patches(
+            conn,
+            fields=fields,
+            like_pattern=patch_pattern,
+            dim=dim,
+            where_clause=where_clause,
+            args=args,
+            limit=candidate_limit,
+            limit_param=limit_param,
+            per_image=3,
         )
-        SELECT r.sample_id, r.field_name, r.distance,
-               s.filepath, s.metadata, s.media_type, s.tags,
-               ST_AsGeoJSON(s.location)::json as location
-        FROM ranked r
-        JOIN samples s ON r.sample_id = s.id
-        WHERE r.rn <= 3
-        ORDER BY r.distance ASC
-        LIMIT {limit_param}
-        """,
-        *args,
-    )
 
     # Existing labeled boxes per candidate parent image, to exclude already-covered tiles.
     parent_ids = list({r['sample_id'] for r in rows})

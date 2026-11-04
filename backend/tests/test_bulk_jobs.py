@@ -46,6 +46,18 @@ async def step(database, job, *, release=False):
     )
 
 
+async def step_retrying_contention(database, job):
+    """step(), run again while it meets QueueContended ("retry this operation"), as the runner does: it defers
+    the job without counting a failure and runs the unit again from the same checkpoint. A concurrent ingest
+    can hold a lock past the queue's 100 ms lock timeout on a busy machine."""
+    for _ in range(50):
+        try:
+            return await step(database, job)
+        except job_queue.QueueContended:
+            await asyncio.sleep(0.05)
+    pytest.fail('The unit stayed contended through 50 attempts')
+
+
 async def finish(database, job=None):
     job = job or await claim(database)
     for _ in range(10000):
@@ -112,12 +124,12 @@ def test_500k_bounded_units_with_concurrent_ingest(registry_database, operation)
         while job['state'] != 'succeeded':
             if units % 10 == 0:
                 job, arrival = await asyncio.gather(
-                    step(database, job),
+                    step_retrying_contention(database, job),
                     ingest([{}], prefix=f'arrival-{units}'),
                 )
                 later.extend(arrival['ids'])
             else:
-                job = await step(database, job)
+                job = await step_retrying_contention(database, job)
             assert job['checkpoint'].get('last_unit_rows', 0) <= 1000
             units += 1
         assert units >= 501

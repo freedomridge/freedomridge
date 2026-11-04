@@ -11,7 +11,8 @@ imports, patch embeddings, guest checks, backup recovery and teardown.
 
 Use Docker with Compose v2, a public DNS hostname, inbound 80/443 and outbound
 access for images, ACME and model weights. Plan for at least 8 GiB of RAM: the
-backend alone uses about 3.4 GiB with search warm, so 16 GiB gives headroom. The full
+backend alone uses about 3.4 GiB with search warm, so 16 GiB gives headroom. Larger
+datasets need more; see [Sizing](#sizing). The full
 four-dataset CPU import takes a day or more on a small host; see the import plan in
 the AWS guide. The four-dataset demo needs about 40 GiB of OS/build space, 300 GiB
 of data and 30 GiB of cache; see the AWS guide's assumptions. CPU-only torch and
@@ -56,6 +57,47 @@ and `TLS_STATE_PATH` to the provisioned EBS directories. Do not change paths or
 The backend runs as uid 1000; custom cache bind mounts need writable `s3`, `crop`,
 `composite` and `huggingface` subdirectories owned by that uid. Never put backups
 or secrets inside `DATA_VOLUME_PATH`.
+
+## Sizing
+
+The 8 GiB minimum covers the application and the four-dataset demo. Beyond that, the database
+grows with samples, embedding vectors and their search (HNSW) indexes. These figures were measured
+on a development database with 4.5 million samples and 9.7 million vectors (PostgreSQL 18,
+pgvector 0.8):
+
+| Per item | Disk |
+|---|---|
+| Sample, with its metadata and indexes | about 4–6 KB (more with large metadata) |
+| Stored vector, 512 dimensions | about 2.2 KB |
+| Stored vector, 1024 dimensions | about 4.2 KB |
+| Search index entry, 512 dimensions | about 2.7 KB |
+| Search index entry, 1024 dimensions | about 8.1 KB (one entry per 8 KB page) |
+
+For example, 3.8 million samples with a 512-dimension CLIP field and a 1024-dimension DINOv3
+field, both indexed, take about 22 GB of samples, 24 GB of vectors and 41 GB of indexes: roughly
+90 GB of database before map coordinates, backups and the image cache.
+
+**RAM** is the 8 GiB minimum plus room for the search indexes you use most. Search reads only a
+small part of an index, so a single search works from SSD. Jobs that search once per sample, such
+as `compute_uniqueness` and duplicate detection, are much faster when the field's index fits in
+memory: about 10 GB for the CLIP field above and 31 GB for the DINOv3 one.
+
+**The job runner** is one container that runs up to `JOB_WORKER_SLOTS` jobs at once (default 3),
+sharing the host's memory with PostgreSQL and the backend. Bulk edits and deletions work in
+chunks of 1,000 samples; each vector search-index (HNSW) build uses 256 MB of PostgreSQL
+maintenance memory.
+Server-side map re-fits run one at a time in a memory-capped process that leaves 20% of the
+host's RAM free. A re-fit holds every vector of the field plus its fit sample: about
+`vectors × dimensions × 4` bytes + `dimensions × 3.5 MB` + 1 GiB, or about 20 GiB for the
+DINOv3 field above. The cap needs `systemd-run`, which the job-runner image does not include, so
+in this Docker deployment the runner skips re-fits with "Memory containment is not available".
+Build maps with the SDK instead (`compute_visualization`).
+
+**Heavy computation runs where the SDK runs.** Embeddings, image metrics and maps are computed by
+the SDK on the machine that calls it, which only uploads the results. Run those from a machine
+with the RAM, CPU or GPU for them; the server does not need to be sized for that work. A separate
+compute worker that claims jobs from the server is designed but not built yet (see
+[Jobs](architecture/JOBS.md)).
 
 ## TLS, startup and admin login
 
@@ -130,7 +172,7 @@ docker compose -f docker-compose.prod.yml up -d --no-deps --force-recreate backe
 | backend | API, media access checks, lazy CPU CLIP text/image inference |
 | db | PostgreSQL 18, PostGIS and pgvector |
 | worker | Hourly pruning of media caches only |
-| job-runner | Background jobs (index builds, statistics, map re-fits, schedules) and expired demo-account cleanup |
+| job-runner | Background jobs (index builds, statistics, map re-fits where supported, schedules) and expired demo-account cleanup; see [Sizing](#sizing) |
 | backup | Daily logical dumps, two local copies, optional S3 copy |
 | certbot | On-demand certificate issuance/renewal; `tls` profile |
 | umap-worker | Optional `umap` profile; requires separately fitted models |

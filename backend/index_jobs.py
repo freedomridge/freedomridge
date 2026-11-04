@@ -368,17 +368,35 @@ def ann_index_name(field: str) -> str:
     return name[:54] + "_" + hashlib.sha1(field.encode()).hexdigest()[:8]
 
 
+# indisvalid matters: a failed CREATE INDEX CONCURRENTLY leaves an INVALID index that pg_indexes
+# still lists.
+_VALID_HNSW_INDEXDEFS = (
+    "SELECT ix.indexdef FROM pg_indexes ix "
+    "JOIN pg_class c ON c.relname = ix.indexname AND c.relnamespace = ix.schemaname::regnamespace "
+    "JOIN pg_index i ON i.indexrelid = c.oid "
+    "WHERE ix.tablename = 'embeddings' AND ix.indexdef LIKE '%hnsw%' AND i.indisvalid"
+)
+# The field of a per-field index, as PostgreSQL prints its predicate: WHERE (field_name = 'clip'::text)
+_INDEXED_FIELD = re.compile(r"WHERE \(field_name = '([a-zA-Z0-9_]+)'::text\)$")
+
+
 async def valid_hnsw_index(connection, field: str, dim: int) -> bool:
-    # indisvalid matters: a failed CREATE INDEX CONCURRENTLY leaves an INVALID index that
-    # pg_indexes still lists.
-    rows = await connection.fetch(
-        "SELECT ix.indexdef FROM pg_indexes ix "
-        "JOIN pg_class c ON c.relname = ix.indexname AND c.relnamespace = ix.schemaname::regnamespace "
-        "JOIN pg_index i ON i.indexrelid = c.oid "
-        "WHERE ix.tablename = 'embeddings' AND ix.indexdef LIKE '%hnsw%' AND i.indisvalid",
-    )
+    rows = await connection.fetch(_VALID_HNSW_INDEXDEFS)
     need_dim, need_field = f"vector({dim})", f"field_name = '{field}'"
     return any(need_dim in row['indexdef'] and need_field in row['indexdef'] for row in rows)
+
+
+async def cosine_hnsw_fields(connection, dim: int) -> set[str]:
+    """Fields with a valid per-field cosine HNSW index at dimension `dim`: the ones an
+    `ORDER BY vector::vector(dim) <=> ...` query on `field_name = '<field>'` can use."""
+    rows = await connection.fetch(_VALID_HNSW_INDEXDEFS)
+    fields = set()
+    for row in rows:
+        indexdef = row['indexdef']
+        match = _INDEXED_FIELD.search(indexdef)
+        if match and f"::vector({dim})" in indexdef and 'vector_cosine_ops' in indexdef:
+            fields.add(match.group(1))
+    return fields
 
 
 def ann_handler(pool):

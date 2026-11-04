@@ -162,6 +162,7 @@ export function UserProvider({ children }: { children: React.ReactNode }) {
     }
 
     async function changePassword(current: string, newPass: string) {
+        const wasRequired = !!user?.must_change_password;
         const res = await fetch('/api/auth/change-password', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -181,6 +182,9 @@ export function UserProvider({ children }: { children: React.ReactNode }) {
 
         // Refresh user to clear must_change_password flag
         await checkAuth();
+        // While the change was required every API but auth answered 403, so the open page's queries
+        // (the home page's dataset list) failed. Refetch them now that they can succeed.
+        if (wasRequired) void queryClient.resetQueries();
     }
 
     return (

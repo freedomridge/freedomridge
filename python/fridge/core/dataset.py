@@ -322,11 +322,25 @@ def _media_metadata(img, filepath):
 
 
 def _saturation(img):
-    """Mean saturation (0-255) via PIL's HSV conversion — washed-out/grayscale images
-    score low, vivid ones high."""
+    """Mean saturation (0-255) of an RGB image, as PIL's HSV conversion gives it — washed-out/grayscale
+    images score low, vivid ones high."""
     import numpy as np
 
-    return float(np.asarray(img.convert("HSV"))[:, :, 1].mean())
+    return float(_hsv_saturation(np.asarray(img)).mean())
+
+
+def _hsv_saturation(rgb):
+    """The S channel of ``Image.convert("HSV")`` for an RGB uint8 array, identical value for value but
+    faster than converting the whole image. PIL computes each pixel's S as
+    ``(int)((float)(max - min) / (float)max * 255.0)``, and 0 where ``max == min``."""
+    import numpy as np
+
+    r, g, b = rgb[..., 0], rgb[..., 1], rgb[..., 2]
+    high = np.maximum(np.maximum(r, g), b)
+    low = np.minimum(np.minimum(r, g), b)
+    # max - min is 0 wherever max is, so skipping those divisions leaves the 0 PIL gives them.
+    ratio = np.divide(high - low, high, out=np.zeros(high.shape, np.float32), where=high != 0, dtype=np.float32)
+    return (ratio.astype(np.float64) * 255.0).astype(np.uint8)
 
 
 def _exposure_clipping(gray):
@@ -376,8 +390,10 @@ def compute_image_metrics(img):
 
     blurriness = float(cv2.Laplacian(np.array(gray), cv2.CV_64F).var())
 
-    hist, _ = np.histogram(cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR), bins=256, range=(0, 256))
-    contrast = float(np.max(np.where(hist > 0)) - np.min(np.where(hist > 0)))
+    # The spread of the channel values: what the last minus the first non-empty bin of a 256-bin
+    # histogram gives, without the histogram (which took most of this function's time).
+    rgb = np.asarray(img)
+    contrast = float(int(rgb.max()) - int(rgb.min()))
 
     gray_pixels = np.array(gray)
     salt = gray_pixels >= 244
@@ -395,7 +411,7 @@ def compute_image_metrics(img):
         "contrast": contrast,
         "entropy": float(img.entropy()),
         "salt_and_pepper": salt_and_pepper,
-        "saturation": _saturation(img),
+        "saturation": float(_hsv_saturation(rgb).mean()),
         "pct_underexposed": under,
         "pct_overexposed": over,
     }
@@ -808,6 +824,34 @@ class Dataset:
         """Delete IDs or a captured view in resumable chunks (admin only)."""
         target = sample_ids._bulk_target() if hasattr(sample_ids, '_bulk_target') else {'sample_ids': sample_ids}
         return self.client.bulk_delete_samples(self._id, wait=wait, timeout=timeout, **target)
+
+    def delete_embeddings(self, field, sample_ids, *, wait=True, timeout=1800):
+        """Delete the vectors of embedding field ``field`` for ``sample_ids`` in resumable chunks (admin only).
+        Samples and their metadata are untouched; the cleared samples are listed by
+        ``missing('embedding', field=field)`` and vectors of the same dimension can be uploaded again.
+
+        ``sample_ids``: a list of ids (sent in requests of 50,000) or a view. Use ``delete_embedding_field``
+        for every sample. With wait=True returns ``{'deleted': n}``; with wait=False the Job (one request's
+        worth of ids at most).
+        """
+        if sample_ids is None:
+            raise TypeError(
+                'delete_embeddings needs sample_ids (a list or a view); '
+                'use delete_embedding_field to delete the whole field',
+            )
+        if hasattr(sample_ids, '_bulk_target'):
+            if sample_ids._dataset.id != self._id:
+                raise ValueError(
+                    f'The view belongs to dataset {sample_ids._dataset.id}, not to this dataset ({self._id})',
+                )
+            return sample_ids.delete_embeddings(field, wait=wait, timeout=timeout)
+        return self.client.delete_embeddings(self._id, field, sample_ids, wait=wait, timeout=timeout)
+
+    def delete_embedding_field(self, field, *, wait=True, timeout=1800):
+        """Delete the vectors of embedding field ``field`` for every sample of the dataset (admin only).
+        Only the vectors go: map state, the field's model record and ANN index stay. Returns ``{'deleted': n}``,
+        or the Job with wait=False."""
+        return self.client.delete_embeddings(self._id, field, filters={}, wait=wait, timeout=timeout)
 
     def delete_sample(self, sample_id: int) -> dict:
         """Delete a sample from this dataset."""
@@ -1800,15 +1844,17 @@ class Dataset:
         batch_size=50,
         force_register=False,
         skip_existing=False,
+        model_source="sentence-transformers",
     ):
-        """Compute CLIP embeddings for every sample (or just those lacking the field) and upload them.
+        """Compute image embeddings for every sample (or just those lacking the field) and upload them.
 
         Loads each image, encodes a batch through the model, and uploads the
         vectors. All requests go through the authenticated SDK client, so this
         works on private (non-global) datasets.
 
         Args:
-            model_name: sentence-transformers model id (default: "clip-ViT-B-32").
+            model_name: model id for ``model_source`` (default: the sentence-transformers CLIP
+                "clip-ViT-B-32").
             field_name: embedding field to write (default: "clip").
             image_loader: Callable(filepath) -> PIL.Image. If None, uses the
                 default loader (handles s3://, /media/s3/, /media/, and local
@@ -1823,6 +1869,10 @@ class Dataset:
                 were added. Default False re-embeds every sample and overwrites existing vectors,
                 which is what a model change needs. Existing vectors are not checked against
                 ``model_name``, so do not use it to switch models on a field.
+            model_source: "sentence-transformers" (default; vectors L2-normalized) or "huggingface":
+                a Transformers image model such as DINOv3, with its vectors as the model outputs them
+                (see fridge.core.image_encoders.load_image_encoder). Needs
+                ``pip install "freedomridge[huggingface-embeddings]"``.
 
         Returns:
             Counts for total, written and dropped embeddings, plus dropped_sample_ids.
@@ -1833,20 +1883,21 @@ class Dataset:
             # local files only:
             from PIL import Image
             dataset.compute_embeddings(image_loader=lambda p: Image.open(p))
-        """
-        try:
-            from sentence_transformers import SentenceTransformer
-        except ImportError:
-            raise ImportError(
-                "Please install sentence-transformers: pip install sentence-transformers Pillow "
-                "(or: pip install \"freedomridge[all]\")",
+            # DINOv3 (its CLS token), for the samples that don't have it yet:
+            dataset.compute_embeddings(
+                model_name="facebook/dinov3-vitl16-pretrain-sat493m",
+                field_name="dinov3",
+                model_source="huggingface",
+                skip_existing=True,
             )
+        """
+        from .image_encoders import load_image_encoder
 
         if image_loader is None:
             image_loader = _default_s3_image_loader()
 
         print(f"Loading model {model_name}...")
-        model = SentenceTransformer(model_name)
+        encode = load_image_encoder(model_name, model_source)
 
         processed = 0
         written_total = 0
@@ -1860,7 +1911,7 @@ class Dataset:
             nonlocal processed, written_total, dropped_total, batch_imgs, batch_ids
             if not batch_imgs:
                 return
-            vectors = model.encode(batch_imgs, normalize_embeddings=True)
+            vectors = encode(batch_imgs)
             payload = [
                 {"sample_id": sid, "vector": vec.tolist(), "field_name": field_name}
                 for sid, vec in zip(batch_ids, vectors)

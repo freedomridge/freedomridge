@@ -8,6 +8,8 @@ tests would have caught them):
     that makes objects work like patches
   - image -> objects pivot (parent_id IN selected images)
   - object -> patch cross-search (find-unlabeled) with region-level IoU exclusion
+  - patch and find-unlabeled search give the exact answers with and without per-position
+    HNSW indexes
 
 Runs against a live backend; creates + destroys an 'objgrain-test' dataset.
 
@@ -15,6 +17,8 @@ Usage (requires FRIDGE_TEST_URL pointing to a disposable backend):
     python -m fridge.test_objects
 """
 
+import math
+import random
 import sys
 import traceback
 
@@ -493,6 +497,153 @@ def run_tests():
                     assert got == set(sample_ids), f"tile r{r}c{c}: coords for all 16 samples expected, got {len(got)}"
         finally:
             client.delete_dataset(pv._id)
+
+    print("\n--- patch searches: same answers with one HNSW index per tile position ---")
+
+    @test("patch and find-unlabeled search match a brute-force answer before, during and after indexing")
+    def _():
+        # Own field names: per-field HNSW indexes are global, so no other test's fields get one.
+        base = 'idxclip'
+        positions = [f'{base}_patch_2x2_r{r}c{c}' for r in range(2) for c in range(2)]
+        rng = random.Random(11)
+
+        def vec():
+            # 4-d: the same space as clip_obj (find-unlabeled's seed field), whose dimension is server-wide.
+            return [round(rng.uniform(-1, 1), 3) for _ in range(4)]
+
+        def cosine_distance(a, b):
+            dot = sum(x * y for x, y in zip(a, b))
+            return 1 - dot / (math.sqrt(sum(x * x for x in a)) * math.sqrt(sum(y * y for y in b)))
+
+        for d in client.get_datasets():
+            if d['name'] in ('idxpatch-big', 'idxpatch-small'):
+                client.delete_dataset(d['id'])
+        big = Dataset('idxpatch-big', description='indexed patch search integration')
+        small = Dataset('idxpatch-small', description='indexed patch search integration')
+        try:
+            tiles = {}  # dataset id -> {image id: {field: vector}}
+            numbers = {}  # image id -> its metadata n
+            for ds, count in ((big, 120), (small, 12)):
+                vectors = [{field: vec() for field in positions} for _ in range(count)]
+                ids = client.add_samples(
+                    ds._id,
+                    [
+                        {
+                            'filepath': f's3://{ds.name}/img{i}.jpg',
+                            'media_type': 'image',
+                            'metadata': {'n': i},
+                            'embeddings': vectors[i],
+                        }
+                        for i in range(count)
+                    ],
+                )['ids']
+                tiles[ds._id] = dict(zip(ids, vectors))
+                numbers.update({sid: i for i, sid in enumerate(ids)})
+            big_ids, small_ids = list(tiles[big._id]), list(tiles[small._id])
+            # One labeled object on the first big image, covering its top-left tile (r0c0).
+            seed_vec = vec()
+            obj = client.add_samples(
+                big._id,
+                [
+                    {
+                        'filepath': 's3://idxpatch-big/img0#o0',
+                        'media_type': 'object',
+                        'metadata': {'parent_id': big_ids[0], 'crop_bbox': [0, 0, 0.5, 0.5], 'label': 'x'},
+                        'embeddings': {'clip_obj': seed_vec},
+                    },
+                ],
+            )['ids'][0]
+
+            def expected_patches(dsid, seed_id, seed_field, limit, below=None):
+                seed = tiles[dsid][seed_id][seed_field]
+                best: dict[int, tuple[float, str]] = {}
+                for sid, fields in tiles[dsid].items():
+                    if below is not None and numbers[sid] >= below:
+                        continue
+                    for field, v in fields.items():
+                        if (sid, field) != (seed_id, seed_field):
+                            best[sid] = min(best.get(sid, (2.0, '')), (cosine_distance(seed, v), field))
+                return [(sid, field) for _, sid, field in sorted((d, sid, f) for sid, (d, f) in best.items())[:limit]]
+
+            def expected_unlabeled(limit):
+                candidates = []
+                for sid, fields in tiles[big._id].items():
+                    candidates += sorted((cosine_distance(seed_vec, v), sid, f) for f, v in fields.items())[:3]
+                found: list[tuple[int, str]] = []
+                for _, sid, field in sorted(candidates)[: max(limit * 4, 50)]:
+                    covered = (sid, field) == (big_ids[0], f'{base}_patch_2x2_r0c0')
+                    if not covered and sid not in {s for s, _ in found} and len(found) < limit:
+                        found.append((sid, field))
+                return found
+
+            def post(path, body):
+                resp = client.session.post(f"{client.base_url}{path}", json=body)
+                assert resp.status_code == 200, resp.text
+                return [(h['sample_id'], f"{base}_patch_2x2_r{h['patch_row']}c{h['patch_col']}") for h in resp.json()]
+
+            def check(stage):
+                patch = {'field_name': base, 'patch_scale': '2x2', 'limit': 10}
+                cases = [
+                    (
+                        post(
+                            '/search/patches',
+                            {**patch, 'dataset_id': big._id, 'sample_id': big_ids[5], 'patch_row': 1},
+                        ),
+                        expected_patches(big._id, big_ids[5], f'{base}_patch_2x2_r1c0', 10),
+                    ),
+                    (
+                        post(
+                            '/search/patches',
+                            {
+                                **patch,
+                                'dataset_id': big._id,
+                                'sample_id': big_ids[5],
+                                'filters': {'field': 'n', 'operator': '<', 'value': 40},
+                            },
+                        ),
+                        expected_patches(big._id, big_ids[5], f'{base}_patch_2x2_r0c0', 10, below=40),
+                    ),
+                    (
+                        post(
+                            '/search/patches',
+                            {**patch, 'dataset_id': small._id, 'sample_id': small_ids[2], 'patch_col': 1},
+                        ),
+                        expected_patches(small._id, small_ids[2], f'{base}_patch_2x2_r0c1', 10),
+                    ),
+                    (
+                        post(
+                            '/search/object-to-patches',
+                            {'dataset_id': big._id, 'object_sample_id': obj, 'base_field': base, 'limit': 10},
+                        ),
+                        expected_unlabeled(10),
+                    ),
+                    (
+                        post(
+                            '/search/object-to-patches',
+                            {
+                                'dataset_id': big._id,
+                                'object_sample_id': obj,
+                                'base_field': base,
+                                'patch_scale': '2x2',
+                                'limit': 10,
+                            },
+                        ),
+                        expected_unlabeled(10),
+                    ),
+                ]
+                for i, (got, want) in enumerate(cases):
+                    assert len(want) == 10, f"{stage}, case {i}: the fixture should fill the limit"
+                    assert got == want, f"{stage}, case {i}: got {got}, want {want}"
+
+            check('no indexes')
+            for field in positions[:3]:
+                big.build_ann_index(field)
+            check('three of four positions indexed')  # an incomplete grid uses the exact scan
+            big.build_ann_index(positions[3])
+            check('every position indexed')
+        finally:
+            client.delete_dataset(big._id)
+            client.delete_dataset(small._id)
 
     client.delete_dataset(dsid)
     print("\n" + "=" * 60)

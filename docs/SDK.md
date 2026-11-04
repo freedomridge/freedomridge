@@ -16,6 +16,7 @@ pip install -e "python/[all]"
 | Extra | Needed for |
 |-------|------------|
 | `embeddings` | `compute_embeddings`, `compute_visualization`, `compute_all`, local text encoding |
+| `huggingface-embeddings` | `compute_embeddings(model_source="huggingface")`: Transformers image models such as DINOv3 |
 | `patch-embeddings` | `compute_patch_embeddings` |
 | `hashes` | `compute_hashes` |
 | `metrics` | `compute_metrics` |
@@ -406,6 +407,22 @@ dataset.compute_embeddings(
 - `clip-ViT-B-32` - CLIP ViT-B/32 (512-dim)
 - `clip-ViT-B-16` - CLIP ViT-B/16 (512-dim)
 - `clip-ViT-L-14` - CLIP ViT-L/14 (768-dim)
+
+With `model_source="huggingface"` (needs the `huggingface-embeddings` extra), `model_name` is a
+Transformers image model with a pooled output or `get_image_features`, run through its own processor:
+DINOv2, DINOv3 (its CLS token), ViT, CLIP, SigLIP. These vectors are stored as the model outputs them,
+not L2-normalized (Freedom Ridge compares by cosine either way), so they match what other tools running
+the same checkpoint store.
+
+```python
+# DINOv3, only for samples that don't have it yet (1024-dim)
+dataset.compute_embeddings(
+    model_name="facebook/dinov3-vitl16-pretrain-sat493m",
+    field_name="dinov3",
+    model_source="huggingface",
+    skip_existing=True,
+)
+```
 
 An embedding field's dimension is fixed server-wide by its first vectors, across
 every dataset, so name fields after the model (`clip` for ViT-B/32, `clip_large`
@@ -1177,6 +1194,68 @@ ds.compute_metrics()   # brightness / blurriness / contrast / entropy / salt_and
                        # saturation / pct_underexposed / pct_overexposed
 ```
 
+### Deleting a field's vectors
+
+`delete_embeddings(field, sample_ids, *, wait=True, timeout=1800)` removes one embedding field's
+vectors and nothing else (admin only). Use it to recompute a model's vectors for chosen samples: delete
+them, list the cleared samples with `missing()`, upload new vectors.
+
+```python
+ds.delete_embeddings("dino", bad_ids)          # {"deleted": 1850000}; bad_ids is a list of sample ids
+ds.filter(batch="b7").delete_embeddings("dino")  # a view, or ds.delete_embeddings("dino", view)
+ds.delete_embedding_field("dino")              # every sample of the dataset (the whole field)
+
+while True:                                    # fill-in: page the cleared samples by id
+    page = ds.missing("embedding", field="dino", limit=1000, after_id=last_id)
+    ...
+    ds.client.upload_embeddings(ds.id, ...)    # same dimension; queued for map projection like new vectors
+```
+
+- It runs as a resumable runner job in chunks of 1,000 samples, with progress; cancelling keeps the
+  chunks already deleted, and `client.resume_bulk_job(job_id)` runs the rest. It shares the dataset's
+  bulk-job slot, so it waits for or is refused (409, retried by the SDK) behind another bulk job.
+- A list of ids is sent 50,000 per request, each request a job that is waited for before the next;
+  the result sums them (`{"deleted": n}`). `wait=False` returns the Job and is refused when the ids need
+  more than one request. An empty list deletes nothing. `deleted` counts vectors, so ids that had none
+  (or belong to another dataset) add nothing and deleting twice returns `{"deleted": 0}`.
+- Sample metadata is never touched, including fields such as `uniqueness_<model>`; recompute those
+  with `compute_uniqueness` after refilling.
+- Deleting a vector removes its map position (`embedding_coordinates`), its queued projection and its
+  scatter rank row, and the field's map point count follows. Vectors uploaded later are queued for projection
+  like new ones and no stale position remains. The field's map state and model are kept, so with a scheduled
+  re-fit the new vectors are placed with the field's current map model.
+- The field's ANN index (`hnsw_emb_<field>`, hashed when the name is long) is maintained by the delete and the later uploads: similarity
+  search and `compute_uniqueness` see only the current vectors, with no rebuild.
+- Concept scores of the field are rescored by the background upkeep (the delete queues it): a sample
+  without a vector loses its score there, not in the delete.
+- `field` is the stored field name, as in `upload_embeddings`. A patch field's tiles are separate names
+  (`<field>_patch_<scale>_r<row>c<col>`); a name that has no vectors in the dataset deletes nothing
+  (`{"deleted": 0}`).
+
+- Don't upload new vectors for the targeted samples until the delete job has succeeded or been
+  discarded. A unit that hasn't run yet deletes whatever vector its samples have when it runs, a new one
+  included; that applies to a stopped job resumed later too.
+- Deleted vectors and index entries free their disk only after PostgreSQL vacuums the table and the
+  index, so refilling a field needs room for it about twice over for a while.
+
+**Whole field.** Only `delete_embedding_field(field, *, wait=True, timeout=1800)` deletes every sample's
+vectors. Everything else that would select every sample is refused: `sample_ids=None` raises `TypeError`,
+a view without a filter raises `ValueError` (so does a view of another dataset), and the server answers
+400 to a filter whose conditions have no value (`score__lt=None`), which would otherwise match every
+sample. A list of ids together with a filter is refused too.
+
+Deleting every vector of a field removes the vectors only, exactly like a partial
+delete: the dataset's map state, map point count, the field's model record (`embeddings/field-model`,
+shared by every dataset using the field name), any scheduled re-fit and the ANN index all stay. If the
+field is refilled by a different model under the same name, re-fit the map or use a new field name.
+
+**Dimension.** A field's dimension is fixed per field name across every dataset on the server, and its
+ANN index is built for one dimension. While any dataset still holds vectors of the field the dimension
+is known from them. Once none remain anywhere, a new dimension is refused with 422 if the field's ANN
+index exists, because the index would reject the vectors on insert; the message names the index. Remove
+the index (Indexes panel, admin) first, or use a new field name. With no index, any dimension is accepted
+again.
+
 To compute the same metrics for one PIL image yourself (for example before upload), use
 `fridge.compute_image_metrics(img)`. It returns the dict of eight floats that `compute_metrics()`
 stores per sample, and needs the same optional dependencies (`pip install "freedomridge[all]"`).
@@ -1770,6 +1849,9 @@ class Dataset:
     def untag_samples(sample_ids: list[int], tags: list[str], *, wait=True, timeout=1800) -> dict | Job
     def set_values(sample_ids: list[int], field: str, value: Any, *, wait=True, timeout=1800) -> int | Job
     def delete_samples(sample_ids, *, wait=True, timeout=1800) -> dict | Job   # admin only
+    # One embedding field's vectors only; see "Deleting a field's vectors". sample_ids: a list or a view
+    def delete_embeddings(field, sample_ids, *, wait=True, timeout=1800) -> dict | Job   # admin only
+    def delete_embedding_field(field, *, wait=True, timeout=1800) -> dict | Job   # every sample; admin only
     # Requests of at most 5,000 patches, each waited in turn; wait=False returns one Job per batch
     # (a single Job for one batch). Completed batches stay applied if a later one fails.
     def set_values_per_sample(field: str, values_by_id: dict[int, Any], batch_size=5000, *, wait=True,
@@ -1824,7 +1906,8 @@ class Dataset:
     # Embeddings & visualization
     # Both return {"total", "written", "dropped", "dropped_sample_ids"}
     def compute_embeddings(model_name="clip-ViT-B-32", field_name="clip", image_loader=None, batch_size=50,
-                           force_register=False) -> dict
+                           force_register=False, skip_existing=False,
+                           model_source="sentence-transformers") -> dict
     def compute_patch_embeddings(model_name="openai/clip-vit-base-patch32", field_name="clip", scales=None,
                                  image_loader=None, batch_size=50, reduce=True, partition=None,
                                  total_partitions=None, num_threads=4) -> dict
@@ -2051,6 +2134,18 @@ This will:
 2. Run CLIP on each patch
 3. Upload patch embeddings (stored as `clip_patch_2x2_r0c0`, `clip_patch_4x4_r3c2`, etc.)
 4. Run UMAP reduction so patches appear in the embeddings panel
+
+Patch search compares the selected patch with every patch at that scale. To make it an index
+search, give each tile position its own HNSW index, once per scale (16 for `4x4`). Patch search
+and find-unlabeled use them once every position of the scale has one; until then they rank every
+patch exactly, which takes seconds on a large dataset. Each index takes about as much disk as its
+vectors, and covers every dataset with that field.
+
+```python
+for r in range(4):
+    for c in range(4):
+        dataset.build_ann_index(f"clip_patch_4x4_r{r}c{c}")
+```
 
 ### Patch Similarity Search (SDK)
 

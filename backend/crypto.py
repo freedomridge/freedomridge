@@ -21,6 +21,8 @@ from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
 from .security import production
 
+# "aurora" is the project's former name. This default and the salt below feed the key derivation,
+# so changing either makes every value already encrypted unreadable.
 _DEFAULT_ENCRYPTION_KEY = "aurora-default-key-change-me"
 
 logger = logging.getLogger(__name__)

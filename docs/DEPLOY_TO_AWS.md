@@ -645,9 +645,12 @@ docker compose -f docker-compose.prod.yml exec db psql -U freedomridge -d freedo
   build in the worker container, which has no limit:
   `docker compose -f docker-compose.prod.yml exec worker python3 scripts/build_ann_indexes.py --field clip`
   (then `--field clip_obj`).
-- Patch search matches all tiles of a scale at once and does not use per-field
-  indexes. The backend log may warn at startup that the patch tile fields
-  (`clip_patch_4x4_r0c0` and so on) have no HNSW index; that is expected.
+- Patch search and find-unlabeled rank every tile of a scale unless each tile position
+  has its own index; on a small server that takes 15-30 s for Open Images. Build the 16
+  `4x4` position indexes the same way (about 18 s each for 55,000 vectors):
+  `python -c 'from fridge import Dataset, connect; connect(); ds = Dataset("coco-val2017"); [print(ds.build_ann_index(f"clip_patch_4x4_r{r}c{c}")) for r in range(4) for c in range(4)]'`.
+  Until all 16 exist, the backend log may warn at startup that the patch tile fields have
+  no HNSW index.
 - `backfill_sample_lonlat.py` fills any missing longitude/latitude columns, builds
   the covering index `idx_samples_lonlat_cover` for the map without blocking writes,
   then runs `VACUUM (ANALYZE) samples`. It is safe to rerun.

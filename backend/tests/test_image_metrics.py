@@ -7,7 +7,7 @@ env. Synthetic images with known properties make the expected values exact.
 """
 
 import numpy as np
-from fridge.core.dataset import _exposure_clipping, _media_metadata, _saturation
+from fridge.core.dataset import _exposure_clipping, _hsv_saturation, _media_metadata, _saturation
 from PIL import Image
 
 
@@ -34,6 +34,18 @@ def test_saturation_extremes():
     gray = Image.new("RGB", (32, 32), (128, 128, 128))  # no chroma at all
     assert _saturation(vivid) == 255.0
     assert _saturation(gray) == 0.0
+
+
+def test_hsv_saturation_matches_pil_for_every_rgb_value():
+    # All 2**24 RGB triples, one per pixel: the numpy S channel must equal PIL's HSV conversion everywhere.
+    values = np.arange(1 << 24, dtype=np.uint32)
+    rgb = np.stack([values >> 16, (values >> 8) & 255, values & 255], axis=-1).astype(np.uint8).reshape(4096, 4096, 3)
+    expected = np.asarray(Image.fromarray(rgb, "RGB").convert("HSV"))[:, :, 1]
+    actual = _hsv_saturation(rgb)
+    assert actual.dtype == np.uint8 and actual.shape == expected.shape
+    mismatched = np.flatnonzero(actual != expected)
+    examples = rgb.reshape(-1, 3)[mismatched[:5]].tolist()
+    assert mismatched.size == 0, f"{mismatched.size} RGB values differ, e.g. {examples}"
 
 
 def test_exposure_clipping_black_white_and_mid():

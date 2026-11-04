@@ -676,6 +676,22 @@ class DatasetView:
             **self._bulk_target(),
         )
 
+    def delete_embeddings(self, field, *, wait=True, timeout=1800):
+        """Delete embedding field ``field``'s vectors for the samples of this view (admin only).
+
+        A view without a filter selects every sample, so it is refused: deleting a whole field is
+        ``Dataset.delete_embedding_field``, never an accident."""
+        target = self._bulk_target()
+        client = self._dataset.client
+        if 'sample_ids' in target:  # an exact membership (a limited view or an id list): send only the ids
+            return client.delete_embeddings(self._dataset.id, field, target['sample_ids'], wait=wait, timeout=timeout)
+        if not target.get('filters'):
+            raise ValueError(
+                'This view has no filter, so it selects every sample; '
+                'use delete_embedding_field to delete the whole field',
+            )
+        return client.delete_embeddings(self._dataset.id, field, filters=target['filters'], wait=wait, timeout=timeout)
+
     def ids(self) -> List[int]:
         """Get all sample IDs in this view."""
         # Don't use select_fields as it may cause issues with some backends

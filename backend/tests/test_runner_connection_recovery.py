@@ -142,11 +142,14 @@ def test_cancel_during_begin_discards_session_and_later_jobs_commit(registry_dat
             return StepResult(finished=True, result=job['args']['value'])
 
         jobs = [await job_queue.enqueue_job(database.pool, 'example', args={'value': value}) for value in (1, 2)]
+        # Each lease step (connect, renewal, telemetry) gets lease_seconds / 8, capped at 1 s for telemetry.
+        # At 0.8 s that was 100 ms, which a busy machine's reconnect or commit can outlast: the session was
+        # then discarded a second time, opening a third connection. 8 s gives every step 1 s.
         consumer = job_runner.ServerWorker(
             database.pool,
             {'example': handler},
             heartbeat_connect=connect,
-            lease_seconds=0.8,
+            lease_seconds=8,
             heartbeat_seconds=0.05,
             poll_seconds=0.01,
         )
@@ -156,7 +159,7 @@ def test_cancel_during_begin_discards_session_and_later_jobs_commit(registry_dat
             async def completed():
                 return await database.fetchval("SELECT count(*) FROM jobs WHERE state='succeeded'") == 2
 
-            await wait_until(completed, timeout=4)
+            await wait_until(completed, timeout=15)
             assert injected.is_set()
             assert len(connections) == 2
             assert connections[0].is_closed()
