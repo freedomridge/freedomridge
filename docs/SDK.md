@@ -45,6 +45,11 @@ fridge.connect("http://localhost:8000/api", api_token="<your-token>")
 fridge.connect()
 ```
 
+Requests time out after `(10, 300)` seconds by default (connect, read). Pass `timeout=` to change
+it, for example for large uploads over a slow link or long statistics refreshes:
+`fridge.connect(url, api_token=..., timeout=(120, 1800))`. It takes a number or a
+`(connect, read)` tuple.
+
 **Username/password (interactive use)** — logs in with a session cookie:
 
 ```python

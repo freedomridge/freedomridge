@@ -1832,7 +1832,7 @@ class Client:
 _client = None
 
 
-def connect(url=None, api_token=None):
+def connect(url=None, api_token=None, timeout=None):
     """Configure the global Freedom Ridge client.
 
     Args:
@@ -1840,6 +1840,12 @@ def connect(url=None, api_token=None):
             ``http://localhost:8000/api``.
         api_token: Optional API token (Bearer). Falls back to
             ``$FRIDGE_API_TOKEN``. When set, no ``login()`` is needed.
+        timeout: Default timeout for every request, in seconds: a number or a
+            ``(connect, read)`` tuple, as ``Client`` accepts. ``None`` (the default)
+            keeps ``DEFAULT_TIMEOUT``, ``(10, 300)``. Raise it for large uploads over a
+            slow link (the request body is sent under the connect timeout) or long
+            server-side work, e.g. ``timeout=(120, 1800)``. A call that passes its own
+            timeout keeps it.
 
     Example:
         import fridge
@@ -1849,7 +1855,7 @@ def connect(url=None, api_token=None):
         fridge.get_client().login("user", "pass")
     """
     global _client
-    _client = Client(url, api_token=api_token)
+    _client = Client(url, api_token=api_token, timeout=DEFAULT_TIMEOUT if timeout is None else timeout)
     return _client
 
 
