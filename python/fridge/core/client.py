@@ -628,6 +628,22 @@ class Client:
             return _decode_vectors_binary(resp.content)
         return resp.json()
 
+    def get_vectors_by_ids(self, dataset_id, sample_ids, field_names) -> dict:
+        """Raw vectors for specific samples: ``{sample_id: {field_name: vector}}``.
+
+        Samples (or fields) with no stored vector are absent from the result. At most 10,000 sample ids
+        per request; the caller batches.
+        """
+        resp = self.session.post(
+            f"{self.base_url}/datasets/{dataset_id}/embeddings/vectors/by-ids",
+            json={"sample_ids": list(sample_ids), "field_names": list(field_names)},
+        )
+        _raise_for_status(resp)
+        out: dict = {}
+        for item in resp.json()["items"]:
+            out.setdefault(item["sample_id"], {})[item["field_name"]] = item["vector"]
+        return out
+
     def upload_coordinates(self, dataset_id, field_name, coordinates, batch_size=5000, model_id=None):
         """Upload 2D layout coordinates in batches, independently of vector storage.
 
@@ -1284,6 +1300,21 @@ class Client:
         )
         _raise_for_status(resp)
         return resp.json()
+
+    def get_hashes_by_ids(self, dataset_id, sample_ids, field_names) -> dict:
+        """Stored hashes for specific samples: ``{sample_id: {field_name: hash_hex}}``.
+
+        The subset counterpart to ``export_hashes``. At most 10,000 sample ids per request.
+        """
+        resp = self.session.post(
+            f"{self.base_url}/datasets/{dataset_id}/hashes/by-ids",
+            json={"sample_ids": list(sample_ids), "field_names": list(field_names)},
+        )
+        _raise_for_status(resp)
+        out: dict = {}
+        for item in resp.json()["items"]:
+            out.setdefault(item["sample_id"], {})[item["field_name"]] = item["hash_hex"]
+        return out
 
     def lookup_samples(self, dataset_id, field: str, values: list) -> dict:
         """Fast bulk lookup: metadata field values -> sample IDs.

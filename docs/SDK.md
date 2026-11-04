@@ -980,6 +980,12 @@ dataset.clear_field("scratch_field")
 preds = [Sample("/img1.jpg", metadata={"predictions": Detections([...])}), ...]
 dataset.merge_samples(preds, key_field="filepath")   # source values win
 dataset.merge_samples(preds, key_field="source_id", fields=["predictions"], skip_existing=True)
+
+# merge_samples never ADDS samples. To copy samples between datasets (metadata, tags, location,
+# heading, array fields, embeddings, hashes), adding the ones the target lacks:
+target.add_samples_from(source.filter(split="eval"))          # a view, or a whole Dataset
+target.add_samples_from(source.filter(source_id__in=ids), embedding_fields=["dinov3"], hash_fields=[])
+# Matches by filepath; samples already in the target are left untouched. Streams in batches.
 ```
 
 ## Geospatial filtering
@@ -1808,6 +1814,7 @@ class Dataset:
     def clone_field(field_name, new_name, *, wait=True, timeout=1800) -> dict | Job
     def clear_field(field_name, *, wait=True, timeout=1800) -> dict | Job
     def merge_samples(source, key_field="filepath", fields=None, skip_existing=False) -> int
+    def add_samples_from(source, *, embedding_fields=None, hash_fields=None, batch_size=500) -> dict  # {"seen","added","skipped"}
 
     # Embeddings & visualization
     # Both return {"total", "written", "dropped", "dropped_sample_ids"}

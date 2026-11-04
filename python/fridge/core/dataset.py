@@ -711,8 +711,11 @@ class Dataset:
         sample._dataset = self
         if row.get("location"):
             sample.location = row["location"]
-        if row.get("heading") is not None:
-            sample.heading = row["heading"]
+        heading = row.get("heading")
+        if heading is None and isinstance(row.get("location"), dict):
+            heading = row["location"].get("heading")  # the samples endpoints nest it in location
+        if heading is not None:
+            sample.heading = heading
         # Populate array fields (uses the cached names — no extra network call)
         for af in self._array_field_names:
             if af != 'tags' and af in row:
@@ -898,6 +901,80 @@ class Dataset:
         n = self.set_values_per_sample_multi(updates) if updates else 0
         print(f"merge_samples: merged into {n} samples")
         return n
+
+    def add_samples_from(self, source, *, embedding_fields=None, hash_fields=None, batch_size: int = 500) -> dict:
+        """Copy samples from ``source`` into this dataset, adding the ones that aren't here.
+
+        Unlike ``merge_samples`` (which only merges metadata into samples that already exist), this
+        inserts missing samples with everything they carry: metadata, tags, location, heading, array
+        fields, embeddings and hashes. A sample is matched by ``filepath``; one that already exists in
+        this dataset is left exactly as it is (nothing is overwritten, merged or re-embedded).
+
+        Runs client-side in a stream: it pages the source in ``batch_size`` samples, fetches only those
+        samples' vectors and hashes, and writes each batch before reading the next, so memory stays
+        bounded however large the source is. Interrupted? Run it again; samples already copied are
+        skipped.
+
+        Args:
+            source: a Dataset (copy everything) or a DatasetView (copy just that selection). The source
+                may live on a different Freedom Ridge instance.
+            embedding_fields: embedding fields to copy (default: every stored field, patch embeddings
+                included; ``[]`` for none).
+            hash_fields: hash fields to copy (default: all; ``[]`` for none).
+            batch_size: samples per request.
+
+        Returns:
+            dict: ``{"seen": n, "added": n, "skipped": n}`` (``skipped`` = already in this dataset).
+
+        Example:
+            target.add_samples_from(source.filter(split="eval"))
+            # select by a metadata key:
+            target.add_samples_from(source.filter(source_id__in=source_ids))
+        """
+        view = source.all() if isinstance(source, Dataset) else source
+        src = view._dataset
+        if src.client.base_url == self.client.base_url and src.id == self._id:
+            raise ValueError("source and target are the same dataset")
+        if batch_size < 1:
+            raise ValueError("batch_size must be at least 1")
+
+        stored_embeddings = [f['field_name'] for f in src.client.get_embedding_field_inventory(src.id)]
+        embeddings = stored_embeddings if embedding_fields is None else list(embedding_fields)
+        stored_hashes = src.client.get_hash_fields(src.id)
+        hashes = stored_hashes if hash_fields is None else list(hash_fields)
+        for kind, wanted, stored in (("embedding", embeddings, stored_embeddings), ("hash", hashes, stored_hashes)):
+            missing = sorted(set(wanted) - set(stored))
+            if missing:
+                raise ValueError(f"source dataset '{src.name}' has no {kind} field(s) {missing}")
+
+        # Listing the source's array fields also registers them, so iterating it returns their values.
+        array_names = [name for name in src.list_array_fields() if name != 'tags']
+        if array_names:
+            existing = set(self.list_array_fields())
+            for name in array_names:
+                if name not in existing:
+                    self.create_array_field(name)
+
+        seen = added = skipped = 0
+        samples = view.iter_samples(batch_size=batch_size)
+        while batch := list(islice(samples, batch_size)):
+            ids = [sample.id for sample in batch]
+            vectors = src.client.get_vectors_by_ids(src.id, ids, embeddings) if embeddings else {}
+            hash_values = src.client.get_hashes_by_ids(src.id, ids, hashes) if hashes else {}
+            rows = []
+            for sample in batch:
+                row = sample.to_dict()
+                row["embeddings"] = vectors.get(sample.id)
+                row["hashes"] = hash_values.get(sample.id)
+                rows.append(row)
+            result = self.client.add_samples(self._id, rows, on_duplicate='skip')
+            seen += len(batch)
+            added += len(result.get("ids", []))
+            skipped += result.get("skipped", 0)
+        if added:
+            self._dirty = True
+        print(f"add_samples_from: {added} added, {skipped} already present ({seen} read from '{src.name}')")
+        return {"seen": seen, "added": added, "skipped": skipped}
 
     def list_views(self) -> list:
         """List all saved views for this dataset."""
