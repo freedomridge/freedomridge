@@ -322,11 +322,25 @@ def _media_metadata(img, filepath):
 
 
 def _saturation(img):
-    """Mean saturation (0-255) via PIL's HSV conversion — washed-out/grayscale images
-    score low, vivid ones high."""
+    """Mean saturation (0-255) of an RGB image, as PIL's HSV conversion gives it — washed-out/grayscale
+    images score low, vivid ones high."""
     import numpy as np
 
-    return float(np.asarray(img.convert("HSV"))[:, :, 1].mean())
+    return float(_hsv_saturation(np.asarray(img)).mean())
+
+
+def _hsv_saturation(rgb):
+    """The S channel of ``Image.convert("HSV")`` for an RGB uint8 array, identical value for value but
+    faster than converting the whole image. PIL computes each pixel's S as
+    ``(int)((float)(max - min) / (float)max * 255.0)``, and 0 where ``max == min``."""
+    import numpy as np
+
+    r, g, b = rgb[..., 0], rgb[..., 1], rgb[..., 2]
+    high = np.maximum(np.maximum(r, g), b)
+    low = np.minimum(np.minimum(r, g), b)
+    # max - min is 0 wherever max is, so skipping those divisions leaves the 0 PIL gives them.
+    ratio = np.divide(high - low, high, out=np.zeros(high.shape, np.float32), where=high != 0, dtype=np.float32)
+    return (ratio.astype(np.float64) * 255.0).astype(np.uint8)
 
 
 def _exposure_clipping(gray):
@@ -376,8 +390,10 @@ def compute_image_metrics(img):
 
     blurriness = float(cv2.Laplacian(np.array(gray), cv2.CV_64F).var())
 
-    hist, _ = np.histogram(cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR), bins=256, range=(0, 256))
-    contrast = float(np.max(np.where(hist > 0)) - np.min(np.where(hist > 0)))
+    # The spread of the channel values: what the last minus the first non-empty bin of a 256-bin
+    # histogram gives, without the histogram (which took most of this function's time).
+    rgb = np.asarray(img)
+    contrast = float(int(rgb.max()) - int(rgb.min()))
 
     gray_pixels = np.array(gray)
     salt = gray_pixels >= 244
@@ -395,7 +411,7 @@ def compute_image_metrics(img):
         "contrast": contrast,
         "entropy": float(img.entropy()),
         "salt_and_pepper": salt_and_pepper,
-        "saturation": _saturation(img),
+        "saturation": float(_hsv_saturation(rgb).mean()),
         "pct_underexposed": under,
         "pct_overexposed": over,
     }

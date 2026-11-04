@@ -1,11 +1,15 @@
 """fridge.compute_image_metrics must return exactly what Dataset.compute_metrics used to compute per sample.
 
 The reference functions below are verbatim copies of the closures that lived inside
-Dataset.compute_metrics before the computation was made public. Needs opencv (the
-"metrics" extra), so the module is skipped where it is not installed.
+Dataset.compute_metrics before the computation was made public, and of _saturation before it
+stopped converting the image to HSV. The faster code must return identical values, so stored
+metrics don't change. Needs opencv (the "metrics" extra), so the module is skipped where it is
+not installed.
 """
 
 import builtins
+import math
+from collections.abc import Callable
 
 import pytest
 
@@ -13,7 +17,7 @@ cv2 = pytest.importorskip("cv2")
 
 import fridge  # noqa: E402
 import numpy as np  # noqa: E402
-from fridge.core.dataset import _exposure_clipping, _saturation, compute_image_metrics  # noqa: E402
+from fridge.core.dataset import _exposure_clipping, compute_image_metrics  # noqa: E402
 from PIL import Image, ImageStat  # noqa: E402
 
 KEYS = {
@@ -62,6 +66,10 @@ def _salt_and_pepper(gray):
     return float(isolated / g.size * 100)
 
 
+def _saturation(img):
+    return float(np.asarray(img.convert("HSV"))[:, :, 1].mean())
+
+
 def reference_metrics(img):
     """The per-sample dict the old compute_metrics loop built (img is RGB)."""
     gray = img.convert("L")
@@ -105,6 +113,49 @@ IMAGES = {
 }
 
 
+def _random(shape, seed, values=None):
+    rng = np.random.default_rng(seed)
+    if values is None:
+        return rng.integers(0, 256, shape, dtype=np.uint8)
+    return rng.choice(np.array(values, dtype=np.uint8), shape)
+
+
+def _random_rgb(height: int, width: int, seed: int) -> Callable[[], Image.Image]:
+    return lambda: Image.fromarray(_random((height, width, 3), seed), "RGB")
+
+
+# Inputs for the identical-output check: random images of several sizes, the degenerate ones, and every
+# mode compute_image_metrics converts to RGB first.
+EDGE_IMAGES: dict[str, Callable[[], Image.Image]] = {
+    **{
+        f"random_{h}x{w}_{seed}": _random_rgb(h, w, seed)
+        for h, w, seed in [(64, 48, 0), (333, 217, 1), (480, 640, 2), (1, 1, 3), (1, 97, 4), (97, 1, 5)]
+    },
+    "only_0_and_255": lambda: Image.fromarray(_random((40, 30, 3), 6, values=[0, 255]), "RGB"),
+    "near_extremes": lambda: Image.fromarray(_random((40, 30, 3), 7, values=[0, 1, 5, 10, 244, 250, 254, 255]), "RGB"),
+    "black": lambda: Image.new("RGB", (16, 16), (0, 0, 0)),
+    "white": lambda: Image.new("RGB", (16, 16), (255, 255, 255)),
+    "constant_color": lambda: Image.new("RGB", (16, 16), (12, 200, 77)),
+    "black_1x1": lambda: Image.new("RGB", (1, 1), (0, 0, 0)),
+    "white_1x1": lambda: Image.new("RGB", (1, 1), (255, 255, 255)),
+    "mode_L": lambda: Image.fromarray(_random((50, 40), 8), "L"),
+    "mode_1": lambda: Image.fromarray(_random((50, 40), 9, values=[0, 1]).astype(bool)),
+    "mode_P": lambda: Image.fromarray(_random((50, 40, 3), 10), "RGB").quantize(colors=37),
+    "mode_RGBA": lambda: Image.fromarray(_random((50, 40, 4), 11), "RGBA"),
+    "mode_LA": lambda: Image.fromarray(_random((50, 40, 2), 12), "LA"),
+    "mode_CMYK": lambda: Image.fromarray(_random((50, 40, 4), 13), "CMYK"),
+}
+
+
+def _assert_identical(actual, expected):
+    """Same keys, every value a float and exactly equal (NaN only where the reference has NaN)."""
+    assert actual.keys() == expected.keys()
+    for key, value in expected.items():
+        assert type(actual[key]) is float and type(value) is float, key
+        same = actual[key] == value or (math.isnan(actual[key]) and math.isnan(value))
+        assert same, f"{key}: {actual[key]!r} != reference {value!r}"
+
+
 def test_public_export():
     assert fridge.compute_image_metrics is compute_image_metrics
     assert "compute_image_metrics" in fridge.__all__
@@ -136,6 +187,13 @@ def test_known_values_on_solid_gray_and_checkerboard():
     assert board["pct_overexposed"] == 50.0
     speckled = compute_image_metrics(IMAGES["speckled"]())
     assert speckled["salt_and_pepper"] == 2 / (64 * 64) * 100
+
+
+@pytest.mark.parametrize("name", EDGE_IMAGES)
+def test_values_identical_to_the_reference_on_edge_cases(name):
+    img = EDGE_IMAGES[name]()
+    assert img.mode == (name.removeprefix("mode_") if name.startswith("mode_") else "RGB")
+    _assert_identical(compute_image_metrics(img), reference_metrics(img.convert("RGB")))
 
 
 @pytest.mark.parametrize("mode", ["L", "RGBA"])
