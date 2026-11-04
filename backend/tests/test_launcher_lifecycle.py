@@ -33,15 +33,22 @@ def process_state(identifier):
 
 
 def group_members(group):
+    """The group's processes that still have a running thread.
+
+    A killed process's main thread can read 'Z' while its other threads are still exiting and still hold
+    its open files (a listening socket, say), so a process is gone only once every thread is."""
     members = []
     for process in Path('/proc').iterdir():
         if not process.name.isdigit():
             continue
         try:
             status = (process / 'stat').read_text().rsplit(')', 1)[1].split()
+            if int(status[2]) != group:
+                continue
+            threads = [thread.name for thread in (process / 'task').iterdir()]
         except (FileNotFoundError, ProcessLookupError):
             continue
-        if int(status[2]) == group and status[0] != 'Z':
+        if any(process_state(thread) not in (None, 'Z') for thread in threads):
             members.append(int(process.name))
     return members
 
