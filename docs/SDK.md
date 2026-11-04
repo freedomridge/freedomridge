@@ -16,6 +16,7 @@ pip install -e "python/[all]"
 | Extra | Needed for |
 |-------|------------|
 | `embeddings` | `compute_embeddings`, `compute_visualization`, `compute_all`, local text encoding |
+| `huggingface-embeddings` | `compute_embeddings(model_source="huggingface")`: Transformers image models such as DINOv3 |
 | `patch-embeddings` | `compute_patch_embeddings` |
 | `hashes` | `compute_hashes` |
 | `metrics` | `compute_metrics` |
@@ -406,6 +407,22 @@ dataset.compute_embeddings(
 - `clip-ViT-B-32` - CLIP ViT-B/32 (512-dim)
 - `clip-ViT-B-16` - CLIP ViT-B/16 (512-dim)
 - `clip-ViT-L-14` - CLIP ViT-L/14 (768-dim)
+
+With `model_source="huggingface"` (needs the `huggingface-embeddings` extra), `model_name` is a
+Transformers image model with a pooled output or `get_image_features`, run through its own processor:
+DINOv2, DINOv3 (its CLS token), ViT, CLIP, SigLIP. These vectors are stored as the model outputs them,
+not L2-normalized (Freedom Ridge compares by cosine either way), so they match what other tools running
+the same checkpoint store.
+
+```python
+# DINOv3, only for samples that don't have it yet (1024-dim)
+dataset.compute_embeddings(
+    model_name="facebook/dinov3-vitl16-pretrain-sat493m",
+    field_name="dinov3",
+    model_source="huggingface",
+    skip_existing=True,
+)
+```
 
 An embedding field's dimension is fixed server-wide by its first vectors, across
 every dataset, so name fields after the model (`clip` for ViT-B/32, `clip_large`
@@ -1824,7 +1841,8 @@ class Dataset:
     # Embeddings & visualization
     # Both return {"total", "written", "dropped", "dropped_sample_ids"}
     def compute_embeddings(model_name="clip-ViT-B-32", field_name="clip", image_loader=None, batch_size=50,
-                           force_register=False) -> dict
+                           force_register=False, skip_existing=False,
+                           model_source="sentence-transformers") -> dict
     def compute_patch_embeddings(model_name="openai/clip-vit-base-patch32", field_name="clip", scales=None,
                                  image_loader=None, batch_size=50, reduce=True, partition=None,
                                  total_partitions=None, num_threads=4) -> dict

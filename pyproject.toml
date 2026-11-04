@@ -32,9 +32,11 @@ dependencies = [
 
 # Server-side CLIP (text search, reverse image search). Kept out of the base dependencies so
 # the core server runs without ML; the backend Docker image installs the cpu extra.
+# torchvision is here only so it is installed from the same PyTorch build as torch (see
+# [tool.uv.sources]); the SDK's huggingface-embeddings extra uses it, the server does not.
 [project.optional-dependencies]
-cpu = ["torch>=2.9", "transformers>=4.57.1,<5"]
-cuda = ["torch>=2.9", "transformers>=4.57.1,<5"]
+cpu = ["torch>=2.9", "torchvision", "transformers>=4.57.1,<5"]
+cuda = ["torch>=2.9", "torchvision", "transformers>=4.57.1,<5"]
 
 [dependency-groups]
 # Example importers (examples/): the SDK with every optional feature plus their own needs.
@@ -72,6 +74,10 @@ members = ["python"]
 [tool.uv.sources]
 freedomridge = { workspace = true }
 torch = [
+    { index = "pytorch-cpu", extra = "cpu" },
+    { index = "pytorch-cuda", extra = "cuda" },
+]
+torchvision = [
     { index = "pytorch-cpu", extra = "cpu" },
     { index = "pytorch-cuda", extra = "cuda" },
 ]

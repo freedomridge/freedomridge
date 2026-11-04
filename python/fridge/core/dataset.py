@@ -1800,15 +1800,17 @@ class Dataset:
         batch_size=50,
         force_register=False,
         skip_existing=False,
+        model_source="sentence-transformers",
     ):
-        """Compute CLIP embeddings for every sample (or just those lacking the field) and upload them.
+        """Compute image embeddings for every sample (or just those lacking the field) and upload them.
 
         Loads each image, encodes a batch through the model, and uploads the
         vectors. All requests go through the authenticated SDK client, so this
         works on private (non-global) datasets.
 
         Args:
-            model_name: sentence-transformers model id (default: "clip-ViT-B-32").
+            model_name: model id for ``model_source`` (default: the sentence-transformers CLIP
+                "clip-ViT-B-32").
             field_name: embedding field to write (default: "clip").
             image_loader: Callable(filepath) -> PIL.Image. If None, uses the
                 default loader (handles s3://, /media/s3/, /media/, and local
@@ -1823,6 +1825,10 @@ class Dataset:
                 were added. Default False re-embeds every sample and overwrites existing vectors,
                 which is what a model change needs. Existing vectors are not checked against
                 ``model_name``, so do not use it to switch models on a field.
+            model_source: "sentence-transformers" (default; vectors L2-normalized) or "huggingface":
+                a Transformers image model such as DINOv3, with its vectors as the model outputs them
+                (see fridge.core.image_encoders.load_image_encoder). Needs
+                ``pip install "freedomridge[huggingface-embeddings]"``.
 
         Returns:
             Counts for total, written and dropped embeddings, plus dropped_sample_ids.
@@ -1833,20 +1839,21 @@ class Dataset:
             # local files only:
             from PIL import Image
             dataset.compute_embeddings(image_loader=lambda p: Image.open(p))
-        """
-        try:
-            from sentence_transformers import SentenceTransformer
-        except ImportError:
-            raise ImportError(
-                "Please install sentence-transformers: pip install sentence-transformers Pillow "
-                "(or: pip install \"freedomridge[all]\")",
+            # DINOv3 (its CLS token), for the samples that don't have it yet:
+            dataset.compute_embeddings(
+                model_name="facebook/dinov3-vitl16-pretrain-sat493m",
+                field_name="dinov3",
+                model_source="huggingface",
+                skip_existing=True,
             )
+        """
+        from .image_encoders import load_image_encoder
 
         if image_loader is None:
             image_loader = _default_s3_image_loader()
 
         print(f"Loading model {model_name}...")
-        model = SentenceTransformer(model_name)
+        encode = load_image_encoder(model_name, model_source)
 
         processed = 0
         written_total = 0
@@ -1860,7 +1867,7 @@ class Dataset:
             nonlocal processed, written_total, dropped_total, batch_imgs, batch_ids
             if not batch_imgs:
                 return
-            vectors = model.encode(batch_imgs, normalize_embeddings=True)
+            vectors = encode(batch_imgs)
             payload = [
                 {"sample_id": sid, "vector": vec.tolist(), "field_name": field_name}
                 for sid, vec in zip(batch_ids, vectors)
