@@ -82,6 +82,9 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
+        with:
+          # Every tag: backend/tests/test_upgrade_paths.py upgrades each release's database to this schema.
+          fetch-depth: 0
       - uses: astral-sh/setup-uv@v10.3.3
         with:
           python-version: '3.14'
