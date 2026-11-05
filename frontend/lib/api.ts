@@ -1,3 +1,5 @@
+import type { DefaultView } from './default-view';
+
 // Segmentation visualization configuration
 export interface FieldColorConfig {
     colorByAttribute: 'label' | 'id';
@@ -33,6 +35,10 @@ export interface Dataset {
     // GET /datasets/{id} only: the filter sidebar opens with every field expanded and computed (the
     // dataset's rows are few enough to filter every field at once).
     sidebar_expand_all?: boolean | null;
+    // The public saved view the app opens the dataset on (lib/default-view.ts). Set by an administrator
+    // (PATCH default_view_id; null removes it). `default_view` is GET /datasets/{id} only.
+    default_view_id?: number | null;
+    default_view?: DefaultView | null;
 }
 
 export interface ActiveDatasetJob {

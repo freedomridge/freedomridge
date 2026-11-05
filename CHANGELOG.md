@@ -4,6 +4,14 @@ Freedom Ridge has one version for the server, the web app and the Python SDK (th
 file), following [Semantic Versioning](https://semver.org). A release lists **upgrade notes** when
 it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
 
+## Unreleased
+
+- A dataset can have a default view: a public saved view the web app opens the dataset on, for
+  example one whose concept filters hide black images. An administrator stars it in **Saved Views**
+  (`default_view_id` in `PATCH /datasets/{id}`). Its filters are labelled in the filter bar; **Clear
+  All** keeps them, and **Show all images** removes them until the next Clear All. The API and the
+  SDK still return every sample. Migration `0002_dataset_default_view.sql`.
+
 ## 1.2.1 (2026-11-05)
 
 ### Fixed

@@ -5,6 +5,7 @@ import type { Feature, Polygon } from 'geojson';
 import { ComplexFilter, MAP_REFITTED_EVENT, type MapRefitted, ViewStage } from '@/lib/api';
 import { useToast } from '@/contexts/ToastContext';
 import { convertSimpleFiltersToComplex, describeFilter } from '@/lib/filter-utils';
+import { type DefaultView, defaultViewStages, isDefaultViewStage, opensOnDefaultView } from '@/lib/default-view';
 
 // The map lasso selection — a GeoJSON polygon feature (or none).
 type MapPolygon = Feature<Polygon> | null;
@@ -27,6 +28,9 @@ interface PersistedFilterState {
     selectedIds: number[];
     currentPolygon: MapPolygon;
     selectionSource: string;
+    // The default view this browser's viewer chose to see past (Show all images, or removing its filters):
+    // the dataset doesn't open on it again until they clear the filters.
+    dismissedDefaultViewId?: number | null;
 }
 
 function loadFilterState(datasetId: number | undefined): PersistedFilterState | null {
@@ -125,9 +129,15 @@ interface FilterContextType {
     setSimpleFilters: (filters: SimpleFilters) => void;
     setAdvancedFilters: (filters: ComplexFilter) => void;
 
-    // Apply/Reset
+    // Apply/Reset. resetFilters goes back to the dataset's default view (no filters when it has none).
     applyFilters: () => void;
     resetFilters: () => void;
+
+    // The dataset's default view (undefined until the dataset has loaded; null when it has none). The page
+    // passes it in; the dataset opens on it, and showAllImages removes it and every other filter.
+    defaultView: DefaultView | null | undefined;
+    setDefaultView: (view: DefaultView | null) => void;
+    showAllImages: () => void;
     clearSelection: () => void;
     showResultsAsView: (stage: ViewStage) => void;
     hasUnappliedChanges: boolean;
@@ -279,9 +289,19 @@ export function FilterProvider({ children, datasetId }: { children: React.ReactN
         setViewStages(prev => [...prev, stage]);
     }, []);
 
-    const removeStage = useCallback((index: number) => {
-        setViewStages(prev => prev.filter((_, i) => i !== index));
+    // The dataset's default view, from the page's dataset answer. Its id only changes when an administrator
+    // picks another view, and a saved view's content never changes, so the id says whether it is new.
+    const [defaultView, setDefaultViewState] = useState<DefaultView | null | undefined>(undefined);
+    const setDefaultView = useCallback((view: DefaultView | null) => {
+        setDefaultViewState(prev => (prev !== undefined && (prev?.id ?? null) === (view?.id ?? null) ? prev : view));
     }, []);
+    const [dismissedDefaultViewId, setDismissedDefaultViewId] = useState<number | null>(savedState?.dismissedDefaultViewId ?? null);
+
+    const removeStage = useCallback((index: number) => {
+        // Removing a default-view filter is choosing to see past it, also after a reload.
+        if (defaultView && isDefaultViewStage(viewStages[index], defaultView)) setDismissedDefaultViewId(defaultView.id);
+        setViewStages(prev => prev.filter((_, i) => i !== index));
+    }, [viewStages, defaultView]);
 
     const updateStage = useCallback((index: number, newStage: ViewStage) => {
         setViewStages(prev => prev.map((s, i) => i === index ? newStage : s));
@@ -332,11 +352,11 @@ export function FilterProvider({ children, datasetId }: { children: React.ReactN
         saveTimerRef.current = setTimeout(() => {
             saveFilterState(datasetId, {
                 viewStages, filterMode, simpleFilters, advancedFilters,
-                brushedIds, selectedIds, currentPolygon, selectionSource,
+                brushedIds, selectedIds, currentPolygon, selectionSource, dismissedDefaultViewId,
             });
         }, 300);
         return () => { if (saveTimerRef.current) clearTimeout(saveTimerRef.current); };
-    }, [datasetId, viewStages, filterMode, simpleFilters, advancedFilters, brushedIds, selectedIds, currentPolygon, selectionSource]);
+    }, [datasetId, viewStages, filterMode, simpleFilters, advancedFilters, brushedIds, selectedIds, currentPolygon, selectionSource, dismissedDefaultViewId]);
 
     // --- Browser history (back/forward) for filter state ---
     // Each settled filter change pushes a history entry; Back/Forward restores that
@@ -348,6 +368,8 @@ export function FilterProvider({ children, datasetId }: { children: React.ReactN
     const historyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
     const historyInitializedRef = useRef(false);
     const suppressPushUntilRef = useRef(0);
+    // The default view applied on opening replaces the opening entry: Back doesn't step to "no filters".
+    const replaceHistoryRef = useRef(false);
 
     const buildHistorySnapshot = useCallback(() => ({
         _fridge: true,  // marker to distinguish our entries from Next.js'
@@ -381,8 +403,16 @@ export function FilterProvider({ children, datasetId }: { children: React.ReactN
         if (historyTimerRef.current) clearTimeout(historyTimerRef.current);
         historyTimerRef.current = setTimeout(() => {
             // Don't record the cascade of updates a Back/Forward restore just triggered.
-            if (Date.now() < suppressPushUntilRef.current) return;
+            if (Date.now() < suppressPushUntilRef.current) {
+                replaceHistoryRef.current = false;  // or the next real change would replace an entry
+                return;
+            }
             const snap = buildHistorySnapshot();
+            if (replaceHistoryRef.current) {
+                replaceHistoryRef.current = false;
+                window.history.replaceState(withRouterState(snap), '');
+                return;
+            }
             const cur = window.history.state;
             // Don't push a duplicate of the current entry (mount echo / no-op churn).
             if (cur && cur._fridge && historyStateSig(cur) === historyStateSig(snap)) return;
@@ -614,10 +644,28 @@ export function FilterProvider({ children, datasetId }: { children: React.ReactN
     }, [simpleFilters, advancedFilters, filterMode, brushedIds, selectedIds, currentPolygon, currentEmbeddingRegion, selectionSource, addStage, selectAll, deselectedIds, selectionCount]);
 
     const resetFilters = useCallback(() => {
-        // Clear only global filters (view stages)
+        // Clear only global filters (view stages), back to the dataset's default view.
         // Preserve draft sidebar filters and selections
+        setViewStages(defaultViewStages(defaultView));
+        setDismissedDefaultViewId(null);
+    }, [defaultView]);
+
+    const showAllImages = useCallback(() => {
         setViewStages([]);
-    }, []);
+        if (defaultView) setDismissedDefaultViewId(defaultView.id);
+    }, [defaultView]);
+
+    // Open on the default view once the dataset's answer says which it is (see opensOnDefaultView).
+    const openedRef = useRef(false);
+    useEffect(() => {
+        if (defaultView === undefined || openedRef.current) return;
+        openedRef.current = true;
+        if (opensOnDefaultView(viewStages, dismissedDefaultViewId, defaultView)) {
+            replaceHistoryRef.current = true;
+            // eslint-disable-next-line react-hooks/set-state-in-effect -- once per visit, when the dataset's answer arrives
+            setViewStages(defaultViewStages(defaultView));
+        }
+    }, [defaultView]); // eslint-disable-line react-hooks/exhaustive-deps -- once, with the filters this visit opened with
 
     // A search's result set becomes THE view. It replaces the applied stages AND every other
     // input the grid would otherwise AND with it: draft sidebar / Query Builder filters, the
@@ -692,6 +740,9 @@ export function FilterProvider({ children, datasetId }: { children: React.ReactN
         setAdvancedFilters,
         applyFilters,
         resetFilters,
+        defaultView,
+        setDefaultView,
+        showAllImages,
         hasUnappliedChanges,
         selectedIds,
         setSelectedIds,

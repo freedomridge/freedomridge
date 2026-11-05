@@ -185,6 +185,9 @@ function DatasetPageContent() {
         setAdvancedFilters,
         applyFilters,
         resetFilters,
+        defaultView,
+        setDefaultView,
+        showAllImages,
         showResultsAsView,
         hasUnappliedChanges,
         selectedIds,
@@ -253,6 +256,11 @@ function DatasetPageContent() {
             setModalMediaFieldLocal(dataset.modal_media_field || 'filepath');
         }
     }, [dataset]);
+
+    // The dataset opens on its default view (FilterContext applies it once it knows which it is).
+    useEffect(() => {
+        if (dataset) setDefaultView(dataset.default_view ?? null);
+    }, [dataset, setDefaultView]);
 
 
     // Does this dataset have object rows at all? The cross-grain link only applies when it
@@ -1316,6 +1324,8 @@ function DatasetPageContent() {
                                 datasetId={datasetId}
                                 currentFilters={globalFilters} // View content filters (legacy/compiled)
                                 currentViewStages={viewStages} // New: Stages history
+                                defaultViewId={dataset?.default_view_id ?? null}
+                                onDefaultViewChanged={() => queryClient.invalidateQueries({ queryKey: ['dataset', datasetId] })}
                                 onLoadView={(view) => {
                                     if (view.content.viewStages) {
                                         setViewStages(view.content.viewStages);
@@ -1367,6 +1377,8 @@ function DatasetPageContent() {
                         }}
                         onAddStage={addStage}
                         onClearAll={resetFilters}
+                        defaultView={defaultView}
+                        onShowAll={showAllImages}
                         onTextSearch={(embeddingFields || []).some(f => !f.includes('_patch_') && f !== 'clip_obj') ? handleTextSearch : undefined}
                         onImageSearch={(embeddingFields || []).some(f => !f.includes('_patch_') && f !== 'clip_obj') ? handleImageSearch : undefined}
                         datasetId={datasetId!}
