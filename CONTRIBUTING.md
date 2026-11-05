@@ -17,6 +17,9 @@ change. Only the map panel needs a Mapbox token; see [frontend/README.md](fronte
 The local checks below follow `.github/workflows/ci.yml` job by job; run them before opening a
 pull request. If the two ever disagree, `ci.yml` is right and this section needs fixing. Run every
 section your change touches; for changes that cross areas, run all of them.
+`scripts/ci_local.sh <commit>` runs every job in a fresh clone of that commit, with its own database
+and ports, and prints a summary. The comment at the top of the script lists its options. The
+sections below are the same steps by hand.
 
 Two safety rules:
 
