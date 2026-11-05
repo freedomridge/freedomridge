@@ -7,7 +7,9 @@ env. Synthetic images with known properties make the expected values exact.
 """
 
 import numpy as np
-from fridge.core.dataset import _exposure_clipping, _hsv_saturation, _media_metadata, _saturation
+import pytest
+from fridge.core import dataset
+from fridge.core.dataset import _exposure_clipping, _hsv_saturation, _mean_hsv_saturation, _media_metadata, _saturation
 from PIL import Image
 
 
@@ -46,6 +48,17 @@ def test_hsv_saturation_matches_pil_for_every_rgb_value():
     mismatched = np.flatnonzero(actual != expected)
     examples = rgb.reshape(-1, 3)[mismatched[:5]].tolist()
     assert mismatched.size == 0, f"{mismatched.size} RGB values differ, e.g. {examples}"
+
+
+@pytest.mark.parametrize("strip_pixels", [1, 7, 97, 3000, 1 << 16])
+@pytest.mark.parametrize("height, width", [(1, 1), (1, 97), (97, 1), (61, 53), (240, 320)])
+def test_mean_hsv_saturation_in_strips_equals_the_whole_image_mean(monkeypatch, strip_pixels, height, width):
+    # Strips of one row, of several rows with a shorter last one, and the whole image in one strip.
+    monkeypatch.setattr(dataset, "_SATURATION_STRIP_PIXELS", strip_pixels)
+    rgb = np.random.default_rng(height * width).integers(0, 256, (height, width, 3), dtype=np.uint8)
+    expected = float(_hsv_saturation(rgb).mean())
+    assert _mean_hsv_saturation(rgb) == expected
+    assert _saturation(Image.fromarray(rgb, "RGB")) == expected
 
 
 def test_exposure_clipping_black_white_and_mid():

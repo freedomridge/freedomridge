@@ -326,7 +326,26 @@ def _saturation(img):
     images score low, vivid ones high."""
     import numpy as np
 
-    return float(_hsv_saturation(np.asarray(img)).mean())
+    return _mean_hsv_saturation(np.asarray(img))
+
+
+# Pixels per strip in _mean_hsv_saturation: its temporary arrays (up to 8 bytes a pixel) then stay in a
+# core's cache. Several times larger and the strips no longer fit, and with the whole image at once (about
+# 200 MB of temporaries for an 8 MP photo) 16 processes computed it 14 times slower than in strips.
+_SATURATION_STRIP_PIXELS = 1 << 16
+
+
+def _mean_hsv_saturation(rgb):
+    """``float(_hsv_saturation(rgb).mean())``, the same value, computed a strip of rows at a time so that the
+    temporary arrays stay in cache: memory bandwidth is what limits processes computing metrics side by side.
+    The S values are integers, so their sum is exact in any order, as it is in ``mean()``."""
+    import numpy as np
+
+    rows = max(1, _SATURATION_STRIP_PIXELS // rgb.shape[1])
+    total = 0
+    for start in range(0, rgb.shape[0], rows):
+        total += int(_hsv_saturation(rgb[start : start + rows]).sum(dtype=np.uint64))
+    return float(np.float64(total) / (rgb.shape[0] * rgb.shape[1]))
 
 
 def _hsv_saturation(rgb):
@@ -411,7 +430,7 @@ def compute_image_metrics(img):
         "contrast": contrast,
         "entropy": float(img.entropy()),
         "salt_and_pepper": salt_and_pepper,
-        "saturation": float(_hsv_saturation(rgb).mean()),
+        "saturation": _mean_hsv_saturation(rgb),
         "pct_underexposed": under,
         "pct_overexposed": over,
     }
