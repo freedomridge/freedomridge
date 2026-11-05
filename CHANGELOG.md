@@ -4,13 +4,26 @@ Freedom Ridge has one version for the server, the web app and the Python SDK (th
 file), following [Semantic Versioning](https://semver.org). A release lists **upgrade notes** when
 it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
 
-## Unreleased
+## 1.3.0 (2026-11-05)
+
+### Added
 
 - A dataset can have a default view: a public saved view the web app opens the dataset on, for
-  example one whose concept filters hide black images. An administrator stars it in **Saved Views**
-  (`default_view_id` in `PATCH /datasets/{id}`). Its filters are labelled in the filter bar; **Clear
-  All** keeps them, and **Show all images** removes them until the next Clear All. The API and the
-  SDK still return every sample. Migration `0002_dataset_default_view.sql`.
+  example one whose concept filters hide black images or road photos. An administrator stars it in
+  **Saved Views** (`default_view_id` in `PATCH /datasets/{id}`). Its filters show in the filter bar
+  after a **Default view:** label with the view's name. **Clear All** keeps them, and **Show all
+  images** removes them until the next Clear All. Only the app applies it: the API and the SDK still
+  return every sample. The view must be public, and stays public while it is the default.
+- CI checks the upgrade path: a database created by each 1.x release, upgraded with the current
+  migrations, must match a fresh install. Contributors run the whole CI on their own machine with
+  `scripts/ci_local.sh <commit>`.
+
+### Upgrade notes
+
+- One database migration, `0002_dataset_default_view.sql`, which adds a column to `datasets`. Apply
+  it with `scripts/apply_migrations.sh`, as step 4 of [Upgrading](docs/UPGRADING.md) describes. It
+  locks `datasets` and `views` for an instant and waits at most 2 seconds for those locks: if it
+  stops with a lock timeout because something was using the tables, run it again.
 
 ## 1.2.1 (2026-11-05)
 

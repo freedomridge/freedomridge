@@ -185,10 +185,11 @@ in the API process and refuses fields with more than 200,000 vectors (HTTP 413).
 ## Default view (admin)
 
 A dataset's default view is a public saved view that the web app opens the dataset on, for example
-one that hides black images or road photos with concept filters. Its filters show in the filter bar as
-**Default view: <name>**, each marked ★. **Clear All** removes the viewer's own filters and keeps
-the default view, and **Show all images** removes it too, until the next Clear All. New samples pass
-through its filters like any others; a concept filter hides a new image once the image is scored.
+one that hides black images or road photos with concept filters. Its filters show in the filter bar
+after a **Default view:** label with the view's name, each marked ★. **Clear All** removes the
+viewer's own filters and keeps the default view, and **Show all images** removes it too, until the
+next Clear All. New samples pass through its filters like any others; a concept filter hides a new
+image once the image is scored.
 
 Only the app applies it. The API and the SDK return every sample, and a script loads the view
 like any other saved view when it wants those filters.
