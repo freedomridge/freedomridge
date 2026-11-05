@@ -8,10 +8,16 @@
 # db-recovery (migration runner + backup restore round-trip).
 name: CI
 
+# Public repositories (this one and its forks) run CI on every pull request and every push to main,
+# where Actions minutes are free. A private copy, such as the development repository, skips every job
+# unless the run is started by hand from the Actions tab, so it spends no minutes. The check is on
+# visibility, not the repository's name: a skipped job reports success, so a rename must not quietly
+# turn public CI off.
 on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -22,6 +28,7 @@ concurrency:
 
 jobs:
   lint:
+    if: ${{ !github.event.repository.private || github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -45,6 +52,7 @@ jobs:
         run: flake8 backend/ python/ scripts/ examples/
 
   example-tests:
+    if: ${{ !github.event.repository.private || github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -69,10 +77,14 @@ jobs:
         run: python -m pytest examples backend/tests/test_encoders.py -q
 
   backend-tests:
+    if: ${{ !github.event.repository.private || github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
+        with:
+          # Every tag: backend/tests/test_upgrade_paths.py upgrades each release's database to this schema.
+          fetch-depth: 0
       - uses: astral-sh/setup-uv@v10.3.3
         with:
           python-version: '3.14'
@@ -134,6 +146,7 @@ jobs:
         run: tail -150 backend.log || true
 
   frontend:
+    if: ${{ !github.event.repository.private || github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     defaults:
@@ -157,6 +170,7 @@ jobs:
         run: npm run build
 
   e2e:
+    if: ${{ !github.event.repository.private || github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -214,6 +228,7 @@ jobs:
           retention-days: 7
 
   db-recovery:
+    if: ${{ !github.event.repository.private || github.event_name == 'workflow_dispatch' }}
     # BLOCKING: guards the disaster-recovery path, which no other job exercises.
     # Both halves were broken in `main` with every other job green:
     #   * the scheduled pg_dump produced dumps that restored NOTHING onto a compose-deployed box
@@ -314,6 +329,7 @@ jobs:
         run: ./scripts/test_backup_restore.sh
 
   quality:
+    if: ${{ !github.event.repository.private || github.event_name == 'workflow_dispatch' }}
     # BLOCKING: mypy (mypy.ini) + eslint must stay clean
     # (frontend any/unused/require/img/hooks + backend/SDK mypy).
     runs-on: ubuntu-latest

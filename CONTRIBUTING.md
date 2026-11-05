@@ -17,6 +17,9 @@ change. Only the map panel needs a Mapbox token; see [frontend/README.md](fronte
 The local checks below follow `.github/workflows/ci.yml` job by job; run them before opening a
 pull request. If the two ever disagree, `ci.yml` is right and this section needs fixing. Run every
 section your change touches; for changes that cross areas, run all of them.
+`scripts/ci_local.sh <commit>` runs every job in a fresh clone of that commit, with its own database
+and ports, and prints a summary. The comment at the top of the script lists its options. The
+sections below are the same steps by hand.
 
 Two safety rules:
 
@@ -192,15 +195,21 @@ To change the schema:
 
 1. Add `backend/db/migrations/NNNN_short_name.sql` with the next free four-digit number (`0001_`,
    `0002_`, ...). Files hold the changes since 1.0.0, which the ledger records as `0000_baseline.sql`.
-   Never edit or renumber a file that has been released.
+   Never edit, renumber or delete a file that has been released: a database from any release of the
+   major version upgrades straight to the latest through all of them.
 2. Make the same change in `backend/db/schema.sql` and add the filename to its `schema_migrations`
-   list. New databases are created from it. A backend test fails when the two drift apart. If you
+   list. New databases are created from it. `backend/tests/test_upgrade_paths.py` upgrades a
+   database from every release of the major version with the migrations and fails unless it ends
+   up identical to a fresh install from `schema.sql`, column order included: add a new column at the
+   end of its `CREATE TABLE`. It reads old schemas from the release tags (`git fetch --tags`). If you
    change a function, regenerate `backend/db/functions.sql`
    (`python -m backend.schema_check --emit-functions > backend/db/functions.sql`).
 3. Keep the file safe on a large database. It runs in one transaction with its ledger row, so set a
    short `lock_timeout` (for example `SET LOCAL lock_timeout = '2s';`) and fail rather than queue
    behind readers. Don't rewrite or backfill a large table inside it: do that as a job the runner
-   queues. Migrations only go forward; going back is restoring the backup taken before the upgrade.
+   queues, and keep that job kind working for the rest of the major version, since a database from
+   that release can upgrade straight to any later one. Migrations only go forward; going back is
+   restoring the backup taken before the upgrade.
 4. Run sections 4 and 5.
 
 To apply pending migrations to an existing database, run `scripts/apply_migrations.sh` from the

@@ -39,6 +39,11 @@ class Dataset(BaseModel):
     # GET /datasets/{id} only (None elsewhere): the filter sidebar opens with every field expanded and
     # computed, because the dataset's rows are few enough to filter every field at once.
     sidebar_expand_all: Optional[bool] = None
+    # The saved view the app opens the dataset on and goes back to when the filters are cleared. Only the
+    # app applies it: the API and the SDK return every sample. Set by an administrator; must be public.
+    default_view_id: Optional[int] = None
+    # GET /datasets/{id} only: that view's id, name and content, so the app can apply it without another request.
+    default_view: Optional[Dict[str, Any]] = None
 
 
 class Sample(BaseModel):

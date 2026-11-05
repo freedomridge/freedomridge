@@ -1,18 +1,23 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { View, ViewStage, ComplexFilter, getDatasetViews, createView, deleteView } from '../lib/api';
+import { View, ViewStage, ComplexFilter, getDatasetViews, createView, deleteView, updateDataset } from '../lib/api';
 import { useUser } from '@/contexts/UserContext';
 import { filterHasInSelection } from '@/contexts/FilterContext';
 import { ShareViewModal } from './ShareViewModal';
-import { Share1Icon, TrashIcon, EyeOpenIcon, LockClosedIcon, GlobeIcon, PersonIcon } from '@radix-ui/react-icons';
+import { Share1Icon, TrashIcon, EyeOpenIcon, LockClosedIcon, GlobeIcon, PersonIcon, StarIcon, StarFilledIcon } from '@radix-ui/react-icons';
 
 interface ViewManagerProps {
     datasetId: number;
     currentFilters: ComplexFilter;
     currentViewStages?: ViewStage[];
     onLoadView: (view: View) => void;
+    // The dataset's default view, which an administrator sets here (the dataset opens on it).
+    defaultViewId?: number | null;
+    onDefaultViewChanged?: () => void;
 }
 
-export default function ViewManager({ datasetId, currentFilters, currentViewStages, onLoadView }: ViewManagerProps) {
+export default function ViewManager({
+    datasetId, currentFilters, currentViewStages, onLoadView, defaultViewId = null, onDefaultViewChanged,
+}: ViewManagerProps) {
     const { user } = useUser();
     const [views, setViews] = useState<View[]>([]);
     const [loadError, setLoadError] = useState<string | null>(null);
@@ -21,6 +26,7 @@ export default function ViewManager({ datasetId, currentFilters, currentViewStag
     const [loading, setLoading] = useState(false);
     const [sharingView, setSharingView] = useState<View | null>(null);
     const [filterType, setFilterType] = useState<'all' | 'mine' | 'shared' | 'public'>('all');
+    const [defaultError, setDefaultError] = useState<string | null>(null);
 
     // Ref for detecting outside clicks
     const containerRef = useRef<HTMLDivElement>(null);
@@ -103,6 +109,16 @@ export default function ViewManager({ datasetId, currentFilters, currentViewStag
         }
     }
 
+    async function handleSetDefault(viewId: number | null) {
+        setDefaultError(null);
+        try {
+            await updateDataset(datasetId, { default_view_id: viewId });
+            onDefaultViewChanged?.();
+        } catch (e) {
+            setDefaultError((e as Error).message || 'Failed to change the default view');
+        }
+    }
+
     const filteredViews = views.filter(v => {
         if (filterType === 'all') return true;
         if (filterType === 'mine') return v.user_id === user?.id;
@@ -172,6 +188,10 @@ export default function ViewManager({ datasetId, currentFilters, currentViewStag
                         )}
                     </div>
 
+                    {defaultError && (
+                        <p data-testid="default-view-error" className="text-xs text-red-300">{defaultError}</p>
+                    )}
+
                     {/* List Views */}
                     <div className="max-h-[400px] overflow-y-auto space-y-1 pr-1 custom-scrollbar">
                         {loadError ? (
@@ -199,6 +219,15 @@ export default function ViewManager({ datasetId, currentFilters, currentViewStag
                                     >
                                         <div className="flex items-center gap-2 mb-1">
                                             <span className="font-medium text-sm text-zinc-200 truncate">{view.name}</span>
+                                            {view.id === defaultViewId && (
+                                                <span
+                                                    data-testid="view-default-badge"
+                                                    className="inline-flex items-center gap-1 px-1.5 py-0.5 bg-amber-500/10 text-amber-300 text-[10px] rounded border border-amber-500/20 uppercase font-medium tracking-wide"
+                                                    title="The dataset opens on this view, and Clear All goes back to it"
+                                                >
+                                                    <StarFilledIcon className="w-3 h-3" /> Default
+                                                </span>
+                                            )}
                                         </div>
 
                                         <div className="flex items-center gap-2">
@@ -228,6 +257,24 @@ export default function ViewManager({ datasetId, currentFilters, currentViewStag
                                     </button>
 
                                     <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                                        {user?.role === 'admin' && (
+                                            <button
+                                                data-testid="view-default-toggle"
+                                                onClick={(e) => {
+                                                    e.stopPropagation();
+                                                    handleSetDefault(view.id === defaultViewId ? null : view.id);
+                                                }}
+                                                disabled={view.id !== defaultViewId && !isPublic}
+                                                className="p-1.5 text-zinc-400 hover:text-amber-300 hover:bg-amber-300/10 rounded transition-colors disabled:opacity-40 disabled:hover:text-zinc-400 disabled:hover:bg-transparent"
+                                                title={view.id === defaultViewId
+                                                    ? 'Remove as the default view: the dataset opens with no filters'
+                                                    : isPublic
+                                                        ? 'Set as the default view: everyone opens the dataset on it, and Clear All goes back to it'
+                                                        : 'Make this view public first to set it as the default view: everyone who opens the dataset starts on it'}
+                                            >
+                                                {view.id === defaultViewId ? <StarFilledIcon className="w-3.5 h-3.5" /> : <StarIcon className="w-3.5 h-3.5" />}
+                                            </button>
+                                        )}
                                         {isMine && user?.can_share_views !== false && (
                                             <button
                                                 onClick={(e) => {

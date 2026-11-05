@@ -265,10 +265,24 @@ async def share_view(id: int, view_id: int, share: ViewShare, user: dict = Depen
         raise HTTPException(status_code=403, detail="Not authorized to share this view")
     await _require_known_users(share.shared_with_user_ids)
 
-    await db.execute(
-        "UPDATE views SET is_public = $1, shared_with_user_ids = $2 WHERE id = $3",
-        share.is_public,
-        share.shared_with_user_ids,
-        view_id,
-    )
+    async with db.pool.acquire() as connection, connection.transaction():
+        # FOR UPDATE first: a default-view change holds the view FOR SHARE until it commits, and then the
+        # check below sees it.
+        await connection.execute("SELECT 1 FROM views WHERE id = $1 FOR UPDATE", view_id)
+        if not share.is_public and await connection.fetchval(
+            "SELECT 1 FROM datasets WHERE default_view_id = $1",
+            view_id,
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="This is the dataset's default view, which everyone who opens the dataset starts on, "
+                "so it stays public until an administrator chooses another default view or removes this one "
+                "as the default.",
+            )
+        await connection.execute(
+            "UPDATE views SET is_public = $1, shared_with_user_ids = $2 WHERE id = $3",
+            share.is_public,
+            share.shared_with_user_ids,
+            view_id,
+        )
     return {"message": "View sharing updated"}

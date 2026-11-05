@@ -4,6 +4,7 @@ import { Cross2Icon, PlusIcon, MagnifyingGlassIcon, ImageIcon } from '@radix-ui/
 import { Rocket } from 'lucide-react';
 import { FilterStageEditor } from './filter-stage-editor';
 import { describeFilter, isAutoFilterLabel } from '@/lib/filter-utils';
+import { type DefaultView, defaultViewStages, isDefaultViewStage } from '@/lib/default-view';
 // import * as Tooltip from '@radix-ui/react-tooltip';
 import * as Popover from '@radix-ui/react-popover';
 
@@ -12,7 +13,11 @@ interface QueryBuilderBarProps {
     onRemoveStage: (index: number) => void;
     onUpdateStage: (index: number, stage: ViewStage) => void;
     onAddStage: (stage: ViewStage) => void;
+    // Back to the dataset's default view (no filters when it has none).
     onClearAll: () => void;
+    // The dataset's default view: its filters are labelled, and Show all images removes them too.
+    defaultView?: DefaultView | null;
+    onShowAll?: () => void;
     datasetId: number;
     schema: SchemaField[];
     lightningMode: boolean;
@@ -38,6 +43,8 @@ export function QueryBuilderBar({
     onUpdateStage,
     onAddStage,
     onClearAll,
+    defaultView,
+    onShowAll,
     datasetId,
     schema,
     lightningMode,
@@ -74,6 +81,12 @@ export function QueryBuilderBar({
         f.name.toLowerCase().includes(searchTerm.toLowerCase())
     );
 
+    const defaultCount = stages.filter(s => isDefaultViewStage(s, defaultView)).length;
+    const hasDefaultFilters = defaultCount > 0;
+    const hasOwnFilters = stages.some(s => !isDefaultViewStage(s, defaultView));
+    // Some of the default view's filters were removed and none of the viewer's own added: one click back.
+    const offersDefaultView = !!defaultView && !hasOwnFilters && defaultCount < defaultViewStages(defaultView).length;
+
     const handleAddSave = (stage: ViewStage) => {
         onAddStage({ ...stage, description: describeFilter(stage.filter) });
         setIsAdding(false);
@@ -86,6 +99,15 @@ export function QueryBuilderBar({
 
             {/* --- Existing Filters (Pipeline) --- */}
             <div className="flex items-center flex-1 overflow-x-auto no-scrollbar gap-1">
+                {hasDefaultFilters && defaultView && (
+                    <span
+                        data-testid="default-view-label"
+                        className="px-2 text-xs text-amber-300/90 whitespace-nowrap"
+                        title="The dataset's default view: it opens on these filters (★), and Clear All keeps them"
+                    >
+                        Default view: {defaultView.name}
+                    </span>
+                )}
                 {stages.map((stage, index) => {
                     const isReadOnly = stage.type === 'map_region' || stage.type === 'similarity' || stage.type === 'selection' || stage.metadata?.collapse || stage.metadata?.dupGroupCollapse || stage.metadata?.concept;
 
@@ -108,6 +130,7 @@ export function QueryBuilderBar({
                                 {stage.type === 'similarity' && <span className="mr-1">🔍</span>}
                                 {(stage.metadata?.collapse || stage.metadata?.dupGroupCollapse) && <span className="mr-1">⧉</span>}
                                 {stage.metadata?.concept && <span className="mr-1">⊘</span>}
+                                {isDefaultViewStage(stage, defaultView) && <span data-testid="default-view-star" className="mr-1 text-amber-300">★</span>}
                                 {stage.description}
                             </span>
                             <button
@@ -210,15 +233,34 @@ export function QueryBuilderBar({
             <div className="flex items-center gap-2 border-l border-zinc-800 pl-3">
 
                 {
-                    stages.length > 0 && (
+                    hasOwnFilters && (
                         <button
                             onClick={onClearAll}
+                            title={defaultView ? `Remove your filters; the default view “${defaultView.name}” stays` : undefined}
                             className="text-xs font-medium text-zinc-500 hover:text-red-400 transition-colors whitespace-nowrap px-2"
                         >
                             Clear All
                         </button>
                     )
                 }
+                {hasDefaultFilters && onShowAll && (
+                    <button
+                        onClick={onShowAll}
+                        title="Remove every filter, the default view's too. Clear All brings the default view back."
+                        className="text-xs font-medium text-zinc-500 hover:text-amber-300 transition-colors whitespace-nowrap px-2"
+                    >
+                        Show all images
+                    </button>
+                )}
+                {defaultView && offersDefaultView && (
+                    <button
+                        onClick={onClearAll}
+                        title={`Back to the dataset's default view “${defaultView.name}”`}
+                        className="text-xs font-medium text-zinc-500 hover:text-amber-300 transition-colors whitespace-nowrap px-2"
+                    >
+                        Default view
+                    </button>
+                )}
 
                 {/* --- Semantic (text -> embedding) search --- */}
                 {onTextSearch && (

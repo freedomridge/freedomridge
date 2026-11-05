@@ -182,6 +182,32 @@ on the client, sized to the machine's RAM, and uploads coordinates for every
 sample. The server-side `POST /api/datasets/{id}/embeddings/reduce` endpoint fits
 in the API process and refuses fields with more than 200,000 vectors (HTTP 413).
 
+## Default view (admin)
+
+A dataset's default view is a public saved view that the web app opens the dataset on, for example
+one that hides black images or road photos with concept filters. Its filters show in the filter bar
+after a **Default view:** label with the view's name, each marked ★. **Clear All** removes the
+viewer's own filters and keeps the default view, and **Show all images** removes it too, until the
+next Clear All. New samples pass through its filters like any others; a concept filter hides a new
+image once the image is scored.
+
+Only the app applies it. The API and the SDK return every sample, and a script loads the view
+like any other saved view when it wants those filters.
+
+An administrator sets it in **Saved Views** with the ★ next to a public view, or over REST:
+
+```python
+requests.patch(
+    f"{API_URL}/datasets/{dataset_id}",
+    headers=headers,
+    json={"default_view_id": view_id},   # None removes it
+).raise_for_status()
+```
+
+The view must be one of the dataset's saved views and public (400 otherwise), and it can't be made
+private while it is the default (409). Deleting the view, which its owner can do, leaves the dataset
+without a default view.
+
 ## Delete a dataset (admin)
 
 ```python
@@ -198,7 +224,7 @@ Jobs panel. The SDK's `Dataset.delete()` waits for it.
 |----------|--------|------|-------------|
 | `/datasets` | POST | admin | Create a dataset |
 | `/datasets/{id}` | GET | any logged-in user with access | Dataset details |
-| `/datasets/{id}` | PATCH | admin | Update name, description, media fields, `segmentation_config` |
+| `/datasets/{id}` | PATCH | admin | Update name, description, media fields, `segmentation_config`, `default_view_id` |
 | `/datasets/{id}` | DELETE | admin | Delete (202, server job) |
 | `/datasets/{id}/samples` | POST | power_user | Add samples |
 | `/datasets/{id}/samples` | GET | any logged-in user with access | List samples (`{"items", "total"}`) |

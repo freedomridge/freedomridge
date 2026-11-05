@@ -56,6 +56,7 @@ from ..validation import clean_name, clean_tags
 from .auth import get_current_user, get_optional_user, require_role
 from .embeddings import _validate_field_name as is_embedding_field_name
 from .embeddings import validate_embedding_dims
+from .views import _decode_content as _decode_view_content
 
 router = APIRouter()
 
@@ -176,13 +177,15 @@ class DatasetUpdate(BaseModel):
     segmentation_config: Optional[Dict[str, Any]] = None
     storage_config_id: Optional[int] = None
     is_global: Optional[bool] = None
+    default_view_id: Optional[int] = None
 
 
 # Columns selected when returning a Dataset model. Centralised so list/get/create/update
 # all stay in sync with the model definition.
 _DATASET_SELECT = (
     "id, name, description, media_fields, grid_media_field, modal_media_field, "
-    "segmentation_config, storage_config_id, owner_id, is_global, created_at, deleting, deletion_job_id"
+    "segmentation_config, storage_config_id, owner_id, is_global, created_at, deleting, deletion_job_id, "
+    "default_view_id"
 )
 
 
@@ -288,7 +291,41 @@ async def get_dataset(id: int, request: Request):
     row = await db.fetchrow(f"SELECT {_DATASET_SELECT} FROM datasets WHERE id = $1", id)
     if not row:
         raise HTTPException(status_code=404, detail="Dataset not found")
-    return {**_parse_dataset_row(row), 'sidebar_expand_all': await _sidebar_expands_all(id)}
+    return {
+        **_parse_dataset_row(row),
+        'sidebar_expand_all': await _sidebar_expands_all(id),
+        'default_view': await _default_view(row['default_view_id']),
+    }
+
+
+async def _default_view(view_id: Optional[int]) -> Optional[Dict[str, Any]]:
+    """The dataset's default view as the app applies it. It is public (see _require_default_view_candidate),
+    so everyone who can open the dataset may read it."""
+    if view_id is None:
+        return None
+    row = await db.fetchrow("SELECT id, name, slug, content FROM views WHERE id = $1", view_id)
+    return None if row is None else {**dict(row), 'content': _decode_view_content(row['content'])}
+
+
+async def _require_default_view_candidate(connection: Any, dataset_id: int, view_id: int) -> None:
+    """A default view must be one of the dataset's saved views, and public: everyone who opens the dataset
+    starts on it. FOR SHARE keeps it public until the caller's transaction commits (share_view takes the
+    row FOR UPDATE before it checks for a default view)."""
+    view = await connection.fetchrow(
+        "SELECT name, is_public FROM views WHERE id = $1 AND dataset_id = $2 FOR SHARE",
+        view_id,
+        dataset_id,
+    )
+    if view is None:
+        if not await connection.fetchval("SELECT 1 FROM datasets WHERE id = $1", dataset_id):
+            raise HTTPException(status_code=404, detail="Dataset not found")
+        raise HTTPException(status_code=400, detail=f"View {view_id} is not a saved view of this dataset")
+    if not view['is_public']:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Share the view '{view['name']}' with everyone first: everyone who opens the dataset "
+            "starts on its default view.",
+        )
 
 
 async def _sidebar_expands_all(id: int) -> bool:
@@ -375,6 +412,15 @@ async def update_dataset(id: int, dataset: DatasetUpdate, user: dict = Depends(r
         values.append(dataset.is_global)
         idx += 1
 
+    # Nullable like storage_config_id: null removes the default view.
+    if "default_view_id" in dataset.model_fields_set:
+        if dataset.default_view_id is None:
+            fields.append("default_view_id = NULL")
+        else:
+            fields.append(f"default_view_id = ${idx}")
+            values.append(dataset.default_view_id)
+            idx += 1
+
     if not fields:
         # No-op patch. PATCH already required admin, so a straight fetch is
         # fine — no additional access check needed.
@@ -392,7 +438,10 @@ async def update_dataset(id: int, dataset: DatasetUpdate, user: dict = Depends(r
     """
 
     try:
-        row = await db.fetchrow(query, *values)
+        async with db.pool.acquire() as connection, connection.transaction():
+            if dataset.default_view_id is not None:
+                await _require_default_view_candidate(connection, id, dataset.default_view_id)
+            row = await connection.fetchrow(query, *values)
         if not row:
             raise HTTPException(status_code=404, detail="Dataset not found")
         return _parse_dataset_row(row)

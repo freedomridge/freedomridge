@@ -9,7 +9,11 @@ while on a large database, downtime, a configuration change or an SDK change.
 ## What is supported
 
 - **Upgrade from any earlier release straight to the latest one** within the same major version
-  (or as its release notes say). You don't need to install the versions in between.
+  (or as its release notes say). You don't need to install the versions in between: the migration
+  runner applies every migration the database lacks, in order. CI checks this for each release: it
+  upgrades a database created by that release and compares it with a fresh install.
+- A new major version may start from a new baseline schema. Its release notes then name the release
+  to upgrade to first.
 - **Migrations only go forward.** Going back is restoring the backup taken before the upgrade
   and running the previous version (below).
 - Versions follow [Semantic Versioning](https://semver.org): a release that breaks the SDK, the

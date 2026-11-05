@@ -41,7 +41,8 @@ CREATE TABLE IF NOT EXISTS datasets (
                                 -- because storage_configs is declared later in this file
     owner_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
     is_global BOOLEAN DEFAULT FALSE,  -- private: admins, the owner and granted users
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    default_view_id INTEGER  -- the saved view the app opens on; FK to views(id) added below, after views
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_datasets_active_name ON datasets(name) WHERE NOT deleting;
@@ -617,6 +618,21 @@ CREATE INDEX IF NOT EXISTS idx_views_dataset_id ON views(dataset_id);
 CREATE INDEX IF NOT EXISTS idx_views_user_id ON views(user_id);
 CREATE INDEX IF NOT EXISTS idx_views_slug ON views(slug);
 CREATE INDEX IF NOT EXISTS idx_views_public ON views(is_public) WHERE is_public = true;
+
+-- A dataset's default view (migration 0002): the saved view the app opens the dataset on, and goes back to
+-- when the filters are cleared. Only the app uses it. Deleting the view leaves the dataset without one.
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'datasets_default_view_id_fkey'
+          AND conrelid = 'datasets'::regclass
+    ) THEN
+        ALTER TABLE datasets
+            ADD CONSTRAINT datasets_default_view_id_fkey
+            FOREIGN KEY (default_view_id) REFERENCES views(id) ON DELETE SET NULL;
+    END IF;
+END $$;
 
 -- Admission history survives account deletion for the one-hour IP rate limit.
 CREATE TABLE IF NOT EXISTS demo_admissions (
@@ -2387,5 +2403,6 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 );
 INSERT INTO schema_migrations (filename) VALUES
     ('0000_baseline.sql'),
-    ('0001_storage_config_dataset_scope.sql')
+    ('0001_storage_config_dataset_scope.sql'),
+    ('0002_dataset_default_view.sql')
 ON CONFLICT (filename) DO NOTHING;
