@@ -4,6 +4,21 @@ Freedom Ridge has one version for the server, the web app and the Python SDK (th
 file), following [Semantic Versioning](https://semver.org). A release lists **upgrade notes** when
 it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
 
+## 1.2.1 (2026-11-05)
+
+### Fixed
+
+- `fridge.compute_image_metrics()` and `compute_metrics()` were slower in 1.2.0 than in 1.1.0 when
+  several processes compute them at once, as an ingest does: 16 processes computed saturation for about
+  38 images a second, against 78 with 1.1.0. Saturation is now computed a strip of rows at a time, which
+  makes it about 520 a second, and an ingest with 16 worker processes went from 7.2 images/s to 8.9
+  (8.0 with 1.1.0). The values are identical.
+
+### Upgrade notes
+
+- No database migration. Only the Python SDK changed; the server and the web app are the same as in
+  1.2.0.
+
 ## 1.2.0 (2026-11-04)
 
 ### Added
