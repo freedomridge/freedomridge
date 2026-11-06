@@ -50,8 +50,18 @@ def test_a_bubble_takes_in_the_loose_points_it_is_drawn_over(registry_database):
         points = [item for item in result['items'] if item.get('id') is not None]
         absorbed = sum(count for _, count, inside in GROUPS.values() if inside)
         # The bubble stays where its own samples are, and is drawn at the radius it was measured with.
+        # It also carries the extent of every sample it counts, the ones it took in included.
         assert bubbles == [
-            {'lon': pytest.approx(DENSE[0]), 'lat': pytest.approx(DENSE[1]), 'count': 150 + absorbed, 'radius': 52},
+            {
+                'lon': pytest.approx(DENSE[0]),
+                'lat': pytest.approx(DENSE[1]),
+                'count': 150 + absorbed,
+                'radius': 52,
+                'w': DENSE[0],
+                's': DENSE[1],
+                'e': -92.0,
+                'n': 43.15,
+            },
         ]
         drawn = sorted({(point['lon'], point['lat']) for point in points})
         assert drawn == sorted(location for location, _, inside in GROUPS.values() if not inside)
