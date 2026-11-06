@@ -15,7 +15,9 @@ import requests
 from fridge.core.client import Client
 from fridge.core.dataset import Dataset
 from fridge.core.sample import Sample
-from fridge.core.view import DatasetView, SimilarityResultView, parse_query_string
+from fridge.core.view import DatasetView, SimilarityResultView
+
+from backend.filter_query import TEXT, parse_query
 
 
 def _response(body, status=200):
@@ -136,6 +138,9 @@ def test_create_concept_sends_an_explicit_threshold():
 # --------------------------------------------------------------------------------------------
 
 
+QUERY_FIELDS = {"reviewed": TEXT, "scene": TEXT}
+
+
 def _filter_dict(**kwargs):
     dataset = Dataset.__new__(Dataset)  # no network: filter() only builds a dict
     return Dataset.filter(dataset, **kwargs)._filters
@@ -151,14 +156,12 @@ def _filter_dict(**kwargs):
     ],
 )
 def test_query_is_null_matches_filter_is_null(query, kwargs):
-    assert parse_query_string(query) == _filter_dict(**kwargs)
+    # dataset.query() sends the text to the server's parser (backend/filter_query.py).
+    assert parse_query(query, QUERY_FIELDS) == [_filter_dict(**kwargs)]
 
 
 def test_query_is_null_combines_with_other_conditions():
-    assert parse_query_string("scene = 'highway' AND reviewed IS NOT NULL") == {
-        "logic": "AND",
-        "filters": [
-            {"field": "scene", "operator": "=", "value": "highway"},
-            {"field": "reviewed", "operator": "is_not_null", "value": None},
-        ],
-    }
+    assert parse_query("scene = 'highway' AND reviewed IS NOT NULL", QUERY_FIELDS) == [
+        {"field": "scene", "operator": "=", "value": "highway"},
+        {"field": "reviewed", "operator": "is_not_null", "value": None},
+    ]

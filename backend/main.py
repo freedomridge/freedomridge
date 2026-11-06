@@ -26,6 +26,7 @@ from .routers import (
     concepts,
     datasets,
     embeddings,
+    filter_query,
     hashes,
     index_advisor,
     jobs,
@@ -197,6 +198,7 @@ app.include_router(datasets.router, prefix="/api")
 app.include_router(search.router, prefix="/api")
 app.include_router(users.router, prefix="/api")
 app.include_router(views.router, prefix="/api")
+app.include_router(filter_query.router, prefix="/api")
 app.include_router(embeddings.router, prefix="/api")
 app.include_router(auth.router, prefix="/api")
 app.include_router(tokens.router, prefix="/api")

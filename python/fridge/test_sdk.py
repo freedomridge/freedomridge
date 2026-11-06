@@ -1231,11 +1231,34 @@ def run_tests():
 
     _()
 
+    @test("dataset.query() checks fields: an unknown one is an error naming it, with a suggestion")
+    def _():
+        try:
+            ds.query("categroy = 'a'")
+        except ValueError as error:
+            assert "line 1, column 1: unknown field 'categroy'" in str(error) and "'category'" in str(error), error
+        else:
+            raise AssertionError("a misspelt field was accepted")
+
+    _()
+
+    @test("dataset.query() lists with any separators, and create_view(query=)")
+    def _():
+        values = sorted({s.metadata.get("category") for s in ds.all() if s.metadata.get("category")})
+        pasted = "category in (" + "  ".join(f'"{v}"' for v in values[:2]) + ")"
+        assert ds.query(pasted).count() == ds.filter(category__in=values[:2]).count() > 0
+        view = ds.create_view("query-language view", query=pasted + "\nAND category != 'zzz'")
+        try:
+            stages = view["content"]["viewStages"]
+            assert [stage["filter"]["operator"] for stage in stages] == ["in", "!="], stages
+            assert ds.load_view("query-language view").count() == ds.query(pasted).count()
+        finally:
+            ds.delete_view(view["id"])
+
+    _()
+
     @test("dataset.query() IS NULL / IS NOT NULL treat a missing key as null")
     def _():
-        total = ds.all().count()
-        absent, present = ds.query("never_set IS NULL").count(), ds.query("never_set IS NOT NULL").count()
-        assert (absent, present) == (total, 0), f"missing key: IS NULL {absent}, IS NOT NULL {present}, total {total}"
         # Some samples added earlier have no category: both spellings must agree with filter().
         for query, is_null in (("category IS NULL", True), ("category IS NOT NULL", False)):
             got, expected = ds.query(query).count(), ds.filter(category__is_null=is_null).count()
