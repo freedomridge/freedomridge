@@ -21,6 +21,9 @@ it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
   version. SDKs before 2.0 neither send their version nor check the server's, so a 2.x server can't refuse
   a 1.x SDK: it fails wherever the API changed instead. Install the SDK from the server's release:
   `pip install "freedomridge @ git+https://github.com/freedomridge/freedomridge.git@v2.0.0#subdirectory=python"`.
+- Migration `0004_map_state_without_model.sql` lets a re-fitted map have no model file (a map fitted on a
+  compute worker, which never brings one back). It only changes a check on `embedding_map_state`, and is
+  applied like the others.
 
 ## 1.4.0 (2026-11-06)
 

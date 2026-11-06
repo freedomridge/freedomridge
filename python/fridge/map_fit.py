@@ -34,6 +34,22 @@ _SIGNATURE = b"PGCOPY\n\xff\r\n\x00"
 
 def read_export(path):
     """(ids, versions, vectors) from a binary COPY file with one fixed-size row per vector."""
+    rows = _export_rows(path)
+    if rows is None:
+        return np.empty(0, np.int32), np.empty(0, np.int64), np.empty((0, 0), np.float32)
+    return rows["id"].astype(np.int32), rows["version"].astype(np.int64), rows["vector"].astype(np.float32)
+
+
+def read_export_ids(path):
+    """(ids, versions) of a binary COPY export, without loading its vectors."""
+    rows = _export_rows(path)
+    if rows is None:
+        return np.empty(0, np.int32), np.empty(0, np.int64)
+    return rows["id"].astype(np.int32), rows["version"].astype(np.int64)
+
+
+def _export_rows(path):
+    """The export's rows, memory-mapped (None when it has none), after checking its layout."""
     size = os.path.getsize(path)
     head = np.fromfile(path, dtype=np.uint8, count=min(size, 64))
     if size < 21 or head[:11].tobytes() != _SIGNATURE:
@@ -44,7 +60,7 @@ def read_export(path):
     if trailer.size != 1 or trailer[0] != -1:
         raise ValueError(f"{path} is truncated (no end-of-data marker)")
     if size - offset == 2:
-        return np.empty(0, np.int32), np.empty(0, np.int64), np.empty((0, 0), np.float32)
+        return None
     first = np.fromfile(path, dtype=">i4", count=1, offset=offset + 2 + 4 + 4 + 4 + 8)
     dim = (int(first[0]) - 4) // 4
     row = np.dtype(
@@ -72,7 +88,7 @@ def read_export(path):
         and (rows["dim"] == dim).all()
     ):
         raise ValueError(f"{path}: unexpected row layout or mixed vector dimensions")
-    return rows["id"].astype(np.int32), rows["version"].astype(np.int64), rows["vector"].astype(np.float32)
+    return rows
 
 
 def _cgroup_anon_bytes():

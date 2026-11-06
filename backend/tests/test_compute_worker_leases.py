@@ -30,7 +30,8 @@ async def setup(database, monkeypatch):
     for module in (auth, workers):
         monkeypatch.setattr(module, 'db', database)
     monkeypatch.setattr(workers, 'COMPUTE_KINDS', (*workers.COMPUTE_KINDS, KIND))
-    monkeypatch.setattr(workers, 'REMOTE_KINDS', {KIND: JobPolicy(max_failures=2, retry_seconds=1)})
+    remote = workers.RemoteKind(policy=JobPolicy(max_failures=2, retry_seconds=1))
+    monkeypatch.setattr(workers, 'REMOTE_KINDS', {KIND: remote})
     await database.execute(
         "INSERT INTO users(id, username, role) VALUES (10, 'owner', 'power_user'), (12, 'other', 'power_user'), "
         "(13, 'boss', 'admin')",
@@ -70,7 +71,16 @@ def test_a_worker_claims_renews_reports_and_completes_a_job(registry_database, m
         headers = await setup(database, monkeypatch)
         async with client() as api:
             worker = await register(api, headers[10])
+            await database.execute(
+                "UPDATE workers SET heartbeat_at = clock_timestamp() - interval '5 minutes' WHERE id = $1",
+                worker,
+            )
             assert (await api.post(f'/api/workers/{worker}/claim', json={}, headers=headers[10])).status_code == 204
+            # Even a claim that finds nothing keeps the worker online.
+            assert await database.fetchval(
+                "SELECT heartbeat_at > clock_timestamp() - interval '5 seconds' FROM workers WHERE id = $1",
+                worker,
+            )
             queued = await enqueue(database)
             claimed = await api.post(f'/api/workers/{worker}/claim', json={}, headers=headers[10])
             assert claimed.status_code == 200
@@ -131,7 +141,7 @@ def test_a_worker_claims_only_remote_kinds_on_datasets_its_owner_can_access(regi
         headers = await setup(database, monkeypatch)
         async with client() as api:
             mine = await register(api, headers[10])
-            await enqueue(database, kind='map_refit')  # a compute kind that doesn't run remotely yet
+            await enqueue(database, kind='map_refit')  # a compute kind this worker didn't register for
             private = await enqueue(database, dataset_id=2)  # dataset 2 is user 12's
             assert (await api.post(f'/api/workers/{mine}/claim', json={}, headers=headers[10])).status_code == 204
             theirs = await register(api, headers[12])

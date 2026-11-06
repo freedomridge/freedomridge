@@ -3,17 +3,23 @@ for the server, starting with map re-fits. They register and heartbeat into the 
 server's own job runners write too; system status counts the compute ones online."""
 
 import asyncio
+import fcntl
+import os
 import time
 import uuid
-from typing import Any, Dict, List, Optional
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Response
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from .. import job_queue, map_refit
 from ..access import filter_datasets_for_user
 from ..database import db
 from ..job_queue import JobPolicy
+from ..map_artifacts import LocalArtifactStore
 from ..validation import clean_name
 from .auth import get_worker_user, require_role
 
@@ -21,9 +27,37 @@ router = APIRouter()
 
 # The job kinds a compute worker can take.
 COMPUTE_KINDS = (map_refit.KIND,)
-# The compute kinds a worker can claim now, with their queue policy. A kind joins with its handler on the worker
-# and its hand-off on the server (the map re-fit next); until then its jobs stay with the server's runner.
-REMOTE_KINDS: Dict[str, JobPolicy] = {}
+
+
+@dataclass(frozen=True)
+class RemoteKind:
+    """A compute kind a worker can claim: its queue policy, which of its steps run on the worker (the others go
+    back to the server's runners), the job files the worker may download and upload, and how a completed step
+    becomes the server's next one: `finish(job, staged folder, result)` returns its checkpoint. Without
+    `finish` the job simply ends with the worker's result. `output_limit(job, name)` caps each output's size."""
+
+    policy: JobPolicy
+    runs_remotely: Callable[[Dict[str, Any]], bool] = lambda job: True
+    inputs: tuple = ()
+    outputs: tuple = ()
+    finish: Optional[Callable[[Dict[str, Any], Path, Any], Dict[str, Any]]] = None
+    output_limit: Callable[[Dict[str, Any], str], int] = lambda job, name: 0
+
+
+# The compute kinds a worker can claim now. A map re-fit's worker does its fit; the server exports the vectors
+# before and swaps the map in after.
+REMOTE_KINDS: Dict[str, RemoteKind] = {
+    map_refit.KIND: RemoteKind(
+        policy=map_refit.POLICY,
+        runs_remotely=lambda job: (job['checkpoint'] or {}).get('phase') == 'fit',
+        inputs=map_refit.REMOTE_INPUTS,
+        outputs=map_refit.REMOTE_OUTPUTS,
+        finish=map_refit.remote_fit_checkpoint,
+        output_limit=map_refit.remote_output_limit,
+    ),
+}
+# The largest upload chunk (nginx allows 70 MB on /api/workers/).
+UPLOAD_CHUNK_BYTES = 64 * 1024**2
 # How often a worker heartbeats; system status and the list count a worker heard from in the last 60 s online.
 HEARTBEAT_SECONDS = 20
 # A claimed job's lease, and how often the worker renews it: a worker that stops renewing (a laptop asleep, the
@@ -166,6 +200,8 @@ async def claim(worker_id: str, request: ClaimRequest, user: dict = Depends(get_
     datasets its owner can access (jobs on no dataset only for an admin's worker). The job comes with a lease
     of LEASE_SECONDS: renew it with the job heartbeat every JOB_HEARTBEAT_SECONDS."""
     worker = await _own_worker(worker_id, user)
+    # A waiting worker claims again every CLAIM_WAIT_SECONDS at most: each claim keeps it online.
+    await db.execute('UPDATE workers SET heartbeat_at = clock_timestamp() WHERE id = $1', worker_id)
     kinds = [kind for kind in worker['capabilities'].get('kinds', []) if kind in REMOTE_KINDS]
     admin = user['role'] == 'admin'
     dataset_ids = None
@@ -182,13 +218,20 @@ async def claim(worker_id: str, request: ClaimRequest, user: dict = Depends(get_
                     worker_id,
                     placements=('compute',),
                     kinds=kinds,
-                    policies=REMOTE_KINDS,
+                    policies={kind: remote.policy for kind, remote in REMOTE_KINDS.items()},
                     lease_seconds=LEASE_SECONDS,
                     dataset_ids=dataset_ids,
                     unscoped=admin,
                 )
             except (job_queue.QueueBusy, job_queue.QueueContended):
                 pass  # busy just now: look again within the wait
+        if job is not None and not REMOTE_KINDS[job['kind']].runs_remotely(job):
+            # A step of the job that isn't the worker's (a map re-fit's start and export): back to the server.
+            try:
+                await job_queue.publish_step(db.pool, job['id'], job['lease_token'], release=True, placement='server')
+            except (job_queue.LeaseLost, job_queue.QueueBusy):
+                pass  # it expires back to the queue instead
+            job = None
         if job is not None:
             break
         remaining = deadline - time.monotonic()
@@ -242,11 +285,29 @@ async def job_heartbeat(worker_id: str, job_id: uuid.UUID, report: JobProgress, 
 
 @router.post('/workers/{worker_id}/jobs/{job_id}/complete')
 async def complete(worker_id: str, job_id: uuid.UUID, outcome: JobOutcome, user: dict = Depends(get_worker_user)):
-    """Finish the job with its result. It ends cancelled instead when a cancel came in first."""
-    await _worker_job(worker_id, job_id, user)
-    job = await _queue(
-        job_queue.publish_step(db.pool, job_id, outcome.lease_token, result=outcome.result, finished=True),
-    )
+    """Finish the worker's step with its result. A kind whose work goes on on the server (a map re-fit's swap)
+    hands the job back with its uploads; any other ends with the result. It ends cancelled instead when a cancel
+    came in first. 400 when the uploads aren't complete."""
+    claimed = await _worker_job(worker_id, job_id, user)
+    remote = REMOTE_KINDS.get(claimed['kind'])
+    if remote is not None and remote.finish is not None:
+        job = await db.fetchrow('SELECT * FROM jobs WHERE id = $1', job_id)
+        staged = LocalArtifactStore().staging_dir(job_id, outcome.lease_token)
+        try:
+            checkpoint = await asyncio.to_thread(remote.finish, dict(job), staged, outcome.result)
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error))
+        step = job_queue.publish_step(
+            db.pool,
+            job_id,
+            outcome.lease_token,
+            checkpoint=checkpoint,
+            release=True,
+            placement='server',
+        )
+    else:
+        step = job_queue.publish_step(db.pool, job_id, outcome.lease_token, result=outcome.result, finished=True)
+    job = await _queue(step)
     await _done_with(worker_id, job_id)
     return {'state': job['state']}
 
@@ -258,7 +319,7 @@ async def fail(worker_id: str, job_id: uuid.UUID, failure: JobFailure, user: dic
     job = await _worker_job(worker_id, job_id, user)
     error = failure.error.model_dump()
     if failure.retryable:
-        policy = REMOTE_KINDS.get(job['kind'], JobPolicy())
+        policy = REMOTE_KINDS[job['kind']].policy if job['kind'] in REMOTE_KINDS else JobPolicy()
         ended = await _queue(
             job_queue.defer_job(db.pool, job_id, failure.lease_token, error, delay_seconds=policy.retry_seconds),
         )
@@ -276,6 +337,95 @@ async def release(worker_id: str, job_id: uuid.UUID, lease: JobLease, user: dict
     job = await _queue(job_queue.publish_step(db.pool, job_id, lease.lease_token, release=True))
     await _done_with(worker_id, job_id)
     return {'state': job['state']}
+
+
+async def _live_lease(worker_id: str, job_id: uuid.UUID, lease_token: uuid.UUID, user: dict):
+    """(the job's RemoteKind, the job) while this worker holds its live lease; 409 otherwise. Every file transfer
+    checks it."""
+    await _own_worker(worker_id, user)
+    job = await db.fetchrow(
+        """SELECT kind, checkpoint FROM jobs WHERE id = $1 AND worker_id = $2 AND lease_token = $3
+             AND state = 'running' AND lease_expires_at > clock_timestamp()""",
+        job_id,
+        worker_id,
+        lease_token,
+    )
+    if job is None or job['kind'] not in REMOTE_KINDS:
+        raise HTTPException(status_code=409, detail=LEASE_LOST)
+    return REMOTE_KINDS[job['kind']], dict(job)
+
+
+@router.get('/workers/{worker_id}/jobs/{job_id}/files/{name}')
+async def download(
+    worker_id: str,
+    job_id: uuid.UUID,
+    name: str,
+    x_fridge_lease: uuid.UUID = Header(),
+    user: dict = Depends(get_worker_user),
+):
+    """One of the job's inputs (a map re-fit's vectors.bin), for the lease holder. Range requests resume it."""
+    remote, _ = await _live_lease(worker_id, job_id, x_fridge_lease, user)
+    path = LocalArtifactStore().work_dir(job_id) / name
+    if name not in remote.inputs or not path.is_file():
+        raise HTTPException(status_code=404, detail=f'This job has no input {name!r}')
+    return FileResponse(path, media_type='application/octet-stream')
+
+
+class _Offset(Exception):
+    def __init__(self, size: int):
+        self.size = size
+
+
+def _append(path: Path, offset: int, chunk: bytes) -> int:
+    """Append `chunk` if the file is `offset` bytes long, under an exclusive lock: two uploads of the same chunk
+    at once add it once, and the other gets _Offset with the size to resume at."""
+    path.parent.mkdir(exist_ok=True)
+    with open(path, 'ab') as target:
+        fcntl.flock(target, fcntl.LOCK_EX)
+        size = os.fstat(target.fileno()).st_size
+        if size != offset:
+            raise _Offset(size)
+        target.write(chunk)
+        target.flush()
+        os.fsync(target.fileno())
+        return size + len(chunk)
+
+
+@router.put('/workers/{worker_id}/jobs/{job_id}/files/{name}')
+async def upload(
+    worker_id: str,
+    job_id: uuid.UUID,
+    name: str,
+    request: Request,
+    offset: int = Query(0, ge=0),
+    x_fridge_lease: uuid.UUID = Header(),
+    user: dict = Depends(get_worker_user),
+):
+    """Append a chunk (at most 64 MiB) to one of the job's outputs, staged under this lease, up to the output's
+    size limit. `offset` must be the size uploaded so far; a 409 says the size, to resume from after a dropped
+    connection."""
+    remote, job = await _live_lease(worker_id, job_id, x_fridge_lease, user)
+    if name not in remote.outputs:
+        raise HTTPException(status_code=404, detail=f'This job takes no output {name!r}')
+    # Never more than the chunk limit, nor past what the output can hold: checked before the body is read.
+    room = min(UPLOAD_CHUNK_BYTES, remote.output_limit(job, name) - offset)
+    declared = request.headers.get('content-length')
+    if room < 0 or (declared is not None and declared.isdigit() and int(declared) > room):
+        raise HTTPException(status_code=413, detail=f'{name} takes at most {max(0, room)} more bytes here')
+    path = LocalArtifactStore().staging_dir(job_id, x_fridge_lease) / name
+    size = path.stat().st_size if path.is_file() else 0
+    if size != offset:  # before reading the chunk; _append checks again under its lock
+        raise HTTPException(status_code=409, detail={'code': 'offset', 'message': 'Resume at size', 'size': size})
+    chunk = bytearray()
+    async for piece in request.stream():
+        chunk += piece
+        if len(chunk) > room:
+            raise HTTPException(status_code=413, detail=f'{name} takes at most {room} more bytes here')
+    try:
+        # A lease that ends meanwhile only leaves this lease's folder behind: completion reads its own lease's.
+        return {'size': await asyncio.to_thread(_append, path, offset, bytes(chunk))}
+    except _Offset as error:
+        raise HTTPException(status_code=409, detail={'code': 'offset', 'message': 'Resume at size', 'size': error.size})
 
 
 @router.get('/workers')

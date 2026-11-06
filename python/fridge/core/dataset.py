@@ -159,6 +159,10 @@ def load_map_model(state):
     once per model id. The folder is ``FRIDGE_UMAP_MODEL_DIR`` (default ``$FRIDGE_DATA_ROOT/umap_models``),
     else the server's own path for it on this machine."""
     model_id = state["model_id"]
+    if not state.get("artifact_location"):
+        raise ValueError(
+            "This map has no model: the server places new samples on it from their nearest mapped neighbours",
+        )
     if model_id in _MAP_MODELS:
         return _MAP_MODELS[model_id]
     import hashlib

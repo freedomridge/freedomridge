@@ -163,6 +163,8 @@ async def main():
                 for key, row in states.items():
                     if row["active"] or row["model_id"] is None:
                         continue  # paused while a re-fit runs; a field never re-fitted keeps its legacy model
+                    if row["artifact_location"] is None:
+                        continue  # a map with no model (fitted on a compute worker): the server places its samples
                     try:
                         work.append((key, _load_managed(row, managed.setdefault(key, {})), row["model_id"]))
                     except Exception as e:

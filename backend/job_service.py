@@ -39,6 +39,17 @@ SELECTION_CLEANUP = 'selection_cleanup'
 PRUNE_BATCH_SIZE = 1000
 
 
+def runner_placements() -> tuple[str, ...]:
+    """JOB_RUNNER_PLACEMENTS: the work this runner takes, 'server' and 'compute' (the default, one machine), or
+    only 'server' when compute workers (python -m fridge.worker) do the compute work, such as map re-fits' fits."""
+    placements = tuple(
+        part.strip() for part in os.getenv('JOB_RUNNER_PLACEMENTS', 'server,compute').split(',') if part.strip()
+    )
+    if not placements or set(placements) - {'server', 'compute'} or 'server' not in placements:
+        raise ValueError("JOB_RUNNER_PLACEMENTS is 'server,compute' or 'server'")
+    return placements
+
+
 def positive_seconds(name, default):
     value = float(os.getenv(name, str(default)))
     if not math.isfinite(value) or value <= 0:
@@ -199,6 +210,7 @@ async def run_service(dsn=DATABASE_URL):
     stats_interval = positive_seconds('JOB_STATISTICS_SECONDS', 5)
     concept_interval = positive_seconds('JOB_CONCEPT_SECONDS', 60)
     shutdown_seconds = positive_seconds('JOB_SHUTDOWN_SECONDS', 20)
+    placements = runner_placements()
     stopping = asyncio.Event()
     loop = asyncio.get_running_loop()
     for signum in (signal.SIGINT, signal.SIGTERM):
@@ -232,7 +244,7 @@ async def run_service(dsn=DATABASE_URL):
         return await index_jobs.ann_handler(pool)(job)
 
     async def handle_map_refit(job):
-        return await map_refit.handler(pool)(job)
+        return await map_refit.handler(pool, fits_here='compute' in placements)(job)
 
     async def handle_index_review(job):
         return await index_advisor.handler(pool)(job)
@@ -269,6 +281,7 @@ async def run_service(dsn=DATABASE_URL):
         async with local_runner(
             dsn,
             handlers,
+            placements=placements,
             policies={
                 SELECTION_CLEANUP: JobPolicy(max_unit_seconds=15),
                 statistics.KIND: statistics.POLICY,
@@ -351,6 +364,7 @@ async def run_service(dsn=DATABASE_URL):
                 (lambda: dataset_schedules.schedule_dataset_jobs(pool), 60, 'Dataset schedules', False),
                 (lambda: map_refit.sweep(pool), 600, 'Map artifact cleanup', False),
                 (lambda: map_refit.heal_unranked_maps(pool), 600, 'Unranked map heal', False),
+                (lambda: map_refit.expire_unclaimed_fits(pool), 600, 'Unclaimed map fit expiry', False),
             ]
             retries = [FailureBackoff(logger, f'{name} scheduling', period) for _, period, name, _ in schedules]
             next_runs = [0.0] * len(schedules)

@@ -699,8 +699,7 @@ a permanent warning banner.
 
 A plain `ServerWorker` claims only `server` jobs. The co-located runner (`local_runner`, used by
 `job_service`) defaults to `placements=('server','compute')`, so it also runs compute jobs such as map
-re-fits. Artifact transfer and remote compute handlers are not built yet; a deployment with separate
-compute workers would stop the server runner from claiming compute work.
+re-fits. `JOB_RUNNER_PLACEMENTS=server` leaves compute work to compute workers.
 
 **Remote compute workers over HTTP** (`backend/routers/workers.py`). A machine runs
 `python -m fridge.worker` with a worker token (`api_tokens.scope = 'worker'`, which only these endpoints
@@ -719,8 +718,34 @@ functions above, so their semantics are the same as a local slot's:
 - Each checks that the job's `worker_id` is the caller's worker. A lost lease is 409 (`lease_lost`: stop
   without reporting), and a busy queue is 503 with Retry-After. A worker that stops renewing loses the job
   when its lease expires: the next claim requeues it with a failure, as for a local slot.
-`REMOTE_KINDS` is empty until a kind brings its worker handler and its server hand-off, the map re-fit
-first, so until then no job can be claimed remotely.
+
+`REMOTE_KINDS` lists what a worker can claim, with each kind's policy, which of its steps the worker runs,
+the job files it may download (`GET .../jobs/{job_id}/files/{name}`, Range requests resume it) and upload
+(`PUT .../files/{name}?offset=`, chunks of at most 64 MiB, append-only, a 409 gives the size to resume at),
+and how `complete` hands the job back. Each transfer carries the lease in `X-Fridge-Lease` and is refused
+unless that lease is live. Uploads are staged per lease (`staging_dir`: `work/<job>/remote-<lease>/`), so a
+worker whose lease ended can never mix its files into a later attempt's.
+
+**The map re-fit** is the first remote kind. Each step names where the next runs (`StepResult.placement`):
+- The job is queued as compute work, so nothing starts (no projection pause, no export) until something that
+  takes compute work claims it. A worker's claim of its start hands it straight to the server
+  (`runs_remotely` is true only in the fit phase).
+- The server runs `_start` and `_export`. A runner with `fits_here=False` (`JOB_RUNNER_PLACEMENTS=server`)
+  doesn't measure its own memory, and says the fit waits for a compute worker. `_export` makes the work folder
+  writable by the API, which runs as another user in Docker.
+- The worker downloads `vectors.bin`, runs `fridge.map_fit`, uploads `REMOTE_OUTPUTS` (`ids.npy`,
+  `versions.npy`, `coords.npy`, `manifest.json`) and completes with each one's sha256. No model crosses: a
+  model is a pickle, which runs code when loaded. Each upload is capped by what the exported rows allow
+  (`remote_output_limit`), checked before anything is written, and appended under a file lock.
+- `remote_fit_checkpoint` checks every output against its sha256, reads the arrays with pickles off, checks
+  their shapes and types against the exported rows (and the manifest's), and hands the job back to the server
+  in the publish phase. A failed check is a 400, and the job stays the worker's.
+- `_publish` requires the worker's ids and versions to be the export's, in order (other ids would drop the
+  map's points, another order would misplace them), then swaps and ranks as for a local fit. The map is
+  published with no model file (`artifact_location` NULL; migration 0004 allows that).
+- A fit no worker claims within `UNCLAIMED_FIT_HOURS` (12) is cancelled by `expire_unclaimed_fits` (every
+  10 minutes on the server runner), with the reason in its message. The old map stays, and projection resumes
+  with its model.
 
 **Remote fencing (design, not built yet).** The lease fence covers only SQL inside the
 publication transaction. A remote worker uploads results over HTTP, so a laptop whose lease
@@ -972,9 +997,11 @@ maps; `compute_all` still completes hashes and metrics. Saved model files are pu
 all coordinate batches succeed.
 Both SDK visualization and incremental projection treat a server without `/map-state` (404) as unmanaged.
 
-Still to build for remote compute workers: an authenticated claim/heartbeat/upload/finish API, worker
-credentials, object storage behind `map_artifacts` (the database already stores keys, not paths), and
-starting/stopping machines. The export and publish steps stay on the server; only `fit` moves.
+Still to build for remote compute workers: the worker's own loop that claims and runs a fit (today
+`python -m fridge.worker` registers and heartbeats), object storage behind `map_artifacts` (the database
+already stores keys, not paths), and starting/stopping machines. The worker credentials and the
+claim/heartbeat/upload/complete API exist (**Remote compute workers over HTTP**, above). The export and publish steps stay on
+the server; only `fit` moves.
 
 ## Index advisor: the review
 

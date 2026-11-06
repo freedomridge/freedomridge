@@ -2279,7 +2279,8 @@ CREATE TABLE IF NOT EXISTS embedding_map_state (
     active_job_id UUID,  -- no FK: a job that no longer exists is not active
     active_since TIMESTAMPTZ,
     PRIMARY KEY (dataset_id, field_name),
-    CHECK ((model_id IS NULL) = (artifact_location IS NULL))
+    -- A map may have no model file (it places new samples by neighbours); a model file needs its model id.
+    CONSTRAINT embedding_map_state_artifact_needs_model CHECK (artifact_location IS NULL OR model_id IS NOT NULL)
 );
 
 -- A lasso selection is a polygon in one map's coordinates (`embedding_polygon` filters). Once a field's
@@ -2410,5 +2411,6 @@ INSERT INTO schema_migrations (filename) VALUES
     ('0000_baseline.sql'),
     ('0001_storage_config_dataset_scope.sql'),
     ('0002_dataset_default_view.sql'),
-    ('0003_compute_worker_tokens.sql')
+    ('0003_compute_worker_tokens.sql'),
+    ('0004_map_state_without_model.sql')
 ON CONFLICT (filename) DO NOTHING;
