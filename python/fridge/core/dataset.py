@@ -761,7 +761,7 @@ class Dataset:
         name: str,
         view_stages: Optional[list] = None,
         description: Optional[str] = None,
-        is_public: bool = True,
+        is_public: bool = False,
         query: Optional[str] = None,
     ) -> dict:
         """Create a saved view on this dataset, from stages or from a filter query.
@@ -770,7 +770,9 @@ class Dataset:
             name: View name (must be unique per dataset)
             view_stages: List of ViewStage dicts (same format as FilterContext)
             description: Optional description
-            is_public: Whether the view is visible to all users
+            is_public: Whether every user can see it. Default False (2.0): only you, and those you share it
+                with, as client.create_view() and the app's Save View already did. A dataset's default
+                view must be public.
             query: The filter as text instead of view_stages (docs/FILTER_QUERY.md): each top-level
                 AND part becomes one stage, one chip in the app's filter bar.
 
