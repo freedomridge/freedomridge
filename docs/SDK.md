@@ -73,6 +73,25 @@ client.revoke_token(tok["id"])
 > If you don't call `connect()`, the SDK defaults to `FRIDGE_API_URL` or
 > `http://localhost:8000/api` (and `FRIDGE_API_TOKEN` if set).
 
+### Compute workers
+
+A machine with the RAM or CPUs for heavy jobs can run them for a server as a compute worker. It
+needs a worker token, which only the worker endpoints accept:
+
+```python
+token = client.create_token("my desktop", scope="worker")["token"]
+```
+
+```bash
+FRIDGE_API_URL=https://YOUR_DOMAIN/api FRIDGE_API_TOKEN=<worker token> python -m fridge.worker
+```
+
+The worker registers with the server and keeps a heartbeat, so the server lists it
+(`client.list_workers()`) and System status counts it online. It keeps going while the server is
+down, restarting or slow to answer, and registers again if the server dropped it. A refusal only a
+person can fix, such as a revoked token or an unknown `--kinds`, stops it with the reason. `--name` sets how
+the server lists it (default: the host name). Taking map re-fit jobs follows.
+
 ## Core Classes
 
 ### Dataset

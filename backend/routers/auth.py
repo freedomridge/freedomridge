@@ -147,6 +147,47 @@ def _enforce_password_change(user: dict, request: Request) -> None:
         )
 
 
+async def _token_user(auth_header: str) -> tuple[dict, str]:
+    """(user, token scope) for an Authorization "Bearer <token>" header; 401 for an unknown, revoked or expired
+    token, 403 for an inactive account."""
+    token = auth_header.replace("Bearer ", "").strip()
+    # Tokens are stored hashed; look up by the hash of the presented token.
+    query = """
+        SELECT u.id, u.username, u.email, u.role, u.must_change_password, u.is_active,
+               u.is_demo_account, t.id as token_id, t.scope
+        FROM api_tokens t
+        JOIN users u ON t.user_id = u.id
+        WHERE t.token = $1
+          AND t.is_active = TRUE
+          AND (t.expires_at IS NULL OR t.expires_at > NOW())
+    """
+    user = await db.fetchrow(query, hash_token(token))
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+    if not user['is_active']:
+        raise HTTPException(status_code=403, detail="Account is inactive")
+    await db.execute("UPDATE api_tokens SET last_used_at = NOW() WHERE id = $1", user['token_id'])
+    user_dict = dict(user)
+    del user_dict['token_id'], user_dict['scope']
+    return user_dict, user['scope']
+
+
+async def get_worker_user(request: Request) -> dict:
+    """The user behind a compute worker token. The worker endpoints accept these tokens and nothing else: no
+    session, no full token. As for creating a token, the user must be a power user or an admin."""
+    auth_header = request.headers.get("Authorization")
+    if not (auth_header and auth_header.startswith("Bearer ")):
+        raise HTTPException(status_code=401, detail="A compute worker authenticates with a worker token")
+    user, scope = await _token_user(auth_header)
+    if scope != 'worker':
+        raise HTTPException(status_code=403, detail="Use a worker token (scope 'worker') for a compute worker")
+    if user['role'] not in get_allowed_roles('power_user'):
+        raise HTTPException(status_code=403, detail="Insufficient permissions")
+    await set_request_user(user)
+    _enforce_password_change(user, request)
+    return user
+
+
 async def get_current_user(request: Request):
     """
     Authenticate via API token (Bearer) OR session cookie.
@@ -159,38 +200,15 @@ async def get_current_user(request: Request):
     # Check for Bearer token first
     auth_header = request.headers.get("Authorization")
     if auth_header and auth_header.startswith("Bearer "):
-        token = auth_header.replace("Bearer ", "").strip()
-        # Tokens are stored hashed; look up by the hash of the presented token.
-        token_lookup = hash_token(token)
-
-        query = """
-            SELECT u.id, u.username, u.email, u.role, u.must_change_password, u.is_active,
-                   u.is_demo_account, t.id as token_id
-            FROM api_tokens t
-            JOIN users u ON t.user_id = u.id
-            WHERE t.token = $1
-              AND t.is_active = TRUE
-              AND (t.expires_at IS NULL OR t.expires_at > NOW())
-        """
-
-        user = await db.fetchrow(query, token_lookup)
-
-        if user:
-            if not user['is_active']:
-                raise HTTPException(status_code=403, detail="Account is inactive")
-
-            # Update last_used_at asynchronously (don't block request)
-            await db.execute("UPDATE api_tokens SET last_used_at = NOW() WHERE id = $1", user['token_id'])
-
-            # Return user dict without token_id
-            user_dict = dict(user)
-            del user_dict['token_id']
-            await set_request_user(user_dict)
-            _enforce_password_change(user_dict, request)
-            return user_dict
-
-        # Invalid token provided
-        raise HTTPException(status_code=401, detail="Invalid or expired token")
+        user_dict, scope = await _token_user(auth_header)
+        if scope == 'worker':
+            raise HTTPException(
+                status_code=403,
+                detail="This is a compute worker token: only the worker endpoints (python -m fridge.worker) accept it",
+            )
+        await set_request_user(user_dict)
+        _enforce_password_change(user_dict, request)
+        return user_dict
 
     # Fall back to session cookie authentication
     session_id = request.cookies.get("session_id")
