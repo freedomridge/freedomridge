@@ -4,6 +4,21 @@ Freedom Ridge has one version for the server, the web app and the Python SDK (th
 file), following [Semantic Versioning](https://semver.org). A release lists **upgrade notes** when
 it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
 
+## 1.3.1 (2026-11-06)
+
+### Fixed
+
+- Restoring a version (**Restore sample data**, `POST /datasets/{id}/versions/{version_id}/revert`,
+  `Dataset.revert()`) failed with 409 "Dataset changed during restore" whenever something else wrote
+  to the dataset while it ran. That included the statistics refresh that the previous restore started,
+  so two restores in a row could fail. The server now runs the restore again, up to three attempts in
+  all, and returns the 409 only when every attempt is interrupted.
+
+### Upgrade notes
+
+- No database migration. Only the server changed; the web app and the Python SDK are the same as in
+  1.3.0.
+
 ## 1.3.0 (2026-11-05)
 
 ### Added
