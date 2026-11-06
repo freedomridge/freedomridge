@@ -107,12 +107,20 @@ zoomed-in loads (~100ms) don't flicker, and hidden the MOMENT fresh data renders
 (geojson changes) rather than when the network settles — so it doesn't linger after the
 new data is already visible.
 
-## 10. Map resize is MANUAL
+## 10. The map fills its panel when the panel is resized
 
-Panel-size changes are handled by the manual **"Resize Map"** button (calls
-`map.resize()`). Do **not** add a container `ResizeObserver` / auto-resize to the map —
-it has caused instability and was explicitly declined. (Re-fitting on browser *window*
-resize is fine.)
+mapbox-gl resizes its canvas only when the browser *window* changes size. Dragging a panel
+separator or splitting a panel resizes the map's container alone, which left the canvas at its
+old size: a black strip beside it, and a map that still worked only in the old area. A
+`ResizeObserver` on the container calls `map.resize()`, and the resulting `moveend` refetches for
+the new visible area (debounced). The **"Resize Map"** button stays as a manual fallback.
+
+The observer must be attached once the map is mounted. The first render is a placeholder without
+the container, so an effect with `[]` deps finds no container and never runs again. Every earlier
+observer (November 2025 to June 2026) was attached that way, so none of them ever ran, and this
+item used to say auto-resize "caused instability" and should stay manual.
+`e2e/panels.spec.ts` ("the map fills its panel after the separator is dragged") checks that the
+canvas matches its container after a drag, with no page errors.
 
 ## 11. Performance / scale
 
