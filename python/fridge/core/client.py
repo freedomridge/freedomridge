@@ -1543,6 +1543,26 @@ class Client:
         _raise_for_status(resp)
         return resp.json()
 
+    def parse_filter_query(self, dataset_id, query, current=None) -> dict:
+        """Filter query text (docs/FILTER_QUERY.md) as filters, checked against the dataset's fields:
+        {filters, parts, filter, reuse}. Raises ValueError with the line, column and any suggestion
+        when the text doesn't fit the dataset."""
+        resp = self.session.post(
+            f"{self.base_url}/datasets/{dataset_id}/filter_query/parse",
+            json={"query": query, "current": current or []},
+        )
+        if resp.status_code == 400:
+            try:
+                detail = resp.json().get("detail")
+            except ValueError:
+                detail = None
+            if isinstance(detail, dict) and detail.get("errors"):
+                suggestions = detail["errors"][0].get("suggestions") or []
+                hint = f" (did you mean {' or '.join(repr(s) for s in suggestions)}?)" if suggestions else ""
+                raise ValueError(f"{detail['message']}{hint}")
+        _raise_for_status(resp)
+        return resp.json()
+
     def list_views(self, dataset_id) -> list:
         """List saved views for a dataset."""
         resp = self.session.get(f"{self.base_url}/datasets/{dataset_id}/views")

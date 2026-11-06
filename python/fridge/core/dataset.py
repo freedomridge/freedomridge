@@ -12,7 +12,7 @@ import requests
 from .client import get_client
 from .sample import Sample
 from .version_view import VersionView
-from .view import Condition, DatasetView, SampleQuery, filters_from_view_stages, parse_query_string
+from .view import Condition, DatasetView, SampleQuery, filters_from_view_stages
 
 # `field__op=value` suffixes accepted by Dataset.filter(), mapped to the wire operator that
 # backend/routers/datasets.py's parse_filter_node actually implements.
@@ -283,6 +283,11 @@ def fit_reducer(vectors, fit_sample_size, method="umap", timings=None):
 
 
 _PATCH_SCALE_RE = re.compile(r"^(?P<base>.+)_patch_(?P<rows>\d+)x(?P<cols>\d+)$")
+
+
+def _stage_label(part: str, limit: int = 80) -> str:
+    """A filter-bar chip label from a query part: the text itself, shortened when a long list makes it wide."""
+    return part if len(part) <= limit else part[: limit - 1].rstrip() + "…"
 
 
 def _patch_tile_fields(field_name: str) -> Optional[List[str]]:
@@ -784,28 +789,40 @@ class Dataset:
     def create_view(
         self,
         name: str,
-        view_stages: list,
+        view_stages: Optional[list] = None,
         description: Optional[str] = None,
         is_public: bool = True,
+        query: Optional[str] = None,
     ) -> dict:
-        """Create a saved view on this dataset.
+        """Create a saved view on this dataset, from stages or from a filter query.
 
         Args:
             name: View name (must be unique per dataset)
             view_stages: List of ViewStage dicts (same format as FilterContext)
             description: Optional description
             is_public: Whether the view is visible to all users
+            query: The filter as text instead of view_stages (docs/FILTER_QUERY.md): each top-level
+                AND part becomes one stage, one chip in the app's filter bar.
 
         Returns:
             dict: Created view object with id, slug, etc.
 
         Example:
+            dataset.create_view("Serials", query="serial in (103000752 103001025) AND split = train")
             dataset.create_view("My Selection", view_stages=[{
                 "type": "selection",
                 "description": "500 Selected",
                 "filter": {"field": "id", "operator": "in", "value": [1, 2, 3]},
             }])
         """
+        if (view_stages is None) == (query is None):
+            raise ValueError("create_view takes view_stages or query, not both or neither")
+        if query is not None:
+            parsed = self.client.parse_filter_query(self._id, query)
+            view_stages = [
+                {"type": "filter", "description": _stage_label(part), "filter": node}
+                for node, part in zip(parsed["filters"], parsed["parts"])
+            ]
         return self.client.create_view(
             self._id,
             name,
@@ -1150,33 +1167,28 @@ class Dataset:
 
     def query(self, query_string: str) -> DatasetView:
         """
-        Query samples using SQL-like syntax.
+        Filter samples with the filter query language (docs/FILTER_QUERY.md), the same text the app's
+        filter bar and saved views take. The server checks every field, operator and value against this
+        dataset, and raises ValueError with the line, the column and a suggestion when one doesn't fit.
 
         Example:
             view = dataset.query("brightness > 0.5 AND scene = 'highway'")
-            view = dataset.query("scene IN ('highway', 'city') AND weather != 'sunny'")
+            view = dataset.query("serial in (103000752 103001025 103004080) AND split = train")
             view = dataset.query("brightness BETWEEN 0.3 AND 0.8")
-            view = dataset.query("filename LIKE '%night%'")
+            view = dataset.query("NOT (scene = city OR weather is null)")
 
-        Supported operators:
-            - Comparison: =, !=, <>, <, >, <=, >=
-            - Logical: AND, OR, NOT
-            - Set: IN (value1, value2, ...)
-            - Range: BETWEEN min AND max
-            - String: LIKE '%pattern%', CONTAINS 'pattern'
-            - Null: IS NULL, IS NOT NULL
+        Operators: = != > >= < <=, in (...) and not in (...) with commas or spaces between values,
+        contains, between ... and ..., exists, not exists, is null, is not null, with AND, OR, NOT and
+        brackets. AND binds tighter than OR.
 
         Args:
-            query_string: SQL-like filter expression
+            query_string: the filter, as text
 
         Returns:
             DatasetView: A filtered view of the dataset
         """
-        filters = parse_query_string(query_string)
-        view = DatasetView(self)
-        if filters:
-            view._filters = filters
-        return view
+        parsed = self.client.parse_filter_query(self._id, query_string)
+        return DatasetView(self, parsed["filter"] if parsed["filters"] else None)
 
     def filter(self, *conditions: Condition, **kwargs) -> DatasetView:
         """

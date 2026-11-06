@@ -268,25 +268,35 @@ view = s[
 ]
 ```
 
-###### Method 2: SQL-like Strings (Most Readable)
+###### Method 2: Filter Query Strings (Most Readable)
+
+The same filter query language the app's filter bar takes ([FILTER_QUERY.md](FILTER_QUERY.md)). The
+server parses it and checks every field, operator and value against the dataset, so a misspelt field
+raises `ValueError` with the line, the column and a suggestion instead of matching nothing.
 
 ```python
 # Simple
 view = dataset.query("brightness > 0.5")
 
-# AND/OR
+# AND/OR (AND binds tighter than OR, as in SQL)
 view = dataset.query("scene = 'highway' AND weather = 'rainy'")
 view = dataset.query("scene = 'highway' OR scene = 'city'")
 
-# IN clause
+# Lists: commas or any whitespace between values, so a pasted column works as is
 view = dataset.query("scene IN ('highway', 'city', 'residential')")
+view = dataset.query("""serial in (
+    103000752  103001025  103004080
+    103004120  103004128
+)""")
 
-# BETWEEN
+# Ranges
 view = dataset.query("brightness BETWEEN 0.3 AND 0.8")
 
-# Case-insensitive substring: LIKE (the % wildcards are ignored) or CONTAINS
-view = dataset.query("filename LIKE '%img_00%'")
-view = dataset.query("filename CONTAINS 'img_00'")
+# Case-insensitive substring: CONTAINS (or LIKE '%...%')
+view = dataset.query("filepath CONTAINS 'img_00'")
+
+# Missing or empty: IS NULL / IS NOT NULL, EXISTS / NOT EXISTS
+view = dataset.query("reviewed IS NULL")
 
 # NOT and <> (same as !=)
 view = dataset.query("NOT scene = 'highway'")
@@ -298,12 +308,10 @@ view = dataset.query("""
     AND brightness > 0.5
     AND weather != 'sunny'
 """)
-```
 
-To test whether a field is missing or empty, use `filter()` with `__exists` or
-`__is_null` (below). Older SDK versions turn `IS NULL` / `IS NOT NULL` in a query
-string into comparisons with null, so `IS NULL` matches no samples and
-`IS NOT NULL` matches every sample.
+# A saved view from the same text: each top-level AND part is one chip in the app
+dataset.create_view("Highway serials", query="scene = 'highway' AND serial in (103000752 103001025)")
+```
 
 ###### Method 3: Django-style Keyword Args (Simplest)
 
