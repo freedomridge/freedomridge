@@ -11,7 +11,8 @@ it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
 - Compute workers, first part: a worker token (`"scope": "worker"` in `POST /api/tokens`,
   `client.create_token(name, scope="worker")`), which only the new worker endpoints accept, and
   `python -m fridge.worker`, which registers a machine with the server and keeps it online.
-  `GET /api/workers` lists workers (an admin sees all of them), and System status counts them.
+  **Settings → Compute Workers** and `GET /api/workers` list workers (an admin sees all of them), and
+  System status counts them. **API Tokens** makes a worker token (**Used by: a compute worker**).
 
 ### Upgrade notes
 

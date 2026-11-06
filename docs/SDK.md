@@ -86,8 +86,8 @@ token = client.create_token("my desktop", scope="worker")["token"]
 FRIDGE_API_URL=https://YOUR_DOMAIN/api FRIDGE_API_TOKEN=<worker token> python -m fridge.worker
 ```
 
-The worker registers with the server and keeps a heartbeat, so the server lists it
-(`client.list_workers()`) and System status counts it online. It keeps going while the server is
+The worker registers with the server and keeps a heartbeat, so **Settings → Compute Workers** and
+`client.list_workers()` list it, and System status counts it online. It keeps going while the server is
 down, restarting or slow to answer, and registers again if the server dropped it. A refusal only a
 person can fix, such as a revoked token or an unknown `--kinds`, stops it with the reason. `--name` sets how
 the server lists it (default: the host name). Taking map re-fit jobs follows.

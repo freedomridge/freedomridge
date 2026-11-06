@@ -15,12 +15,15 @@ interface Token {
     last_used_at?: string;
     expires_at?: string;
     is_active: boolean;
+    // 'worker': for a compute worker (python -m fridge.worker); only the worker endpoints accept it.
+    scope: 'full' | 'worker';
 }
 
 export default function TokensPage() {
     const [showCreateForm, setShowCreateForm] = useState(false);
     const [newTokenName, setNewTokenName] = useState('');
     const [expiryDays, setExpiryDays] = useState(90);
+    const [scope, setScope] = useState<'full' | 'worker'>('full');
     const [createdToken, setCreatedToken] = useState<Token | null>(null);
     const [copiedToken, setCopiedToken] = useState(false);
 
@@ -38,7 +41,7 @@ export default function TokensPage() {
 
     // Create token
     const createMutation = useMutation({
-        mutationFn: async (data: { name: string, expires_days: number }) => {
+        mutationFn: async (data: { name: string, expires_days: number, scope: 'full' | 'worker' }) => {
             const res = await fetch('/api/tokens', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -52,6 +55,7 @@ export default function TokensPage() {
             setCreatedToken(data);
             setShowCreateForm(false);
             setNewTokenName('');
+            setScope('full');
             queryClient.invalidateQueries({ queryKey: ['api-tokens'] });
         }
     });
@@ -121,9 +125,18 @@ export default function TokensPage() {
                                 {copiedToken ? <Check className="w-4 h-4" /> : <Copy className="w-4 h-4" />}
                             </button>
                         </div>
-                        <p className="mt-3 text-xs text-zinc-400">
-                            Usage: <code className="bg-zinc-800 px-2 py-1 rounded">Authorization: Bearer {'{'}token{'}'}</code>
-                        </p>
+                        {createdToken.scope === 'worker' ? (
+                            <p data-testid="worker-token-command" className="mt-3 text-xs text-zinc-400">
+                                On the worker machine, with the Python SDK installed:{' '}
+                                <code className="bg-zinc-800 px-2 py-1 rounded break-all">
+                                    FRIDGE_API_URL={typeof window === 'undefined' ? '' : window.location.origin}/api FRIDGE_API_TOKEN={createdToken.token} python -m fridge.worker
+                                </code>
+                            </p>
+                        ) : (
+                            <p className="mt-3 text-xs text-zinc-400">
+                                Usage: <code className="bg-zinc-800 px-2 py-1 rounded">Authorization: Bearer {'{'}token{'}'}</code>
+                            </p>
+                        )}
                     </div>
                 )}
 
@@ -169,9 +182,23 @@ export default function TokensPage() {
                                         <option value={365}>1 year</option>
                                     </select>
                                 </div>
+                                <div>
+                                    <label className="block text-sm font-medium mb-1 text-zinc-300">
+                                        Used by
+                                    </label>
+                                    <select
+                                        data-testid="token-scope"
+                                        value={scope}
+                                        onChange={(e) => setScope(e.target.value as 'full' | 'worker')}
+                                        className="w-full p-2 bg-zinc-800 border border-zinc-700 rounded text-white focus:outline-none focus:border-cyan-500"
+                                    >
+                                        <option value="full">Scripts and the SDK: everything your role can do</option>
+                                        <option value="worker">A compute worker: only runs jobs for this server</option>
+                                    </select>
+                                </div>
                                 <div className="flex gap-2 pt-2">
                                     <button
-                                        onClick={() => createMutation.mutate({ name: newTokenName, expires_days: expiryDays })}
+                                        onClick={() => createMutation.mutate({ name: newTokenName, expires_days: expiryDays, scope })}
                                         disabled={!newTokenName.trim() || createMutation.isPending}
                                         className="px-4 py-2 bg-cyan-600 hover:bg-cyan-700 disabled:bg-zinc-700 disabled:cursor-not-allowed text-white rounded font-medium"
                                     >
@@ -211,7 +238,14 @@ export default function TokensPage() {
                         tokens.map(token => (
                             <div key={token.id} className="p-4 border border-zinc-700 rounded-lg bg-zinc-900 flex justify-between items-start">
                                 <div className="flex-1">
-                                    <h3 className="font-semibold text-lg">{token.name}</h3>
+                                    <h3 className="font-semibold text-lg">
+                                        {token.name}
+                                        {token.scope === 'worker' && (
+                                            <span data-testid="token-worker-badge" className="ml-2 align-middle rounded border border-cyan-700 px-1.5 py-0.5 text-xs font-medium text-cyan-300">
+                                                Worker
+                                            </span>
+                                        )}
+                                    </h3>
                                     <div className="mt-2 space-y-1 text-sm text-zinc-400">
                                         <p>
                                             <span className="text-zinc-500">Created:</span>{' '}

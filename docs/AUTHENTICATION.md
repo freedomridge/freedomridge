@@ -100,7 +100,8 @@ Details:
   disables a token immediately. Users can list and revoke only their own tokens
   (`client.list_tokens()`, `GET /api/tokens`).
 - A deactivated user's tokens stop working (403).
-- A **worker token** (`"scope": "worker"`, `client.create_token(name, scope="worker")`) is for a compute
+- A **worker token** (on the tokens page, **Used by: a compute worker**; `"scope": "worker"`;
+  `client.create_token(name, scope="worker")`) is for a compute
   worker, a machine that runs jobs for the server (`python -m fridge.worker`). Only the worker endpoints
   accept it; everywhere else it gets a 403, so the token kept on a worker machine can do only what a
   worker does. A full token or a session doesn't work on the worker endpoints either.
