@@ -10,7 +10,8 @@ and verify every requirement still holds after your change.** The most-broken on
 1. **Auto-show ALL individual points at zoom ≥ `_MAP_POINT_ZOOM` (12)** — the old
    `clusterMaxZoom`. Enforced server-side. Never remove it.
 2. **Per-cell hybrid below that zoom**: cell with ≥ `_MAP_CLUSTER_MIN_POINTS` (100) →
-   one bubble; sparser cell → individual points.
+   one bubble; sparser cell → individual points, except points under a neighbouring
+   bubble, which count in it.
 3. **A bubble always represents ≥ 100 samples** — no "1"/"12" bubbles, in any path.
    Overflow coarsens the grid; it never drops the floor or truncates points.
 4. **View everything**: never silently cap/truncate visible data; signal limits and
@@ -18,8 +19,9 @@ and verify every requirement still holds after your change.** The most-broken on
 5. **Selecting samples (grid checkboxes) fits the map to them** — 1 → fly in close,
    N → fitBounds; live as selection changes. (Distinct from: no auto-zoom when a drawn
    polygon is deleted.)
-6. **"Zoom to Data" must work after clearing filters**; map resize is the manual
-   "Resize Map" button (no auto ResizeObserver).
+6. **"Zoom to Data" must work after clearing filters**; the map fills its panel when the
+   panel is resized (a container ResizeObserver attached once mounted; "Resize Map" stays
+   as a fallback).
 
 See the doc for the full, authoritative list and the tunables.
 

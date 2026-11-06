@@ -115,18 +115,23 @@ export function MapPanel({
         });
     }, []);
 
-    // Resize the canvas AND refetch for the new visible area whenever the panel /
-    // container changes size (panel splits, layout changes, window resize).
+    // Resize the canvas AND refetch for the new visible area (the Resize Map button).
     const refitToContainer = useCallback(() => {
         mapRef.current?.resize();
         captureView();
     }, [captureView]);
 
+    // mapbox-gl only follows window resizes; dragging a panel separator or splitting a panel
+    // resizes the container alone, which left the canvas at its old size. resize() fires
+    // moveend when the size changed, so handleMoveEnd refetches for the new visible area.
+    // The container exists once `mounted` is set (the first render is a placeholder).
     useEffect(() => {
-        const handler = () => refitToContainer();
-        window.addEventListener('resize', handler);
-        return () => window.removeEventListener('resize', handler);
-    }, [refitToContainer]);
+        const container = containerRef.current;
+        if (!container) return;
+        const observer = new ResizeObserver(() => mapRef.current?.resize());
+        observer.observe(container);
+        return () => observer.disconnect();
+    }, [mounted]);
 
     // Hybrid by default (server: dense cells -> cluster bubble, sparse cells ->
     // individual points). The server ALSO auto-returns ALL individual points once
