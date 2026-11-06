@@ -43,9 +43,9 @@ function tileBbox(bbox: [number, number, number, number], zoom: number): [number
 }
 
 // A map_points item: with an `id` it's an individual sample point; without one it's
-// a cluster bubble (cell centroid + count).
+// a cluster bubble (cell centroid + count, and the radius in px the server sized it for).
 interface MapPointItem { id: number; lon: number; lat: number; heading?: number }
-interface MapClusterItem { id?: null; lon: number; lat: number; count: number }
+interface MapClusterItem { id?: null; lon: number; lat: number; count: number; radius: number }
 type MapItem = MapPointItem | MapClusterItem;
 
 // Stable empty-array identity so `items` (and the geojson useMemo that depends on it)
@@ -207,7 +207,7 @@ export function MapPanel({
                 : {
                     type: 'Feature',
                     geometry: { type: 'Point', coordinates: [it.lon, it.lat] },
-                    properties: { cluster_count: it.count },
+                    properties: { cluster_count: it.count, radius: it.radius },
                 }
             ),
         };
@@ -312,10 +312,10 @@ export function MapPanel({
             // Sized to roughly FILL the cluster's grid cell (a cell is ~128px on screen by
             // design) so a cluster visibly COVERS its area — restoring the pre-server-
             // clustering behavior (clusterRadius=50 + ~40px circles) that the regression
-            // migration shrank to a tiny dot. Still grows with count. This is a frontend
-            // approximation; exact cell-fit (incl. when the grid is coarsened on zoom-out)
-            // needs the backend to return the effective cell size — follow-up.
-            'circle-radius': ['step', ['get', 'cluster_count'], 52, 1000, 60, 10000, 70, 100000, 84],
+            // migration shrank to a tiny dot. Grows with count (52-84 px). The server
+            // sends the radius: the loose points within it count in the bubble instead of
+            // being drawn under it (_map_bubble_radius_px in backend/routers/datasets.py).
+            'circle-radius': ['get', 'radius'],
         }
     }), [clusterColor]);
 

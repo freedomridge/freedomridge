@@ -43,6 +43,17 @@ So sparse areas show real points at *any* zoom (you don't have to reach point-vi
 see a handful of points in an empty region). A single response is a **mix** of bubbles
 and points.
 
+**A bubble takes in the points drawn under it.** A bubble sits at its own points' average
+position and is 52–84 px in radius, while a cell is 128 px wide, so it spills into neighbouring
+cells. Their loose points used to be drawn on top of it, as if they were part of the cluster but
+left out of its count. A loose point within a bubble's on-screen radius at the request's zoom now
+counts in the nearest such bubble instead of being drawn. Points outside every bubble stay
+individual, and every sample is still represented. The server sends each bubble's `radius`
+(`_map_bubble_radius_px`) and the map draws exactly that, so the bubble absorbs exactly the
+points it covers. This is done on the cells after the single GROUP BY, looking only at a dense
+cell's 8 neighbours. Timed on 3.75M synthetic samples at zooms 3–11.5, it made no measurable
+difference. Tests: `backend/tests/test_map_clusters.py`.
+
 ## 3. A cluster bubble ALWAYS represents ≥ `_MAP_CLUSTER_MIN_POINTS` samples
 
 No "1" / "12" bubbles, ever, in any code path. Every clustering path uses the one
