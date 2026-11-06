@@ -251,7 +251,7 @@ def test_a_fit_grows_at_most_a_step_beyond_its_measured_size(registry_database, 
     store = LocalArtifactStore(tmp_path)
     sizes = []
 
-    async def fit(command, source, output, log_path, allowance, bytes_per_point=None, max_fit_size=None):
+    async def fit(command, source, output, log_path, allowance, bytes_per_point=None, max_fit_size=None, shared=False):
         sizes.append((bytes_per_point, max_fit_size))
         await asyncio.to_thread(write_outputs, monkeypatch, source, output)
 
