@@ -4731,19 +4731,9 @@ def build_sample_query_parts(
     return where_clause, args, arg_idx
 
 
-@router.get("/datasets/{id}/map_points", dependencies=[Depends(require_dataset_access)])
-@guest_heavy
-async def get_dataset_map_points(id: int, filters: Optional[str] = None):
-    """
-    Get all samples with location data for map visualization.
-    """
-    filter_obj = json.loads(filters) if filters else None
-    return await _get_dataset_map_points_impl(id, filter_obj)
-
-
 class MapPointsRequest(BaseModel):
     filters: Optional[Dict[str, Any]] = None
-    zoom: Optional[float] = None  # if set, return server-side clusters for this zoom
+    zoom: Optional[float] = None  # the map's zoom: server-side clusters below _MAP_POINT_ZOOM, points from it on
     bbox: Optional[List[float]] = None  # [west, south, east, north] viewport (GiST-indexed)
     points: bool = False  # force ALL points (manual de-cluster)
 
@@ -4751,9 +4741,11 @@ class MapPointsRequest(BaseModel):
 @router.post("/datasets/{id}/map_points", dependencies=[Depends(require_dataset_access)])
 @guest_heavy
 async def get_dataset_map_points_post(id: int, request: MapPointsRequest):
-    """
-    POST version of get_dataset_map_points to handle large filter payloads.
-    """
+    """The map's points and cluster bubbles for a zoom and viewport (docs/MAP_REQUIREMENTS.md), or with
+    `points` every individual point up to the cap. One of `zoom` and `points` is required: an answer with every
+    located sample at once has no bound."""
+    if request.zoom is None and not request.points:
+        raise HTTPException(status_code=422, detail='map_points needs the map\'s zoom, or "points": true')
     return await _get_dataset_map_points_impl(id, request.filters, request.zoom, request.bbox, request.points)
 
 
@@ -5086,9 +5078,9 @@ async def _get_dataset_map_points_impl(
             cell *= 2.0
         return {"mode": "hybrid", "items": items, "capped": points or auto_points}
 
-    # Legacy (no zoom): ALL points as a flat list — unchanged contract.
-    rows = await db.fetch(f"{pt_select} WHERE {base_where}", *base_args)
-    return [dict(row) for row in rows]
+    # Neither a zoom nor points: the endpoint refuses this (no unbounded answer). A points request with no zoom
+    # that is over the cap has no zoom to cluster at either.
+    raise HTTPException(status_code=422, detail='Too many points to return at once: zoom in, or send the zoom')
 
 
 class SamplesRequest(BaseModel):

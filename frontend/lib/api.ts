@@ -968,7 +968,7 @@ export async function getMapPoints(
         body: JSON.stringify({ filters, zoom: opts?.zoom, bbox: opts?.bbox, points: opts?.points }),
     });
     await ensureOk(res, 'Failed to fetch map points');
-    // zoom set -> { mode: 'hybrid'|'points', items, capped? }; no zoom -> legacy array.
+    // { mode: 'hybrid'|'points', items, capped }. The server needs the zoom, or points: true.
     return res.json();
 }
 

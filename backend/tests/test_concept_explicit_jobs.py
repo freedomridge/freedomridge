@@ -586,7 +586,7 @@ def test_every_read_path_refuses_a_concept_being_rescored_with_409(concept_datab
             'field stats': datasets._get_dataset_field_stats_impl(1, node),
             'field stats exact': datasets._get_dataset_field_stats_impl(1, node, lightning_mode=False),
             'histogram': datasets.get_histogram(1, 'media_type', bins=None, filters=json.dumps(node), top=50),
-            'map points': datasets.get_dataset_map_points_post(1, datasets.MapPointsRequest(filters=node)),
+            'map points': datasets.get_dataset_map_points_post(1, datasets.MapPointsRequest(filters=node, points=True)),
             'map extent': datasets.get_dataset_map_extent(1, datasets.MapExtentRequest(filters=node)),
             'scatter': embeddings.get_embeddings_post(1, embeddings.EmbeddingsRequest(filters=node)),
         }
