@@ -114,6 +114,8 @@ interface FilterContextType {
     setViewStages: (stages: ViewStage[]) => void;
     addStage: (stage: ViewStage) => void;
     removeStage: (index: number) => void;
+    // The query editor's chips, replacing every chip (docs/FILTER_QUERY.md).
+    replaceStages: (stages: ViewStage[]) => void;
     updateStage: (index: number, stage: ViewStage) => void;
 
     // Staged filters (affects grid preview only)
@@ -301,6 +303,14 @@ export function FilterProvider({ children, datasetId }: { children: React.ReactN
         // Removing a default-view filter is choosing to see past it, also after a reload.
         if (defaultView && isDefaultViewStage(viewStages[index], defaultView)) setDismissedDefaultViewId(defaultView.id);
         setViewStages(prev => prev.filter((_, i) => i !== index));
+    }, [viewStages, defaultView]);
+
+    const replaceStages = useCallback((stages: ViewStage[]) => {
+        // Leaving a default-view filter out of the text is choosing to see past it, as removing its chip is.
+        if (defaultView && viewStages.some(stage => isDefaultViewStage(stage, defaultView) && !stages.includes(stage))) {
+            setDismissedDefaultViewId(defaultView.id);
+        }
+        setViewStages(stages);
     }, [viewStages, defaultView]);
 
     const updateStage = useCallback((index: number, newStage: ViewStage) => {
@@ -729,6 +739,7 @@ export function FilterProvider({ children, datasetId }: { children: React.ReactN
         addStage,
 
         removeStage,
+        replaceStages,
         updateStage,
         stagedFilters,
         activeFilters: globalFilters,
