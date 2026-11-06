@@ -73,6 +73,18 @@ client.revoke_token(tok["id"])
 > If you don't call `connect()`, the SDK defaults to `FRIDGE_API_URL` or
 > `http://localhost:8000/api` (and `FRIDGE_API_TOKEN` if set).
 
+**The SDK and the server must share a major version.** Within one major version, any SDK works with any server.
+
+- **The server's version:** every answer says which release made it (the `X-Fridge-Version` header). The SDK
+  raises `fridge.IncompatibleServerError` on the first answer from a server of another major version.
+- **The SDK's version:** every request says which release it is (`X-Fridge-SDK-Version`). The server refuses an
+  SDK of another major version with HTTP 426.
+
+Either way, the message names both versions and the SDK to install, from the server's release:
+`pip install "freedomridge @ git+https://github.com/freedomridge/freedomridge.git@v2.0.0#subdirectory=python"`.
+SDKs before 2.0 send no version, so a 2.x server can't refuse them. Upgrade the SDK when you upgrade the
+server.
+
 ### Compute workers
 
 A machine with the RAM or CPUs for heavy jobs can run them for a server as a compute worker. It

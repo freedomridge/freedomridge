@@ -4,6 +4,24 @@ Freedom Ridge has one version for the server, the web app and the Python SDK (th
 file), following [Semantic Versioning](https://semver.org). A release lists **upgrade notes** when
 it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
 
+## Unreleased
+
+### Added
+
+- The SDK and the server check each other's version.
+  - Every answer from the server carries its release in an `X-Fridge-Version` header. The SDK raises
+    `fridge.IncompatibleServerError` when the server runs another major version, naming both versions and
+    how to install the SDK of the server's release.
+  - Every SDK request carries `X-Fridge-SDK-Version`, and the server refuses an SDK of another major version
+    with HTTP 426 and the same advice.
+
+### Upgrade notes
+
+- **Upgrade the Python SDK together with the server.** An SDK works only with a server of its own major
+  version. SDKs before 2.0 neither send their version nor check the server's, so a 2.x server can't refuse
+  a 1.x SDK: it fails wherever the API changed instead. Install the SDK from the server's release:
+  `pip install "freedomridge @ git+https://github.com/freedomridge/freedomridge.git@v2.0.0#subdirectory=python"`.
+
 ## 1.4.0 (2026-11-06)
 
 ### Added

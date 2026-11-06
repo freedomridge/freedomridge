@@ -42,6 +42,7 @@ from .routers import (
     workers,
 )
 from .security import production
+from .version import VERSION
 
 # Fail fast in prod if the storage-secret encryption key is missing/default.
 # Local dev (FRIDGE_ENV=development) just logs a warning.
@@ -52,6 +53,45 @@ warn_insecure_session_cookie()
 
 app = FastAPI(lifespan=lifespan)
 app.add_middleware(RequestLimitsMiddleware)
+
+
+class VersionHeaderMiddleware:
+    """Every HTTP answer says which release made it (X-Fridge-Version), so the SDK can refuse a server of another
+    major version instead of misreading its answers (python/fridge/core/client.py). Plain ASGI, so streamed and
+    file answers get the header too; only a 500 from Starlette's outermost error handler goes without it, and the
+    SDK lets an answer without the header through. A request from an SDK of another major version (its
+    X-Fridge-SDK-Version, sent from 2.0 on) is refused with 426. SDKs before 2.0 send no version and aren't
+    refused: the upgrade notes say to upgrade the SDK with the server."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope['type'] != 'http':
+            return await self.app(scope, receive, send)
+        sdk = dict(scope.get('headers') or []).get(b'x-fridge-sdk-version', b'').decode('latin-1')
+        if sdk and sdk.split('.')[0] != VERSION.split('.')[0]:
+            install = (
+                f'pip install "freedomridge @ git+https://github.com/freedomridge/freedomridge.git@v{VERSION}'
+                '#subdirectory=python"'
+            )
+            detail = (
+                f'This server runs Freedom Ridge {VERSION}, and this SDK is {sdk}. An SDK works only with a server '
+                f'of its own major version: {install}'
+            )
+            response = JSONResponse(status_code=426, content={'detail': detail})
+            response.headers['X-Fridge-Version'] = VERSION
+            return await response(scope, receive, send)
+
+        async def send_with_version(message):
+            if message['type'] == 'http.response.start':
+                message['headers'] = [*message.get('headers', []), (b'x-fridge-version', VERSION.encode())]
+            await send(message)
+
+        await self.app(scope, receive, send_with_version)
+
+
+app.add_middleware(VersionHeaderMiddleware)
 
 
 @app.exception_handler(CodedHTTPException)
