@@ -19,6 +19,11 @@ Three steps with file handoffs, so the heavy middle one can later move to a comp
 
 Failure or cancellation at any step leaves the old map and model in place; projection resumes with the
 old model as soon as the job is no longer queued or running. Files live behind ``map_artifacts``.
+
+Each step names where the next one runs (``StepResult.placement``): the export, the publish and the ranks on
+the server, the fit on compute. A runner that takes both placements (the default, one machine) carries on; one
+that takes only one gives the job back to the queue for the other side, so a compute worker can do the fit.
+The job is queued as compute work.
 """
 
 import asyncio
@@ -459,6 +464,7 @@ async def _start(pool, job, store):
         checkpoint={'phase': 'export', 'model_id': model_id},
         message='Exporting vectors; new samples wait to be placed until the new map is ready',
         publish=activate,
+        placement='server',  # the export reads the database
     )
 
 
@@ -509,6 +515,7 @@ async def _export(pool, job, store):
     return StepResult(
         checkpoint={**job['checkpoint'], 'phase': 'fit', 'rows': rows, 'dimension': dim},
         message=f'Fitting the map on {rows:,} vectors; new samples wait to be placed until it is ready',
+        placement='compute',  # the fit is pure computation, so a compute worker can take it
     )
 
 
@@ -777,6 +784,7 @@ async def _fit(pool, job, store):
             'measured_bytes_per_point': measured,
         },
         message='Swapping in the new map; ingest into this dataset pauses briefly',
+        placement='server',  # the swap and the ranks are database work
     )
 
 
@@ -1191,7 +1199,7 @@ async def submit_rank(connection, dataset_id: int, field: str) -> Tuple[Dict[str
         KIND,
         dataset_id=dataset_id,
         args={'field': field, 'schedule_id': None, 'window_end': None, 'rank_only': True},
-        placement='compute',
+        placement='server',  # re-ranking is database work
         lane='maintenance',
     )
     points = await current_points(connection, dataset_id, field)

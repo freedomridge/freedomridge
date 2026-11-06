@@ -502,10 +502,14 @@ async def publish_step(
     finished: bool = False,
     release: bool = False,
     publisher: Publisher | None = None,
+    placement: str | None = None,
 ) -> Job:
-    """Commit effects with their checkpoint; a late cancel stops after this unit."""
+    """Commit effects with their checkpoint; a late cancel stops after this unit. `placement` hands the job's
+    next step to the server's runners or to compute workers (a map re-fit's fit runs on compute)."""
     if finished and release:
         raise ValueError('A finished job cannot be requeued')
+    if placement not in (None, 'server', 'compute'):
+        raise ValueError("placement is 'server' or 'compute'")
     if (done is not None and done < 0) or (total is not None and total < 0):
         raise ValueError('Progress must be nonnegative')
     async with _transaction(pool) as connection:
@@ -535,7 +539,8 @@ async def publish_step(
                available_at=CASE WHEN $7='queued' THEN clock_timestamp() ELSE available_at END,
                finished_at=CASE WHEN $7 IN ('succeeded','cancelled') THEN clock_timestamp() ELSE finished_at END,
                lease_token=CASE WHEN $7='running' THEN lease_token ELSE NULL END,
-               lease_expires_at=CASE WHEN $7='running' THEN lease_expires_at ELSE NULL END
+               lease_expires_at=CASE WHEN $7='running' THEN lease_expires_at ELSE NULL END,
+               placement=COALESCE($8,placement)
                WHERE id=$1 AND lease_expires_at>clock_timestamp() RETURNING *""",
             job_id,
             checkpoint,
@@ -544,6 +549,7 @@ async def publish_step(
             message,
             result,
             next_state,
+            placement,
         )
         if row is None:
             raise LeaseLost(f'Job {job_id} lease expired during publication')
