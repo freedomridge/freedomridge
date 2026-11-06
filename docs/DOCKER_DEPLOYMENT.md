@@ -89,9 +89,12 @@ maintenance memory.
 Server-side map re-fits run one at a time in a memory-capped process that leaves 20% of the
 host's RAM free. A re-fit holds every vector of the field plus its fit sample: about
 `vectors × dimensions × 4` bytes + `dimensions × 3.5 MB` + 1 GiB, or about 20 GiB for the
-DINOv3 field above. The cap needs `systemd-run`, which the job-runner image does not include, so
-in this Docker deployment the runner skips re-fits with "Memory containment is not available".
-Build maps with the SDK instead (`compute_visualization`).
+DINOv3 field above. There is no systemd in the job-runner container, so the fit runs within the
+container's own memory limit, `JOB_RUNNER_MEMORY_LIMIT` in `.env` (for example `24g`), which every
+job in that container shares. The fit is sized to what the limit leaves; if it still runs out, the
+kernel stops only the fit, and the runner retries it with fewer points. Exports and models go to the
+`umap_models` volume. Unset (the default), there is no limit and the runner skips re-fits with
+"Memory containment is not available"; build maps with the SDK instead (`compute_visualization`).
 
 **Heavy computation runs where the SDK runs.** Embeddings, image metrics and maps are computed by
 the SDK on the machine that calls it, which only uploads the results. Run those from a machine

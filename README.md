@@ -102,6 +102,9 @@ ds.compute_embeddings()  # CLIP, computed on this machine; needs the `embeddings
 similar = s.all().sort_by_similarity(text="a dog on a beach")
 ```
 
+Filters can also be written as text, checked against the dataset's fields:
+`ds.query("category in (dog cat) AND score >= 0.5")` ([docs/FILTER_QUERY.md](docs/FILTER_QUERY.md)).
+
 [docs/SDK.md](docs/SDK.md) is the full reference, and [docs/AUTHENTICATION.md](docs/AUTHENTICATION.md)
 covers accounts, roles and tokens.
 

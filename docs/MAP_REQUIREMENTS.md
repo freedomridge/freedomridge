@@ -43,6 +43,20 @@ So sparse areas show real points at *any* zoom (you don't have to reach point-vi
 see a handful of points in an empty region). A single response is a **mix** of bubbles
 and points.
 
+**A bubble takes in the points drawn under it.** A bubble sits at its own points' average
+position and is 52–84 px in radius, while a cell is 128 px wide, so it spills into neighbouring
+cells. Their loose points used to be drawn on top of it, as if they were part of the cluster but
+left out of its count. A loose point within a bubble's on-screen radius at the request's zoom now
+counts in the nearest such bubble instead of being drawn. Points outside every bubble stay
+individual, and every sample is still represented. The server sends each bubble's `radius`
+(`_map_bubble_radius_px`), measured at the zoom it clustered at. The map asks for a whole-number
+zoom (`qzoom = Math.round(zoom)`), so it scales the circle by 2^(zoom − qzoom) to cover the same
+area at its actual zoom. The bubble therefore covers exactly the points it absorbed. Drawn at a
+fixed size, a circle could be up to 41% too small or too large, half a zoom level either way: it
+would hide absorbed points outside its edge, or leave points drawn under it. This is done on the cells after the single GROUP BY, looking only at a dense
+cell's 8 neighbours. Timed on 3.75M synthetic samples at zooms 3–11.5, it made no measurable
+difference. Tests: `backend/tests/test_map_clusters.py`.
+
 ## 3. A cluster bubble ALWAYS represents ≥ `_MAP_CLUSTER_MIN_POINTS` samples
 
 No "1" / "12" bubbles, ever, in any code path. Every clustering path uses the one
@@ -96,12 +110,20 @@ zoomed-in loads (~100ms) don't flicker, and hidden the MOMENT fresh data renders
 (geojson changes) rather than when the network settles — so it doesn't linger after the
 new data is already visible.
 
-## 10. Map resize is MANUAL
+## 10. The map fills its panel when the panel is resized
 
-Panel-size changes are handled by the manual **"Resize Map"** button (calls
-`map.resize()`). Do **not** add a container `ResizeObserver` / auto-resize to the map —
-it has caused instability and was explicitly declined. (Re-fitting on browser *window*
-resize is fine.)
+mapbox-gl resizes its canvas only when the browser *window* changes size. Dragging a panel
+separator or splitting a panel resizes the map's container alone, which left the canvas at its
+old size: a black strip beside it, and a map that still worked only in the old area. A
+`ResizeObserver` on the container calls `map.resize()`, and the resulting `moveend` refetches for
+the new visible area (debounced). The **"Resize Map"** button stays as a manual fallback.
+
+The observer must be attached once the map is mounted. The first render is a placeholder without
+the container, so an effect with `[]` deps finds no container and never runs again. Every earlier
+observer (November 2025 to June 2026) was attached that way, so none of them ever ran, and this
+item used to say auto-resize "caused instability" and should stay manual.
+`e2e/panels.spec.ts` ("the map fills its panel after the separator is dragged") checks that the
+canvas matches its container after a drag, with no page errors.
 
 ## 11. Performance / scale
 
@@ -112,7 +134,7 @@ seconds; it is **not** acceptable to cap the view to make it fast (see #0).
 The clustered query groups on the stored `samples.lon`/`lat` columns (schema.sql,
 trigger-maintained from `location` — never stale) so the whole-world view runs as an
 **index-only scan** over `idx_samples_lonlat_cover` (~750ms vs the old ~2.6s geometry
-scan). Two things this depends on — don't undo them:
+scan). Three things this depends on — don't undo them:
 - `_hybrid_items` must group with `round(lon/cell)` / `round(lat/cell)` (pure arithmetic
   on the columns), NOT `ST_SnapToGrid(location...)` — referencing `location` drops the
   index-only scan back to a full heap scan. `round()` matches the grid `ST_SnapToGrid`
@@ -122,6 +144,13 @@ scan). Two things this depends on — don't undo them:
   it heavy ingestion lets the visibility map go stale and the query slows (heap fetches).
   This affects speed only, never which samples appear (see the lon/lat columns are
   trigger-maintained, so a new sample is on the map the instant it commits).
+- `_hybrid_items` runs with `SET LOCAL plan_cache_mode = force_custom_plan`. asyncpg keeps the
+  query as a prepared statement on each pooled connection, and from its 6th run PostgreSQL may
+  switch to a generic plan, one not made for that run's cell size and bbox. For this query the
+  generic plan was about 9 times slower: 14 s instead of 1.5 s on 3.75M samples at zoom 4.5,
+  and 0.75 s instead of 0.22 s at zoom 7.5. So the map got slow after its first few views on
+  each connection. `test_the_clustered_view_never_runs_on_a_generic_plan` checks
+  `pg_prepared_statements` after 8 runs.
 
 ## 12. Selecting samples fits the map to them  ← was undocumented, got dropped
 
@@ -158,6 +187,18 @@ Don't refetch on every pixel of pan, and don't reload a view you've already seen
 This is client-side and per-session (in-memory) — NOT a persisted/cross-session cache,
 and NOT a server-side precompute. Don't add cross-session persistence without an
 explicit invalidation story (that's the staleness footgun to avoid).
+
+## 14. A click on a bubble always breaks it apart
+
+Clicking a cluster bubble must never leave the same bubble on screen. Each bubble carries the
+extent (`w`, `s`, `e`, `n`) of every sample it counts, including the loose points it took in (#2).
+A click fits the map to that extent, with 40 px of padding and at most zoom 16, and goes at least
+one level deeper than the current zoom. Once fitted, the extent spans more than one 128 px cell, so
+its samples fall in several cells: smaller bubbles or points. Samples at one spot reach zoom 16,
+past `_MAP_POINT_ZOOM`, where every point shows. The old click zoomed in 2.5 levels at the bubble,
+which left a tight group, a single field say, in one cell: the same bubble again. In draw mode a
+click is a polygon vertex and doesn't zoom. Tests: `e2e/map-cluster-click.spec.ts`, which fails
+against the old click.
 
 ---
 

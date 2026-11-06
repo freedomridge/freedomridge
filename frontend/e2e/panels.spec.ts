@@ -1,4 +1,4 @@
-import { test, expect } from '@playwright/test';
+import { test, expect, type Locator } from '@playwright/test';
 import { AUTH_STATE, gotoDataset, expectTotal, expandField } from './helpers';
 
 // Panel-wiring tests: each panel's primary interaction, proven end-to-end
@@ -216,6 +216,42 @@ test('map panel: opens with its controls', async ({ page }) => {
     test.skip(await noToken.isVisible(), 'No Mapbox token configured');
     await expect(zoomBtn).toBeVisible();
     await expect(map.getByRole('button', { name: 'Resize Map' })).toBeVisible();
+});
+
+test('map panel: the map fills its panel after the separator is dragged', async ({ page }) => {
+    // mapbox-gl resizes its canvas on window resizes only: a dragged separator left the canvas at
+    // its old width, with an empty strip beside it.
+    // Window error events: Chrome reports "ResizeObserver loop completed with undelivered
+    // notifications" only there, not to pageerror or the console.
+    await page.addInitScript(() => {
+        const target = window as unknown as { windowErrors: string[] };
+        target.windowErrors = [];
+        window.addEventListener('error', event => target.windowErrors.push(event.message));
+    });
+    await gotoDataset(page);
+    await page.getByTestId('panel-filters').getByTestId('panel-type-select').selectOption('map');
+    const map = page.getByTestId('panel-map');
+    const noToken = map.getByText(/NEXT_PUBLIC_MAPBOX_TOKEN/);
+    await expect(noToken.or(map.getByRole('button', { name: 'Zoom to Data' })).first()).toBeVisible({ timeout: 20_000 });
+    test.skip(await noToken.isVisible(), 'No Mapbox token configured');
+    const canvas = map.locator('canvas.mapboxgl-canvas');
+    const container = map.locator('.mapboxgl-map');
+    const width = async (locator: Locator) => (await locator.boundingBox())?.width ?? 0;
+    await expect.poll(() => width(canvas)).toBeGreaterThan(0);
+    const before = await width(container);
+
+    const handle = await page.locator('[data-separator]').first().boundingBox();
+    if (!handle) throw new Error('the first separator has no bounding box');
+    const x = handle.x + handle.width / 2;
+    const y = handle.y + handle.height / 2;
+    await page.mouse.move(x, y);
+    await page.mouse.down();
+    await page.mouse.move(x + 200, y, { steps: 10 });
+    await page.mouse.up();
+
+    await expect.poll(() => width(container)).toBeGreaterThan(before + 150);
+    await expect.poll(async () => Math.abs((await width(canvas)) - (await width(container)))).toBeLessThan(2);
+    expect(await page.evaluate(() => (window as unknown as { windowErrors: string[] }).windowErrors)).toEqual([]);
 });
 
 test('panel layout: opens at 20/50/30 and a panel stops at its 10 percent minimum', async ({ page }) => {

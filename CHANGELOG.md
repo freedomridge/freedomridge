@@ -4,6 +4,67 @@ Freedom Ridge has one version for the server, the web app and the Python SDK (th
 file), following [Semantic Versioning](https://semver.org). A release lists **upgrade notes** when
 it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
 
+## 1.4.0 (2026-11-06)
+
+### Added
+
+- A filter query language: filters written as text, checked against the dataset's own fields
+  ([FILTER_QUERY.md](docs/FILTER_QUERY.md)), for example
+  `serial in (103000752 103001025) AND split = train AND NOT (score < 0.2 OR note exists)`.
+  - **Query** in the filter bar shows the current filters as text to read, copy, paste or edit, and
+    Apply turns the text back into chips.
+  - A list takes commas or any whitespace between values, so a pasted column of serial numbers works
+    as is.
+  - A mistake names its line and column, with a suggestion ("unknown field 'splt' (did you mean
+    'split'?)"), and changes nothing.
+  - Concept scores, map regions, lassos and selections have no text form and stay as chips.
+  - The same text works in the SDK (`dataset.query(...)` and the new
+    `dataset.create_view(name, query=...)`) and over HTTP
+    (`POST /api/datasets/{id}/filter_query/parse` and `.../format`).
+- Map: a click on a cluster bubble now zooms in until the bubble breaks apart. It fits every image
+  the bubble counts, and always goes at least one zoom level deeper.
+- Compute workers, first part: a worker token (`"scope": "worker"` in `POST /api/tokens`,
+  `client.create_token(name, scope="worker")`), which only the new worker endpoints accept, and
+  `python -m fridge.worker`, which registers a machine with the server and keeps it online.
+  **Settings → Compute Workers** and `GET /api/workers` list workers (an admin sees all of them), and
+  System status counts them. **API Tokens** makes a worker token (**Used by: a compute worker**).
+
+### Changed
+
+- Map: a cluster bubble takes in the individual points it is drawn over and counts them, instead of
+  drawing them on top of it. Bubbles grow and shrink with the map between data loads, so a circle
+  always covers exactly the points it counts.
+- Map: the map fills its panel when the panel is resized (dragging a separator, splitting a panel).
+  Before, it kept its old size, with a black strip beside it.
+
+### Fixed
+
+- Map: the clustered view slowed down after its first few uses on each database connection. From
+  the sixth run, PostgreSQL could switch to a generic plan, about 9 times slower: 14 s instead of
+  1.5 s on 3.75M samples at zoom 4.5.
+
+### Upgrade notes
+
+- **`dataset.query()` now uses the server's parser**, the same one as the filter bar. Existing
+  queries keep working, `BETWEEN` and `LIKE '%x%'` included. Two things differ:
+  - **A field the dataset doesn't have raises `ValueError`**, naming its line, its column and the
+    closest field. Before, a misspelt field silently matched nothing (or, with `IS NULL`, everything).
+  - **`AND` binds tighter than `OR`, as in SQL.** `a = 1 OR b = 2 AND c = 3` now means
+    `a = 1 OR (b = 2 AND c = 3)`; the SDK used to read it as `(a = 1 OR b = 2) AND c = 3`. Add
+    brackets to a query that relied on the old order.
+- One database migration, `0003_compute_worker_tokens.sql`, which adds a column to `api_tokens` and
+  two to `workers`. Apply it with `scripts/apply_migrations.sh`, as step 4 of
+  [Upgrading](docs/UPGRADING.md) describes. It waits at most 2 seconds for its locks: if it stops with
+  a lock timeout, run it again.
+- **Docker:** `docker-compose.prod.yml` mounts the `umap_models` volume on the job-runner at
+  `/models` (`FRIDGE_UMAP_MODEL_DIR`), and takes an optional `JOB_RUNNER_MEMORY_LIMIT` (its
+  `mem_limit` and `memswap_limit`).
+  - **Unset (the default):** there is no limit, and server-side map re-fits stay skipped, as before.
+    No action is needed to keep today's behaviour.
+  - **Set, for example to `24g`:** re-fits run inside that limit, and the fit is the kernel's first
+    choice for an out-of-memory kill, so the runner survives one.
+  - On a t3.large, leave it unset ([Deploy to AWS](docs/DEPLOY_TO_AWS.md)).
+
 ## 1.3.1 (2026-11-06)
 
 ### Fixed

@@ -251,13 +251,15 @@ class Client:
 
     # --- API tokens ---
 
-    def create_token(self, name, expires_days=90):
+    def create_token(self, name, expires_days=90, scope="full"):
         """Create an API token (requires power_user or admin).
 
         Args:
             name: Human-readable label for the token.
             expires_days: Days until expiry (default 90). Pass ``None`` for the
                 server default.
+            scope: ``"full"`` (default), or ``"worker"`` for a compute worker
+                (``python -m fridge.worker``): only the worker endpoints accept it.
 
         Returns:
             dict with ``id``, ``name``, ``expires_at`` and ``token`` — the
@@ -265,7 +267,7 @@ class Client:
             securely. Use it via ``Client(api_token=...)`` / ``set_token()`` /
             ``$FRIDGE_API_TOKEN``.
         """
-        payload = {"name": name}
+        payload = {"name": name, "scope": scope}
         if expires_days is not None:
             payload["expires_days"] = expires_days
         resp = self.session.post(f"{self.base_url}/tokens", json=payload)
@@ -281,6 +283,32 @@ class Client:
     def revoke_token(self, token_id):
         """Revoke (deactivate) one of your API tokens."""
         resp = self.session.delete(f"{self.base_url}/tokens/{token_id}")
+        _raise_for_status(resp)
+        return resp.json()
+
+    def register_worker(self, name, kinds, capabilities=None, hostname="", sdk_version=""):
+        """Register this machine as a compute worker (needs a worker token). Returns ``worker_id`` and
+        ``heartbeat_seconds``. ``python -m fridge.worker`` calls it."""
+        payload = {
+            "name": name,
+            "kinds": list(kinds),
+            "capabilities": capabilities or {},
+            "hostname": hostname,
+            "sdk_version": sdk_version,
+        }
+        resp = self.session.post(f"{self.base_url}/workers/register", json=payload)
+        _raise_for_status(resp)
+        return resp.json()
+
+    def worker_heartbeat(self, worker_id):
+        """Keep a registered compute worker online. A 404 means the server no longer knows it: register again."""
+        resp = self.session.post(f"{self.base_url}/workers/{worker_id}/heartbeat")
+        _raise_for_status(resp)
+        return resp.json()
+
+    def list_workers(self):
+        """The compute workers you can see (an admin sees every one, with the server's job runners)."""
+        resp = self.session.get(f"{self.base_url}/workers")
         _raise_for_status(resp)
         return resp.json()
 
@@ -1540,6 +1568,26 @@ class Client:
         if username:
             payload["username"] = username
         resp = self.session.post(f"{self.base_url}/datasets/{dataset_id}/views", json=payload)
+        _raise_for_status(resp)
+        return resp.json()
+
+    def parse_filter_query(self, dataset_id, query, current=None) -> dict:
+        """Filter query text (docs/FILTER_QUERY.md) as filters, checked against the dataset's fields:
+        {filters, parts, filter, reuse}. Raises ValueError with the line, column and any suggestion
+        when the text doesn't fit the dataset."""
+        resp = self.session.post(
+            f"{self.base_url}/datasets/{dataset_id}/filter_query/parse",
+            json={"query": query, "current": current or []},
+        )
+        if resp.status_code == 400:
+            try:
+                detail = resp.json().get("detail")
+            except ValueError:
+                detail = None
+            if isinstance(detail, dict) and detail.get("errors"):
+                suggestions = detail["errors"][0].get("suggestions") or []
+                hint = f" (did you mean {' or '.join(repr(s) for s in suggestions)}?)" if suggestions else ""
+                raise ValueError(f"{detail['message']}{hint}")
         _raise_for_status(resp)
         return resp.json()
 

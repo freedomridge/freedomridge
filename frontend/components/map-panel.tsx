@@ -43,9 +43,11 @@ function tileBbox(bbox: [number, number, number, number], zoom: number): [number
 }
 
 // A map_points item: with an `id` it's an individual sample point; without one it's
-// a cluster bubble (cell centroid + count).
+// a cluster bubble (cell centroid + count, and the radius in px the server sized it for).
 interface MapPointItem { id: number; lon: number; lat: number; heading?: number }
-interface MapClusterItem { id?: null; lon: number; lat: number; count: number }
+interface MapClusterItem { id?: null; lon: number; lat: number; count: number; radius: number; w: number; s: number; e: number; n: number }
+// The extent of every sample a bubble counts (its feature's properties).
+interface ClusterExtent { w: number; s: number; e: number; n: number }
 type MapItem = MapPointItem | MapClusterItem;
 
 // Stable empty-array identity so `items` (and the geojson useMemo that depends on it)
@@ -115,18 +117,23 @@ export function MapPanel({
         });
     }, []);
 
-    // Resize the canvas AND refetch for the new visible area whenever the panel /
-    // container changes size (panel splits, layout changes, window resize).
+    // Resize the canvas AND refetch for the new visible area (the Resize Map button).
     const refitToContainer = useCallback(() => {
         mapRef.current?.resize();
         captureView();
     }, [captureView]);
 
+    // mapbox-gl only follows window resizes; dragging a panel separator or splitting a panel
+    // resizes the container alone, which left the canvas at its old size. resize() fires
+    // moveend when the size changed, so handleMoveEnd refetches for the new visible area.
+    // The container exists once `mounted` is set (the first render is a placeholder).
     useEffect(() => {
-        const handler = () => refitToContainer();
-        window.addEventListener('resize', handler);
-        return () => window.removeEventListener('resize', handler);
-    }, [refitToContainer]);
+        const container = containerRef.current;
+        if (!container) return;
+        const observer = new ResizeObserver(() => mapRef.current?.resize());
+        observer.observe(container);
+        return () => observer.disconnect();
+    }, [mounted]);
 
     // Hybrid by default (server: dense cells -> cluster bubble, sparse cells ->
     // individual points). The server ALSO auto-returns ALL individual points once
@@ -138,13 +145,17 @@ export function MapPanel({
     // "all samples" view — is instant instead of a multi-second reload. #13.
     const qzoom = view ? Math.round(view.zoom) : 1;
     const qbbox = view ? tileBbox(view.bbox, qzoom) : undefined;
-    const { data: resp, isFetching, isError, refetch } = useQuery<{ mode?: string; items?: MapItem[]; capped?: boolean }>({
+    // `zoom` is the zoom the server clustered at (qzoom): it measured each bubble's radius there.
+    const { data: resp, isFetching, isError, refetch } = useQuery<{ mode?: string; items?: MapItem[]; capped?: boolean; zoom: number }>({
         queryKey: ['map-points', datasetId, filters, forceMode, qzoom,
             qbbox ? qbbox.map(v => v.toFixed(3)).join(',') : ''],
-        queryFn: () => getMapPoints(datasetId, filters, {
+        queryFn: async () => ({
+            ...(await getMapPoints(datasetId, filters, {
+                zoom: qzoom,
+                bbox: qbbox,
+                points: forceMode === 'points',
+            })),
             zoom: qzoom,
-            bbox: qbbox,
-            points: forceMode === 'points',
         }),
         enabled: !!datasetId && !!view,
         staleTime: 30_000,        // re-show instantly; background-refresh after 30s so edits still surface
@@ -166,6 +177,7 @@ export function MapPanel({
     });
 
     const items: MapItem[] = resp?.items ?? EMPTY_ITEMS;
+    const measuredZoom = resp?.zoom;
     const hasClusters = items.some((it) => it.id == null);
     // "Showing points" = forced, or the hybrid view came back with no cluster bubbles.
     const showingPoints = forceMode === 'points' || (items.length > 0 && !hasClusters);
@@ -207,7 +219,7 @@ export function MapPanel({
                 : {
                     type: 'Feature',
                     geometry: { type: 'Point', coordinates: [it.lon, it.lat] },
-                    properties: { cluster_count: it.count },
+                    properties: { cluster_count: it.count, radius: it.radius, w: it.w, s: it.s, e: it.e, n: it.n },
                 }
             ),
         };
@@ -233,9 +245,17 @@ export function MapPanel({
     // the MapboxDraw init effect; if it changes on every zoom (as it did when it closed
     // over viewState.zoom) that effect tears down and recreates the draw control mid-zoom,
     // wiping the user's drawn polygon. Read the live zoom from the map ref instead.
-    const flyToCluster = useCallback((coords: [number, number]) => {
-        const z = mapRef.current?.getMap()?.getZoom() ?? 1;
-        mapRef.current?.flyTo({ center: coords, zoom: Math.min(z + 2.5, 22), duration: 500 });
+    // A click on a bubble always breaks it apart (docs/MAP_REQUIREMENTS.md #14): fit the extent of
+    // every sample it counts, and go at least one level deeper. Fitted, the extent spans more than
+    // a 128 px cell, so its samples fall in several cells; samples at one spot reach maxZoom, past
+    // the zoom where every point shows.
+    const flyToCluster = useCallback((coords: [number, number], extent: ClusterExtent) => {
+        const map = mapRef.current?.getMap();
+        if (!map) return;
+        const z = map.getZoom();
+        const camera = map.cameraForBounds([[extent.w, extent.s], [extent.e, extent.n]], { padding: 40, maxZoom: 16 });
+        const zoom = Math.min(Math.max(camera?.zoom ?? z + 2.5, z + 1), 22);
+        map.flyTo({ center: camera?.center ?? coords, zoom, duration: 500 });
     }, []);
 
     const zoomToData = useCallback(async () => {
@@ -312,12 +332,19 @@ export function MapPanel({
             // Sized to roughly FILL the cluster's grid cell (a cell is ~128px on screen by
             // design) so a cluster visibly COVERS its area — restoring the pre-server-
             // clustering behavior (clusterRadius=50 + ~40px circles) that the regression
-            // migration shrank to a tiny dot. Still grows with count. This is a frontend
-            // approximation; exact cell-fit (incl. when the grid is coarsened on zoom-out)
-            // needs the backend to return the effective cell size — follow-up.
-            'circle-radius': ['step', ['get', 'cluster_count'], 52, 1000, 60, 10000, 70, 100000, 84],
+            // migration shrank to a tiny dot. Grows with count (52-84 px). The server
+            // sends the radius: the loose points within it count in the bubble instead of
+            // being drawn under it (_map_bubble_radius_px in backend/routers/datasets.py).
+            // It measured that radius at the zoom it clustered at, a whole number, so the
+            // circle is scaled by 2^(zoom - measuredZoom) to cover the same area at the map's
+            // actual zoom (exponential interpolation between these stops is exactly that).
+            'circle-radius': measuredZoom == null ? ['get', 'radius'] : [
+                'interpolate', ['exponential', 2], ['zoom'],
+                measuredZoom - 3, ['*', ['get', 'radius'], 1 / 8],
+                measuredZoom + 3, ['*', ['get', 'radius'], 8],
+            ],
         }
-    }), [clusterColor]);
+    }), [clusterColor, measuredZoom]);
 
     const clusterCountLayer = useMemo<LayerProps>(() => ({
         id: 'cluster-count', type: 'symbol', filter: ['has', 'cluster_count'],
@@ -494,8 +521,8 @@ export function MapPanel({
         const bbox: [[number, number], [number, number]] = [[event.point.x - 5, event.point.y - 5], [event.point.x + 5, event.point.y + 5]];
         const feature = mapRef.current.queryRenderedFeatures(bbox)
             .find(f => ['clusters', 'cluster-count'].includes(f.layer?.id || ''));
-        if (feature) {  // cluster click -> zoom in (server re-clusters finer)
-            flyToCluster((feature.geometry as Point).coordinates as [number, number]);
+        if (feature) {  // cluster click -> zoom in until it breaks apart
+            flyToCluster((feature.geometry as Point).coordinates as [number, number], feature.properties as ClusterExtent);
             return;
         }
         // Background click: start drawing a lasso (if not already). Keep the current
@@ -526,7 +553,7 @@ export function MapPanel({
                 if (isDrawingPolygon()) return;  // the click is a polygon vertex
                 e.preventDefault();
                 const f = e.features?.[0];
-                if (f) flyToCluster((f.geometry as Point).coordinates as [number, number]);
+                if (f) flyToCluster((f.geometry as Point).coordinates as [number, number], f.properties as ClusterExtent);
             };
             mapInstance.on('click', 'clusters', onClusterClick);
             mapInstance.on('click', 'cluster-count', onClusterClick);

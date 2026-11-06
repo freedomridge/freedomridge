@@ -665,7 +665,9 @@ CREATE TABLE IF NOT EXISTS api_tokens (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     last_used_at TIMESTAMP,
     expires_at TIMESTAMP,
-    is_active BOOLEAN DEFAULT TRUE
+    is_active BOOLEAN DEFAULT TRUE,
+    -- 'worker': a compute worker's token, which only the worker endpoints accept (routers/workers.py).
+    scope TEXT NOT NULL DEFAULT 'full' CONSTRAINT api_tokens_scope_check CHECK (scope IN ('full', 'worker'))
 );
 
 CREATE INDEX IF NOT EXISTS idx_api_tokens_token ON api_tokens(token);
@@ -1503,7 +1505,10 @@ CREATE TABLE IF NOT EXISTS workers (
     capabilities JSONB NOT NULL DEFAULT '{}' CHECK (jsonb_typeof(capabilities) = 'object'),
     started_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
     heartbeat_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
-    current_job_id UUID REFERENCES jobs(id) ON DELETE SET NULL
+    current_job_id UUID REFERENCES jobs(id) ON DELETE SET NULL,
+    -- A compute worker's owner (the user of its worker token) and SDK version; NULL for the server's runners.
+    user_id INTEGER CONSTRAINT workers_user_id_fkey REFERENCES users(id) ON DELETE CASCADE,
+    sdk_version TEXT
 );
 
 CREATE OR REPLACE FUNCTION initialize_job_controls()
@@ -2404,5 +2409,6 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 INSERT INTO schema_migrations (filename) VALUES
     ('0000_baseline.sql'),
     ('0001_storage_config_dataset_scope.sql'),
-    ('0002_dataset_default_view.sql')
+    ('0002_dataset_default_view.sql'),
+    ('0003_compute_worker_tokens.sql')
 ON CONFLICT (filename) DO NOTHING;

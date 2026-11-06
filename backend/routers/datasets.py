@@ -4885,6 +4885,22 @@ def _cluster_cell_deg(zoom: float) -> float:
     return max(0.00001, 90.0 / (2**z))
 
 
+def _map_bubble_radius_px(count: int) -> int:
+    """A cluster bubble's radius on screen. The map panel draws the radius each bubble carries."""
+    for floor, radius in ((100_000, 84), (10_000, 70), (1_000, 60)):
+        if count >= floor:
+            return radius
+    return 52
+
+
+def _map_screen_px(lon: float, lat: float, zoom: float) -> tuple[float, float]:
+    """Where mapbox-gl draws (lon, lat) at `zoom`, in pixels of its Web Mercator world (512 px tiles)."""
+    world = 512.0 * 2.0 ** max(0.0, min(22.0, float(zoom)))
+    lat = max(-85.051129, min(85.051129, lat))
+    y = math.log(math.tan(math.pi / 4 + math.radians(lat) / 2))
+    return (lon + 180.0) / 360.0 * world, (1.0 - y / math.pi) / 2.0 * world
+
+
 async def _get_dataset_map_points_impl(
     id: int,
     filter_obj: Optional[Dict[str, Any]],
@@ -4946,12 +4962,22 @@ async def _get_dataset_map_points_impl(
 
     POINT_CAP = 65000
 
-    async def _hybrid_items(where, a, cell):
+    async def _hybrid_items(where, a, cell, zoom):
         """The ONE per-cell rule shared by every clustered view: a grid cell with
         >= _MAP_CLUSTER_MIN_POINTS samples becomes a single cluster bubble; a sparser
         cell yields its INDIVIDUAL points. Returns (items, loose_point_count). Because
         the floor is applied everywhere, a cluster bubble ALWAYS represents
-        >= _MAP_CLUSTER_MIN_POINTS samples — no stray "1"/"12" bubbles."""
+        >= _MAP_CLUSTER_MIN_POINTS samples — no stray "1"/"12" bubbles.
+
+        A bubble also takes in the loose points it is drawn over. It sits at its points'
+        average position and is drawn wider than half a cell (52-84 px; a cell is 128 px),
+        so it covered points of neighbouring sparse cells, which looked as if they belonged
+        to it. A loose point within a bubble's radius on screen at this zoom counts in the
+        nearest such bubble instead of being drawn. The radius reaches the 8 neighbouring
+        cells at most, so only points of a sparse cell next to a dense one are measured.
+
+        Each bubble also carries the extent (w, s, e, n) of every sample it counts, the ones it
+        took in included, so a click can zoom to fit them and break the bubble apart."""
         a = list(a) + [cell, _MAP_CLUSTER_MIN_POINTS]
         cell_p, minp_p = len(a) - 1, len(a)
         # Group on the stored lon/lat columns with pure float arithmetic:
@@ -4961,34 +4987,73 @@ async def _get_dataset_map_points_impl(
         # heap + per-row PostGIS. One GROUP BY (no window): dense cells (cc>=minp) emit one
         # bubble; sparse cells (cc<minp) carry their points in arrays we unnest into point
         # rows. lon/lat are trigger-maintained from location — never stale. See MAP_REQUIREMENTS.md.
-        rows = await db.fetch(
-            f"""
-            WITH g AS (
-                SELECT count(*) AS cc, AVG(lon) AS lon, AVG(lat) AS lat,
-                       array_agg(id) AS ids, array_agg(lon) AS xs, array_agg(lat) AS ys,
-                       array_agg(heading::double precision) AS hs
-                FROM samples WHERE {where}
-                GROUP BY round(lon / ${cell_p}::float8), round(lat / ${cell_p}::float8)
+        # Planned for every run's own cell size and bbox (#11): from a prepared statement's 6th
+        # run on a connection PostgreSQL may switch to a generic plan, which for this query was
+        # about 9 times slower (14 s instead of 1.5 s on 3.75M samples at zoom 4.5).
+        async with db.pool.acquire() as connection, connection.transaction():
+            await connection.execute("SET LOCAL plan_cache_mode = force_custom_plan")
+            rows = await connection.fetch(
+                f"""
+                WITH g AS (
+                    SELECT round(lon / ${cell_p}::float8) AS gx, round(lat / ${cell_p}::float8) AS gy,
+                           count(*) AS cc, AVG(lon) AS lon, AVG(lat) AS lat,
+                           MIN(lon) AS w, MIN(lat) AS s, MAX(lon) AS e, MAX(lat) AS n,
+                           array_agg(id) AS ids, array_agg(lon) AS xs, array_agg(lat) AS ys,
+                           array_agg(heading::double precision) AS hs
+                    FROM samples WHERE {where}
+                    GROUP BY round(lon / ${cell_p}::float8), round(lat / ${cell_p}::float8)
+                )
+                SELECT gx, gy, NULL::int AS id, lon, lat, cc AS count, NULL::double precision AS heading,
+                       w, s, e, n
+                FROM g WHERE cc >= ${minp_p}
+                UNION ALL
+                SELECT gx, gy, u.id, u.x AS lon, u.y AS lat, 1 AS count, u.h AS heading,
+                       NULL, NULL, NULL, NULL
+                FROM g, unnest(g.ids, g.xs, g.ys, g.hs) AS u(id, x, y, h)
+                WHERE g.cc < ${minp_p}
+            """,
+                *a,
             )
-            SELECT NULL::int AS id, lon, lat, cc AS count, NULL::double precision AS heading
-            FROM g WHERE cc >= ${minp_p}
-            UNION ALL
-            SELECT u.id, u.x AS lon, u.y AS lat, 1 AS count, u.h AS heading
-            FROM g, unnest(g.ids, g.xs, g.ys, g.hs) AS u(id, x, y, h)
-            WHERE g.cc < ${minp_p}
-        """,
-            *a,
-        )
-        loose = sum(1 for r in rows if r['id'] is not None)
-        items = [
-            (
-                {"id": r['id'], "lon": r['lon'], "lat": r['lat'], "heading": r['heading']}
-                if r['id'] is not None
-                else {"lon": r['lon'], "lat": r['lat'], "count": r['count']}
-            )
+        bubbles = {
+            (r['gx'], r['gy']): {
+                "lon": r['lon'],
+                "lat": r['lat'],
+                "count": r['count'],
+                "radius": _map_bubble_radius_px(r['count']),
+                "w": r['w'],
+                "s": r['s'],
+                "e": r['e'],
+                "n": r['n'],
+            }
             for r in rows
-        ]
-        return items, loose
+            if r['id'] is None
+        }
+        centres = {cell_key: _map_screen_px(b['lon'], b['lat'], zoom) for cell_key, b in bubbles.items()}
+        steps = [(dx, dy) for dx in (-1, 0, 1) for dy in (-1, 0, 1)]
+        reachable = {(gx + dx, gy + dy) for gx, gy in bubbles for dx, dy in steps}
+        points = []
+        for r in rows:
+            if r['id'] is None:
+                continue
+            if (r['gx'], r['gy']) in reachable:
+                x, y = _map_screen_px(r['lon'], r['lat'], zoom)
+                nearest, nearest_d2 = None, 0.0
+                for dx, dy in steps:
+                    cell_key = (r['gx'] + dx, r['gy'] + dy)
+                    if cell_key not in bubbles:
+                        continue
+                    cx, cy = centres[cell_key]
+                    d2 = (x - cx) ** 2 + (y - cy) ** 2
+                    if d2 <= bubbles[cell_key]['radius'] ** 2 and (nearest is None or d2 < nearest_d2):
+                        nearest, nearest_d2 = cell_key, d2
+                if nearest is not None:
+                    bubble = bubbles[nearest]
+                    bubble['count'] += 1
+                    bubble['w'], bubble['e'] = min(bubble['w'], r['lon']), max(bubble['e'], r['lon'])
+                    bubble['s'], bubble['n'] = min(bubble['s'], r['lat']), max(bubble['n'], r['lat'])
+                    continue
+            points.append({"id": r['id'], "lon": r['lon'], "lat": r['lat'], "heading": r['heading']})
+        return [*bubbles.values(), *points], len(points)
 
     # Individual points show when the user de-clusters manually (points=True) OR
     # AUTOMATICALLY once zoomed past _MAP_POINT_ZOOM — the old clusterMaxZoom.
@@ -5015,7 +5080,7 @@ async def _get_dataset_map_points_impl(
         where, base = _wa()
         cell = _cluster_cell_deg(zoom)
         for _ in range(6):
-            items, loose = await _hybrid_items(where, base, cell)
+            items, loose = await _hybrid_items(where, base, cell, zoom)
             if loose <= POINT_CAP:
                 break
             cell *= 2.0

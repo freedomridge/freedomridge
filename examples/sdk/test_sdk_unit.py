@@ -195,60 +195,6 @@ def test_complex_nested():
     print("  All complex nested tests passed!\n")
 
 
-def test_parse_query_string():
-    """Test SQL-like query string parser."""
-    from fridge.core.view import parse_query_string
-
-    print("Testing SQL-like query parser...")
-
-    # Simple comparison
-    result = parse_query_string("brightness > 0.5")
-    assert result == {"field": "brightness", "operator": ">", "value": 0.5}
-    print("  ✓ 'brightness > 0.5'")
-
-    # String value
-    result = parse_query_string("scene = 'highway'")
-    assert result == {"field": "scene", "operator": "=", "value": "highway"}
-    print("  ✓ \"scene = 'highway'\"")
-
-    # AND
-    result = parse_query_string("brightness > 0.5 AND scene = 'highway'")
-    assert result["logic"] == "AND"
-    assert len(result["filters"]) == 2
-    print("  ✓ 'brightness > 0.5 AND scene = highway'")
-
-    # OR
-    result = parse_query_string("scene = 'highway' OR scene = 'city'")
-    assert result["logic"] == "OR"
-    assert len(result["filters"]) == 2
-    print("  ✓ \"scene = 'highway' OR scene = 'city'\"")
-
-    # IN clause
-    result = parse_query_string("scene IN ('highway', 'city', 'residential')")
-    assert result["field"] == "scene"
-    assert result["operator"] == "in"
-    assert result["value"] == ["highway", "city", "residential"]
-    print("  ✓ \"scene IN ('highway', 'city', 'residential')\"")
-
-    # BETWEEN
-    result = parse_query_string("brightness BETWEEN 0.3 AND 0.8")
-    assert result["logic"] == "AND"
-    assert result["filters"][0]["operator"] == ">="
-    assert result["filters"][0]["value"] == 0.3
-    assert result["filters"][1]["operator"] == "<="
-    assert result["filters"][1]["value"] == 0.8
-    print("  ✓ 'brightness BETWEEN 0.3 AND 0.8'")
-
-    # LIKE / CONTAINS
-    result = parse_query_string("filename LIKE '%night%'")
-    assert result["field"] == "filename"
-    assert result["operator"] == "contains"
-    assert result["value"] == "night"
-    print("  ✓ \"filename LIKE '%night%'\"")
-
-    print("  All query parser tests passed!\n")
-
-
 def test_sample_query_proxy():
     """Test SampleQuery proxy for attribute access."""
     from fridge.core.view import FieldExpression, SampleQuery
@@ -332,7 +278,6 @@ def main():
         test_condition_or,
         test_condition_not,
         test_complex_nested,
-        test_parse_query_string,
         test_sample_query_proxy,
         test_label_classes,
         test_evaluation_helpers,

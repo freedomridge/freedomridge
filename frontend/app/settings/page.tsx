@@ -5,7 +5,7 @@ import { Header } from '@/components/header';
 import { ProtectedRoute } from '@/components/ProtectedRoute';
 import { useUser } from '@/contexts/UserContext';
 import Link from 'next/link';
-import { Key, Users, Shield, Cloud, Activity } from 'lucide-react';
+import { Key, Users, Shield, Cloud, Activity, Cpu } from 'lucide-react';
 import { ChangePasswordModal } from '@/components/ChangePasswordModal';
 
 export default function SettingsPage() {
@@ -41,6 +41,27 @@ export default function SettingsPage() {
                                 Manage your personal access tokens for the Python SDK and API access.
                             </p>
                         </Link>
+
+                        {/* Compute Workers Card (power users and admins) */}
+                        {(user?.role === 'admin' || user?.role === 'power_user') && (
+                            <Link
+                                href="/settings/workers"
+                                data-testid="settings-workers-card"
+                                className="group block p-6 bg-zinc-900/50 border border-zinc-800 rounded-xl hover:border-cyan-500/50 hover:ring-1 hover:ring-cyan-500/50 transition-all shadow-lg hover:shadow-cyan-900/10"
+                            >
+                                <div className="flex items-center gap-4 mb-4">
+                                    <div className="p-3 bg-cyan-500/10 rounded-lg text-cyan-400 group-hover:bg-cyan-500/20 transition-colors">
+                                        <Cpu size={24} />
+                                    </div>
+                                    <h3 className="text-xl font-semibold text-white group-hover:text-cyan-400 transition-colors">
+                                        Compute Workers
+                                    </h3>
+                                </div>
+                                <p className="text-zinc-400 text-sm">
+                                    Connect machines that run heavy jobs, such as map re-fits, for this server.
+                                </p>
+                            </Link>
+                        )}
 
                         {/* User Management Card (Admin Only) */}
                         {(user?.role === 'admin') && (
