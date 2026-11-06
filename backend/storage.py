@@ -138,67 +138,6 @@ class StorageBackend:
                 )
         return self._s3_client
 
-    def get_file_url(self, filepath: str) -> str:
-        """
-        Convert internal filepath to public URL.
-
-        Hybrid Mode: For S3 paths, checks local cache first.
-        - If file exists in S3_LOCAL_CACHE_PATH, returns local URL (fast)
-        - Otherwise returns S3 URL (slower but works)
-
-        Args:
-            filepath: Either absolute local path or s3://bucket/key format
-
-        Returns:
-            URL accessible by frontend (via nginx proxy)
-        """
-        # S3 URL - check local cache first (hybrid mode)
-        if filepath.startswith('s3://'):
-            # Extract bucket and key
-            parts = filepath[5:].split('/', 1)
-            key = parts[1] if len(parts) > 1 else ''
-
-            # Hybrid mode: Check if file exists in local cache
-            if self.config.s3_local_cache_path:
-                local_cache_file = os.path.join(self.config.s3_local_cache_path, key)
-                if os.path.exists(local_cache_file):
-                    # File exists locally! Return local URL
-                    rel_path = os.path.relpath(local_cache_file, self.config.s3_local_cache_path)
-                    return f"/media/{rel_path}"
-
-            # Fall back to S3 proxy URL
-            return f"/media/s3/{key}"
-
-        # Local file - maintain backward compatibility
-        # Keep same URL format as before (/media/path)
-        else:
-            # Already a URL - return as-is
-            if filepath.startswith('/media/'):
-                return filepath
-
-            # Convert absolute path to relative URL
-            if os.path.isabs(filepath):
-                # Check if this is a host path that needs translation to container path
-                host_data_root = os.getenv("HOST_DATA_ROOT")
-                if host_data_root and filepath.startswith(host_data_root):
-                    # Translate host path to container path
-                    rel_path = os.path.relpath(filepath, host_data_root)
-                    return f"/media/{rel_path}"
-
-                # Try to make it relative to data_root
-                try:
-                    if filepath.startswith(self.config.local_data_root):
-                        rel_path = os.path.relpath(filepath, self.config.local_data_root)
-                        return f"/media/{rel_path}"
-                    else:
-                        # Path outside data_root - just use basename
-                        return f"/media/{os.path.basename(filepath)}"
-                except Exception:
-                    return f"/media/{os.path.basename(filepath)}"
-            else:
-                # Already relative path
-                return f"/media/{filepath}"
-
     def generate_presigned_url(self, s3_key: str, expiration: int = 3600) -> str:
         """
         Generate presigned URL for private S3 objects.
@@ -274,11 +213,6 @@ class StorageBackend:
 
 # Global instance
 storage = StorageBackend()
-
-
-def get_storage() -> StorageBackend:
-    """Dependency injection helper for FastAPI"""
-    return storage
 
 
 # --- Per-dataset storage routing ---

@@ -446,11 +446,8 @@ def _default_s3_image_loader():
 
     Supported inputs:
       - s3://bucket/key       → bucket is parsed from the path (no env var needed)
-      - /media/s3/key         → legacy; requires S3_BUCKET env var to be set
-                                (the backend no longer emits this form, but old
-                                cached URLs may still surface)
-      - any other path        → opened as a local file via PIL; relative paths
-                                use FRIDGE_DATA_ROOT when set
+      - any other path        → opened as a local file via PIL: an absolute path as it is (an external drive
+                                mounted at /media/<user>/... included), a relative one under FRIDGE_DATA_ROOT
 
     The loader uses the ambient boto3 credential chain (env vars, ~/.aws,
     IAM role) — for per-dataset credentials in the web UI, use the backend's
@@ -459,10 +456,6 @@ def _default_s3_image_loader():
     from PIL import Image
 
     s3_client = None
-    # No default bucket — the library is deployment-agnostic. Legacy
-    # /media/s3/ paths that don't embed the bucket require the caller to
-    # set S3_BUCKET themselves.
-    legacy_bucket = os.environ.get("S3_BUCKET")
 
     def open_rgb(path):
         with Image.open(path) as image:
@@ -473,29 +466,6 @@ def _default_s3_image_loader():
         if filepath.startswith("s3://"):
             parts = filepath[5:].split("/", 1)
             b, key = parts[0], parts[1]
-        elif filepath.startswith("/media/s3/"):
-            if not legacy_bucket:
-                raise ValueError(
-                    f"Cannot load legacy /media/s3/ path without S3_BUCKET env var set: {filepath}. "
-                    "Prefer raw s3://bucket/key paths (what the backend returns by default).",
-                )
-            b, key = legacy_bucket, filepath[len("/media/s3/") :]
-        elif filepath.startswith("/media/"):
-            # A real local file under a /media mount (e.g. an external data drive mounted at
-            # /media/<user>/...) takes precedence — only fall back to the legacy proxy resolution
-            # (re-rooting under FRIDGE_DATA_ROOT) when no literal file exists at the path.
-            if os.path.exists(filepath):
-                return open_rgb(filepath)
-            data_root = os.environ.get("FRIDGE_DATA_ROOT")
-            if not data_root:
-                raise ValueError(f"Cannot resolve legacy /media/ path without FRIDGE_DATA_ROOT set: {filepath}")
-            # An absolute path already under the data root that simply isn't present on THIS host
-            # (remote SDK, unmounted drive, moved file) is a missing file — re-rooting it would
-            # double-nest the data root into a path that can never exist. Only re-root genuine
-            # legacy proxy paths ("/media/<rel-to-root>"), never an absolute data-root path.
-            if filepath == data_root or filepath.startswith(data_root.rstrip("/") + "/"):
-                raise FileNotFoundError(f"No such media file: {filepath}")
-            return open_rgb(os.path.join(data_root, filepath[len("/media/") :]))
         else:
             if not os.path.isabs(filepath):
                 filepath = os.path.join(os.environ.get('FRIDGE_DATA_ROOT', ''), filepath)
@@ -1888,7 +1858,7 @@ class Dataset:
                 "clip-ViT-B-32").
             field_name: embedding field to write (default: "clip").
             image_loader: Callable(filepath) -> PIL.Image. If None, uses the
-                default loader (handles s3://, /media/s3/, /media/, and local
+                default loader (handles s3:// and local
                 paths; S3 needs boto3 + AWS credentials).
             force_register: re-point the field's model registration when it is already
                 registered to a DIFFERENT checkpoint. Without it the mismatch is reported as a
@@ -2103,7 +2073,7 @@ class Dataset:
         processor = CLIPProcessor.from_pretrained(model_name)
         print(f"Using device: {device}")
 
-        # Reuse the shared loader (handles s3://, /media/s3/, /media/, and local
+        # Reuse the shared loader (handles s3:// and local
         # paths) so patch embeddings work on S3-backed datasets and a missing
         # FRIDGE_DATA_ROOT surfaces loudly instead of silently using './data'.
         loader = image_loader or _default_s3_image_loader()
