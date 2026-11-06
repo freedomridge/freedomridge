@@ -699,9 +699,28 @@ a permanent warning banner.
 
 A plain `ServerWorker` claims only `server` jobs. The co-located runner (`local_runner`, used by
 `job_service`) defaults to `placements=('server','compute')`, so it also runs compute jobs such as map
-re-fits. HTTP worker
-registration, scoped tokens, artifact transfer and remote compute handlers are not built yet; a
-deployment with separate compute workers would stop the server runner from claiming compute work.
+re-fits. Artifact transfer and remote compute handlers are not built yet; a deployment with separate
+compute workers would stop the server runner from claiming compute work.
+
+**Remote compute workers over HTTP** (`backend/routers/workers.py`). A machine runs
+`python -m fridge.worker` with a worker token (`api_tokens.scope = 'worker'`, which only these endpoints
+accept). It registers (`POST /api/workers/register`) as a `placement='compute'` row in `workers`, with
+its owner, and heartbeats (`POST /api/workers/{id}/heartbeat`). The job endpoints wrap the queue
+functions above, so their semantics are the same as a local slot's:
+- `POST /api/workers/{id}/claim {wait_seconds ≤ 25}` long-polls `claim_job` with `placements=('compute',)`,
+  the kinds the worker registered that run remotely (`REMOTE_KINDS`, with each kind's `JobPolicy`), and
+  `dataset_ids` = the datasets its owner can access (`filter_datasets_for_user`); a job on no dataset only
+  for an admin's worker. 200 is the job with a 120 s lease; 204 is none.
+- `POST .../jobs/{job_id}/heartbeat {lease_token, done?, total?, message?}`: `heartbeat_job`, then the
+  progress through `publish_step`. It returns `cancel_requested`.
+- `.../complete {lease_token, result}`: `publish_step(finished=True)`. `.../fail {lease_token, error,
+  retryable}`: `defer_job` (the kind's retry delay) or `fail_job`. `.../release {lease_token}`:
+  `publish_step(release=True)`, queued again or cancelled when a cancel came in.
+- Each checks that the job's `worker_id` is the caller's worker. A lost lease is 409 (`lease_lost`: stop
+  without reporting), and a busy queue is 503 with Retry-After. A worker that stops renewing loses the job
+  when its lease expires: the next claim requeues it with a failure, as for a local slot.
+`REMOTE_KINDS` is empty until a kind brings its worker handler and its server hand-off, the map re-fit
+first, so until then no job can be claimed remotely.
 
 **Remote fencing (design, not built yet).** The lease fence covers only SQL inside the
 publication transaction. A remote worker uploads results over HTTP, so a laptop whose lease
