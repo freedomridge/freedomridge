@@ -847,7 +847,7 @@ Then on the recovery instance:
 
 ```bash
 cd /home/ubuntu/app
-docker compose -f docker-compose.prod.yml stop nginx frontend backend worker job-runner backup umap-worker
+docker compose -f docker-compose.prod.yml stop nginx frontend backend worker job-runner backup
 docker compose -f docker-compose.prod.yml up -d db
 sudo install -m 600 /home/ubuntu/restore.sql.gz /data/backups/restore.sql.gz
 sudo gzip -t /data/backups/restore.sql.gz

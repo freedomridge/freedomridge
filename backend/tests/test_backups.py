@@ -393,8 +393,8 @@ def test_the_runner_service_runs_and_schedules_backups(monkeypatch, tmp_path):
             return True
 
         @asynccontextmanager
-        async def local_runner(dsn, handlers, policies):
-            seen.update(handlers=handlers, policies=policies)
+        async def local_runner(dsn, handlers, policies, placements):
+            seen.update(handlers=handlers, policies=policies, placements=placements)
             yield SimpleNamespace(
                 workers=[SimpleNamespace(pool=SimpleNamespace(fetchval=fetchval))],
                 run=stopped.wait,
@@ -418,6 +418,7 @@ def test_the_runner_service_runs_and_schedules_backups(monkeypatch, tmp_path):
 
     asyncio.run(scenario())
     assert backups.KIND in seen['handlers'] and seen['policies'][backups.KIND] is backups.POLICY
+    assert seen['placements'] == ('server', 'compute')  # the default: one machine takes every step
     assert seen['migrations'] == [schema_check.BASELINE, '0001_shipped.sql'] and seen['scheduled']
 
 

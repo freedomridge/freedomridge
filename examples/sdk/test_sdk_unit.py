@@ -314,6 +314,7 @@ def test_visualization_returns_resolved_fit_size(monkeypatch, requested, expecte
     dataset._id = 7
     dataset.client = Mock()
     dataset.client.get_map_state.return_value = {}
+    dataset.client.hold_map_placement.return_value = {'held_until': None}  # a field without a map yet
     dataset.client.get_vectors.return_value = {
         'total': 8,
         'items': [{'sample_id': i, 'vector': [i, 1]} for i in range(1, 9)],

@@ -19,6 +19,7 @@ from backend import (
     job_queue,
     job_runner,
     job_service,
+    map_placement,
     map_refit,
     statistics,
 )
@@ -157,6 +158,8 @@ def test_service_logs_migration_and_outage_transitions_only(monkeypatch, caplog)
         monkeypatch.setattr(dataset_schedules, 'schedule_dataset_jobs', schedule_statistics)
         monkeypatch.setattr(map_refit, 'sweep', schedule_statistics)
         monkeypatch.setattr(map_refit, 'heal_unranked_maps', schedule_statistics)
+        monkeypatch.setattr(map_refit, 'expire_unclaimed_fits', schedule_statistics)
+        monkeypatch.setattr(map_placement, 'schedule_placements', schedule_statistics)
         monkeypatch.setattr(auth_cleanup, 'scheduled_cleanup', schedule_statistics)
         monkeypatch.setenv('JOB_STATISTICS_SECONDS', '1000000')
         monkeypatch.setenv('JOB_CONCEPT_SECONDS', '1000000')

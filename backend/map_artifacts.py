@@ -5,7 +5,8 @@ models). Object storage such as S3 can implement the same methods later. The dat
 locations as keys relative to the store, so every process (runner, projection daemon, SDK on the same
 machine) resolves them against its own mount of the folder.
 
-    managed/<dataset>__<field>/<model_id>.joblib   immutable models; embedding_map_state names the current one
+    managed/<dataset>__<field>/<model_id>.joblib   models of maps fitted before re-fits stopped keeping one;
+                                                   deleted when their map is re-fitted (or by the sweep)
     work/<job_id>/                                 one re-fit's export, fit outputs and log; disposable
 
 Legacy saved models (<dataset>__<field>.joblib at the top level) are never touched here.
@@ -52,18 +53,10 @@ class LocalArtifactStore:
     def work_dir(self, job_id) -> Path:
         return self.root / 'work' / str(uuid.UUID(str(job_id)))
 
-    def put_model(self, source: Path, dataset_id: int, field: str, model_id) -> str:
-        """Move a finished model file into the store under its immutable key; returns the key."""
-        key = model_key(dataset_id, field, model_id)
-        target = self.path(key)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        os.replace(source, target)  # same filesystem: work/ and managed/ share the root
-        directory = os.open(target.parent, os.O_RDONLY)
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
-        return key
+    def staging_dir(self, job_id, lease_token) -> Path:
+        """Where a compute worker's uploads for one lease of the job go. Keyed by lease, so a worker whose lease
+        ended can never mix its files into a later attempt's: completion reads only its own lease's folder."""
+        return self.work_dir(job_id) / f'remote-{uuid.UUID(str(lease_token))}'
 
     def delete(self, key: str) -> None:
         target = self.path(key)

@@ -3,7 +3,7 @@
 The browser never reads media files directly. It requests
 `/api/samples/ID/media`, and the backend checks that the user may see the dataset
 before it reads the file from local disk or S3. In production, nginx proxies that
-route (and the admin-only legacy `/media/s3/` route) to the backend. nginx has no
+route to the backend. nginx has no
 direct file alias and does not cache media responses. Media requests use their own
 nginx rate and connection zones, so a thumbnail grid cannot use up the API
 allowance; see the limits table in [Deploy to AWS](DEPLOY_TO_AWS.md#10-public-demo-behavior-and-credits).

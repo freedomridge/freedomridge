@@ -40,13 +40,11 @@ async def post(database, monkeypatch, path, payload, params=None):
 
 @needs_database
 @pytest.mark.parametrize('phase', ['swap', 'rank'])
-@pytest.mark.parametrize('writer', ['project_pending', 'compute_visualization'])
-def test_sdk_waits_past_120_seconds_for_another_maps_phase(registry_database, monkeypatch, phase, writer):
+def test_sdk_waits_past_120_seconds_for_another_maps_phase(registry_database, monkeypatch, phase):
     headers: dict[str, str] = {}
 
     async def scenario(database):
         await seed(database, n=8)
-        version = await database.fetchval('SELECT xmin::text FROM embeddings WHERE sample_id=1')
         async with database.pool.acquire() as holder, holder.transaction():
             gate = 'pg_advisory_xact_lock' if phase == 'swap' else 'pg_advisory_xact_lock_shared'
             await holder.execute(f'SELECT {gate}(20261016, 1)')
@@ -54,10 +52,7 @@ def test_sdk_waits_past_120_seconds_for_another_maps_phase(registry_database, mo
             until = await holder.fetchval('SELECT ceil(extract(epoch FROM clock_timestamp()))::bigint + 600')
             await holder.execute(f"SET LOCAL application_name='fridge map {phase} until {until}'")
             with pytest.raises(HTTPException) as refused:
-                await write(
-                    'manual' if writer == 'compute_visualization' else 'incremental',
-                    version=version if writer == 'project_pending' else None,
-                )
+                await write('manual')
             headers.update(refused.value.headers or {})
             assert 120 < int(headers.get('X-Map-Swap-Seconds', '0')) <= 601
 
@@ -76,11 +71,7 @@ def test_sdk_waits_past_120_seconds_for_another_maps_phase(registry_database, mo
     client.session = session
     sdk, _ = sdk_fixture(monkeypatch)
     sdk.client.upload_coordinates = client.upload_coordinates
-    if writer == 'compute_visualization':
-        assert sdk.compute_visualization(FIELD, 8)['reduced'] == 8
-    else:
-        sdk.client.get_vectors.side_effect = [sdk.client.get_vectors.return_value, {'items': []}]
-        assert sdk.project_pending(FIELD, FakeModel(0)) == 8
+    assert sdk.compute_visualization(FIELD, 8)['reduced'] == 8
     assert sum(sleeps) > 120 and len(calls) == 23
 
 

@@ -1034,12 +1034,16 @@ def run_tests():
 
     _()
 
-    @test("Sample backward compat: single embedding → embeddings dict")
+    @test("Sample takes named embeddings only (the single embedding= is gone in 2.0)")
     def _():
-        s = Sample(filepath='s3://test/emb_compat.jpg', embedding=[0.5] * 8)
-        assert s.embeddings == {'clip': [0.5] * 8}
-        d = s.to_dict()
-        assert d['embeddings'] == {'clip': [0.5] * 8}
+        s = Sample(filepath='s3://test/emb_named.jpg', embeddings={'clip': [0.5] * 8})
+        assert s.to_dict()['embeddings'] == {'clip': [0.5] * 8}
+        try:
+            Sample(filepath='s3://test/emb_single.jpg', embedding=[0.5] * 8)  # type: ignore[call-arg]
+        except TypeError:
+            pass
+        else:
+            raise AssertionError("Sample(embedding=...) was accepted")
 
     _()
 
@@ -1220,6 +1224,18 @@ def run_tests():
     def _():
         hist = ds.all().histogram_values('score', bins=5)
         assert len(hist) > 0, "Empty histogram"
+
+    _()
+
+    @test("view.histogram_values() with a filter too large for a URL")
+    def _():
+        # A saved selection of 20,000 ids (here 5 samples and ids no sample has) is ~200 KB of JSON, past
+        # the server's 64 KB request line: a histogram sent with the filter in its URL got HTTP 400.
+        ids = ds.filter(category='a').ids()
+        s = ds.samples
+        view = s[s.id.is_in(ids + list(range(10_000_000, 10_020_000 - len(ids))))]
+        hist = view.histogram_values('score', bins=5)
+        assert sum(bucket['count'] for bucket in hist) == len(ids) == 5, hist
 
     _()
 

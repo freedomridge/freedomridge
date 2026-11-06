@@ -7,6 +7,7 @@ import time
 from datetime import timedelta
 
 import pytest
+from starlette.requests import Request
 
 from backend import field_usage
 from backend.routers import datasets
@@ -50,7 +51,7 @@ def test_filter_fields_count_only_comparisons_a_field_index_serves():
     }
     assert field_usage.filter_fields(tree) == ['country', 'score', 'site']
     assert field_usage.filter_fields('{"field": "country", "operator": "<", "value": 1}') == ['country']
-    assert field_usage.filter_fields({'country': 'US', 'score': {'min': 1}}) == ['country', 'score']  # legacy flat form
+    assert field_usage.filter_fields({'country': 'US', 'score': {'min': 1}}) == []  # the flat form is gone in 2.0
     assert field_usage.filter_fields(None) == []
     assert field_usage.filter_fields('not json') == []
     assert field_usage.filter_fields(['garbage']) == []
@@ -130,6 +131,7 @@ def test_grid_histogram_autocomplete_and_facets_record_their_fields(registry_dat
         await datasets.list_samples_post(1, datasets.SamplesRequest(limit=2))
         await datasets.list_samples(
             1,
+            Request({'type': 'http', 'query_string': b'', 'headers': []}),  # the route reads removed parameters
             limit=2,
             offset=0,
             filters='{"field": "score", "operator": ">", "value": 2}',

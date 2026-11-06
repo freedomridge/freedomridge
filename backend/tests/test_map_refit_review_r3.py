@@ -11,6 +11,7 @@ import asyncpg
 import pytest
 from fridge import map_fit
 from fridge.core import dataset as sdk_dataset
+from starlette.requests import Request
 
 from backend import map_refit
 from backend.map_artifacts import LocalArtifactStore
@@ -46,7 +47,8 @@ def test_page_only_keyset_and_slim_grid_queries_refuse_a_stale_lasso(registry_da
             with pytest.raises(asyncpg.ObjectNotInPrerequisiteStateError, match='re-fitted'):
                 await datasets.list_samples_post(1, datasets.SamplesRequest(limit=5, filters=stale, **options))
         with pytest.raises(asyncpg.ObjectNotInPrerequisiteStateError, match='re-fitted'):
-            await datasets.list_samples(1, limit=5, offset=0, filters=json.dumps(stale))
+            no_query = Request({'type': 'http', 'query_string': b'', 'headers': []})
+            await datasets.list_samples(1, no_query, limit=5, offset=0, filters=json.dumps(stale))
 
     registry_database(scenario)
 

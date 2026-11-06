@@ -7,7 +7,7 @@
 # Always pass one of the two extras: they choose which PyTorch build is installed.
 [project]
 name = "freedomridge-app"
-version = "1.4.0"
+version = "2.0.0"
 requires-python = ">=3.12"
 dependencies = [
     # API server
@@ -43,7 +43,6 @@ cuda = ["torch>=2.9", "torchvision", "transformers>=4.57.1,<5"]
 examples = [
     "freedomridge[all]",
     "imagehash",
-    "joblib",
     "rasterio",
     "python-dotenv>=1.0,<2",
     "tqdm",

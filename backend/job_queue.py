@@ -275,8 +275,12 @@ async def claim_job(
     lanes: Sequence[str] | None = None,
     policies: Mapping[str, JobPolicy] | None = None,
     lease_seconds: float = 60,
+    dataset_ids: Sequence[int] | None = None,
+    unscoped: bool = True,
 ) -> Job | None:
-    """Lease a slot without overtaking an unfinished operation in its dataset lane."""
+    """Lease a slot without overtaking an unfinished operation in its dataset lane. `dataset_ids` limits it to
+    jobs on those datasets (a remote worker's: what its owner can access), and then a job on no dataset only
+    with `unscoped`."""
     _seconds(lease_seconds)
     if not worker_id:
         raise ValueError('worker_id is required')
@@ -334,6 +338,7 @@ async def claim_job(
                       -- A backup that already started may be the one a restored dump holds; recovery cancels it.
                       AND NOT (kind='backup' AND jobs.started_at IS NOT NULL)))
                   AND state='queued' AND available_at<=clock_timestamp()
+                  AND ($5::int[] IS NULL OR jobs.dataset_id=ANY($5::int[]) OR (jobs.dataset_id IS NULL AND $6))
                   AND (dataset_id IS NULL OR EXISTS(SELECT 1 FROM datasets WHERE datasets.id=jobs.dataset_id
                       AND (NOT deleting OR jobs.kind='dataset_deletion')))
                   AND (dataset_id IS NULL OR jobs.started_at IS NOT NULL OR NOT EXISTS (
@@ -345,6 +350,8 @@ async def claim_job(
             None if kinds is None else list(kinds),
             None if lanes is None else list(lanes),
             recovering,
+            None if dataset_ids is None else list(dataset_ids),
+            unscoped,
         )
         for candidate in candidates:
             if candidate['cancel_requested']:
@@ -495,10 +502,14 @@ async def publish_step(
     finished: bool = False,
     release: bool = False,
     publisher: Publisher | None = None,
+    placement: str | None = None,
 ) -> Job:
-    """Commit effects with their checkpoint; a late cancel stops after this unit."""
+    """Commit effects with their checkpoint; a late cancel stops after this unit. `placement` hands the job's
+    next step to the server's runners or to compute workers (a map re-fit's fit runs on compute)."""
     if finished and release:
         raise ValueError('A finished job cannot be requeued')
+    if placement not in (None, 'server', 'compute'):
+        raise ValueError("placement is 'server' or 'compute'")
     if (done is not None and done < 0) or (total is not None and total < 0):
         raise ValueError('Progress must be nonnegative')
     async with _transaction(pool) as connection:
@@ -528,7 +539,8 @@ async def publish_step(
                available_at=CASE WHEN $7='queued' THEN clock_timestamp() ELSE available_at END,
                finished_at=CASE WHEN $7 IN ('succeeded','cancelled') THEN clock_timestamp() ELSE finished_at END,
                lease_token=CASE WHEN $7='running' THEN lease_token ELSE NULL END,
-               lease_expires_at=CASE WHEN $7='running' THEN lease_expires_at ELSE NULL END
+               lease_expires_at=CASE WHEN $7='running' THEN lease_expires_at ELSE NULL END,
+               placement=COALESCE($8,placement)
                WHERE id=$1 AND lease_expires_at>clock_timestamp() RETURNING *""",
             job_id,
             checkpoint,
@@ -537,6 +549,7 @@ async def publish_step(
             message,
             result,
             next_state,
+            placement,
         )
         if row is None:
             raise LeaseLost(f'Job {job_id} lease expired during publication')

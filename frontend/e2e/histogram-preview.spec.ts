@@ -1,4 +1,4 @@
-import { test, expect, type Page } from '@playwright/test';
+import { test, expect, type Page, type Route } from '@playwright/test';
 import { adminLogin, apiFetch, deleteDatasetAndWait, readState } from './api';
 import { AUTH_STATE, expectTotal, gotoDataset } from './helpers';
 
@@ -50,12 +50,16 @@ test('a broad histogram shows a labelled approximate preview until the exact res
     const cookie = await adminLogin();
     const { datasetId } = readState();
     // The 12-sample fixture is never broad: the real preview endpoint declines it.
-    const real = await apiFetch(cookie, `/datasets/${datasetId}/histogram/preview?field=split`);
+    const real = await apiFetch(cookie, `/datasets/${datasetId}/histogram/preview`, {
+        method: 'POST', body: JSON.stringify({ field: 'split' }),
+    });
     expect(real).toEqual({ field: 'split', approximate: true, preview: { status: 'not_broad' } });
 
     // Stand in for a broad dataset: answer the preview from the server's shape, and hold the
     // exact request until the preview has been inspected.
-    await page.route(url => url.pathname.endsWith('/histogram/preview') && url.searchParams.get('field') === 'split', route => route.fulfill({ json: {
+    // The app POSTs its histogram requests, the field in the JSON body.
+    const forSplit = (route: Route) => route.request().postDataJSON()?.field === 'split';
+    await page.route(url => url.pathname.endsWith('/histogram/preview'), route => !forSplit(route) ? route.continue() : route.fulfill({ json: {
         field: 'split', total: 1000, missing: 0, distinct_total: 2, other_count: 0,
         buckets: [{ key: 'train', count: 520, label: 'train' }, { key: 'val', count: 480, label: 'val' }],
         approximate: true,
@@ -63,8 +67,8 @@ test('a broad histogram shows a labelled approximate preview until the exact res
     } }));
     let release = () => {};
     const exactReleased = new Promise<void>(resolve => { release = resolve; });
-    await page.route(url => url.pathname.endsWith('/histogram') && url.searchParams.get('field') === 'split', async route => {
-        await exactReleased;
+    await page.route(url => url.pathname.endsWith('/histogram'), async route => {
+        if (forSplit(route)) await exactReleased;
         await route.continue();
     });
 

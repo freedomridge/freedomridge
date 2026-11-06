@@ -42,6 +42,7 @@ from .routers import (
     workers,
 )
 from .security import production
+from .version import VERSION
 
 # Fail fast in prod if the storage-secret encryption key is missing/default.
 # Local dev (FRIDGE_ENV=development) just logs a warning.
@@ -54,6 +55,45 @@ app = FastAPI(lifespan=lifespan)
 app.add_middleware(RequestLimitsMiddleware)
 
 
+class VersionHeaderMiddleware:
+    """Every HTTP answer says which release made it (X-Fridge-Version), so the SDK can refuse a server of another
+    major version instead of misreading its answers (python/fridge/core/client.py). Plain ASGI, so streamed and
+    file answers get the header too; only a 500 from Starlette's outermost error handler goes without it, and the
+    SDK lets an answer without the header through. A request from an SDK of another major version (its
+    X-Fridge-SDK-Version, sent from 2.0 on) is refused with 426. SDKs before 2.0 send no version and aren't
+    refused: the upgrade notes say to upgrade the SDK with the server."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope['type'] != 'http':
+            return await self.app(scope, receive, send)
+        sdk = dict(scope.get('headers') or []).get(b'x-fridge-sdk-version', b'').decode('latin-1')
+        if sdk and sdk.split('.')[0] != VERSION.split('.')[0]:
+            install = (
+                f'pip install "freedomridge @ git+https://github.com/freedomridge/freedomridge.git@v{VERSION}'
+                '#subdirectory=python"'
+            )
+            detail = (
+                f'This server runs Freedom Ridge {VERSION}, and this SDK is {sdk}. An SDK works only with a server '
+                f'of its own major version: {install}'
+            )
+            response = JSONResponse(status_code=426, content={'detail': detail})
+            response.headers['X-Fridge-Version'] = VERSION
+            return await response(scope, receive, send)
+
+        async def send_with_version(message):
+            if message['type'] == 'http.response.start':
+                message['headers'] = [*message.get('headers', []), (b'x-fridge-version', VERSION.encode())]
+            await send(message)
+
+        await self.app(scope, receive, send_with_version)
+
+
+app.add_middleware(VersionHeaderMiddleware)
+
+
 @app.exception_handler(CodedHTTPException)
 async def coded_http_error(request: Request, exc: CodedHTTPException):
     return JSONResponse(
@@ -64,12 +104,10 @@ async def coded_http_error(request: Request, exc: CodedHTTPException):
 
 
 DATA_ROOT = os.getenv("FRIDGE_DATA_ROOT", os.path.join(os.getcwd(), "data"))
-# NOTE: there is deliberately NO `app.mount("/media", StaticFiles(DATA_ROOT))`.
-# A StaticFiles mount on /media served the entire data tree with NO auth, and
-# (because mounts are matched before routes) it shadowed the admin-gated
-# /media/s3 route below, turning that auth check into dead code. All local
-# images are served through the access-controlled /api/samples/{id}/media route,
-# which enforces check_dataset_access and confines reads to FRIDGE_DATA_ROOT.
+# NOTE: there is deliberately NO `app.mount("/media", StaticFiles(DATA_ROOT))`:
+# it would serve the entire data tree with NO auth. Every image, local or S3, is
+# served through the access-controlled /api/samples/{id}/media route, which
+# enforces check_dataset_access and confines local reads to FRIDGE_DATA_ROOT.
 
 # CORS
 origins = os.getenv("ALLOWED_ORIGINS", "http://localhost:5173,http://localhost:3000").split(",")
@@ -280,8 +318,6 @@ from fastapi.responses import FileResponse, Response  # noqa: E402
 # any file under FRIDGE_DATA_ROOT with no dataset-access check, bypassing the
 # media access-control hardening. Local images are served exclusively via the
 # access-checked /api/samples/{id}/media route.
-# S3 Proxy with local sync/cache
-from .storage import get_storage  # noqa: E402
 
 # Local path that mirrors S3 structure. If set:
 #   - Serves files from here instantly (no S3 hit)
@@ -364,74 +400,6 @@ def _overlay_range(value: float) -> float:
     if not math.isfinite(value) or not -65535 <= value <= 65535:
         raise HTTPException(400, "Overlay range must be finite and in [-65535, 65535]")
     return round(value, 2) + 0.0
-
-
-@app.get("/media/s3/{key:path}")
-async def proxy_s3(key: str, request: Request):
-    """
-    Legacy S3 proxy (env-var credentials, env-var bucket, no per-dataset routing).
-
-    Kept so any pre-existing browser-cached or external links continue to work.
-    All NEW image URLs are issued via /api/samples/{id}/media which respects
-    per-dataset storage configs and access control.
-
-    Auth policy: requires ANY authenticated user. This route has no way to
-    know which dataset a key belongs to, so it can't enforce per-dataset
-    access — but requiring auth at least prevents a drive-by attacker who
-    guesses a key from bypassing the new media-access work entirely.
-    """
-    # Admin-only. This shim can't enforce per-dataset access (it has no dataset
-    # scope), so without a gate any authenticated user — including a guest — could
-    # read any object in the env-var bucket by key. The modern, access-checked
-    # route is /api/samples/{id}/media; the frontend uses only that. Restricting
-    # the shim to admins keeps old bookmarks working for operators without
-    # reopening the cross-dataset read hole.
-    from .routers.auth import get_current_user
-
-    _legacy_user = await get_current_user(request)  # Raises 401 if not logged in.
-    if _legacy_user.get("role") != "admin":
-        raise HTTPException(
-            status_code=403,
-            detail="Legacy media route is admin-only; use /api/samples/{id}/media",
-        )
-
-    # Reuse the same path-traversal guard as the modern route so a malicious
-    # key like `../../etc/passwd` can't escape the local cache directory.
-    _validate_s3_key(key)
-
-    local_path = os.path.join(S3_LOCAL_PATH, key)
-
-    # Serve from local mirror
-    cached = await asyncio.to_thread(_cached_media_response, request, local_path, key)
-    if cached is not None:
-        return cached
-
-    # Download from S3, save to local mirror, and serve. Boto3 is blocking, so
-    # run it in the default thread pool to keep the event loop responsive.
-    # This route is a deprecated compat shim — we log errors and return a
-    # single failure rather than mapping granular S3 error codes (the
-    # modern /api/samples/{id}/media route does that work properly).
-    import asyncio as _asyncio
-
-    storage = get_storage()
-    if not storage.s3_client:
-        raise HTTPException(status_code=500, detail="S3 not configured")
-
-    def _fetch():
-        resp = storage.s3_client.get_object(Bucket=storage.config.s3_bucket, Key=key)
-        return resp['Body'].read(), resp.get('ContentType', mimetypes.guess_type(key)[0] or 'application/octet-stream')
-
-    try:
-        body, content_type = await _asyncio.to_thread(_fetch)
-    except Exception as e:
-        log.error("legacy S3 proxy failed for %s: %s", key, e)
-        raise HTTPException(status_code=404, detail="File not found in S3")
-
-    return Response(
-        content=body,
-        background=BackgroundTask(_cache_media_later, local_path, body),
-        **_media_response_kwargs(content_type, body[:_MEDIA_HEAD_BYTES], key, **{"X-Cache": "MISS"}),
-    )
 
 
 # --- Sample-based media route ------------------------------------------------

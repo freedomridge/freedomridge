@@ -5,7 +5,9 @@ import random
 import struct
 import time
 import warnings
+from importlib import metadata
 from typing import Any, Dict, Optional
+from urllib.parse import urlsplit
 
 import numpy as np
 import requests
@@ -94,6 +96,9 @@ class _Session(requests.Session):
     def __init__(self, timeout=DEFAULT_TIMEOUT):
         super().__init__()
         self._default_timeout = timeout
+        if _SDK_VERSION:
+            # The server refuses an SDK of another major version from this (backend/main.py).
+            self.headers["X-Fridge-SDK-Version"] = _SDK_VERSION
 
     def rebuild_auth(self, prepared_request, response):
         super().rebuild_auth(prepared_request, response)
@@ -130,7 +135,44 @@ class _Session(requests.Session):
             time.sleep(pause)
             delay = min(delay * 2, 8.0)
             resp = super().request(*args, **kwargs)
+        _check_server_version(resp)
         return resp
+
+
+class IncompatibleServerError(RuntimeError):
+    """The server runs another major version than this SDK (its X-Fridge-Version header): an SDK only works with
+    a server of its own major version."""
+
+
+def _installed_version() -> Optional[str]:
+    try:
+        return metadata.version("freedomridge")
+    except metadata.PackageNotFoundError:
+        return None  # run from a source tree without installing: nothing to compare
+
+
+_SDK_VERSION = _installed_version()
+
+
+def _check_server_version(resp) -> None:
+    """Refuse an answer from a server of another major version: its answers may not mean what this SDK reads
+    (a re-fitted map without a model file, a removed endpoint). Servers before 2.0 send no version header."""
+    server = resp.headers.get("X-Fridge-Version")
+    if not server or not _SDK_VERSION or server.split(".")[0] == _SDK_VERSION.split(".")[0]:
+        return
+    url = urlsplit(resp.url or "")
+    raise IncompatibleServerError(
+        f"This Freedom Ridge SDK is {_SDK_VERSION}, and the server at {url.scheme}://{url.netloc} runs {server}. "
+        f"An SDK works only with a server of its own major version: {install_command(server)}",
+    )
+
+
+def install_command(version: str) -> str:
+    """How to install the SDK of a server's release (the repository's tag; the SDK isn't on PyPI)."""
+    return (
+        f'pip install "freedomridge @ git+https://github.com/freedomridge/freedomridge.git@v{version}'
+        '#subdirectory=python"'
+    )
 
 
 class _BearerAuth(requests.auth.AuthBase):
@@ -757,6 +799,24 @@ class Client:
         resp = self.session.post(f"{self.base_url}/datasets/{dataset_id}/schedules/{schedule_id}/run")
         _raise_for_status(resp)
         return Job(self, resp.json()["job_id"])
+
+    def hold_map_placement(self, dataset_id, field_name) -> dict:
+        """Hold the server's placement of new samples on a map while a full layout of it is written; call again
+        within ``renew_seconds`` to keep it. ``held_until`` is null for a field without a map."""
+        resp = self.session.put(
+            f"{self.base_url}/datasets/{dataset_id}/embeddings/placement-hold",
+            params={"field_name": field_name},
+        )
+        _raise_for_status(resp)
+        return resp.json()
+
+    def release_map_placement(self, dataset_id, field_name) -> None:
+        """Release a hold on a map's placement (hold_map_placement)."""
+        resp = self.session.delete(
+            f"{self.base_url}/datasets/{dataset_id}/embeddings/placement-hold",
+            params={"field_name": field_name},
+        )
+        _raise_for_status(resp)
 
     def recompute_viz_rank(self, dataset_id, field_name, full=True) -> dict:
         """Recompute the even-coverage scatter sample-priority (viz_cell_rank) for a

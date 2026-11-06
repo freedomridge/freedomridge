@@ -13,6 +13,7 @@ import numpy as np
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from pydantic import BaseModel, Field, FiniteFloat, model_validator
 
+from .. import map_placement
 from ..access import require_dataset_access
 from ..api_errors import CodedHTTPException
 from ..coordinates import (
@@ -577,6 +578,10 @@ async def reduce_embeddings(id: int, req: ReduceRequest, user: dict = Depends(re
         )
 
     limit_clause = "" if req.max_embeddings <= 0 else f"LIMIT {req.max_embeddings}"
+    if not is_patch_scale:
+        # From the vectors read until the new layout is ranked, no new sample is placed from the old layout. An
+        # error on the way leaves the hold to lapse (map_placement.PLACEMENT_HOLD_SECONDS).
+        await map_placement.hold(db, id, req.field_name)
     rows = await db.fetch(
         f"""
         SELECT e.id, e.vector, e.field_name
@@ -660,6 +665,8 @@ async def reduce_embeddings(id: int, req: ReduceRequest, user: dict = Depends(re
                     f'?field_name={req.field_name}&full=true; there is no need to repeat the reduction.'
                 ),
             )
+
+        await map_placement.release(db, id, req.field_name)
 
     # total_embeddings counts every vector of the field, so a max_embeddings cap that left some
     # without coordinates shows as reduced < total_embeddings instead of looking complete.
@@ -1858,10 +1865,11 @@ def map_state_summary(row) -> Optional[Dict[str, Any]]:
 
 @router.get("/map-state")
 async def get_map_state(id: int, field_name: str, user: dict = Depends(require_role("power_user"))):
-    """The field's map: its current model (from the last scheduled re-fit or Run now, or none while it
-    still uses a legacy saved model), when it was re-fitted, and whether a re-fit is in progress. For
-    projectors (power users): it names the model file on the server. Viewers get `map_state` with the
-    scatter."""
+    """The field's map: its points (`current_points`; 0 when the field has no map yet, so nothing is placed
+    on it until a first fit), its current version (`model_id`, from the last scheduled re-fit or Run now;
+    none for a map never re-fitted), when it was re-fitted, and whether a re-fit is in progress. A model
+    file (`artifact_*`) is named only for a map re-fitted before re-fits stopped keeping one. Viewers get
+    `map_state` with the scatter."""
     row = await db.fetchrow(
         """SELECT m.*, (j.state IN ('queued','running')) IS TRUE AS active,
                   (SELECT total_points FROM embedding_viz_meta v
@@ -1872,7 +1880,19 @@ async def get_map_state(id: int, field_name: str, user: dict = Depends(require_r
         field_name,
     )
     if row is None:
-        return {"field_name": field_name, "managed": False, "active": False, "model_id": None, "refitted_at": None}
+        points = await db.fetchval(
+            'SELECT total_points FROM embedding_viz_meta WHERE dataset_id = $1 AND field_name = $2',
+            id,
+            field_name,
+        )
+        return {
+            "field_name": field_name,
+            "managed": False,
+            "active": False,
+            "model_id": None,
+            "refitted_at": None,
+            "current_points": points or 0,
+        }
     location = row['artifact_location']
     return {
         "field_name": field_name,
@@ -1905,8 +1925,8 @@ async def recompute_viz_rank(
     (full=True → re-rank all points). full=False is a compatibility no-op:
     coordinate triggers already maintain ranks in ranked fields.
 
-    Delegates to the recompute_viz_rank() SQL function (the same one the direct-DB
-    umap_project_job daemon calls), so the logic lives in exactly one place.
+    Delegates to the recompute_viz_rank() SQL function (the same one map re-fits call), so the logic lives
+    in exactly one place.
     """
     async with db.pool.acquire() as conn:
         if full:
@@ -1925,3 +1945,26 @@ async def recompute_viz_rank(
             timeout=1800,
         )
     return {"ranked": ranked or 0, "field_name": field_name, "full": full}
+
+
+@router.put("/placement-hold")
+async def hold_placement(id: int, field_name: str, user: dict = Depends(require_role("power_user"))):
+    """Hold placement of new samples on this map while a full layout of it is written over time (the SDK's
+    `compute_visualization` takes it before fetching the vectors): samples that arrive meanwhile stay queued and
+    are placed on the new layout once it is released, instead of from the old one. It lasts
+    `map_placement.PLACEMENT_HOLD_SECONDS`; call again within `renew_seconds` to keep it. A field without a map
+    has nothing placed on it, so nothing to hold (`held_until` null)."""
+    until = await map_placement.hold(db, id, field_name)
+    return {
+        "field_name": field_name,
+        "held_until": until.isoformat() if until else None,
+        "hold_seconds": map_placement.PLACEMENT_HOLD_SECONDS,
+        "renew_seconds": map_placement.HOLD_RENEW_SECONDS,
+    }
+
+
+@router.delete("/placement-hold")
+async def release_placement(id: int, field_name: str, user: dict = Depends(require_role("power_user"))):
+    """Release a hold on this map's placement: its waiting samples are placed within seconds."""
+    await map_placement.release(db, id, field_name)
+    return {"field_name": field_name, "held_until": None}

@@ -7,7 +7,6 @@ free space that can't be read (managed Postgres, non-superuser) never refuses.
 """
 
 import asyncio
-import importlib.util
 import sys
 import types
 from contextlib import nullcontext
@@ -263,63 +262,3 @@ def test_near_the_line_the_message_does_not_read_as_a_contradiction(free):
     with pytest.raises(HTTPException) as e:
         asyncio.run(_call(free, "coordinates"))
     assert "needs about 1.00 GB" in e.value.detail and "0.99 GB free" in e.value.detail
-
-
-def test_the_umap_projection_worker_checks_before_writing_coordinates(free, monkeypatch):
-    """scripts/umap_project_job.py writes x/y straight to the database (a co-located worker, no API),
-    so it runs the same check itself before each batch; main() logs the 507 and retries next cycle."""
-    spec = importlib.util.spec_from_file_location("umap_project_job", ROOT / "scripts" / "umap_project_job.py")
-    assert spec is not None and spec.loader is not None
-    job = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(job)
-
-    class Model:
-        n_features_in_ = 3
-
-        def transform(self, X):
-            return np.zeros((len(X), 2))
-
-    class Conn:
-        def __init__(self):
-            self.pending = [{"sample_id": i, "vector": "[0.1,0.2,0.3]", "vector_version": "1"} for i in range(200)]
-            self.written = 0
-
-        async def fetch(self, query, *args):
-            rows, self.pending = self.pending, []
-            return rows
-
-        async def executemany(self, query, values):
-            self.written += len(values)
-
-        async def execute(self, query, *args):
-            if "INSERT INTO embedding_coordinates" in query:
-                self.written += len(args[0])
-            return None
-
-        async def fetchrow(self, query, *args):  # the map fence: no scheduled re-fits for this field
-            return None
-
-        async def fetchval(self, query, *args):  # no queued re-fit before activation, either
-            return False
-
-        def transaction(self):
-            class Transaction:
-                async def __aenter__(self):
-                    return self
-
-                async def __aexit__(self, *exc):
-                    return False
-
-            return Transaction()
-
-    free["free"] = GB // 2
-    conn = Conn()
-    with pytest.raises(HTTPException) as e:
-        asyncio.run(job._project(conn, 7, "clip", Model(), 5000))
-    assert e.value.status_code == 507 and "projecting 200 UMAP points" in e.value.detail
-    assert conn.written == 0
-
-    free["free"] = 50 * GB
-    conn = Conn()
-    assert asyncio.run(job._project(conn, 7, "clip", Model(), 5000)) == 200
-    assert conn.written == 200

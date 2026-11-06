@@ -409,11 +409,6 @@ export interface Sample {
 }
 
 export interface Filters {
-    file_date?: string;
-    brightness_min?: number;
-    brightness_max?: number;
-    date_min?: string;
-    date_max?: string;
     // Per-field draft filter values are genuinely heterogeneous (scalars, arrays,
     // {min,max} ranges, {_op} markers) and consumed via untyped index access in the
     // sidebar, which relies on `any` to bypass indexed-access narrowing.
@@ -968,7 +963,7 @@ export async function getMapPoints(
         body: JSON.stringify({ filters, zoom: opts?.zoom, bbox: opts?.bbox, points: opts?.points }),
     });
     await ensureOk(res, 'Failed to fetch map points');
-    // zoom set -> { mode: 'hybrid'|'points', items, capped? }; no zoom -> legacy array.
+    // { mode: 'hybrid'|'points', items, capped }. The server needs the zoom, or points: true.
     return res.json();
 }
 
@@ -1079,24 +1074,25 @@ export function missingFieldsStage(fields: string[]): ViewStage {
     };
 }
 
-function histogramParams(field: string, filters?: ComplexFilter, bins?: number, asNumber?: boolean) {
-    const params = new URLSearchParams({ field });
-    if (filters) {
-        params.append('filters', JSON.stringify(filters));
-    }
-    if (bins) {
-        params.append('bins', String(bins));
-    }
-    if (asNumber) {
-        params.append('as_number', 'true');
-    }
-    return params.toString();
+// A histogram request. POST with the filter in the body: a saved selection of a few thousand sample ids
+// makes a filter too large for a URL, and the server answers 400 past its 64 KB request line.
+function histogramRequest(field: string, filters?: ComplexFilter, bins?: number, asNumber?: boolean): RequestInit {
+    return {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            field,
+            ...(filters ? { filters } : {}),
+            ...(bins ? { bins } : {}),
+            ...(asNumber ? { as_number: true } : {}),
+        }),
+    };
 }
 
 // The exact histogram. `asNumber` bins a field declared as text numerically (declared text is
 // grouped by value by default).
 export async function getHistogram(datasetId: number, field: string, filters?: ComplexFilter, bins?: number, asNumber?: boolean): Promise<HistogramResponse> {
-    const res = await fetch(`${API_BASE}/datasets/${datasetId}/histogram?${histogramParams(field, filters, bins, asNumber)}`);
+    const res = await fetch(`${API_BASE}/datasets/${datasetId}/histogram`, histogramRequest(field, filters, bins, asNumber));
     await ensureOk(res, 'Failed to fetch histogram');
     return res.json();
 }
@@ -1104,7 +1100,7 @@ export async function getHistogram(datasetId: number, field: string, filters?: C
 // An APPROXIMATE histogram of a random sample, for broad sets only. Display-only: never filter
 // or select from it. Buckets come back only when `preview.status` is 'ok'.
 export async function getHistogramPreview(datasetId: number, field: string, filters?: ComplexFilter, bins?: number, asNumber?: boolean): Promise<HistogramResponse> {
-    const res = await fetch(`${API_BASE}/datasets/${datasetId}/histogram/preview?${histogramParams(field, filters, bins, asNumber)}`);
+    const res = await fetch(`${API_BASE}/datasets/${datasetId}/histogram/preview`, histogramRequest(field, filters, bins, asNumber));
     await ensureOk(res, 'Failed to fetch histogram preview');
     return res.json();
 }

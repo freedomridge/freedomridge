@@ -1,6 +1,5 @@
 """Coordinate isolation, migration fidelity and bounded projection work on PostgreSQL."""
 
-import importlib.util
 import json
 import os
 import runpy
@@ -14,7 +13,6 @@ import numpy as np
 import pytest
 from fridge.core import client as sdk_client
 from fridge.core import dataset as sdk_dataset
-from fridge.core.dataset import Dataset
 from pydantic import ValidationError
 
 from backend.routers import embeddings, sampling
@@ -69,30 +67,6 @@ def test_api_coordinate_writes_do_not_update_embedding_tuples(registry_database,
     registry_database(scenario)
 
 
-def test_projection_sdk_pages_without_recounting_pending_work():
-    calls = []
-    written = []
-
-    def page(dataset_id, **kwargs):
-        calls.append(kwargs)
-        cursor = kwargs.get('after_id')
-        ids = [1, 2] if cursor is None else [3] if cursor == 2 else []
-        return {'items': [{'sample_id': i, 'vector': [1, 2, 3]} for i in ids]}
-
-    dataset = object.__new__(Dataset)
-    dataset._id = 1
-    dataset.client = SimpleNamespace(
-        get_map_state=lambda dataset_id, field: {'managed': False, 'active': False, 'model_id': None},
-        get_vectors=page,
-        upload_coordinates=lambda dataset_id, field, payload: written.extend(payload),
-        recompute_viz_rank=lambda *args, **kwargs: None,
-    )
-    model = SimpleNamespace(n_features_in_=3, transform=lambda vectors: np.zeros((len(vectors), 2)))
-    assert dataset.project_pending('clip', model, batch=2) == 3
-    assert [call.get('after_id') for call in calls] == [None, 2, 3]
-    assert [p['sample_id'] for p in written] == [1, 2, 3]
-
-
 def test_visualization_example_uses_supported_sdk_arguments(monkeypatch):
     calls = []
 
@@ -119,25 +93,6 @@ def test_visualization_example_uses_supported_sdk_arguments(monkeypatch):
     runpy.run_path(str(ROOT / 'examples/sdk/compute_visualization.py'), run_name='__main__')
     assert calls == [('clip', -1)]
     assert urls == ['http://127.0.0.1:65530/api']  # honours FRIDGE_API_URL, never a hard-coded localhost:8000
-
-
-def test_direct_projection_worker_does_not_update_embeddings(registry_database, monkeypatch):
-    spec = importlib.util.spec_from_file_location('layout_projection', ROOT / 'scripts/umap_project_job.py')
-    assert spec and spec.loader
-    worker = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(worker)
-    monkeypatch.setattr(worker, 'require_free_space', AsyncMock())
-
-    async def scenario(db):
-        await seed(db)
-        before = await db.fetch('SELECT id,ctid::text,xmin::text FROM embeddings ORDER BY id')
-        model = SimpleNamespace(n_features_in_=3, transform=lambda vectors: np.zeros((len(vectors), 2)))
-        async with db.pool.acquire() as conn:
-            assert await worker._project(conn, 1, 'clip', model, 3) == 8
-            assert await worker._project(conn, 1, 'clip', model, 3) == 0
-        assert await db.fetch('SELECT id,ctid::text,xmin::text FROM embeddings ORDER BY id') == before
-
-    registry_database(scenario)
 
 
 def test_server_reduce_writes_separate_coordinates(registry_database, monkeypatch):

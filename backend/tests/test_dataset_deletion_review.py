@@ -83,7 +83,7 @@ def test_deleting_dataset_post_reads_and_access_controls(registry_database, monk
                 ('samples/lookup', {'field': 'score', 'values': [1, 2]}),
                 ('field-stats', {}),
                 ('fields/score/autocomplete', {'q': ''}),
-                ('map_points', {}),
+                ('map_points', {'points': True}),
                 ('map_extent', {}),
                 ('selection_token', {}),
                 ('aggregate', {'aggregations': [{'field': 'score', 'op': 'count'}]}),

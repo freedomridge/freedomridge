@@ -1,6 +1,6 @@
 """Every release upgrades straight to this code (docs/UPGRADING.md, "What is supported").
 
-For each release tag of the current major version, a database is created from that release's
+For each release since the current schema baseline (BASELINE_RELEASE), a database is created from its
 backend/db/schema.sql, given a dataset, a sample and a saved view, and upgraded with this checkout's
 scripts/apply_migrations.sh. Its schema must then equal a fresh install's from this checkout's
 schema.sql, its ledger must record every migration, and its rows must still be there. Old schemas
@@ -33,17 +33,26 @@ INSERT INTO views (dataset_id, name, slug, content) SELECT id, 'v', 'upgrade-che
 """
 
 
+# The oldest release whose database this checkout's migrations upgrade: the start of the current schema
+# baseline (docs/UPGRADING.md, "What is supported"). 2.0 kept 1.x's baseline, so every 1.x release upgrades
+# straight to 2.x; a major version that starts a new baseline moves this to its own first release.
+BASELINE_RELEASE = 'v1.0.0'
+
+
+def _version(tag):
+    return tuple(int(part) for part in tag[1:].split('.'))
+
+
 def release_tags():
-    """The releases of the current major version, oldest first."""
-    major = (ROOT / 'VERSION').read_text().strip().split('.')[0]
+    """The releases since the current schema baseline, oldest first."""
     tags = subprocess.run(
-        ['git', '-C', str(ROOT), 'tag', '--list', f'v{major}.*'],
+        ['git', '-C', str(ROOT), 'tag', '--list', 'v*'],
         capture_output=True,
         text=True,
         check=True,
     ).stdout.split()
-    releases = [t for t in tags if re.fullmatch(r'v\d+\.\d+\.\d+', t)]
-    return sorted(releases, key=lambda t: tuple(int(part) for part in t[1:].split('.')))
+    releases = [t for t in tags if re.fullmatch(r'v\d+\.\d+\.\d+', t) and _version(t) >= _version(BASELINE_RELEASE)]
+    return sorted(releases, key=_version)
 
 
 @pytest.fixture

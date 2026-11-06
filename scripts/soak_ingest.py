@@ -15,7 +15,7 @@ from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
 import asyncpg
-from fridge import Dataset, Sample, connect
+from fridge import Sample, connect
 from fridge.core.client import Client
 
 
@@ -270,8 +270,7 @@ async def run(args):
     reads_client = client_for(args)
     dataset_id = None
     samples, batches = [], []
-    models = {}
-    state = {'inserted': 0, 'retry_batches': 0, 'projection_count': 0}
+    state = {'inserted': 0, 'retry_batches': 0}
     name = f'soak-ingest-{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}-{uuid.uuid4().hex[:8]}'
     prefix = 'soak/'
     args.output.mkdir(parents=True, exist_ok=False)
@@ -307,14 +306,6 @@ async def run(args):
         actual = await conn.fetchval('SELECT name FROM datasets WHERE id=$1', dataset_id)
         if actual != name:
             raise RuntimeError('API and telemetry database do not match')
-        dataset = await asyncio.to_thread(Dataset.from_id, dataset_id)
-        if args.model_dir:
-            import joblib
-
-            for field in (args.clip_field, args.dino_field):
-                path = args.model_dir / f'{field}.joblib'
-                if path.is_file():
-                    models[field] = joblib.load(path)
         started = time.monotonic()
         with (
             (args.output / 'batches.csv').open('w') as batch_file,
@@ -375,13 +366,6 @@ async def run(args):
                         batches.append(row)
                         write_row(batch_writer, batch_file, row)
                         state['retry_batches'] += int(retry)
-                    for field, model in models.items():
-                        state['projection_count'] += await asyncio.to_thread(
-                            dataset.project_pending,
-                            field,
-                            model,
-                            batch=args.batch_size,
-                        )
                     multiplier = args.burst_multiplier if elapsed % args.burst_every < args.burst_seconds else 1
                     # No unbounded catch-up burst if the API falls behind.
                     due = max(due + args.batch_size / (args.rate * multiplier), time.monotonic() - started)
@@ -463,8 +447,8 @@ async def run(args):
         f"{args.burst_seconds:g}s every {args.burst_every}s; ingest {args.duration:g}s, drain {args.drain_seconds:g}s.",
         f"Limits: p95 < {args.p95_seconds:g}s; queues <= {args.near_zero} within {args.recovery_minutes:g}min; "
         f"late/early disk slope <= {args.growth_ratio:g}.",
-        f"Projection: {state['projection_count']} rows; "
-        f"{'loaded fields ' + json.dumps(list(models)) if models else 'skipped (no saved model found)'}.",
+        "Map placement: the server's map_place jobs place new points on a dataset's maps; this harness fits none, "
+        "so a dataset without a map has none to place.",
         f"Detected queues: {json.dumps(telemetry.queues)}. Missing concept/duplicate queues are not certified.",
         "Database sizes, WAL, queues and job failures are global to the isolated stack; other workloads affect them.",
         "Disk comparison uses samples + embeddings including their indexes/TOAST; database/WAL totals are separate.",
@@ -512,11 +496,6 @@ def parser():
     p.add_argument('--seed', type=int, default=7)
     p.add_argument('--clip-field', default='soak_clip_512')
     p.add_argument('--dino-field', default='soak_dino_1024')
-    p.add_argument(
-        '--model-dir',
-        type=Path,
-        help='Trusted saved models named <embedding_field>.joblib; absent files skipped',
-    )
     return p
 
 

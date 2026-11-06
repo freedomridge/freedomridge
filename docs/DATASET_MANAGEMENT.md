@@ -94,7 +94,7 @@ Use `"skip"` for a script you may re-run. Send smaller batches if you get HTTP 4
 | `metadata` | Free-form JSON. Types are detected from the values; ISO-8601 strings become datetimes. |
 | `location` | GeoJSON Point, `{"type": "Point", "coordinates": [lon, lat]}`. |
 | `heading` | Compass heading in degrees. |
-| `embeddings` | `{field_name: [floats]}`. A field name's dimension is fixed server-wide by its first vectors. (`embedding: [...]` is shorthand for the `clip` field.) |
+| `embeddings` | `{field_name: [floats]}`. A field name's dimension is fixed server-wide by its first vectors. |
 | `hashes` | `{name: "hex string"}`, for example `{"phash_8": "c3a1..."}`. |
 | `array_fields` | `{field_name: [strings]}` for array fields created on the dataset. |
 

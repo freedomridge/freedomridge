@@ -93,12 +93,12 @@ def test_add_sends_inline_artifacts_in_one_request(monkeypatch):
     assert send.call_args.kwargs['json'] == {'samples': [sample.to_dict()], 'on_duplicate': 'skip'}
 
 
-def test_empty_legacy_embedding_reaches_api_validation(monkeypatch):
+def test_empty_embedding_reaches_api_validation(monkeypatch):
     ds = dataset()
     send = Mock(return_value=response(422, {'detail': 'embedding must not be empty'}))
     monkeypatch.setattr(requests.Session, 'request', send)
     with pytest.raises(requests.HTTPError):
-        ds.add_samples([Sample('field.jpg', embedding=[])], on_duplicate='skip')
+        ds.add_samples([Sample('field.jpg', embeddings={'clip': []})], on_duplicate='skip')
     assert send.call_args.kwargs['json']['samples'][0]['embeddings'] == {'clip': []}
 
 

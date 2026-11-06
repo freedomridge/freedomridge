@@ -423,7 +423,6 @@ loads. Use one of the two options above.
 | User accounts and sessions | `users`, `sessions` tables | Yes |
 | Saved views | `views` table | Yes |
 | **Images and other media** | **Local files or S3 (external)** | **No** |
-| **Fitted UMAP models** | **`FRIDGE_UMAP_MODEL_DIR` / prod `umap_models` volume** | **No** |
 
 Media stays where the sample filepaths point: local files below `FRIDGE_DATA_ROOT`,
 or S3 objects. A restored database loads its media only when the target sees the
@@ -447,10 +446,6 @@ Keep:
   `POSTGRES_PASSWORD`, `POSTGRES_DB`, `COMPOSE_PROJECT_NAME`, `COMPOSE_FILE`, `FRIDGE_PGDATA_DIR`,
   `FRIDGE_DB_CONTAINER`, `FRIDGE_DB_NAME`, `FRIDGE_DB_USER`, `HOST_DATA_ROOT`, `TZ`, and database memory overrides. Database
   roles/passwords are not included in a single-database `pg_dump`.
-- **Saved UMAP models:** back up the directory configured by `FRIDGE_UMAP_MODEL_DIR` (default
-  `$FRIDGE_DATA_ROOT/umap_models`, the `umap_models` volume in production) and restore it at the
-  configured path before restarting continuous-ingest projection. These fitted model files are not
-  in `pg_dump`; losing them requires a full re-fit that can move every point.
 - Storage configuration and access: `STORAGE_TYPE`, `FRIDGE_DATA_ROOT`, `DATA_VOLUME_PATH`,
   `S3_BUCKET`, `S3_REGION`, `S3_ENDPOINT_URL`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY`,
   `FRIDGE_CONFIG`/AWS credential files, IAM role/policy recovery instructions, and any backup-bucket

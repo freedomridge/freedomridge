@@ -44,6 +44,9 @@ class StepResult:
     publish: Optional[Callable[[asyncpg.Connection], Awaitable[None]]] = None
     # The handler already ended the job in its own fenced transaction (job_queue.finish_locked).
     committed: bool = False
+    # Where the next step runs ('server' or 'compute'). A runner that doesn't take that placement gives the job
+    # back to the queue for one that does; one that does carries on.
+    placement: Optional[str] = None
 
 
 class UnitCancelled(Exception):
@@ -184,6 +187,7 @@ class ServerWorker:
                 if outcome.committed:
                     return
                 should_yield = self.stopping.is_set() or time.monotonic() - started >= self.step_budget_seconds
+                handed_off = outcome.placement is not None and outcome.placement not in self.placements
                 # The job's own renewal must not hold its row when the publication's fence arrives.
                 async with monitor.paused():
                     job = await run_isolated(
@@ -197,8 +201,9 @@ class ServerWorker:
                             message=outcome.message,
                             result=outcome.result,
                             finished=outcome.finished,
-                            release=should_yield and not outcome.finished,
+                            release=(should_yield or handed_off) and not outcome.finished,
                             publisher=outcome.publish,
+                            placement=outcome.placement,
                         ),
                         name='Job publication',
                     )

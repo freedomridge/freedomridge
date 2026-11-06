@@ -108,9 +108,6 @@ def filter_fields(filters: Any) -> List[str]:
 
         if isinstance(filters, dict) and ('logic' in filters or 'field' in filters or 'filters' in filters):
             walk(filters, 0)
-        elif isinstance(filters, dict):
-            # The legacy flat form {field: value | [values] | {min, max}}.
-            found.update(name for name in filters if isinstance(name, str) and name and '.' not in name)
     except Exception:
         logger.debug('Field usage telemetry could not read a filter', exc_info=True)
     return sorted(found)

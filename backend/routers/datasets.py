@@ -4630,11 +4630,6 @@ def _compile_filter_node(
 
 def build_sample_query_parts(
     dataset_id: int,
-    file_date: Optional[str] = None,
-    brightness_min: Optional[float] = None,
-    brightness_max: Optional[float] = None,
-    date_min: Optional[str] = None,
-    date_max: Optional[str] = None,
     filters: Optional[str] = None,
     array_columns: Optional[set] = None,
     numeric_indexed_fields: Optional[set] = None,
@@ -4647,44 +4642,26 @@ def build_sample_query_parts(
     args: list[Any] = [dataset_id]
     arg_idx = 2
 
-    # Legacy/Specific filters
-    if file_date:
-        conditions.append(f"metadata->>'file_date' = ${arg_idx}")
-        args.append(file_date)
-        arg_idx += 1
-
-    if brightness_min is not None:
-        conditions.append(f"(metadata->>'brightness')::float >= ${arg_idx}")
-        args.append(brightness_min)
-        arg_idx += 1
-
-    if brightness_max is not None:
-        conditions.append(f"(metadata->>'brightness')::float <= ${arg_idx}")
-        args.append(brightness_max)
-        arg_idx += 1
-
-    if date_min:
-        conditions.append(f"metadata->>'file_date' >= ${arg_idx}")
-        args.append(date_min)
-        arg_idx += 1
-
-    if date_max:
-        conditions.append(f"metadata->>'file_date' <= ${arg_idx}")
-        args.append(date_max)
-        arg_idx += 1
-
     # Dynamic filters
     if filters:
         try:
             filter_data = json.loads(filters)
 
-            # Check if it's the new complex format or old flat format
-            is_complex = False
-            if isinstance(filter_data, dict):
-                if 'logic' in filter_data or ('field' in filter_data and 'operator' in filter_data):
-                    is_complex = True
-
-            if is_complex:
+            # A filter tree only: the flat {field: value} form was removed in 2.0. An empty object is no filter.
+            if filter_data != {}:
+                tree = isinstance(filter_data, dict) and (
+                    'logic' in filter_data
+                    or 'filters' in filter_data
+                    or ('field' in filter_data and 'operator' in filter_data)
+                )
+                if not tree:
+                    raise HTTPException(
+                        status_code=422,
+                        detail=(
+                            'filters must be a filter tree: {"field", "operator", "value"} or {"logic", "filters"}. '
+                            'The flat {field: value} form was removed in 2.0'
+                        ),
+                    )
                 sql, arg_idx = parse_filter_node(
                     filter_data,
                     args,
@@ -4695,30 +4672,6 @@ def build_sample_query_parts(
                     array_columns=array_columns,
                 )
                 conditions.append(sql)
-            else:
-                # Backward compatibility: Flat dictionary {key: value}
-                for key, value in filter_data.items():
-                    # key is interpolated into metadata->>'{key}' — skip any
-                    # name that isn't a safe identifier rather than inject it.
-                    if not _is_safe_field_name(key):
-                        continue
-                    if isinstance(value, dict):
-                        if 'min' in value and value['min'] is not None:
-                            conditions.append(f"(metadata->>'{key}')::float >= ${arg_idx}")
-                            args.append(value['min'])
-                            arg_idx += 1
-                        if 'max' in value and value['max'] is not None:
-                            conditions.append(f"(metadata->>'{key}')::float <= ${arg_idx}")
-                            args.append(value['max'])
-                            arg_idx += 1
-                    elif isinstance(value, list):
-                        conditions.append(f"metadata->>'{key}' = ANY(${arg_idx})")
-                        args.append(value)
-                        arg_idx += 1
-                    else:
-                        conditions.append(f"metadata->>'{key}' = ${arg_idx}")
-                        args.append(str(value))
-                        arg_idx += 1
         except HTTPException:
             # A genuine filter validation error (unknown operator, malformed node) MUST surface as
             # a 400 — never fall through to a filter-stripped WHERE that silently returns the whole
@@ -4731,19 +4684,9 @@ def build_sample_query_parts(
     return where_clause, args, arg_idx
 
 
-@router.get("/datasets/{id}/map_points", dependencies=[Depends(require_dataset_access)])
-@guest_heavy
-async def get_dataset_map_points(id: int, filters: Optional[str] = None):
-    """
-    Get all samples with location data for map visualization.
-    """
-    filter_obj = json.loads(filters) if filters else None
-    return await _get_dataset_map_points_impl(id, filter_obj)
-
-
 class MapPointsRequest(BaseModel):
     filters: Optional[Dict[str, Any]] = None
-    zoom: Optional[float] = None  # if set, return server-side clusters for this zoom
+    zoom: Optional[float] = None  # the map's zoom: server-side clusters below _MAP_POINT_ZOOM, points from it on
     bbox: Optional[List[float]] = None  # [west, south, east, north] viewport (GiST-indexed)
     points: bool = False  # force ALL points (manual de-cluster)
 
@@ -4751,9 +4694,11 @@ class MapPointsRequest(BaseModel):
 @router.post("/datasets/{id}/map_points", dependencies=[Depends(require_dataset_access)])
 @guest_heavy
 async def get_dataset_map_points_post(id: int, request: MapPointsRequest):
-    """
-    POST version of get_dataset_map_points to handle large filter payloads.
-    """
+    """The map's points and cluster bubbles for a zoom and viewport (docs/MAP_REQUIREMENTS.md), or with
+    `points` every individual point up to the cap. One of `zoom` and `points` is required: an answer with every
+    located sample at once has no bound."""
+    if request.zoom is None and not request.points:
+        raise HTTPException(status_code=422, detail='map_points needs the map\'s zoom, or "points": true')
     return await _get_dataset_map_points_impl(id, request.filters, request.zoom, request.bbox, request.points)
 
 
@@ -5086,9 +5031,9 @@ async def _get_dataset_map_points_impl(
             cell *= 2.0
         return {"mode": "hybrid", "items": items, "capped": points or auto_points}
 
-    # Legacy (no zoom): ALL points as a flat list — unchanged contract.
-    rows = await db.fetch(f"{pt_select} WHERE {base_where}", *base_args)
-    return [dict(row) for row in rows]
+    # Neither a zoom nor points: the endpoint refuses this (no unbounded answer). A points request with no zoom
+    # that is over the cap has no zoom to cluster at either.
+    raise HTTPException(status_code=422, detail='Too many points to return at once: zoom in, or send the zoom')
 
 
 class SamplesRequest(BaseModel):
@@ -5485,44 +5430,49 @@ async def _list_samples_post(id: int, request: SamplesRequest):
 @guest_heavy
 async def list_samples(
     id: int,
+    request: Request,
     limit: int = Query(50, ge=1),
     offset: int = Query(0, ge=0),
-    file_date: Optional[str] = None,
-    brightness_min: Optional[float] = None,
-    brightness_max: Optional[float] = None,
-    date_min: Optional[str] = None,
-    date_max: Optional[str] = None,
     filters: Optional[str] = None,
     sort_by: Optional[str] = None,
     sort_order: Optional[str] = Query(None, pattern="^(asc|desc)$"),
     fields: Optional[str] = None,  # Comma-separated list of fields to return
 ):
-    with field_usage.measure(id, _grid_usage(filters, sort_by)):
-        return await _list_samples(
-            id,
-            limit,
-            offset,
-            file_date,
-            brightness_min,
-            brightness_max,
-            date_min,
-            date_max,
-            filters,
-            sort_by,
-            sort_order,
-            fields,
+    removed = [name for name in _REMOVED_SAMPLE_FILTERS if name in request.query_params]
+    if removed:
+        # Refused, not ignored: an unknown query parameter would otherwise answer with the unfiltered dataset.
+        field, operator = _REMOVED_SAMPLE_FILTERS[removed[0]]
+        value: Any = request.query_params[removed[0]]
+        if field == 'brightness':  # the old parameter was a number, so the filter compares a number
+            try:
+                value = float(value)
+            except ValueError:
+                pass  # the hint shows what was sent; the 422 stands either way
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"{', '.join(removed)}: removed in 2.0. Send filters as a filter tree, for example "
+                f'filters={{"field": "{field}", "operator": "{operator}", "value": {json.dumps(value)}}}'
+            ),
         )
+    with field_usage.measure(id, _grid_usage(filters, sort_by)):
+        return await _list_samples(id, limit, offset, filters, sort_by, sort_order, fields)
+
+
+# Query parameters that filtered fixed metadata keys before 2.0, and the filter that replaces each.
+_REMOVED_SAMPLE_FILTERS = {
+    'file_date': ('file_date', '='),
+    'date_min': ('file_date', '>='),
+    'date_max': ('file_date', '<='),
+    'brightness_min': ('brightness', '>='),
+    'brightness_max': ('brightness', '<='),
+}
 
 
 async def _list_samples(
     id: int,
     limit: int,
     offset: int,
-    file_date: Optional[str],
-    brightness_min: Optional[float],
-    brightness_max: Optional[float],
-    date_min: Optional[str],
-    date_max: Optional[str],
     filters: Optional[str],
     sort_by: Optional[str],
     sort_order: Optional[str],
@@ -5530,11 +5480,6 @@ async def _list_samples(
 ):
     where_clause, args, arg_idx = build_sample_query_parts(
         id,
-        file_date,
-        brightness_min,
-        brightness_max,
-        date_min,
-        date_max,
         filters,
         array_columns=await get_dataset_array_columns(id),
         numeric_indexed_fields=await get_promoted_numeric_fields(id) if filters else None,
@@ -5699,6 +5644,35 @@ async def get_histogram(
     """
     with field_usage.measure(id, {'histogram': [field]}):
         return await _histogram(id, field, bins, filters, top, as_number)
+
+
+class HistogramRequest(BaseModel):
+    """The histogram query parameters, with the filter as a JSON object instead of a URL parameter."""
+
+    field: str
+    bins: Optional[int] = Field(None, ge=1, le=200)
+    filters: Optional[Dict[str, Any]] = None
+    top: int = Field(50, ge=0, le=10000)
+    as_number: bool = False
+
+    def filters_json(self) -> Optional[str]:
+        return json.dumps(self.filters) if self.filters else None
+
+
+@router.post("/datasets/{id}/histogram", dependencies=[Depends(require_dataset_access)])
+@guest_heavy
+async def get_histogram_post(id: int, request: HistogramRequest):
+    """POST version of get_histogram, for a filter too large for a URL: a selection of a few thousand sample
+    ids already passes the server's 64 KB request-line limit (HTTP 400)."""
+    with field_usage.measure(id, {'histogram': [request.field]}):
+        return await _histogram(
+            id,
+            request.field,
+            request.bins,
+            request.filters_json(),
+            request.top,
+            request.as_number,
+        )
 
 
 async def _histogram(
@@ -6029,6 +6003,31 @@ async def get_histogram_preview(
     returned only when `preview.status` is `ok`; otherwise (`not_broad`, `insufficient_sample`,
     `timeout`, `failed`) the caller waits for /histogram, which is always the exact answer.
     """
+    return await _histogram_preview(id, field, bins, filters, top, as_number)
+
+
+@router.post("/datasets/{id}/histogram/preview", dependencies=[Depends(require_dataset_access)])
+@guest_heavy
+async def get_histogram_preview_post(id: int, request: HistogramRequest):
+    """POST version of get_histogram_preview, for a filter too large for a URL (see get_histogram_post)."""
+    return await _histogram_preview(
+        id,
+        request.field,
+        request.bins,
+        request.filters_json(),
+        request.top,
+        request.as_number,
+    )
+
+
+async def _histogram_preview(
+    id: int,
+    field: str,
+    bins: Optional[int],
+    filters: Optional[str],
+    top: int,
+    as_number: bool,
+) -> Dict[str, Any]:
     _validate_field_name(field)
 
     def unavailable(status: str, **detail: Any) -> Dict[str, Any]:
@@ -6224,8 +6223,10 @@ class SampleCreate(BaseModel):
 
     @field_validator('embedding')
     @classmethod
-    def _embedding(cls, v: Optional[List[float]]) -> Optional[List[float]]:
-        return None if v is None else _finite_vector('embedding', v)
+    def _embedding(cls, v: Any) -> None:
+        if v is not None:
+            raise ValueError("'embedding' was removed in 2.0: send 'embeddings': {field name: vector}")
+        return None
 
     @field_validator('embeddings')
     @classmethod
@@ -6242,7 +6243,9 @@ class SampleCreate(BaseModel):
     metadata: Dict[str, Any] = {}
     location: Optional[Dict[str, Any]] = None
     heading: Optional[float] = None
-    embedding: Optional[List[float]] = None  # Backward compat: single vector (stored as field_name='clip')
+    # Removed in 2.0: a single vector was stored as 'clip' whatever model made it. Refused with the fix, so an
+    # old client's vectors aren't silently dropped.
+    embedding: Any = None
     embeddings: Optional[Dict[str, List[float]]] = None  # Named embeddings: {"clip": [...], "dinov2": [...]}
     hashes: Optional[Dict[str, str]] = None  # Named hashes (hex): {"phash": "ff00...", "dhash": "0a1b..."}
     array_fields: Optional[Dict[str, List[str]]] = None  # Dynamic array fields
@@ -6371,8 +6374,7 @@ async def add_samples(id: int, payload: Any = Body(...), user: dict = Depends(re
     # and check once per field; a mismatch 422s the whole request rather than corrupting data.
     _emb_field_dims: Dict[str, set] = {}
     for s in samples:
-        _embs = s.embeddings if s.embeddings else ({"clip": s.embedding} if s.embedding else {})
-        for _fn, _vec in (_embs or {}).items():
+        for _fn, _vec in (s.embeddings or {}).items():
             try:
                 _emb_field_dims.setdefault(_fn, set()).add(len(_vec))
             except TypeError:
@@ -6386,10 +6388,7 @@ async def add_samples(id: int, payload: Any = Body(...), user: dict = Depends(re
     async with db.pool.acquire() as conn:
         # A full disk mid-ingest PANICs Postgres and can leave it down: refuse
         # the batch with a 507 while there is still room. Rows = each sample + its embeddings + hashes.
-        rows = sum(
-            1 + len(s.embeddings or ({"clip": s.embedding} if s.embedding else {})) + len(s.hashes or {})
-            for s in samples
-        )
+        rows = sum(1 + len(s.embeddings or {}) + len(s.hashes or {}) for s in samples)
         await require_free_space(conn, rows * INGEST_ROW_BYTES, f"adding {len(samples)} samples")
         async with conn.transaction():
             await lock_field_lifecycle(conn, id, exclusive=on_duplicate == 'update', wait=on_duplicate != 'update')

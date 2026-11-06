@@ -295,13 +295,16 @@ CREATE TABLE IF NOT EXISTS embedding_viz_meta (
     -- TRUE once coordinates moved after the last full re-rank: x/y in
     -- embedding_viz_rank are still exact, only the even-coverage ORDER is approximate.
     rank_stale     BOOLEAN NOT NULL DEFAULT FALSE,
+    -- Set while a full layout of the map is written over time (the SDK's compute_visualization): new samples
+    -- aren't placed on it until then (backend/map_placement.py). Renewed by its writer; lapses if it dies.
+    placement_held_until TIMESTAMPTZ,
     PRIMARY KEY (dataset_id, field_name)
 );
 
 -- Even-coverage scatter sample-priority: rebuilds embedding_viz_rank (within-grid-cell
 -- random rank) so the visualization query is an index range scan (WHERE rank < per_cell)
--- instead of a per-request window-sort. Single source of truth for both projection paths
--- (SDK via /embeddings/recompute-viz-rank, and the direct-DB umap_project_job daemon).
+-- instead of a per-request window-sort. Single source of truth for every full re-rank
+-- (the SDK via /embeddings/recompute-viz-rank, /reduce, and map re-fits).
 -- The scatter caps the points it sends the client; a per-request ROW_NUMBER() OVER
 -- (PARTITION BY cell ORDER BY random()) did the same job far slower. Each occupied cell
 -- contributes its first per_cell points, so sparse/outlier clusters stay visible.
@@ -1889,10 +1892,10 @@ CREATE INDEX IF NOT EXISTS idx_duplicate_jobs ON jobs(dataset_id,created_at DESC
 DROP INDEX IF EXISTS idx_jobs_dataset_history;
 DROP INDEX IF EXISTS idx_statistics_history_retention;
 CREATE INDEX idx_jobs_dataset_history ON jobs(dataset_id,created_at DESC,id DESC)
-    WHERE NOT (kind IN ('statistics','concept_scoring','duplicate_maintenance')
+    WHERE NOT (kind IN ('statistics','concept_scoring','duplicate_maintenance','map_place')
                AND dedupe_owner='system' AND state='succeeded' AND NOT barrier @> '{"full":true}');
 CREATE INDEX idx_statistics_history_retention ON jobs(finished_at,id)
-    WHERE kind IN ('statistics','concept_scoring','duplicate_maintenance')
+    WHERE kind IN ('statistics','concept_scoring','duplicate_maintenance','map_place')
           AND dedupe_owner='system' AND state='succeeded' AND NOT barrier @> '{"full":true}';
 
 -- Dataset deletion lifecycle.
@@ -2279,7 +2282,8 @@ CREATE TABLE IF NOT EXISTS embedding_map_state (
     active_job_id UUID,  -- no FK: a job that no longer exists is not active
     active_since TIMESTAMPTZ,
     PRIMARY KEY (dataset_id, field_name),
-    CHECK ((model_id IS NULL) = (artifact_location IS NULL))
+    -- A map may have no model file (it places new samples by neighbours); a model file needs its model id.
+    CONSTRAINT embedding_map_state_artifact_needs_model CHECK (artifact_location IS NULL OR model_id IS NOT NULL)
 );
 
 -- A lasso selection is a polygon in one map's coordinates (`embedding_polygon` filters). Once a field's
@@ -2410,5 +2414,8 @@ INSERT INTO schema_migrations (filename) VALUES
     ('0000_baseline.sql'),
     ('0001_storage_config_dataset_scope.sql'),
     ('0002_dataset_default_view.sql'),
-    ('0003_compute_worker_tokens.sql')
+    ('0003_compute_worker_tokens.sql'),
+    ('0004_map_state_without_model.sql'),
+    ('0005_map_placement_history.sql'),
+    ('0006_map_placement_hold.sql')
 ON CONFLICT (filename) DO NOTHING;

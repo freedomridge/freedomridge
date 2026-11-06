@@ -175,10 +175,9 @@ docker compose -f docker-compose.prod.yml up -d --no-deps --force-recreate backe
 | backend | API, media access checks, lazy CPU CLIP text/image inference |
 | db | PostgreSQL 18, PostGIS and pgvector |
 | worker | Hourly pruning of media caches only |
-| job-runner | Background jobs (index builds, statistics, map re-fits where supported, schedules) and expired demo-account cleanup; see [Sizing](#sizing) |
+| job-runner | Background jobs (index builds, statistics, placing new points on maps, map re-fits where supported, schedules) and expired demo-account cleanup; see [Sizing](#sizing) |
 | backup | Daily logical dumps, two local copies, optional S3 copy |
 | certbot | On-demand certificate issuance/renewal; `tls` profile |
-| umap-worker | Optional `umap` profile; requires separately fitted models |
 
 `HF_HOME=/cache/huggingface` keeps weights across backend recreation; the prune
 worker excludes that directory. Media is authorized by the backend on each request

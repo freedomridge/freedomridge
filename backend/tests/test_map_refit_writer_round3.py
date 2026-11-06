@@ -18,7 +18,7 @@ from backend import access, coordinates, dataset_schedules, job_queue, main, map
 from backend.routers import auth, schedules
 from backend.tests import test_field_registry_postgres
 from backend.tests.test_dataset_schedules import add_schedule
-from backend.tests.test_map_refit import FIELD, USER, FakeModel, map_points, seed
+from backend.tests.test_map_refit import FIELD, USER, map_points, seed
 from backend.tests.test_map_refit_writers import cheap_fit, manage
 from backend.tests.test_map_writer_followup import sdk_fixture
 
@@ -48,8 +48,7 @@ def http(monkeypatch):
 
 @requires_database
 @pytest.mark.parametrize('phase', ['swap', 'rank'])
-@pytest.mark.parametrize('operation', ['project_pending', 'compute_visualization'])
-def test_sdk_waits_past_two_minutes_for_a_siblings_phase(registry_database, monkeypatch, http, phase, operation):
+def test_sdk_waits_past_two_minutes_for_a_siblings_phase(registry_database, monkeypatch, http, phase):
     """Real DB refusal + HTTP body + SDK retry loop; virtual time covers a three-minute pause."""
 
     async def scenario(database):
@@ -112,12 +111,8 @@ def test_sdk_waits_past_two_minutes_for_a_siblings_phase(registry_database, monk
             until = await holder.fetchval('SELECT ceil(extract(epoch FROM clock_timestamp()))::bigint + 600')
             await holder.execute(f"SET LOCAL application_name='fridge map {phase} until {until}'")
             try:
-                if operation == 'project_pending':
-                    result = await asyncio.to_thread(sdk.project_pending, FIELD, FakeModel(5000))
-                    assert result == 8
-                else:
-                    result = await asyncio.to_thread(sdk.compute_visualization, FIELD, 8)
-                    assert result['reduced'] == 8
+                result = await asyncio.to_thread(sdk.compute_visualization, FIELD, 8)
+                assert result['reduced'] == 8
                 assert clock[0] >= 180
                 assert refusal is not None and int(refusal.headers['X-Map-Swap-Seconds']) > 500
                 assert refusal.json()['code'] == f'map_{phase}_busy'

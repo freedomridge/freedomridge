@@ -699,9 +699,53 @@ a permanent warning banner.
 
 A plain `ServerWorker` claims only `server` jobs. The co-located runner (`local_runner`, used by
 `job_service`) defaults to `placements=('server','compute')`, so it also runs compute jobs such as map
-re-fits. HTTP worker
-registration, scoped tokens, artifact transfer and remote compute handlers are not built yet; a
-deployment with separate compute workers would stop the server runner from claiming compute work.
+re-fits. `JOB_RUNNER_PLACEMENTS=server` leaves compute work to compute workers.
+
+**Remote compute workers over HTTP** (`backend/routers/workers.py`). A machine runs
+`python -m fridge.worker` with a worker token (`api_tokens.scope = 'worker'`, which only these endpoints
+accept). It registers (`POST /api/workers/register`) as a `placement='compute'` row in `workers`, with
+its owner, and heartbeats (`POST /api/workers/{id}/heartbeat`). The job endpoints wrap the queue
+functions above, so their semantics are the same as a local slot's:
+- `POST /api/workers/{id}/claim {wait_seconds ≤ 25}` long-polls `claim_job` with `placements=('compute',)`,
+  the kinds the worker registered that run remotely (`REMOTE_KINDS`, with each kind's `JobPolicy`), and
+  `dataset_ids` = the datasets its owner can access (`filter_datasets_for_user`); a job on no dataset only
+  for an admin's worker. 200 is the job with a 120 s lease; 204 is none.
+- `POST .../jobs/{job_id}/heartbeat {lease_token, done?, total?, message?}`: `heartbeat_job`, then the
+  progress through `publish_step`. It returns `cancel_requested`.
+- `.../complete {lease_token, result}`: `publish_step(finished=True)`. `.../fail {lease_token, error,
+  retryable}`: `defer_job` (the kind's retry delay) or `fail_job`. `.../release {lease_token}`:
+  `publish_step(release=True)`, queued again or cancelled when a cancel came in.
+- Each checks that the job's `worker_id` is the caller's worker. A lost lease is 409 (`lease_lost`: stop
+  without reporting), and a busy queue is 503 with Retry-After. A worker that stops renewing loses the job
+  when its lease expires: the next claim requeues it with a failure, as for a local slot.
+
+`REMOTE_KINDS` lists what a worker can claim, with each kind's policy, which of its steps the worker runs,
+the job files it may download (`GET .../jobs/{job_id}/files/{name}`, Range requests resume it) and upload
+(`PUT .../files/{name}?offset=`, chunks of at most 64 MiB, append-only, a 409 gives the size to resume at),
+and how `complete` hands the job back. Each transfer carries the lease in `X-Fridge-Lease` and is refused
+unless that lease is live. Uploads are staged per lease (`staging_dir`: `work/<job>/remote-<lease>/`), so a
+worker whose lease ended can never mix its files into a later attempt's.
+
+**The map re-fit** is the first remote kind. Each step names where the next runs (`StepResult.placement`):
+- The job is queued as compute work, so nothing starts (no projection pause, no export) until something that
+  takes compute work claims it. A worker's claim of its start hands it straight to the server
+  (`runs_remotely` is true only in the fit phase).
+- The server runs `_start` and `_export`. A runner with `fits_here=False` (`JOB_RUNNER_PLACEMENTS=server`)
+  doesn't measure its own memory, and says the fit waits for a compute worker. `_export` makes the work folder
+  writable by the API, which runs as another user in Docker.
+- The worker downloads `vectors.bin`, runs `fridge.map_fit`, uploads `REMOTE_OUTPUTS` (`ids.npy`,
+  `versions.npy`, `coords.npy`, `manifest.json`) and completes with each one's sha256. No model crosses: a
+  model is a pickle, which runs code when loaded. Each upload is capped by what the exported rows allow
+  (`remote_output_limit`), checked before anything is written, and appended under a file lock.
+- `remote_fit_checkpoint` checks every output against its sha256, reads the arrays with pickles off, checks
+  their shapes and types against the exported rows (and the manifest's), and hands the job back to the server
+  in the publish phase. A failed check is a 400, and the job stays the worker's.
+- `_publish` requires the worker's ids and versions to be the export's, in order (other ids would drop the
+  map's points, another order would misplace them), then swaps and ranks as for a local fit. The map is
+  published with no model file (`artifact_location` NULL; migration 0004 allows that).
+- A fit no worker claims within `UNCLAIMED_FIT_HOURS` (12) is cancelled by `expire_unclaimed_fits` (every
+  10 minutes on the server runner), with the reason in its message. The old map stays, and placement of new
+  samples resumes on it.
 
 **Remote fencing (design, not built yet).** The lease fence covers only SQL inside the
 publication transaction. A remote worker uploads results over HTTP, so a laptop whose lease
@@ -801,11 +845,10 @@ duplicate upkeep of that dataset wait for it; other datasets do not). Four check
    divided by 0.75 (kept for the next night), and fail after the job's failure budget or at
    the 50,000-point floor; any other kill (kill -9, a stopped scope) is retried as it is. After the fit,
    the other rows are projected through the model in 50k batches with pynndescent's
-   `parallel_batch_queries` on (using every CPU the fit may use), which the
-   saved model keeps for the projection daemon; the manifest and the job result record
+   `parallel_batch_queries` on (using every CPU the fit may use); the manifest and the job result record
    `umap_fit_seconds` and `transform_seconds`. A backend restart's SIGTERM is retried;
-   cancel/timeout/lease loss stop the child. The model goes into the store as `managed/<dataset>__<field>/<model_id>.joblib` with its
-   sha256.
+   cancel/timeout/lease loss stop the child. The model is not kept: new samples are placed on a re-fitted
+   map by their nearest mapped neighbours (**Placing new samples**, below).
 4. **publish**: waits (unbudgeted) while a backup is queued or running, and the backup scheduler holds
    a backup back while a publish (or a rank) runs. One transaction. Stage the coordinates in a temp table
    **before** the gate. Then name the session `fridge map swap until <epoch>` (the deadline: the 30 s
@@ -816,8 +859,10 @@ duplicate upkeep of that dataset wait for it; other datasets do not). Four check
    that set (the coordinate delete trigger re-queues those that still have vectors); upsert the set; set the
    map's `embedding_viz_meta.occupied_cells = 0` (every reader then draws it from its coordinates until
    it is re-ranked) and its point counter to the points just written (the coordinate trigger keeps
-   counting points placed after it); record the new model, `refitted_at`, `points_at_refit` and the
-   measured cost per fit point, keeping the job as the map's active re-fit (projection stays paused);
+   counting points placed after it); record the new map's id (`model_id`, with no model file: the
+   `artifact_*` columns are cleared, and a model file kept from before is deleted after the commit),
+   `refitted_at`, `points_at_refit` and the measured cost per fit point, keeping the job as the map's
+   active re-fit (placement stays paused);
    then `job_queue.checkpoint_locked` locks the job row, validates lease and cancellation and moves the
    job to its **rank** step in the same transaction (the long-operation contract above), with an
    `uncancellable` reason in its checkpoint. The fence re-reads the cancel flag under a share lock on the
@@ -847,7 +892,7 @@ duplicate upkeep of that dataset wait for it; other datasets do not). Four check
    |---|---|
    | default ingest, new embeddings (inserts) | go on |
    | deletes, update-mode ingest, removed keys, field operations | 409 with the rank's end (`X-Map-Swap-Seconds`, about the budget), "ingest goes on" |
-   | projection (SDK `project_pending`, the projection worker) | paused: the map is still active, so it places nothing |
+   | placement of new samples (`map_place`) | paused: the map is still active, so it places nothing |
    | a projected `POST /coordinates` | 409 at once (the map is active) |
    | other coordinate uploads, a vector change to a placed point | wait for the fence at most 5 s / 2 s, then a 409 with the rank's end (never a 500) |
 
@@ -889,8 +934,7 @@ generation swap (writing the new map beside the old one and switching a pointer)
 constant.
 
 Samples whose vector changed, that were deleted, or added during the fit never keep a coordinate from
-the old map or the stale fit: they stay queued and the projection places them with the new model after
-the swap. Re-sending an identical vector (sample ingest in update mode, `POST /embeddings`) does not
+the old map or the stale fit: they stay queued and are placed on the new map after the swap. Re-sending an identical vector (sample ingest in update mode, `POST /embeddings`) does not
 rewrite the row (`WHERE vector IS DISTINCT FROM EXCLUDED.vector`), so the point keeps its place on the
 new map. Readers see the old map or the new one:
 each scatter query is one snapshot, and the response's `map_state` (`{model_id, refitted_at}`, JSON
@@ -912,18 +956,65 @@ draft), says so once, and the grid, sidebar and scatter load the new map, where 
 again. The panel also clears its own draft lasso when the map changes under it. Fields never re-fitted
 accept polygons as before.
 
-**Projection** (`scripts/umap_project_job.py`, SDK `Dataset.project_pending`, `POST .../coordinates`)
-uses only the field's current model once it has one (`embedding_map_state`, the store key resolved
-against `FRIDGE_UMAP_MODEL_DIR`, checksum verified once per model), never a legacy file, and nothing
-while a re-fit of the field is active (a queued re-fit still permits projection). Every projected write
-checks the model id under a `FOR SHARE` lock of the map-state row in its own transaction
-(`coordinates.check_map_fence`), so a stale
-model's results are refused (409, no Retry-After). Fields never re-fitted keep their legacy model and
-behavior. Failure or cancel leaves the old model current; a job that is no longer queued or running is
-not active, so nothing needs cleaning for projection to resume. The runner's sweep (every 10 minutes)
-deletes work folders of finished re-fits and models that are neither current nor owned by an
-unfinished re-fit; it reads both sets in one statement (one snapshot), so a publish that commits
-meanwhile cannot make its new model look unowned.
+**Placing new samples** on a map (`backend/map_placement.py`, kind `map_place`): every whole-image map, re-fitted
+or made by the SDK (`compute_visualization`), meaning every `embedding_viz_meta` row with points. Patch maps
+aren't placed. No map keeps a model; each new sample goes where the images most like it already are:
+- The field's vector index finds the 15 mapped samples of the dataset with the closest vectors (cosine), one
+  index search per sample (a `LATERAL` join; ordering a plain join by the distance would sort every vector of
+  the field). The index is partial (`WHERE field_name = ...`), so the lookup runs on a plan made for the
+  field's name (`plan_cache_mode = force_custom_plan`), with similarity search's iterative scan. A sample the
+  index comes up short for (a small dataset in a field shared by large ones) is looked up exactly, among its
+  dataset's mapped samples.
+- On the map the neighbours usually sit together but can be split between groups. The sample goes to the
+  densest group: the neighbour whose similarity-weighted map distances to the others are smallest, then the
+  similarity-weighted mean of the neighbours within twice their median distance from it (`place`).
+- Measured on 2,000 mapped images each, treated as new, against where UMAP's fit put them: on Open Images
+  (42k) and on both maps of a 3.7M-image dataset (CLIP 512-d, DINOv3 1024-d), 9 in 10 land within 1.0–1.3%
+  of the map's width, the median within 0.2–0.3%, and 99 in 100 within 12–24% (images whose neighbours sit in
+  separate groups). The plain mean of the neighbours is two to four times worse at the 90th percentile.
+  Against a UMAP fit with images held out (on Open Images and iNaturalist), it keeps more of each held-out
+  image's embedding neighbours near it on the map than UMAP's `transform` does, a measure that favours
+  placing by neighbours.
+- `schedule_placements` (every 5 s, in the job runner) queues one job per map with samples waiting
+  in `embedding_projection_pending`, in the maintenance lane, with the newest waiting sample as its barrier:
+  the job ends even while ingest continues, and the dataset's other maintenance gets its turn. It skips a map
+  whose re-fit is active, one whose placement is queued or running, and, for 5 minutes, one whose last
+  placement failed or found no neighbours for anything. A field with no map yet gets nothing placed: its first
+  fit gives every sample a spot. Like statistics, its successful
+  runs stay out of the dataset's job history and are deleted after a day (migration 0005).
+- Each step looks up one batch, 64 samples per statement, with as many statements at once as the slot's share
+  of the runner's pool (2 by default). On the 3.7M dataset that is about 42 samples a second for DINOv3 and
+  140 for CLIP. The write runs in the step's publication, under `check_map_fence` with the map id read before
+  the lookups, and with each sample's vector version: a batch looked up on a map that is being re-fitted or
+  was replaced meanwhile writes nothing (its samples stay queued, for the new map), and a sample whose vector
+  changed is skipped and queued again. Only samples still waiting are written, with their queue rows locked
+  (`FOR SHARE SKIP LOCKED`), so a sample another writer placed meanwhile keeps its spot.
+- **A full layout holds placement** (`embedding_viz_meta.placement_held_until`, migration 0006). A layout
+  written over time would otherwise leave every sample ingested after its vectors were read at a spot taken
+  from the old layout, kept on the new one. The SDK's `compute_visualization` takes the hold
+  (`PUT .../embeddings/placement-hold`) before it reads the vectors, renews it from a thread every
+  `HOLD_RENEW_SECONDS` (120) while it fits and uploads, and releases it (`DELETE`) once the new layout is
+  ranked, or when it fails. `/reduce` holds it from its read to its ranking. A hold lasts
+  `PLACEMENT_HOLD_SECONDS` (600) unless renewed, so a script that dies holds placement up for at most ten
+  minutes. The scheduler skips a held map, and the write re-checks the hold with the map's
+  `embedding_viz_meta` row share-locked: a batch looked up before a hold writes nothing, and a hold taken
+  during a write waits for it (the layout's read then includes those samples). Samples that arrive meanwhile
+  wait and are placed on the new layout. Any other writer of a full layout should take the hold too. If
+  renewals fail for longer than the hold lasts (the server unreachable, or a long call holding the GIL), the
+  hold lapses and samples may have been placed from the old layout meanwhile. The SDK notices: its deadline
+  is kept on its own monotonic clock from before each renewal, and before writing the first coordinate it
+  raises with the map unchanged ("run it again"). A lapse during the upload is reported before ranking.
+- Measured against a fresh fit while a map grows (an arrival-order replay on the 3.7M dataset; [issue 20](https://github.com/freedomridge/freedomridge/issues/20)):
+  placed images keep 2–3 times more of a full fit's local structure than placing from the fitted points alone,
+  and 3–4 times more than UMAP's `transform`, but they drift as growth compounds. Re-fit a map that has grown
+  well past its fit.
+
+There is no other projection path: the projection daemon, `Dataset.project_pending` and saved model files
+are gone (2.0). A projected `POST .../coordinates` must name the map's current id. Failure or cancel of a
+re-fit leaves the old map current; a job that is no longer queued or running is not active, so nothing needs cleaning for
+placement to resume. The runner's sweep (every 10 minutes) deletes work folders of finished re-fits and model
+files that are neither current nor owned by an unfinished re-fit (models of maps fitted before re-fits
+stopped keeping one); it reads both sets in one statement (one snapshot).
 
 **Manual map writers.** Once `embedding_map_state.model_id` is set, incremental coordinate uploads
 must supply that current identity. Full manual layouts and `/reduce` return 409: "This map is managed
@@ -953,9 +1044,11 @@ maps; `compute_all` still completes hashes and metrics. Saved model files are pu
 all coordinate batches succeed.
 Both SDK visualization and incremental projection treat a server without `/map-state` (404) as unmanaged.
 
-Still to build for remote compute workers: an authenticated claim/heartbeat/upload/finish API, worker
-credentials, object storage behind `map_artifacts` (the database already stores keys, not paths), and
-starting/stopping machines. The export and publish steps stay on the server; only `fit` moves.
+Still to build for remote compute workers: the worker's own loop that claims and runs a fit (today
+`python -m fridge.worker` registers and heartbeats), object storage behind `map_artifacts` (the database
+already stores keys, not paths), and starting/stopping machines. The worker credentials and the
+claim/heartbeat/upload/complete API exist (**Remote compute workers over HTTP**, above). The export and publish steps stay on
+the server; only `fit` moves.
 
 ## Index advisor: the review
 

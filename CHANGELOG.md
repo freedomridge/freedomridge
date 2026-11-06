@@ -4,6 +4,126 @@ Freedom Ridge has one version for the server, the web app and the Python SDK (th
 file), following [Semantic Versioning](https://semver.org). A release lists **upgrade notes** when
 it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
 
+## 2.0.0 (2026-11-06)
+
+2.0 removes old forms of the API that 1.x still accepted, and new images now appear on every map by
+themselves. Read the upgrade notes: an SDK works only with a server of its own major version.
+
+### Added
+
+- The SDK and the server check each other's version.
+  - Every answer from the server carries its release in an `X-Fridge-Version` header. The SDK raises
+    `fridge.IncompatibleServerError` when the server runs another major version, naming both versions and
+    how to install the SDK of the server's release.
+  - Every SDK request carries `X-Fridge-SDK-Version`, and the server refuses an SDK of another major version
+    with HTTP 426 and the same advice.
+- Compute workers, second part: the server side of a compute worker's job.
+  - A worker claims compute work, long-polling up to 25 s, and only for datasets its owner can access. It
+    renews the job's lease with heartbeats, and completes, fails or releases the job. Each claim also counts
+    as the worker's heartbeat.
+  - A map re-fit runs as steps that each say where they run. The export, the swap and the ranks run on the
+    server; the fit is compute work. A runner that doesn't take a step's placement hands the job back.
+  - A worker can download a re-fit's exported vectors, with Range requests to resume, and upload its
+    coordinates under its lease. The server checks them against their sha256, the exported rows and the
+    export's order before swapping the map in. No model crosses: a model is a pickle, which runs code when
+    loaded.
+  - `python -m fridge.worker` doesn't run fits yet. Until it does, keep `JOB_RUNNER_PLACEMENTS` at its
+    default (`server,compute`). With `server` alone, fits wait for a worker and are cancelled after 12
+    hours, leaving the old map.
+
+### Changed
+
+- Map: new images on every map are placed by the server within seconds of arriving, from the 15 mapped
+  images most like them (the densest group of them on the map), by a new background job, **Placing new
+  points on the map**. Before, they waited for the optional projection worker or a
+  `Dataset.project_pending()` run with a saved UMAP model, and appeared only where one of those ran.
+  - It covers every whole-image map, re-fitted or made with `compute_visualization`. A field with no map
+    yet gets nothing placed until its first fit (`dataset.map_state(field)["current_points"]` says how
+    many points a map has). Patch maps aren't placed, as before.
+  - While `compute_visualization` lays out a map again, placement on that map waits, so images ingested
+    meanwhile land on the new layout. A script that dies holds placement up for at most ten minutes. Another
+    writer of a full layout can do the same with `PUT`/`DELETE /api/datasets/{id}/embeddings/placement-hold`.
+  - No map keeps a model: a re-fit no longer saves one, which took about as much disk as the exported
+    vectors (tens of GB for millions of images). A model kept from an earlier re-fit is deleted when its
+    map is next re-fitted.
+  - Measured on 3.7 million images, 9 in 10 new images land within 1.3% of the map's width of where
+    UMAP's own fit put them ([JOBS.md](docs/architecture/JOBS.md), "Placing new samples"). Placed images
+    drift as a map keeps growing, so re-fit a map that has grown well past its fit.
+- `Dataset.create_view()` makes a private view unless `is_public=True`, like `client.create_view()` and
+  the app's Save View.
+
+### Fixed
+
+- Histograms of a view whose filter is long (a selection of more than about 8,000 samples, or a long `in`
+  list) failed with `400 Invalid HTTP request received.`: the filter went in the URL, past uvicorn's 64 KB
+  request line. The app and `view.histogram_values()` now send it in the body of
+  `POST /api/datasets/{id}/histogram` and `.../histogram/preview`; the GET forms remain.
+
+### Removed
+
+- The projection worker (`scripts/umap_project_job.py`, the `umap-worker` service and its `umap` Compose
+  profile), `Dataset.project_pending()`, and `compute_visualization(save_model_path=...)`: the server
+  places new points itself. `python -m fridge.umap_worker fit` still fits every embedding field of a
+  dataset, and no longer saves a model.
+- The legacy S3 proxy `GET /media/s3/<key>`: it was admin-only, read an environment-variable bucket and
+  couldn't check dataset access. Every image is served by `/api/samples/{id}/media`.
+- The SDK's image loader no longer rewrites the old proxy forms `/media/s3/<key>` (with `S3_BUCKET`) or
+  `/media/<path>` (under `FRIDGE_DATA_ROOT`). A filepath is `s3://bucket/key` or a local path: absolute as
+  it is (an external drive at `/media/<user>/...` included), relative under `FRIDGE_DATA_ROOT`.
+- `GET /api/datasets/{id}/map_points`, and `POST .../map_points` without `zoom` or `"points": true`. Both
+  returned every located sample of the dataset at once, with no bound. The map sends its zoom; send
+  `"zoom"` (clusters below 12, points from 12) or `"points": true` (every point, up to the cap).
+- The single `embedding` of a sample (`Sample(embedding=[...])` and `"embedding": [...]` in
+  `POST /datasets/{id}/samples`). It was stored as the `clip` field whatever model made the vector. Use
+  `embeddings={"clip": [...]}` (any field name).
+- The flat filter form `{"field": value}` (with lists and `{"min", "max"}` ranges) in the `filters` of
+  `GET /datasets/{id}/samples` and the other filtered endpoints. Filters are a filter tree:
+  `{"field", "operator", "value"}` or `{"logic", "filters"}`, as the app, the SDK and the query language send.
+- The `file_date`, `date_min`, `date_max`, `brightness_min` and `brightness_max` query parameters of
+  `GET /datasets/{id}/samples`, which filtered fixed metadata keys.
+
+### Upgrade notes
+
+- **Upgrade the Python SDK together with the server.** An SDK works only with a server of its own major
+  version. SDKs before 2.0 neither send their version nor check the server's, so a 2.x server can't refuse
+  a 1.x SDK: it fails wherever the API changed instead. Install the SDK from the server's release:
+  `pip install "freedomridge @ git+https://github.com/freedomridge/freedomridge.git@v2.0.0#subdirectory=python"`.
+- Three database migrations, `0004` to `0006`. Apply them with `scripts/apply_migrations.sh`, as step 4 of
+  [Upgrading](docs/UPGRADING.md) describes. Each waits at most 2 seconds for its locks: if one stops with a
+  lock timeout, run it again. 2.0 keeps 1.x's database baseline, so a database of any 1.x release upgrades
+  straight to 2.0.0 (CI checks every one).
+- Migration `0004_map_state_without_model.sql` lets a re-fitted map have no model file (a map fitted on a
+  compute worker, which never brings one back). It only changes a check on `embedding_map_state`, and is
+  applied like the others.
+- Migration `0005_map_placement_history.sql` rebuilds two small indexes of the job history, so the new
+  placement jobs stay out of a dataset's job history like statistics and are deleted after a day. While it
+  builds them, job updates wait; the indexes cover the jobs table, which stays small because automatic
+  runs are pruned daily (about 1,000 rows and 15 MB on a deployment three days in).
+- Migration `0006_map_placement_hold.sql` adds a column to `embedding_viz_meta`, and is applied like the
+  others.
+- **If you ran the projection worker** (`--profile umap`), stop and remove its container before upgrading:
+  `docker compose --profile umap rm -sf umap-worker` (or `docker compose up -d --remove-orphans` afterwards).
+  The new Compose file no longer defines it, so an upgrade would leave the old container running from its old
+  image, still projecting with saved models.
+- Saved UMAP models (`<dataset>__<field>.joblib` in `FRIDGE_UMAP_MODEL_DIR`) are no longer read; delete
+  them to free their disk. A script that called `project_pending()` after an ingest needs no step now; one
+  that made a field's first map with `compute_visualization()` keeps doing so.
+- No stored filepath needs rewriting unless it uses the old proxy forms, which the server stopped writing
+  long ago. Check with `SELECT count(*) FROM samples WHERE filepath LIKE '/media/s3/%';`: it should be 0. A
+  `/media/...` path that is a real file on disk (a mounted drive) keeps working. A `/media/<path>` in the old
+  local proxy form (relative to `FRIDGE_DATA_ROOT`, not a real file) no longer resolves in the SDK's image
+  loader (the app never served it): store the relative path instead.
+- A script that fetched every location from `map_points` gets a 422: send the zoom, or `"points": true`, or
+  page through `samples/query` for the `location` field.
+- `Sample(embedding=...)` is a `TypeError`, and the API refuses `"embedding"` with a 422 that names the
+  replacement, so an older client's vectors are never silently dropped.
+- A flat `filters` object is now a 422 naming the tree form. `{}` still means no filter. The five removed
+  query parameters are a 422 that gives the filter tree to send instead (for example
+  `{"field": "brightness", "operator": ">=", "value": 0.3}`), so a script using them fails rather than
+  getting the whole dataset.
+- A script that relied on `Dataset.create_view()` sharing the view with everyone must pass `is_public=True`
+  (a dataset's default view must be public).
+
 ## 1.4.0 (2026-11-06)
 
 ### Added

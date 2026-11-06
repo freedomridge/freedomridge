@@ -30,9 +30,6 @@ The set of known array fields is shared across all Sample instances. It's popula
 ### `iter_samples` Progress Bar Needs First Batch
 The progress bar total comes from the first batch's COUNT. If the first batch fails, there's no progress bar. Subsequent batches skip COUNT for performance.
 
-### Legacy `/media/...` filepath handling (planned removal)
-The SDK image loader still special-cases legacy `/media/s3/<key>` and `/media/<rel>` filepaths. Modern ingest writes canonical `s3://...` / root-relative local paths. Removing the legacy branches requires migrating any old datasets' stored `filepath`s first.
-
 ## Data Pipeline
 
 ### Versioning and Array Fields

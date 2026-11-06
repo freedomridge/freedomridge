@@ -29,6 +29,8 @@ from .database import db
 _READ_ONLY_DATASET_POSTS = frozenset(
     {
         'get_dataset_field_stats_post',
+        'get_histogram_post',
+        'get_histogram_preview_post',
         'autocomplete_field_post',
         'get_dataset_map_points_post',
         'get_dataset_map_extent',

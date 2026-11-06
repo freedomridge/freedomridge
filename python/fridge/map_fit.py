@@ -9,9 +9,9 @@ It needs no database or API access, so the same step can later run on a separate
 The input is PostgreSQL's binary COPY of ``(sample_id int4, vector_version int8, vector)``. The fit
 size comes from the same RAM- and dimension-scaled formula as ``Dataset.compute_visualization``
 (``_auto_fit_sample_size``), measured inside the cap; every point is then projected through the
-fitted model. Outputs, each written completely before ``manifest.json`` (written last):
+fitted model. The model itself is not kept: new samples are placed on a re-fitted map by their nearest
+mapped neighbours. Outputs, each written completely before ``manifest.json`` (written last):
 
-    model.joblib    the fitted reducer
     ids.npy         int32 sample IDs, in input order
     versions.npy    int64 vector versions (the embedding row's xmin at export)
     coords.npy      float32 (N, 2) map coordinates
@@ -34,6 +34,22 @@ _SIGNATURE = b"PGCOPY\n\xff\r\n\x00"
 
 def read_export(path):
     """(ids, versions, vectors) from a binary COPY file with one fixed-size row per vector."""
+    rows = _export_rows(path)
+    if rows is None:
+        return np.empty(0, np.int32), np.empty(0, np.int64), np.empty((0, 0), np.float32)
+    return rows["id"].astype(np.int32), rows["version"].astype(np.int64), rows["vector"].astype(np.float32)
+
+
+def read_export_ids(path):
+    """(ids, versions) of a binary COPY export, without loading its vectors."""
+    rows = _export_rows(path)
+    if rows is None:
+        return np.empty(0, np.int32), np.empty(0, np.int64)
+    return rows["id"].astype(np.int32), rows["version"].astype(np.int64)
+
+
+def _export_rows(path):
+    """The export's rows, memory-mapped (None when it has none), after checking its layout."""
     size = os.path.getsize(path)
     head = np.fromfile(path, dtype=np.uint8, count=min(size, 64))
     if size < 21 or head[:11].tobytes() != _SIGNATURE:
@@ -44,7 +60,7 @@ def read_export(path):
     if trailer.size != 1 or trailer[0] != -1:
         raise ValueError(f"{path} is truncated (no end-of-data marker)")
     if size - offset == 2:
-        return np.empty(0, np.int32), np.empty(0, np.int64), np.empty((0, 0), np.float32)
+        return None
     first = np.fromfile(path, dtype=">i4", count=1, offset=offset + 2 + 4 + 4 + 4 + 8)
     dim = (int(first[0]) - 4) // 4
     row = np.dtype(
@@ -72,7 +88,7 @@ def read_export(path):
         and (rows["dim"] == dim).all()
     ):
         raise ValueError(f"{path}: unexpected row layout or mixed vector dimensions")
-    return rows["id"].astype(np.int32), rows["version"].astype(np.int64), rows["vector"].astype(np.float32)
+    return rows
 
 
 def _cgroup_anon_bytes():
@@ -110,8 +126,6 @@ def main(argv=None):
     # umap-learn imports TensorFlow for its optional parametric model when it is installed: ~1 GB of
     # RSS and seconds of start-up inside the memory cap, for nothing a re-fit uses.
     sys.modules.setdefault("tensorflow", None)  # type: ignore[arg-type]
-    import joblib
-
     from .core.dataset import (
         MINIMUM_FIT_POINTS,
         _auto_fit_sample_size,
@@ -160,12 +174,7 @@ def main(argv=None):
     coords = np.asarray(coords, dtype=np.float32)
     if coords.shape != (total, 2) or not np.isfinite(coords).all():
         raise SystemExit("The fit produced missing or non-finite coordinates")
-    del vectors
-    temporary = output / "model.joblib.tmp"
-    joblib.dump(reducer, temporary)
-    with open(temporary, "rb+") as model:
-        os.fsync(model.fileno())
-    os.replace(temporary, output / "model.joblib")
+    del vectors, reducer
     _save(output / "ids.npy", ids)
     _save(output / "versions.npy", versions)
     _save(output / "coords.npy", coords)

@@ -198,7 +198,7 @@ async def list_dataset_jobs(
     scope = 'dataset_id = $1'
     if not include_system_statistics:
         scope += (
-            " AND NOT (kind IN ('statistics','concept_scoring','duplicate_maintenance')"
+            " AND NOT (kind IN ('statistics','concept_scoring','duplicate_maintenance','map_place')"
             " AND dedupe_owner='system' AND state='succeeded'"
             " AND NOT barrier @> '{\"full\":true}')"
         )

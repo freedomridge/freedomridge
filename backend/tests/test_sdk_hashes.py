@@ -125,3 +125,31 @@ def test_default_loader_initializes_s3_only_when_requested(monkeypatch):
             assert image.mode == 'RGB' and image.size == (16, 16)
     boto3.client.assert_called_once_with('s3')
     assert s3.download_fileobj.call_count == 2
+
+
+def test_the_default_loader_reads_any_path_but_s3_as_a_local_file(monkeypatch):
+    """An external drive mounted at /media/<user>/... is an ordinary absolute path, and the old proxy forms
+    (/media/s3/<key>, /media/<relative>) are no longer rewritten: they are local paths like any other."""
+    opened = []
+
+    class Opened:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def convert(self, mode):
+            return mode
+
+    def fake_open(path):
+        opened.append(path)
+        return Opened()
+
+    monkeypatch.setattr(Image, 'open', fake_open)
+    monkeypatch.setenv('FRIDGE_DATA_ROOT', '/data')
+    monkeypatch.setitem(sys.modules, 'boto3', None)  # nothing here may reach S3
+    loader = dataset_module._default_s3_image_loader()
+    for path in ('/media/user/Data/coco/1.jpg', '/media/s3/key.jpg', '/media/relative.jpg', 'relative/2.jpg'):
+        assert loader(path) == 'RGB'
+    assert opened == ['/media/user/Data/coco/1.jpg', '/media/s3/key.jpg', '/media/relative.jpg', '/data/relative/2.jpg']
