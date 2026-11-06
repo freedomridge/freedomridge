@@ -4974,7 +4974,10 @@ async def _get_dataset_map_points_impl(
         so it covered points of neighbouring sparse cells, which looked as if they belonged
         to it. A loose point within a bubble's radius on screen at this zoom counts in the
         nearest such bubble instead of being drawn. The radius reaches the 8 neighbouring
-        cells at most, so only points of a sparse cell next to a dense one are measured."""
+        cells at most, so only points of a sparse cell next to a dense one are measured.
+
+        Each bubble also carries the extent (w, s, e, n) of every sample it counts, the ones it
+        took in included, so a click can zoom to fit them and break the bubble apart."""
         a = list(a) + [cell, _MAP_CLUSTER_MIN_POINTS]
         cell_p, minp_p = len(a) - 1, len(a)
         # Group on the stored lon/lat columns with pure float arithmetic:
@@ -4994,15 +4997,18 @@ async def _get_dataset_map_points_impl(
                 WITH g AS (
                     SELECT round(lon / ${cell_p}::float8) AS gx, round(lat / ${cell_p}::float8) AS gy,
                            count(*) AS cc, AVG(lon) AS lon, AVG(lat) AS lat,
+                           MIN(lon) AS w, MIN(lat) AS s, MAX(lon) AS e, MAX(lat) AS n,
                            array_agg(id) AS ids, array_agg(lon) AS xs, array_agg(lat) AS ys,
                            array_agg(heading::double precision) AS hs
                     FROM samples WHERE {where}
                     GROUP BY round(lon / ${cell_p}::float8), round(lat / ${cell_p}::float8)
                 )
-                SELECT gx, gy, NULL::int AS id, lon, lat, cc AS count, NULL::double precision AS heading
+                SELECT gx, gy, NULL::int AS id, lon, lat, cc AS count, NULL::double precision AS heading,
+                       w, s, e, n
                 FROM g WHERE cc >= ${minp_p}
                 UNION ALL
-                SELECT gx, gy, u.id, u.x AS lon, u.y AS lat, 1 AS count, u.h AS heading
+                SELECT gx, gy, u.id, u.x AS lon, u.y AS lat, 1 AS count, u.h AS heading,
+                       NULL, NULL, NULL, NULL
                 FROM g, unnest(g.ids, g.xs, g.ys, g.hs) AS u(id, x, y, h)
                 WHERE g.cc < ${minp_p}
             """,
@@ -5014,6 +5020,10 @@ async def _get_dataset_map_points_impl(
                 "lat": r['lat'],
                 "count": r['count'],
                 "radius": _map_bubble_radius_px(r['count']),
+                "w": r['w'],
+                "s": r['s'],
+                "e": r['e'],
+                "n": r['n'],
             }
             for r in rows
             if r['id'] is None
@@ -5037,7 +5047,10 @@ async def _get_dataset_map_points_impl(
                     if d2 <= bubbles[cell_key]['radius'] ** 2 and (nearest is None or d2 < nearest_d2):
                         nearest, nearest_d2 = cell_key, d2
                 if nearest is not None:
-                    bubbles[nearest]['count'] += 1
+                    bubble = bubbles[nearest]
+                    bubble['count'] += 1
+                    bubble['w'], bubble['e'] = min(bubble['w'], r['lon']), max(bubble['e'], r['lon'])
+                    bubble['s'], bubble['n'] = min(bubble['s'], r['lat']), max(bubble['n'], r['lat'])
                     continue
             points.append({"id": r['id'], "lon": r['lon'], "lat": r['lat'], "heading": r['heading']})
         return [*bubbles.values(), *points], len(points)

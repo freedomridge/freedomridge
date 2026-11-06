@@ -49,8 +49,11 @@ cells. Their loose points used to be drawn on top of it, as if they were part of
 left out of its count. A loose point within a bubble's on-screen radius at the request's zoom now
 counts in the nearest such bubble instead of being drawn. Points outside every bubble stay
 individual, and every sample is still represented. The server sends each bubble's `radius`
-(`_map_bubble_radius_px`) and the map draws exactly that, so the bubble absorbs exactly the
-points it covers. This is done on the cells after the single GROUP BY, looking only at a dense
+(`_map_bubble_radius_px`), measured at the zoom it clustered at. The map asks for a whole-number
+zoom (`qzoom = Math.round(zoom)`), so it scales the circle by 2^(zoom − qzoom) to cover the same
+area at its actual zoom. The bubble therefore covers exactly the points it absorbed. Drawn at a
+fixed size, a circle could be up to 41% too small or too large, half a zoom level either way: it
+would hide absorbed points outside its edge, or leave points drawn under it. This is done on the cells after the single GROUP BY, looking only at a dense
 cell's 8 neighbours. Timed on 3.75M synthetic samples at zooms 3–11.5, it made no measurable
 difference. Tests: `backend/tests/test_map_clusters.py`.
 
@@ -184,6 +187,18 @@ Don't refetch on every pixel of pan, and don't reload a view you've already seen
 This is client-side and per-session (in-memory) — NOT a persisted/cross-session cache,
 and NOT a server-side precompute. Don't add cross-session persistence without an
 explicit invalidation story (that's the staleness footgun to avoid).
+
+## 14. A click on a bubble always breaks it apart
+
+Clicking a cluster bubble must never leave the same bubble on screen. Each bubble carries the
+extent (`w`, `s`, `e`, `n`) of every sample it counts, including the loose points it took in (#2).
+A click fits the map to that extent, with 40 px of padding and at most zoom 16, and goes at least
+one level deeper than the current zoom. Once fitted, the extent spans more than one 128 px cell, so
+its samples fall in several cells: smaller bubbles or points. Samples at one spot reach zoom 16,
+past `_MAP_POINT_ZOOM`, where every point shows. The old click zoomed in 2.5 levels at the bubble,
+which left a tight group, a single field say, in one cell: the same bubble again. In draw mode a
+click is a polygon vertex and doesn't zoom. Tests: `e2e/map-cluster-click.spec.ts`, which fails
+against the old click.
 
 ---
 
