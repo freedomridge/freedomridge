@@ -28,33 +28,36 @@ for (const extension of ['.ts', '.tsx']) {
 const api = require('../lib/api.ts');
 const { HistogramPreview } = require('../components/histogram-panel.tsx');
 
-async function requestedUrl(call) {
+// The request a call makes: its URL, method and JSON body. Histograms are POSTed with the parameters in
+// the body, because a filter (a saved selection of thousands of ids) can be too large for a URL.
+async function sentRequest(call) {
     const originalFetch = global.fetch;
-    let url;
-    global.fetch = async (requested) => {
-        url = new URL(requested, 'http://app');
+    let sent;
+    global.fetch = async (requested, init = {}) => {
+        sent = { url: new URL(requested, 'http://app'), method: init.method, body: JSON.parse(init.body) };
         return new Response(JSON.stringify({ field: 'device_id', total: 0, buckets: [] }), { status: 200 });
     };
     try { await call(); } finally { global.fetch = originalFetch; }
-    return url;
+    return sent;
 }
 
 test('the exact histogram asks for numbers only when the switch is on', async () => {
-    const plain = await requestedUrl(() => api.getHistogram(7, 'device_id', undefined, undefined));
-    assert.equal(plain.pathname, '/api/datasets/7/histogram');
-    assert.equal(plain.searchParams.get('as_number'), null);
-    const numeric = await requestedUrl(() => api.getHistogram(7, 'device_id', undefined, undefined, true));
-    assert.equal(numeric.pathname, '/api/datasets/7/histogram');
-    assert.equal(numeric.searchParams.get('as_number'), 'true');
+    const plain = await sentRequest(() => api.getHistogram(7, 'device_id', undefined, undefined));
+    assert.equal(plain.url.pathname, '/api/datasets/7/histogram');
+    assert.equal(plain.method, 'POST');
+    assert.deepEqual(plain.body, { field: 'device_id' });
+    const numeric = await sentRequest(() => api.getHistogram(7, 'device_id', undefined, undefined, true));
+    assert.equal(numeric.url.pathname, '/api/datasets/7/histogram');
+    assert.deepEqual(numeric.body, { field: 'device_id', as_number: true });
 });
 
 test('the preview is a separate request with the same parameters', async () => {
     const filters = { field: 'media_type', operator: '!=', value: 'object' };
-    const url = await requestedUrl(() => api.getHistogramPreview(7, 'country', filters, undefined, true));
-    assert.equal(url.pathname, '/api/datasets/7/histogram/preview');
-    assert.equal(url.searchParams.get('field'), 'country');
-    assert.deepEqual(JSON.parse(url.searchParams.get('filters')), filters);
-    assert.equal(url.searchParams.get('as_number'), 'true');
+    const sent = await sentRequest(() => api.getHistogramPreview(7, 'country', filters, 20, true));
+    assert.equal(sent.url.pathname, '/api/datasets/7/histogram/preview');
+    assert.equal(sent.method, 'POST');
+    assert.equal(sent.url.search, '');
+    assert.deepEqual(sent.body, { field: 'country', filters, bins: 20, as_number: true });
 });
 
 test('a categorical preview is labelled approximate, shows shares, and cannot filter', () => {

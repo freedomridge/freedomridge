@@ -792,13 +792,12 @@ class DatasetView:
         """
         client = self._dataset.client
 
-        filters_json = json.dumps(self._filters) if self._filters else None
+        body: Dict[str, Any] = {"field": field, "bins": bins}
+        if self._filters:
+            body["filters"] = self._filters
 
-        params = {"field": field, "bins": bins}
-        if filters_json:
-            params["filters"] = filters_json
-
-        response = client.session.get(f"{client.base_url}/datasets/{self._dataset._id}/histogram", params=params)
+        # POST with the filter in the body: a selection of a few thousand ids is too large for a URL.
+        response = client.session.post(f"{client.base_url}/datasets/{self._dataset._id}/histogram", json=body)
         _raise_for_status(response)
         data = response.json()
 

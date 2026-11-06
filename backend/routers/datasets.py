@@ -5646,6 +5646,35 @@ async def get_histogram(
         return await _histogram(id, field, bins, filters, top, as_number)
 
 
+class HistogramRequest(BaseModel):
+    """The histogram query parameters, with the filter as a JSON object instead of a URL parameter."""
+
+    field: str
+    bins: Optional[int] = Field(None, ge=1, le=200)
+    filters: Optional[Dict[str, Any]] = None
+    top: int = Field(50, ge=0, le=10000)
+    as_number: bool = False
+
+    def filters_json(self) -> Optional[str]:
+        return json.dumps(self.filters) if self.filters else None
+
+
+@router.post("/datasets/{id}/histogram", dependencies=[Depends(require_dataset_access)])
+@guest_heavy
+async def get_histogram_post(id: int, request: HistogramRequest):
+    """POST version of get_histogram, for a filter too large for a URL: a selection of a few thousand sample
+    ids already passes the server's 64 KB request-line limit (HTTP 400)."""
+    with field_usage.measure(id, {'histogram': [request.field]}):
+        return await _histogram(
+            id,
+            request.field,
+            request.bins,
+            request.filters_json(),
+            request.top,
+            request.as_number,
+        )
+
+
 async def _histogram(
     id: int,
     field: str,
@@ -5974,6 +6003,31 @@ async def get_histogram_preview(
     returned only when `preview.status` is `ok`; otherwise (`not_broad`, `insufficient_sample`,
     `timeout`, `failed`) the caller waits for /histogram, which is always the exact answer.
     """
+    return await _histogram_preview(id, field, bins, filters, top, as_number)
+
+
+@router.post("/datasets/{id}/histogram/preview", dependencies=[Depends(require_dataset_access)])
+@guest_heavy
+async def get_histogram_preview_post(id: int, request: HistogramRequest):
+    """POST version of get_histogram_preview, for a filter too large for a URL (see get_histogram_post)."""
+    return await _histogram_preview(
+        id,
+        request.field,
+        request.bins,
+        request.filters_json(),
+        request.top,
+        request.as_number,
+    )
+
+
+async def _histogram_preview(
+    id: int,
+    field: str,
+    bins: Optional[int],
+    filters: Optional[str],
+    top: int,
+    as_number: bool,
+) -> Dict[str, Any]:
     _validate_field_name(field)
 
     def unavailable(status: str, **detail: Any) -> Dict[str, Any]:

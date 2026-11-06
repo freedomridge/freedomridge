@@ -1227,6 +1227,18 @@ def run_tests():
 
     _()
 
+    @test("view.histogram_values() with a filter too large for a URL")
+    def _():
+        # A saved selection of 20,000 ids (here 5 samples and ids no sample has) is ~200 KB of JSON, past
+        # the server's 64 KB request line: a histogram sent with the filter in its URL got HTTP 400.
+        ids = ds.filter(category='a').ids()
+        s = ds.samples
+        view = s[s.id.is_in(ids + list(range(10_000_000, 10_020_000 - len(ids))))]
+        hist = view.histogram_values('score', bins=5)
+        assert sum(bucket['count'] for bucket in hist) == len(ids) == 5, hist
+
+    _()
+
     @test("dataset.query() string syntax")
     def _():
         view = ds.query("category = 'a'")
