@@ -4984,25 +4984,30 @@ async def _get_dataset_map_points_impl(
         # heap + per-row PostGIS. One GROUP BY (no window): dense cells (cc>=minp) emit one
         # bubble; sparse cells (cc<minp) carry their points in arrays we unnest into point
         # rows. lon/lat are trigger-maintained from location — never stale. See MAP_REQUIREMENTS.md.
-        rows = await db.fetch(
-            f"""
-            WITH g AS (
-                SELECT round(lon / ${cell_p}::float8) AS gx, round(lat / ${cell_p}::float8) AS gy,
-                       count(*) AS cc, AVG(lon) AS lon, AVG(lat) AS lat,
-                       array_agg(id) AS ids, array_agg(lon) AS xs, array_agg(lat) AS ys,
-                       array_agg(heading::double precision) AS hs
-                FROM samples WHERE {where}
-                GROUP BY round(lon / ${cell_p}::float8), round(lat / ${cell_p}::float8)
+        # Planned for every run's own cell size and bbox (#11): from a prepared statement's 6th
+        # run on a connection PostgreSQL may switch to a generic plan, which for this query was
+        # about 9 times slower (14 s instead of 1.5 s on 3.75M samples at zoom 4.5).
+        async with db.pool.acquire() as connection, connection.transaction():
+            await connection.execute("SET LOCAL plan_cache_mode = force_custom_plan")
+            rows = await connection.fetch(
+                f"""
+                WITH g AS (
+                    SELECT round(lon / ${cell_p}::float8) AS gx, round(lat / ${cell_p}::float8) AS gy,
+                           count(*) AS cc, AVG(lon) AS lon, AVG(lat) AS lat,
+                           array_agg(id) AS ids, array_agg(lon) AS xs, array_agg(lat) AS ys,
+                           array_agg(heading::double precision) AS hs
+                    FROM samples WHERE {where}
+                    GROUP BY round(lon / ${cell_p}::float8), round(lat / ${cell_p}::float8)
+                )
+                SELECT gx, gy, NULL::int AS id, lon, lat, cc AS count, NULL::double precision AS heading
+                FROM g WHERE cc >= ${minp_p}
+                UNION ALL
+                SELECT gx, gy, u.id, u.x AS lon, u.y AS lat, 1 AS count, u.h AS heading
+                FROM g, unnest(g.ids, g.xs, g.ys, g.hs) AS u(id, x, y, h)
+                WHERE g.cc < ${minp_p}
+            """,
+                *a,
             )
-            SELECT gx, gy, NULL::int AS id, lon, lat, cc AS count, NULL::double precision AS heading
-            FROM g WHERE cc >= ${minp_p}
-            UNION ALL
-            SELECT gx, gy, u.id, u.x AS lon, u.y AS lat, 1 AS count, u.h AS heading
-            FROM g, unnest(g.ids, g.xs, g.ys, g.hs) AS u(id, x, y, h)
-            WHERE g.cc < ${minp_p}
-        """,
-            *a,
-        )
         bubbles = {
             (r['gx'], r['gy']): {
                 "lon": r['lon'],
