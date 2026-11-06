@@ -176,6 +176,7 @@ function DatasetPageContent() {
         setViewStages,
         addStage,
         removeStage,
+        replaceStages,
         updateStage,
         filterMode,
         setFilterMode,
@@ -1376,6 +1377,7 @@ function DatasetPageContent() {
                             updateStage(index, stage);
                         }}
                         onAddStage={addStage}
+                        onReplaceStages={replaceStages}
                         onClearAll={resetFilters}
                         defaultView={defaultView}
                         onShowAll={showAllImages}

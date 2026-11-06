@@ -1,7 +1,8 @@
 # Filter query language
 
-A filter written as text. The same text works in two places:
+A filter written as text. The same text works in three places:
 
+- **The app's filter bar:** **Query** shows the current filters as text. You can read, copy, paste or edit them, then press **Apply** (or Ctrl+Enter).
 - **The SDK:** `dataset.query("...")` returns a view, and `dataset.create_view(name, query="...")` saves one.
 - **The HTTP API:** `POST /api/datasets/{id}/filter_query/parse` and `.../format` convert between text and filters, for scripts and for AI tools.
 
@@ -12,6 +13,15 @@ serial_number in (103000752 103001025 103004080)
 AND split = "train"
 AND NOT (score < 0.2 OR note exists)
 ```
+
+## In the filter bar
+
+**Query**, next to **Add Filter**, opens the current filters as text.
+
+- **Each chip is one line**, joined with `AND`.
+- **Chips with no text form** stay as they are. They show as `# kept: …` lines, and editing those lines does nothing.
+- **Apply replaces your chips with the text's parts.** A part identical to a chip you had keeps that chip, with its name and, for the dataset's default view, its ★. Deleting a default-view line is the same as removing its chip.
+- **A mistake** shows its line, column and suggestion under the text, puts the cursor on it, and changes nothing.
 
 ## Parts and chips
 
@@ -64,7 +74,7 @@ A query takes at most 500 comparisons, and brackets and `NOT` nest at most 100 d
 
 ## What stays a chip
 
-These filters have no text form: concept scores, map regions, lassos, selections and similarity searches. Their values are ids, polygons or tokens rather than something to type. `format` returns `null` for each of them, and they stay stages of their own.
+These filters have no text form: concept scores, map regions, lassos, selections and similarity searches. Their values are ids, polygons or tokens rather than something to type. `format` returns `null` for each of them, and they stay stages of their own. The filter bar's editor shows them as `# kept:` comment lines and leaves them as they are when you apply your text.
 
 ## HTTP API
 

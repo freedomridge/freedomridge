@@ -53,7 +53,8 @@ export function describeFilter(f: ComplexFilter): string {
         case 'contains': return `${f.field}: contains ${JSON.stringify(f.value)}`;
         case 'is_null':
         case 'not_exists': return `${f.field}: no value`;
-        case 'exists': return `${f.field}: has a value`;
+        case 'exists':
+        case 'is_not_null': return `${f.field}: has a value`;
         default: return `${f.field} ${symbol[f.operator ?? ''] ?? f.operator} ${describeList(f.value)}`;
     }
 }

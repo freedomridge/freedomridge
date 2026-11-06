@@ -1,10 +1,12 @@
 import React, { useRef, useState } from 'react';
 import { ViewStage, SchemaField } from '@/lib/api';
-import { Cross2Icon, PlusIcon, MagnifyingGlassIcon, ImageIcon } from '@radix-ui/react-icons';
+import { Cross2Icon, PlusIcon, MagnifyingGlassIcon, ImageIcon, CodeIcon } from '@radix-ui/react-icons';
 import { Rocket } from 'lucide-react';
 import { FilterStageEditor } from './filter-stage-editor';
 import { describeFilter, isAutoFilterLabel } from '@/lib/filter-utils';
 import { type DefaultView, defaultViewStages, isDefaultViewStage } from '@/lib/default-view';
+import { isReadOnlyStage } from '@/lib/filter-query';
+import { FilterQueryEditor } from './filter-query-editor';
 // import * as Tooltip from '@radix-ui/react-tooltip';
 import * as Popover from '@radix-ui/react-popover';
 
@@ -13,6 +15,8 @@ interface QueryBuilderBarProps {
     onRemoveStage: (index: number) => void;
     onUpdateStage: (index: number, stage: ViewStage) => void;
     onAddStage: (stage: ViewStage) => void;
+    // The query editor applies its text as a whole new list of chips (docs/FILTER_QUERY.md).
+    onReplaceStages?: (stages: ViewStage[]) => void;
     // Back to the dataset's default view (no filters when it has none).
     onClearAll: () => void;
     // The dataset's default view: its filters are labelled, and Show all images removes them too.
@@ -42,6 +46,7 @@ export function QueryBuilderBar({
     onRemoveStage,
     onUpdateStage,
     onAddStage,
+    onReplaceStages,
     onClearAll,
     defaultView,
     onShowAll,
@@ -60,6 +65,8 @@ export function QueryBuilderBar({
     const safeLimit = Number.isFinite(resultLimit) && resultLimit > 0 ? Math.min(Math.round(resultLimit), MAX_SEARCH_LIMIT) : DEFAULT_SEARCH_LIMIT;
     const [editingIndex, setEditingIndex] = useState<number | null>(null);
     const [isAdding, setIsAdding] = useState(false);
+    const [queryOpen, setQueryOpen] = useState(false);
+    const [queryEdited, setQueryEdited] = useState(false);  // the query editor's text was changed
     const [searchTerm, setSearchTerm] = useState('');
     const [selectedFieldForAdd, setSelectedFieldForAdd] = useState<string | null>(null);
     const [imageSearchOpen, setImageSearchOpen] = useState(false);
@@ -109,7 +116,7 @@ export function QueryBuilderBar({
                     </span>
                 )}
                 {stages.map((stage, index) => {
-                    const isReadOnly = stage.type === 'map_region' || stage.type === 'similarity' || stage.type === 'selection' || stage.metadata?.collapse || stage.metadata?.dupGroupCollapse || stage.metadata?.concept;
+                    const isReadOnly = isReadOnlyStage(stage);
 
                     const ChipContent = (
                         <div
@@ -379,6 +386,44 @@ export function QueryBuilderBar({
                                         </button>
                                     </div>
                                 </>}
+                            </Popover.Content>
+                        </Popover.Portal>
+                    </Popover.Root>
+                )}
+
+                {/* --- The filters as text (docs/FILTER_QUERY.md) --- */}
+                {onReplaceStages && (
+                    <Popover.Root open={queryOpen} onOpenChange={setQueryOpen}>
+                        <Popover.Trigger asChild>
+                            <button
+                                data-testid="filter-query-trigger"
+                                title="The filters as text: read, paste or edit them"
+                                className={`flex items-center gap-1.5 rounded border px-3 py-2 text-xs font-medium transition-colors ${queryOpen
+                                    ? 'border-cyan-600 bg-zinc-900 text-cyan-300'
+                                    : 'border-zinc-800 text-zinc-400 hover:border-zinc-700 hover:text-zinc-200'
+                                }`}
+                            >
+                                <CodeIcon className="h-4 w-4" />
+                                <span>Query</span>
+                            </button>
+                        </Popover.Trigger>
+                        <Popover.Portal>
+                            <Popover.Content
+                                className="z-[100] rounded-xl border border-zinc-800 bg-zinc-950 shadow-2xl animate-in fade-in zoom-in-95"
+                                sideOffset={5}
+                                align="end"
+                                avoidCollisions={true}
+                                // A click outside keeps an edited query open (a pasted list isn't lost to a stray
+                                // click); Escape and Cancel still close it.
+                                onInteractOutside={(event) => { if (queryEdited) event.preventDefault(); }}
+                            >
+                                <FilterQueryEditor
+                                    datasetId={datasetId}
+                                    stages={stages}
+                                    onApply={onReplaceStages}
+                                    onClose={() => setQueryOpen(false)}
+                                    onDirtyChange={setQueryEdited}
+                                />
                             </Popover.Content>
                         </Popover.Portal>
                     </Popover.Root>

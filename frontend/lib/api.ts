@@ -465,7 +465,7 @@ export interface ComplexFilter {
 
     // Leaf Node
     field?: string;
-    operator?: '=' | '!=' | '>' | '<' | '>=' | '<=' | 'in' | 'not in' | 'contains' | 'geo_polygon' | 'geo_polygon_exclude' | 'embedding_polygon' | 'in_selection' | 'is_null' | 'exists' | 'not_exists' | 'concept_select' | 'concept_exclude' | 'parent_matches' | 'has_matching_object' | 'cg_self';
+    operator?: '=' | '!=' | '>' | '<' | '>=' | '<=' | 'in' | 'not in' | 'contains' | 'geo_polygon' | 'geo_polygon_exclude' | 'embedding_polygon' | 'in_selection' | 'is_null' | 'is_not_null' | 'exists' | 'not_exists' | 'concept_select' | 'concept_exclude' | 'parent_matches' | 'has_matching_object' | 'cg_self';
     // Leaf value shape depends on the operator: scalar for comparisons, an array
     // for in/not-in, a ring of [lon,lat]/[x,y] points for geo_/embedding_polygon, a
     // string token for in_selection, an object {concept_id, op, threshold} for
@@ -969,6 +969,55 @@ export async function getMapPoints(
     });
     await ensureOk(res, 'Failed to fetch map points');
     // zoom set -> { mode: 'hybrid'|'points', items, capped? }; no zoom -> legacy array.
+    return res.json();
+}
+
+// --- Filter query language (docs/FILTER_QUERY.md) ---
+
+/** A query the dataset can't take: where, why, and what may have been meant. */
+export class FilterQueryProblem extends Error {
+    line: number;
+    column: number;
+    suggestions: string[];
+    constructor(detail: { message: string; line: number; column: number; suggestions?: string[] }) {
+        super(detail.message);
+        this.name = 'FilterQueryProblem';
+        this.line = detail.line;
+        this.column = detail.column;
+        this.suggestions = detail.suggestions ?? [];
+    }
+}
+
+export interface ParsedFilterQuery {
+    filters: ComplexFilter[];  // one per top-level AND part
+    parts: (string | null)[];  // each written back as text
+    reuse: (number | null)[];  // the index in `current` of an equal filter, to keep its chip
+}
+
+/** Text to filters, checked against the dataset's fields. Throws FilterQueryProblem for a mistake. */
+export async function parseFilterQuery(datasetId: number, query: string, current: ComplexFilter[]): Promise<ParsedFilterQuery> {
+    const res = await fetch(`${API_BASE}/datasets/${datasetId}/filter_query/parse`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ query, current }),
+    });
+    if (res.status === 400) {
+        const body = await res.clone().json().catch(() => null);
+        const problem = body?.detail?.errors?.[0];
+        if (problem && typeof problem.message === 'string') throw new FilterQueryProblem(problem);
+    }
+    await ensureOk(res, 'Failed to read the query');
+    return res.json();
+}
+
+/** Each filter as text, or null where the language can't express it (concepts, regions, selections). */
+export async function formatFilterQuery(datasetId: number, filters: ComplexFilter[]): Promise<{ parts: (string | null)[] }> {
+    const res = await fetch(`${API_BASE}/datasets/${datasetId}/filter_query/format`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ filters }),
+    });
+    await ensureOk(res, 'Failed to write the filters as a query');
     return res.json();
 }
 
