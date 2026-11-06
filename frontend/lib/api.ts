@@ -409,11 +409,6 @@ export interface Sample {
 }
 
 export interface Filters {
-    file_date?: string;
-    brightness_min?: number;
-    brightness_max?: number;
-    date_min?: string;
-    date_max?: string;
     // Per-field draft filter values are genuinely heterogeneous (scalars, arrays,
     // {min,max} ranges, {_op} markers) and consumed via untyped index access in the
     // sidebar, which relies on `any` to bypass indexed-access narrowing.

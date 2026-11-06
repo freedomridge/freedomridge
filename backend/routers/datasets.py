@@ -4630,11 +4630,6 @@ def _compile_filter_node(
 
 def build_sample_query_parts(
     dataset_id: int,
-    file_date: Optional[str] = None,
-    brightness_min: Optional[float] = None,
-    brightness_max: Optional[float] = None,
-    date_min: Optional[str] = None,
-    date_max: Optional[str] = None,
     filters: Optional[str] = None,
     array_columns: Optional[set] = None,
     numeric_indexed_fields: Optional[set] = None,
@@ -4647,44 +4642,26 @@ def build_sample_query_parts(
     args: list[Any] = [dataset_id]
     arg_idx = 2
 
-    # Legacy/Specific filters
-    if file_date:
-        conditions.append(f"metadata->>'file_date' = ${arg_idx}")
-        args.append(file_date)
-        arg_idx += 1
-
-    if brightness_min is not None:
-        conditions.append(f"(metadata->>'brightness')::float >= ${arg_idx}")
-        args.append(brightness_min)
-        arg_idx += 1
-
-    if brightness_max is not None:
-        conditions.append(f"(metadata->>'brightness')::float <= ${arg_idx}")
-        args.append(brightness_max)
-        arg_idx += 1
-
-    if date_min:
-        conditions.append(f"metadata->>'file_date' >= ${arg_idx}")
-        args.append(date_min)
-        arg_idx += 1
-
-    if date_max:
-        conditions.append(f"metadata->>'file_date' <= ${arg_idx}")
-        args.append(date_max)
-        arg_idx += 1
-
     # Dynamic filters
     if filters:
         try:
             filter_data = json.loads(filters)
 
-            # Check if it's the new complex format or old flat format
-            is_complex = False
-            if isinstance(filter_data, dict):
-                if 'logic' in filter_data or ('field' in filter_data and 'operator' in filter_data):
-                    is_complex = True
-
-            if is_complex:
+            # A filter tree only: the flat {field: value} form was removed in 2.0. An empty object is no filter.
+            if filter_data != {}:
+                tree = isinstance(filter_data, dict) and (
+                    'logic' in filter_data
+                    or 'filters' in filter_data
+                    or ('field' in filter_data and 'operator' in filter_data)
+                )
+                if not tree:
+                    raise HTTPException(
+                        status_code=422,
+                        detail=(
+                            'filters must be a filter tree: {"field", "operator", "value"} or {"logic", "filters"}. '
+                            'The flat {field: value} form was removed in 2.0'
+                        ),
+                    )
                 sql, arg_idx = parse_filter_node(
                     filter_data,
                     args,
@@ -4695,30 +4672,6 @@ def build_sample_query_parts(
                     array_columns=array_columns,
                 )
                 conditions.append(sql)
-            else:
-                # Backward compatibility: Flat dictionary {key: value}
-                for key, value in filter_data.items():
-                    # key is interpolated into metadata->>'{key}' — skip any
-                    # name that isn't a safe identifier rather than inject it.
-                    if not _is_safe_field_name(key):
-                        continue
-                    if isinstance(value, dict):
-                        if 'min' in value and value['min'] is not None:
-                            conditions.append(f"(metadata->>'{key}')::float >= ${arg_idx}")
-                            args.append(value['min'])
-                            arg_idx += 1
-                        if 'max' in value and value['max'] is not None:
-                            conditions.append(f"(metadata->>'{key}')::float <= ${arg_idx}")
-                            args.append(value['max'])
-                            arg_idx += 1
-                    elif isinstance(value, list):
-                        conditions.append(f"metadata->>'{key}' = ANY(${arg_idx})")
-                        args.append(value)
-                        arg_idx += 1
-                    else:
-                        conditions.append(f"metadata->>'{key}' = ${arg_idx}")
-                        args.append(str(value))
-                        arg_idx += 1
         except HTTPException:
             # A genuine filter validation error (unknown operator, malformed node) MUST surface as
             # a 400 — never fall through to a filter-stripped WHERE that silently returns the whole
@@ -5477,44 +5430,49 @@ async def _list_samples_post(id: int, request: SamplesRequest):
 @guest_heavy
 async def list_samples(
     id: int,
+    request: Request,
     limit: int = Query(50, ge=1),
     offset: int = Query(0, ge=0),
-    file_date: Optional[str] = None,
-    brightness_min: Optional[float] = None,
-    brightness_max: Optional[float] = None,
-    date_min: Optional[str] = None,
-    date_max: Optional[str] = None,
     filters: Optional[str] = None,
     sort_by: Optional[str] = None,
     sort_order: Optional[str] = Query(None, pattern="^(asc|desc)$"),
     fields: Optional[str] = None,  # Comma-separated list of fields to return
 ):
-    with field_usage.measure(id, _grid_usage(filters, sort_by)):
-        return await _list_samples(
-            id,
-            limit,
-            offset,
-            file_date,
-            brightness_min,
-            brightness_max,
-            date_min,
-            date_max,
-            filters,
-            sort_by,
-            sort_order,
-            fields,
+    removed = [name for name in _REMOVED_SAMPLE_FILTERS if name in request.query_params]
+    if removed:
+        # Refused, not ignored: an unknown query parameter would otherwise answer with the unfiltered dataset.
+        field, operator = _REMOVED_SAMPLE_FILTERS[removed[0]]
+        value: Any = request.query_params[removed[0]]
+        if field == 'brightness':  # the old parameter was a number, so the filter compares a number
+            try:
+                value = float(value)
+            except ValueError:
+                pass  # the hint shows what was sent; the 422 stands either way
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"{', '.join(removed)}: removed in 2.0. Send filters as a filter tree, for example "
+                f'filters={{"field": "{field}", "operator": "{operator}", "value": {json.dumps(value)}}}'
+            ),
         )
+    with field_usage.measure(id, _grid_usage(filters, sort_by)):
+        return await _list_samples(id, limit, offset, filters, sort_by, sort_order, fields)
+
+
+# Query parameters that filtered fixed metadata keys before 2.0, and the filter that replaces each.
+_REMOVED_SAMPLE_FILTERS = {
+    'file_date': ('file_date', '='),
+    'date_min': ('file_date', '>='),
+    'date_max': ('file_date', '<='),
+    'brightness_min': ('brightness', '>='),
+    'brightness_max': ('brightness', '<='),
+}
 
 
 async def _list_samples(
     id: int,
     limit: int,
     offset: int,
-    file_date: Optional[str],
-    brightness_min: Optional[float],
-    brightness_max: Optional[float],
-    date_min: Optional[str],
-    date_max: Optional[str],
     filters: Optional[str],
     sort_by: Optional[str],
     sort_order: Optional[str],
@@ -5522,11 +5480,6 @@ async def _list_samples(
 ):
     where_clause, args, arg_idx = build_sample_query_parts(
         id,
-        file_date,
-        brightness_min,
-        brightness_max,
-        date_min,
-        date_max,
         filters,
         array_columns=await get_dataset_array_columns(id),
         numeric_indexed_fields=await get_promoted_numeric_fields(id) if filters else None,
