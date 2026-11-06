@@ -4,8 +4,8 @@ Three steps with file handoffs, so the heavy middle one can later move to a comp
 
 1. **Export** (server): one consistent snapshot of the field's vectors, as PostgreSQL binary COPY of
    ``(sample_id, vector_version, vector)``, into the job's work folder. Before it, the job marks itself
-   the field's active re-fit (``embedding_map_state.active_job_id``); projection for that field pauses
-   until the job ends, so new samples wait in the projection queue for the new model.
+   the field's active re-fit (``embedding_map_state.active_job_id``); placement of new samples on that
+   field's map pauses until the job ends, so they wait in the projection queue for the new map.
 2. **Fit and transform** (pure computation): ``python -m fridge.map_fit`` in its own memory-capped
    scope (``systemd-run --user --scope -p MemoryMax=…``), or in a container without systemd, within the
    container's own memory limit (``containment``). The cap keeps ~20% of host RAM free; an
@@ -14,11 +14,12 @@ Three steps with file handoffs, so the heavy middle one can later move to a comp
    the app (``fit_cpus``).
 3. **Publish** (server): one transaction under the dataset's exclusive lifecycle gate. It replaces the
    field's coordinates, skipping samples whose vector changed or that were deleted after the export
-   (they stay queued and are projected with the new model), rebuilds the map's ranks, records the new
-   model as current, and finishes the job in that same transaction.
+   (they stay queued and are placed on the new map), rebuilds the map's ranks, records the new map as
+   current, and finishes the job in that same transaction.
 
-Failure or cancellation at any step leaves the old map and model in place; projection resumes with the
-old model as soon as the job is no longer queued or running. Files live behind ``map_artifacts``.
+No model is kept: new samples are placed on a re-fitted map from their nearest mapped neighbours
+(``map_placement``). Failure or cancellation at any step leaves the old map in place; placement resumes on it
+as soon as the job is no longer queued or running. Files live behind ``map_artifacts``.
 
 Each step names where the next one runs (``StepResult.placement``): the export, the publish and the ranks on
 the server, the fit on compute. A runner that takes both placements (the default, one machine) carries on; one
@@ -89,11 +90,11 @@ GATE_GRACE_SECONDS = 0.2
 # up to a day.
 HEAL_BACKOFF_HOURS = 1
 HEAL_BACKOFF_MAX_HOURS = 24
-# A fit handed to compute workers that none claims in this long ends, and projection resumes with the old model.
+# A fit handed to compute workers that none claims in this long ends, and placement resumes on the old map.
 UNCLAIMED_FIT_HOURS = 12
-# What a compute worker downloads for a fit, and what it uploads: fridge.map_fit's coordinates and manifest, never
-# its model. A model is a pickle, which runs code when loaded, so only models this server fitted itself are kept; a
-# map fitted on a worker has none, and its new samples are placed by their nearest neighbours instead.
+# What a compute worker downloads for a fit, and what it uploads: fridge.map_fit's coordinates and manifest. No
+# fit keeps a model (new samples are placed by their nearest mapped neighbours), and none could cross: a model is a
+# pickle, which runs code when loaded.
 REMOTE_INPUTS = ('vectors.bin',)
 REMOTE_OUTPUTS = ('ids.npy', 'versions.npy', 'coords.npy', 'manifest.json')
 # Each output's columns, for its size cap and its check: (columns, largest item size in bytes).
@@ -505,8 +506,9 @@ async def _export(pool, job, store, fits_here=True):
             field,
             timeout=60,
         )
-        # The export plus a model of about the same size again (the model keeps its fit points).
-        needed = int((points + pending) * (30 + 4 * (dimension or 1024)) * 2.5)
+        # The export (30 bytes of row header plus the vector), the fit's outputs (20 bytes a row), and a quarter
+        # more to spare.
+        needed = int((points + pending) * (30 + 4 * (dimension or 1024) + 20) * 1.25)
         free = shutil.disk_usage(work).free
         if free < needed:
             return _skip(
@@ -783,18 +785,11 @@ async def _fit(pool, job, store):
     measured = None
     if peak is not None and manifest.get('anon_before_fit') is not None and manifest['fit_size']:
         measured = max(1, (peak - manifest['anon_before_fit']) // manifest['fit_size'])
-    model_path = output / 'model.joblib'
-    model_bytes = model_path.stat().st_size
-    checksum = await asyncio.to_thread(sha256, model_path)
-    location = await asyncio.to_thread(store.put_model, model_path, dataset_id, field, checkpoint['model_id'])
     return StepResult(
         checkpoint={
             **checkpoint,
             'phase': 'publish',
             'output': output.name,
-            'location': location,
-            'checksum': checksum,
-            'model_bytes': model_bytes,
             'fit_size': manifest['fit_size'],
             'fit_seconds': manifest['fit_seconds'],
             'umap_fit_seconds': manifest.get('umap_fit_seconds'),
@@ -1044,17 +1039,15 @@ async def _publish(pool, job, store):
                 )
                 points = valid
                 published = await connection.fetchrow(
-                    """UPDATE embedding_map_state SET model_id=$3, artifact_location=$4, artifact_checksum=$5,
-                           artifact_bytes=$6, dimension=$7, fit_size=$8, refitted_at=clock_timestamp(),
-                           points_at_refit=$9,
-                           fit_bytes_per_point=COALESCE($10, fit_bytes_per_point)
+                    # model_id names the map's version; a re-fitted map keeps no model file.
+                    """UPDATE embedding_map_state SET model_id=$3, artifact_location=NULL, artifact_checksum=NULL,
+                           artifact_bytes=NULL, dimension=$4, fit_size=$5, refitted_at=clock_timestamp(),
+                           points_at_refit=$6,
+                           fit_bytes_per_point=COALESCE($7, fit_bytes_per_point)
                        WHERE dataset_id=$1 AND field_name=$2 RETURNING refitted_at""",
                     dataset_id,
                     field,
                     uuid.UUID(checkpoint['model_id']),
-                    checkpoint.get('location'),  # None for a map fitted on a compute worker: no model
-                    checkpoint.get('checksum'),
-                    checkpoint.get('model_bytes'),
                     checkpoint['dimension'],
                     checkpoint['fit_size'],
                     points,
@@ -1113,9 +1106,8 @@ async def _publish(pool, job, store):
             if ending:
                 await asyncio.gather(*ending, return_exceptions=True)
     logger.info('Map re-fit %s swapped in %.1f s under the gate: %s', job['id'], timings['gate_held'], result)
-    previous = state['artifact_location']
-    if previous and previous != checkpoint.get('location'):
-        await asyncio.to_thread(_quietly, store.delete, previous)
+    if state['artifact_location']:  # the model file of a map fitted before maps stopped keeping one
+        await asyncio.to_thread(_quietly, store.delete, state['artifact_location'])
     await asyncio.to_thread(_quietly, store.remove_work, job['id'])
     return await _rank(pool, ranking, store)
 

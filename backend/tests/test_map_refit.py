@@ -7,15 +7,14 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
-import joblib
 import numpy as np
 import pytest
 from fastapi import HTTPException
 from fridge import map_fit
 from fridge.core import dataset as sdk_dataset
 
-from backend import coordinates, job_queue, map_refit
-from backend.map_artifacts import LocalArtifactStore
+from backend import coordinates, job_queue, map_placement, map_refit
+from backend.map_artifacts import LocalArtifactStore, model_key
 from backend.routers import embeddings
 from backend.tests import test_field_registry_postgres
 from backend.tests.test_job_runner import make_worker
@@ -176,8 +175,7 @@ def test_real_fit_in_memory_capped_child_publishes_a_complete_new_map(registry_d
         state = await map_state(database)
         assert str(state['model_id']) == finished['result']['model_id']
         assert state['points_at_refit'] == 600 and state['active_job_id'] is None and not state['active']
-        model = joblib.load(store.path(state['artifact_location']))
-        assert model.transform(np.zeros((1, 16), dtype=np.float32)).shape == (1, 2)
+        assert state['artifact_location'] is None and list(store.models()) == []  # no model is kept
         assert finished['result']['fit_size'] == 600
         assert not store.work_dir(job['id']).exists()
 
@@ -218,13 +216,13 @@ async def pending(db, field=FIELD):
     }
 
 
-def test_changes_during_the_fit_are_skipped_and_queued_for_the_new_model(registry_database, tmp_path, monkeypatch):
+def test_changes_during_the_fit_are_skipped_and_queued_for_the_new_map(registry_database, tmp_path, monkeypatch):
     """Vector changed, sample deleted, new sample, identical re-upload: none keeps a coordinate from
-    either the old map or the stale fit, and all are placed by the new model afterwards."""
+    either the old map or the stale fit, and all are placed on the new map afterwards."""
     store = LocalArtifactStore(tmp_path)
-    monkeypatch.setenv('FRIDGE_UMAP_MODEL_DIR', str(tmp_path))  # the daemon resolves model keys here
     projector = load_projector()
     monkeypatch.setattr(projector, 'require_free_space', AsyncMock())
+    monkeypatch.setattr(map_placement, 'require_free_space', AsyncMock())
 
     async def scenario(database):
         ids = await seed(database, n=200, dim=8)
@@ -263,18 +261,22 @@ def test_changes_during_the_fit_are_skipped_and_queued_for_the_new_model(registr
         state = await map_state(database)
         assert state['points_at_refit'] == 197
 
-        # The projection daemon places them with the new model, and only with it.
-        rows = await projector._map_states(database)
-        row = rows[(1, FIELD)]
-        assert row['model_id'] == result['model_id'] and not row['active']
-        model = projector._load_managed(row, {})
+        # The projection daemon refuses the re-fitted map; the job runner places them on it, by neighbours.
         async with database.pool.acquire() as connection:
-            assert await projector._project(connection, 1, FIELD, FakeModel(shift=-5000), 50, None) == 0
-            assert await pending(database) == {changed, retried, new}
-            assert await projector._project(connection, 1, FIELD, model, 50, row['model_id']) == 3
+            assert await projector._project(connection, 1, FIELD, FakeModel(shift=-5000), 50) == 0
+        assert await pending(database) == {changed, retried, new}
+        [placement] = await map_placement.schedule_placements(database.pool)
+        worker = await make_worker(
+            database,
+            {map_placement.KIND: map_placement.handler(database.pool)},
+            policies={map_placement.KIND: map_placement.POLICY},
+            placements=('server',),
+        )
+        await worker.run_once()
+        assert (await database.fetchval('SELECT state FROM jobs WHERE id=$1', placement['id'])) == 'succeeded'
         assert await pending(database) == set()
         points = await map_points(database)
-        assert points[changed][0] == pytest.approx(1009.0) and points[new][0] == pytest.approx(1001.0)
+        assert all(x > 900 for x, _ in points.values())  # on the new map, among its points
         meta = await assert_ranks_exact(database)
         assert meta['total_points'] == 200  # 199 seeded samples remain, plus the new one
 
@@ -314,7 +316,7 @@ def test_projection_pauses_during_a_refit_and_resumes_after_cancel(registry_data
         assert (await map_state(database))['active']
         # Daemon, API and SDK all hold back.
         async with database.pool.acquire() as connection:
-            assert await projector._project(connection, 1, FIELD, legacy, 50, None) == 0
+            assert await projector._project(connection, 1, FIELD, legacy, 50) == 0
         assert await pending(database) == {900}
         update = [embeddings.CoordinateUpdate(sample_id=900, x=1, y=1, vector_version='1')]
         for kwargs in ({}, {'model_id': str(uuid.uuid4())}):
@@ -336,7 +338,7 @@ def test_projection_pauses_during_a_refit_and_resumes_after_cancel(registry_data
         assert len(points) == 40 and all(x < -50 for x, _ in points.values())  # old map untouched
         # Projection resumes with the field's existing (legacy) model.
         async with database.pool.acquire() as connection:
-            assert await projector._project(connection, 1, FIELD, legacy, 50, None) == 1
+            assert await projector._project(connection, 1, FIELD, legacy, 50) == 1
         assert await pending(database) == set()
         await assert_ranks_exact(database)
 
@@ -536,7 +538,6 @@ def test_failure_at_the_final_fence_rolls_back_the_whole_swap(
             assert not state['active']
             async with database.pool.acquire() as connection, connection.transaction():
                 await coordinates.check_map_fence(connection, 1, FIELD, before_state['model_id'])
-        assert store.path(before_state['artifact_location']).exists()
 
     registry_database(scenario)
 
@@ -675,7 +676,15 @@ def test_sweep_keeps_current_and_unfinished_artifacts_only(registry_database, tm
     async def scenario(database):
         await seed(database, n=30)
         finished = await run_job(database, await submit(database), store)
-        current = (await map_state(database))['artifact_location']
+        # A model kept from before re-fits stopped keeping one, still the map's current one.
+        current = model_key(1, FIELD, (await map_state(database))['model_id'])
+        store.path(current).parent.mkdir(parents=True)
+        store.path(current).write_bytes(b'current')
+        await database.execute(
+            'UPDATE embedding_map_state SET artifact_location=$2 WHERE dataset_id=1 AND field_name=$1',
+            FIELD,
+            current,
+        )
         unfinished = await submit(database)
         await database.execute(
             "UPDATE jobs SET checkpoint=jsonb_build_object('model_id',$2::text) WHERE id=$1",

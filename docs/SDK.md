@@ -1568,7 +1568,8 @@ dataset.compute_visualization(field_name="clip", method="pca")
 Managed maps change layout only through a re-fit. `compute_visualization` checks map state before
 fetching vectors or fitting and skips managed fields with a clear message; `compute_all` continues
 with hashes and metrics. Server-side `reduce_embeddings` and manual coordinate uploads refuse managed
-replacements with HTTP 409. Use `project_pending` with the current model for incremental placement.
+replacements with HTTP 409. The server places new samples on a managed map from their nearest mapped
+neighbours (`project_pending` returns 0 for it), so no model file is needed or kept.
 Incremental writers pause only while a re-fit is active; full replacements also refuse queued re-fits.
 Managed and stale-model refusals have distinct error codes and no retry headers. A model file is saved
 only after every coordinate upload succeeds. Existing unmanaged maps, such as those written by external importers, retain

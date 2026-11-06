@@ -23,6 +23,7 @@ const NAMES: Record<string, string> = {
     bulk_tag: 'Bulk tagging',
     umap_fit: 'Fitting UMAP',
     map_refit: 'Re-fitting the map',
+    map_place: 'Placing new points on the map',
     backup: 'Backing up the database',
     index_review: 'Reviewing indexes',
     index_drop: 'Removing an index',

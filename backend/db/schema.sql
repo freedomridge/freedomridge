@@ -1889,10 +1889,10 @@ CREATE INDEX IF NOT EXISTS idx_duplicate_jobs ON jobs(dataset_id,created_at DESC
 DROP INDEX IF EXISTS idx_jobs_dataset_history;
 DROP INDEX IF EXISTS idx_statistics_history_retention;
 CREATE INDEX idx_jobs_dataset_history ON jobs(dataset_id,created_at DESC,id DESC)
-    WHERE NOT (kind IN ('statistics','concept_scoring','duplicate_maintenance')
+    WHERE NOT (kind IN ('statistics','concept_scoring','duplicate_maintenance','map_place')
                AND dedupe_owner='system' AND state='succeeded' AND NOT barrier @> '{"full":true}');
 CREATE INDEX idx_statistics_history_retention ON jobs(finished_at,id)
-    WHERE kind IN ('statistics','concept_scoring','duplicate_maintenance')
+    WHERE kind IN ('statistics','concept_scoring','duplicate_maintenance','map_place')
           AND dedupe_owner='system' AND state='succeeded' AND NOT barrier @> '{"full":true}';
 
 -- Dataset deletion lifecycle.
@@ -2412,5 +2412,6 @@ INSERT INTO schema_migrations (filename) VALUES
     ('0001_storage_config_dataset_scope.sql'),
     ('0002_dataset_default_view.sql'),
     ('0003_compute_worker_tokens.sql'),
-    ('0004_map_state_without_model.sql')
+    ('0004_map_state_without_model.sql'),
+    ('0005_map_placement_history.sql')
 ON CONFLICT (filename) DO NOTHING;

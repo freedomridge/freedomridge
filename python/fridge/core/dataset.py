@@ -150,49 +150,6 @@ def _auto_fit_sample_size(total: int, dim: int, bytes_per_point: Optional[int] =
     return fit_n
 
 
-# The current map model loaded by project_pending, by model id: one at a time (a model can be 20 GB).
-_MAP_MODELS: Dict[str, Any] = {}
-
-
-def load_map_model(state):
-    """Load a map's current model (``get_map_state``) from the model folder, verifying its checksum
-    once per model id. The folder is ``FRIDGE_UMAP_MODEL_DIR`` (default ``$FRIDGE_DATA_ROOT/umap_models``),
-    else the server's own path for it on this machine."""
-    model_id = state["model_id"]
-    if not state.get("artifact_location"):
-        raise ValueError(
-            "This map has no model: the server places new samples on it from their nearest mapped neighbours",
-        )
-    if model_id in _MAP_MODELS:
-        return _MAP_MODELS[model_id]
-    import hashlib
-
-    import joblib
-
-    root = os.environ.get("FRIDGE_UMAP_MODEL_DIR") or os.path.join(
-        os.environ.get("FRIDGE_DATA_ROOT", os.path.expanduser("~/.fridge")),
-        "umap_models",
-    )
-    candidates = [os.path.join(root, state["artifact_location"]), state.get("artifact_path")]
-    path = next((candidate for candidate in candidates if candidate and os.path.exists(candidate)), None)
-    if path is None:
-        raise FileNotFoundError(
-            f"The current map model {state['artifact_location']} is not readable on this machine; set "
-            f"FRIDGE_UMAP_MODEL_DIR to the server's model folder",
-        )
-    if state.get("artifact_checksum"):
-        digest = hashlib.sha256()
-        with open(path, "rb") as source:
-            for block in iter(lambda: source.read(16 * 1024 * 1024), b""):
-                digest.update(block)
-        if digest.hexdigest() != state["artifact_checksum"]:
-            raise ValueError(f"{path} does not match the current map model's checksum; not projecting with it")
-    model = joblib.load(path)
-    _MAP_MODELS.clear()
-    _MAP_MODELS[model_id] = model
-    return model
-
-
 def _parallel_queries(reducer):
     """Make the fitted UMAP project new points on every core: pynndescent answers a batch of queries on
     one thread unless ``parallel_batch_queries`` is set (measured 4x faster on 32 cores, 2026-10-21; the
@@ -2688,10 +2645,8 @@ class Dataset:
         This is the incremental-ingestion path: newly-added samples get a position via
         ``model.transform()`` without refitting, so existing points don't move.
 
-        A map with scheduled re-fits (Jobs → Schedules) has one current model: it is used instead of
-        ``model`` (loaded from the server's model folder, ``FRIDGE_UMAP_MODEL_DIR``, on this machine).
-        While a re-fit of the map runs nothing is projected (returns 0); new samples are placed with the
-        new model after it finishes.
+        A map with scheduled re-fits (Jobs → Schedules) is not projected here (returns 0): the server
+        places its new samples from their nearest mapped neighbours, and after a re-fit, on the new map.
         """
         if _patch_tile_fields(field_name):
             # A patch-scale field's data lives across per-tile fields; exact-matching the virtual
@@ -2707,17 +2662,11 @@ class Dataset:
         if state.get("active"):
             print(f"  A map re-fit of '{field_name}' is running; new points are placed when it finishes")
             return 0
-        model_id = state.get("model_id")
-        if model_id:
-            if model is not None:
-                warnings.warn(
-                    f"'{field_name}' has scheduled map re-fits; projecting with its current model {model_id} "
-                    f"(re-fitted {state.get('refitted_at')}) instead of the model passed",
-                    stacklevel=2,
-                )
-            model = load_map_model(state)
-        elif model is None:
-            raise ValueError(f"'{field_name}' has no re-fitted map yet: pass the fitted model to project with")
+        if state.get("model_id"):
+            print(f"  '{field_name}' has scheduled map re-fits: the server places its new points")
+            return 0
+        if model is None:
+            raise ValueError(f"'{field_name}' has no re-fitted map: pass the fitted model to project with")
 
         moved = 0
         last_first = -1
@@ -2756,12 +2705,7 @@ class Dataset:
                 for it, c in zip(items, coords)
             ]
             try:
-                self.client.upload_coordinates(
-                    self._id,
-                    field_name,
-                    payload,
-                    **({"model_id": model_id} if model_id else {}),
-                )
+                self.client.upload_coordinates(self._id, field_name, payload)
             except requests.HTTPError as error:
                 if error.response is None or error.response.status_code != 409:
                     raise

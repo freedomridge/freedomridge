@@ -7,10 +7,9 @@ it loops: find samples that have that embedding but queued projections, project
 them through the model via transform(), and write x/y. Newly-ingested points get a
 position within one interval — no refitting, and existing points don't move.
 
-A field with scheduled map re-fits is projected only with its current model from
-embedding_map_state (the model store under FRIDGE_UMAP_MODEL_DIR/managed), never with a legacy file,
-and not at all while a re-fit of it is queued or running: its new samples wait and are placed with the
-new model once the re-fit publishes. Every write is fenced on that model in the same transaction.
+A field with scheduled map re-fits is never projected here, with a legacy file or otherwise: the job
+runner places its new samples from their nearest mapped neighbours (backend.map_placement). Every write
+is fenced in the same transaction, so a legacy model can't write onto a re-fitted map.
 
 Access is INTRINSIC: it uses DATABASE_URL (exactly like backend.job_service),
 so a deployment that provides the DB connection needs no token or login.
@@ -36,7 +35,6 @@ from backend.coordinates import (  # noqa: E402
     check_map_fence,
 )
 from backend.diskspace import COORDINATE_ROW_BYTES, require_free_space  # noqa: E402
-from backend.map_artifacts import LocalArtifactStore, sha256  # noqa: E402
 
 DATABASE_URL = os.getenv("DATABASE_URL", "postgres://freedomridge:password@localhost:5432/freedomridge")
 INTERVAL = float(os.getenv("FRIDGE_UMAP_INTERVAL", "15"))
@@ -61,26 +59,14 @@ def _discover_models():
 async def _map_states(conn):
     """{(dataset_id, field): row} for fields with scheduled re-fits, with `active` while one runs."""
     rows = await conn.fetch(
-        """SELECT m.dataset_id, m.field_name, m.model_id::text AS model_id, m.artifact_location,
-                  m.artifact_checksum, (j.state IN ('queued','running')) IS TRUE AS active
+        """SELECT m.dataset_id, m.field_name, m.model_id::text AS model_id,
+                  (j.state IN ('queued','running')) IS TRUE AS active
            FROM embedding_map_state m LEFT JOIN jobs j ON j.id = m.active_job_id""",
     )
     return {(row["dataset_id"], row["field_name"]): row for row in rows}
 
 
-def _load_managed(row, loaded):
-    """The current model of a re-fitted map, loaded once per model id and checksum-verified."""
-    if row["model_id"] not in loaded:
-        path = LocalArtifactStore().path(row["artifact_location"])
-        if sha256(path) != row["artifact_checksum"]:
-            raise ValueError(f"{path} does not match the map's recorded checksum")
-        loaded.clear()  # one managed model per field at a time; replaced ones are released
-        loaded[row["model_id"]] = joblib.load(path)
-        print(f"[umap-project] loaded current map model {path}")
-    return loaded[row["model_id"]]
-
-
-async def _project(conn, dataset_id, field, model, batch, model_id=None):
+async def _project(conn, dataset_id, field, model, batch):
     """Project all queued samples for one (dataset, field). Returns count."""
     moved = 0
     last_first = -1
@@ -113,7 +99,7 @@ async def _project(conn, dataset_id, field, model, batch, model_id=None):
         try:
             async with conn.transaction():
                 await conn.execute("SET LOCAL lock_timeout = '5s'")
-                await check_map_fence(conn, dataset_id, field, model_id)
+                await check_map_fence(conn, dataset_id, field)  # refuses a re-fitted map
                 await conn.execute(
                     SAVE_PROJECTED_COORDINATES,
                     [r["sample_id"] for r in rows],
@@ -140,7 +126,6 @@ async def _project(conn, dataset_id, field, model, batch, model_id=None):
 async def main():
     print(f"[umap-project] model dir: {MODEL_DIR}; interval {INTERVAL}s; batch {BATCH}")
     models = {}  # (ds_id, field) -> (model, mtime) for legacy saved models
-    managed = {}  # (ds_id, field) -> {model_id: model} for re-fitted maps
     while True:
         try:
             conn = await asyncpg.connect(DATABASE_URL)  # fresh conn each cycle (robust to drops)
@@ -159,20 +144,10 @@ async def main():
                             print(f"[umap-project] loaded model {path}")
                         except Exception as e:
                             print(f"[umap-project] could not load {path} (skipping): {e}")
-                work = [(key, model, None) for key, (model, _) in models.items()]
-                for key, row in states.items():
-                    if row["active"] or row["model_id"] is None:
-                        continue  # paused while a re-fit runs; a field never re-fitted keeps its legacy model
-                    if row["artifact_location"] is None:
-                        continue  # a map with no model (fitted on a compute worker): the server places its samples
-                    try:
-                        work.append((key, _load_managed(row, managed.setdefault(key, {})), row["model_id"]))
-                    except Exception as e:
-                        print(f"[umap-project] could not load the current map model of {key} (skipping): {e}")
                 total = 0
-                for (ds_id, field), model, model_id in work:
+                for (ds_id, field), (model, _) in models.items():
                     try:
-                        total += await _project(conn, ds_id, field, model, BATCH, model_id)
+                        total += await _project(conn, ds_id, field, model, BATCH)
                     except Exception as e:
                         print(f"[umap-project] projecting ds {ds_id} field '{field}' failed: {e}")
             finally:

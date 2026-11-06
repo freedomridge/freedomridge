@@ -19,6 +19,7 @@ from . import (
     index_advisor,
     index_jobs,
     job_queue,
+    map_placement,
     map_refit,
     schema_check,
     statistics,
@@ -146,7 +147,7 @@ async def _cleanup_statistics_history(pool, job):
     async with pool.acquire(timeout=1) as connection:
         expired = await connection.fetch(
             """SELECT id FROM jobs
-               WHERE kind IN ('statistics','concept_scoring','duplicate_maintenance')
+               WHERE kind IN ('statistics','concept_scoring','duplicate_maintenance','map_place')
                  AND dedupe_owner='system' AND state='succeeded'
                  AND NOT barrier @> '{"full":true}' AND finished_at<$1
                ORDER BY finished_at,id LIMIT $2""",
@@ -167,7 +168,7 @@ async def _cleanup_statistics_history(pool, job):
     async def publish(connection):
         await connection.execute(
             """DELETE FROM jobs WHERE id=ANY($1::uuid[])
-               AND kind IN ('statistics','concept_scoring','duplicate_maintenance')
+               AND kind IN ('statistics','concept_scoring','duplicate_maintenance','map_place')
                  AND dedupe_owner='system' AND state='succeeded'
                AND NOT barrier @> '{"full":true}' AND finished_at<$2""",
             [row['id'] for row in expired],
@@ -246,6 +247,10 @@ async def run_service(dsn=DATABASE_URL):
     async def handle_map_refit(job):
         return await map_refit.handler(pool, fits_here='compute' in placements)(job)
 
+    async def handle_map_place(job):
+        # Each slot's share of the runner's connections, for lookups at once.
+        return await map_placement.handler(pool, lookups=(pool.get_max_size() - 1) // len(runner.workers))(job)
+
     async def handle_index_review(job):
         return await index_advisor.handler(pool)(job)
 
@@ -273,6 +278,7 @@ async def run_service(dsn=DATABASE_URL):
         index_jobs.FIELD_KIND: handle_field_index,
         index_jobs.ANN_KIND: handle_ann_index,
         map_refit.KIND: handle_map_refit,
+        map_placement.KIND: handle_map_place,
         index_advisor.KIND: handle_index_review,
         index_actions.DROP_KIND: handle_index_drop,
         index_actions.RESTORE_KIND: handle_index_restore,
@@ -294,6 +300,7 @@ async def run_service(dsn=DATABASE_URL):
                 index_jobs.FIELD_KIND: index_jobs.FIELD_POLICY,
                 index_jobs.ANN_KIND: index_jobs.ANN_POLICY,
                 map_refit.KIND: map_refit.POLICY,
+                map_placement.KIND: map_placement.POLICY,
                 index_advisor.KIND: index_advisor.POLICY,
                 index_actions.DROP_KIND: index_actions.POLICY,
                 index_actions.RESTORE_KIND: index_actions.POLICY,
@@ -360,6 +367,7 @@ async def run_service(dsn=DATABASE_URL):
                 (lambda: concept_jobs.schedule_concepts(pool), concept_interval, 'Concepts', True),
                 (lambda: backups.schedule_backups(pool), 60, 'Backups', False),
                 (lambda: duplicate_jobs.schedule_duplicates(pool), 5, 'Duplicates', True),
+                (lambda: map_placement.schedule_placements(pool), 5, 'Map placement', True),
                 (lambda: index_jobs.sweep_invalid_indexes(pool), 60, 'Invalid index cleanup', False),
                 (lambda: dataset_schedules.schedule_dataset_jobs(pool), 60, 'Dataset schedules', False),
                 (lambda: map_refit.sweep(pool), 600, 'Map artifact cleanup', False),

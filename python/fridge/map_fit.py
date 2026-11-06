@@ -9,9 +9,9 @@ It needs no database or API access, so the same step can later run on a separate
 The input is PostgreSQL's binary COPY of ``(sample_id int4, vector_version int8, vector)``. The fit
 size comes from the same RAM- and dimension-scaled formula as ``Dataset.compute_visualization``
 (``_auto_fit_sample_size``), measured inside the cap; every point is then projected through the
-fitted model. Outputs, each written completely before ``manifest.json`` (written last):
+fitted model. The model itself is not kept: new samples are placed on a re-fitted map by their nearest
+mapped neighbours. Outputs, each written completely before ``manifest.json`` (written last):
 
-    model.joblib    the fitted reducer
     ids.npy         int32 sample IDs, in input order
     versions.npy    int64 vector versions (the embedding row's xmin at export)
     coords.npy      float32 (N, 2) map coordinates
@@ -126,8 +126,6 @@ def main(argv=None):
     # umap-learn imports TensorFlow for its optional parametric model when it is installed: ~1 GB of
     # RSS and seconds of start-up inside the memory cap, for nothing a re-fit uses.
     sys.modules.setdefault("tensorflow", None)  # type: ignore[arg-type]
-    import joblib
-
     from .core.dataset import (
         MINIMUM_FIT_POINTS,
         _auto_fit_sample_size,
@@ -176,12 +174,7 @@ def main(argv=None):
     coords = np.asarray(coords, dtype=np.float32)
     if coords.shape != (total, 2) or not np.isfinite(coords).all():
         raise SystemExit("The fit produced missing or non-finite coordinates")
-    del vectors
-    temporary = output / "model.joblib.tmp"
-    joblib.dump(reducer, temporary)
-    with open(temporary, "rb+") as model:
-        os.fsync(model.fileno())
-    os.replace(temporary, output / "model.joblib")
+    del vectors, reducer
     _save(output / "ids.npy", ids)
     _save(output / "versions.npy", versions)
     _save(output / "coords.npy", coords)

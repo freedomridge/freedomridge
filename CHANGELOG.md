@@ -15,6 +15,21 @@ it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
   - Every SDK request carries `X-Fridge-SDK-Version`, and the server refuses an SDK of another major version
     with HTTP 426 and the same advice.
 
+### Changed
+
+- Map: new images on a re-fitted map are placed by the server within seconds of arriving, from the 15
+  mapped images most like them (the densest group of them on the map), by a new background job,
+  **Placing new points on the map**. Before, they waited for the optional projection worker or a
+  `Dataset.project_pending()` run with the map's saved UMAP model.
+  - A re-fit no longer saves its UMAP model, which took about as much disk as the exported vectors (tens
+    of GB for millions of images). A model kept from an earlier re-fit is deleted when its map is next
+    re-fitted.
+  - The projection worker and `Dataset.project_pending()` now leave re-fitted maps alone
+    (`project_pending()` returns 0 for them). Maps never re-fitted keep their saved model and their
+    workflow.
+  - Measured on 3.7 million images, 9 in 10 new images land within 1.3% of the map's width of where
+    UMAP's own fit put them ([JOBS.md](docs/architecture/JOBS.md), "Placing new samples").
+
 ### Upgrade notes
 
 - **Upgrade the Python SDK together with the server.** An SDK works only with a server of its own major
@@ -24,6 +39,12 @@ it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
 - Migration `0004_map_state_without_model.sql` lets a re-fitted map have no model file (a map fitted on a
   compute worker, which never brings one back). It only changes a check on `embedding_map_state`, and is
   applied like the others.
+- Migration `0005_map_placement_history.sql` rebuilds two small indexes of the job history, so the new
+  placement jobs stay out of a dataset's job history like statistics and are deleted after a day. While it
+  builds them, job updates wait; the indexes cover the jobs table, which stays small because automatic
+  runs are pruned daily (about 1,000 rows and 15 MB on a deployment three days in).
+- Use the SDK of this release with this server: an older SDK's `Dataset.project_pending()` fails on a map
+  re-fitted by this release, which has no model file.
 
 ## 1.4.0 (2026-11-06)
 
