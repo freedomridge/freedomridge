@@ -956,8 +956,9 @@ draft), says so once, and the grid, sidebar and scatter load the new map, where 
 again. The panel also clears its own draft lasso when the map changes under it. Fields never re-fitted
 accept polygons as before.
 
-**Placing new samples** on a re-fitted map (`backend/map_placement.py`, kind `map_place`). A re-fitted map
-keeps no model; each new sample goes where the images most like it already are:
+**Placing new samples** on a map (`backend/map_placement.py`, kind `map_place`): every whole-image map, re-fitted
+or made by the SDK (`compute_visualization`), meaning every `embedding_viz_meta` row with points. Patch maps
+aren't placed. No map keeps a model; each new sample goes where the images most like it already are:
 - The field's vector index finds the 15 mapped samples of the dataset with the closest vectors (cosine), one
   index search per sample (a `LATERAL` join; ordering a plain join by the distance would sort every vector of
   the field). The index is partial (`WHERE field_name = ...`), so the lookup runs on a plan made for the
@@ -974,24 +975,43 @@ keeps no model; each new sample goes where the images most like it already are:
   Against a UMAP fit with images held out (on Open Images and iNaturalist), it keeps more of each held-out
   image's embedding neighbours near it on the map than UMAP's `transform` does, a measure that favours
   placing by neighbours.
-- `schedule_placements` (every 5 s, in the job runner) queues one job per re-fitted map with samples waiting
+- `schedule_placements` (every 5 s, in the job runner) queues one job per map with samples waiting
   in `embedding_projection_pending`, in the maintenance lane, with the newest waiting sample as its barrier:
   the job ends even while ingest continues, and the dataset's other maintenance gets its turn. It skips a map
   whose re-fit is active, one whose placement is queued or running, and, for 5 minutes, one whose last
-  placement failed or found no neighbours for anything (an empty map). Like statistics, its successful
+  placement failed or found no neighbours for anything. A field with no map yet gets nothing placed: its first
+  fit gives every sample a spot. Like statistics, its successful
   runs stay out of the dataset's job history and are deleted after a day (migration 0005).
 - Each step looks up one batch, 64 samples per statement, with as many statements at once as the slot's share
   of the runner's pool (2 by default). On the 3.7M dataset that is about 42 samples a second for DINOv3 and
   140 for CLIP. The write runs in the step's publication, under `check_map_fence` with the map id read before
   the lookups, and with each sample's vector version: a batch looked up on a map that is being re-fitted or
   was replaced meanwhile writes nothing (its samples stay queued, for the new map), and a sample whose vector
-  changed is skipped and queued again.
+  changed is skipped and queued again. Only samples still waiting are written, with their queue rows locked
+  (`FOR SHARE SKIP LOCKED`), so a sample another writer placed meanwhile keeps its spot.
+- **A full layout holds placement** (`embedding_viz_meta.placement_held_until`, migration 0006). A layout
+  written over time would otherwise leave every sample ingested after its vectors were read at a spot taken
+  from the old layout, kept on the new one. The SDK's `compute_visualization` takes the hold
+  (`PUT .../embeddings/placement-hold`) before it reads the vectors, renews it from a thread every
+  `HOLD_RENEW_SECONDS` (120) while it fits and uploads, and releases it (`DELETE`) once the new layout is
+  ranked, or when it fails. `/reduce` holds it from its read to its ranking. A hold lasts
+  `PLACEMENT_HOLD_SECONDS` (600) unless renewed, so a script that dies holds placement up for at most ten
+  minutes. The scheduler skips a held map, and the write re-checks the hold with the map's
+  `embedding_viz_meta` row share-locked: a batch looked up before a hold writes nothing, and a hold taken
+  during a write waits for it (the layout's read then includes those samples). Samples that arrive meanwhile
+  wait and are placed on the new layout. Any other writer of a full layout should take the hold too. If
+  renewals fail for longer than the hold lasts (the server unreachable, or a long call holding the GIL), the
+  hold lapses and samples may have been placed from the old layout meanwhile. The SDK notices: its deadline
+  is kept on its own monotonic clock from before each renewal, and before writing the first coordinate it
+  raises with the map unchanged ("run it again"). A lapse during the upload is reported before ranking.
+- Measured against a fresh fit while a map grows (an arrival-order replay on the 3.7M dataset; [issue 20](https://github.com/freedomridge/freedomridge/issues/20)):
+  placed images keep 2–3 times more of a full fit's local structure than placing from the fitted points alone,
+  and 3–4 times more than UMAP's `transform`, but they drift as growth compounds. Re-fit a map that has grown
+  well past its fit.
 
-The projection daemon (`scripts/umap_project_job.py`) and the SDK's `Dataset.project_pending` place nothing
-on a re-fitted map: the daemon serves only legacy models, and `check_map_fence` refuses their writes on a
-re-fitted map; `project_pending` returns 0 there. A projected `POST .../coordinates` must name the map's
-current id. Fields never re-fitted keep their legacy model and behavior. Failure or cancel of a re-fit leaves
-the old map current; a job that is no longer queued or running is not active, so nothing needs cleaning for
+There is no other projection path: the projection daemon, `Dataset.project_pending` and saved model files
+are gone (2.0). A projected `POST .../coordinates` must name the map's current id. Failure or cancel of a
+re-fit leaves the old map current; a job that is no longer queued or running is not active, so nothing needs cleaning for
 placement to resume. The runner's sweep (every 10 minutes) deletes work folders of finished re-fits and model
 files that are neither current nor owned by an unfinished re-fit (models of maps fitted before re-fits
 stopped keeping one); it reads both sets in one statement (one snapshot).

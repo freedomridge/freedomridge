@@ -1568,12 +1568,15 @@ dataset.compute_visualization(field_name="clip", method="pca")
 Managed maps change layout only through a re-fit. `compute_visualization` checks map state before
 fetching vectors or fitting and skips managed fields with a clear message; `compute_all` continues
 with hashes and metrics. Server-side `reduce_embeddings` and manual coordinate uploads refuse managed
-replacements with HTTP 409. The server places new samples on a managed map from their nearest mapped
-neighbours (`project_pending` returns 0 for it), so no model file is needed or kept.
+replacements with HTTP 409. The server places new samples on every map, managed or not, from their nearest
+mapped neighbours (the job runner's `map_place` jobs, within seconds of ingest), so no model is kept and no
+projection step is needed after an ingest. A field with no map yet (`dataset.map_state(field)["current_points"]`
+is 0) needs a first `compute_visualization` or re-fit. While `compute_visualization` lays out a map that
+already has points, it holds the server's placement on it (renewed while it works, released when it is done),
+so samples ingested meanwhile are placed on the new layout, not the old one.
 Incremental writers pause only while a re-fit is active; full replacements also refuse queued re-fits.
-Managed and stale-model refusals have distinct error codes and no retry headers. A model file is saved
-only after every coordinate upload succeeds. Existing unmanaged maps, such as those written by external importers, retain
-their full-fit workflow.
+Managed and stale-model refusals have distinct error codes and no retry headers. Existing unmanaged maps, such
+as those written by external importers, retain their full-fit workflow.
 
 ### Refresh Stats
 
@@ -1951,7 +1954,7 @@ class Dataset:
     def compute_patch_embeddings(model_name="openai/clip-vit-base-patch32", field_name="clip", scales=None,
                                  image_loader=None, batch_size=50, reduce=True, partition=None,
                                  total_partitions=None, num_threads=4) -> dict
-    def compute_visualization(field_name="clip", fit_sample_size="auto", method="umap", save_model_path=None) -> dict
+    def compute_visualization(field_name="clip", fit_sample_size="auto", method="umap") -> dict
     def refresh_stats(*, wait=True, timeout=1800, force=False) -> dict | Job
 
     # Array fields

@@ -4,7 +4,6 @@ import asyncio
 import os
 import uuid
 from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import numpy as np
@@ -182,16 +181,6 @@ def test_real_fit_in_memory_capped_child_publishes_a_complete_new_map(registry_d
     registry_database(scenario)
 
 
-def load_projector():
-    import importlib.util
-
-    spec = importlib.util.spec_from_file_location('map_refit_projector', ROOT / 'scripts/umap_project_job.py')
-    assert spec and spec.loader
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
 async def add_sample(db, sample_id, vector, dataset_id=1, field=FIELD):
     await db.execute(
         "INSERT INTO samples(id,dataset_id,filepath,media_type) VALUES ($1,$2,'image-' || $1::int,'image')",
@@ -220,8 +209,6 @@ def test_changes_during_the_fit_are_skipped_and_queued_for_the_new_map(registry_
     """Vector changed, sample deleted, new sample, identical re-upload: none keeps a coordinate from
     either the old map or the stale fit, and all are placed on the new map afterwards."""
     store = LocalArtifactStore(tmp_path)
-    projector = load_projector()
-    monkeypatch.setattr(projector, 'require_free_space', AsyncMock())
     monkeypatch.setattr(map_placement, 'require_free_space', AsyncMock())
 
     async def scenario(database):
@@ -261,10 +248,7 @@ def test_changes_during_the_fit_are_skipped_and_queued_for_the_new_map(registry_
         state = await map_state(database)
         assert state['points_at_refit'] == 197
 
-        # The projection daemon refuses the re-fitted map; the job runner places them on it, by neighbours.
-        async with database.pool.acquire() as connection:
-            assert await projector._project(connection, 1, FIELD, FakeModel(shift=-5000), 50) == 0
-        assert await pending(database) == {changed, retried, new}
+        # The job runner places them on the new map, by neighbours.
         [placement] = await map_placement.schedule_placements(database.pool)
         worker = await make_worker(
             database,
@@ -283,10 +267,9 @@ def test_changes_during_the_fit_are_skipped_and_queued_for_the_new_map(registry_
     registry_database(scenario)
 
 
-def test_projection_pauses_during_a_refit_and_resumes_after_cancel(registry_database, tmp_path, monkeypatch):
+def test_placement_pauses_during_a_refit_and_resumes_after_cancel(registry_database, tmp_path, monkeypatch):
     store = LocalArtifactStore(tmp_path)
-    projector = load_projector()
-    monkeypatch.setattr(projector, 'require_free_space', AsyncMock())
+    monkeypatch.setattr(map_placement, 'require_free_space', AsyncMock())
     monkeypatch.setattr(embeddings, 'require_free_space', AsyncMock())
     started = asyncio.Event()
 
@@ -294,7 +277,6 @@ def test_projection_pauses_during_a_refit_and_resumes_after_cancel(registry_data
         monkeypatch.setattr(embeddings, 'db', database)
         await seed(database, n=40)
         await add_sample(database, 900, [1, 1, 1, 1, 1, 1, 1, 1])
-        legacy = FakeModel(shift=-500)
 
         async def run_fit(command, source, output, log_path, allowance, bytes_per_point=None, **sizing):
             started.set()
@@ -314,9 +296,8 @@ def test_projection_pauses_during_a_refit_and_resumes_after_cancel(registry_data
         running = asyncio.create_task(worker.run_once())
         await asyncio.wait_for(started.wait(), 30)
         assert (await map_state(database))['active']
-        # Daemon, API and SDK all hold back.
-        async with database.pool.acquire() as connection:
-            assert await projector._project(connection, 1, FIELD, legacy, 50) == 0
+        # Placement and the API hold back.
+        assert await map_placement.schedule_placements(database.pool) == []
         assert await pending(database) == {900}
         update = [embeddings.CoordinateUpdate(sample_id=900, x=1, y=1, vector_version='1')]
         for kwargs in ({}, {'model_id': str(uuid.uuid4())}):
@@ -325,10 +306,6 @@ def test_projection_pauses_during_a_refit_and_resumes_after_cancel(registry_data
             assert refused.value.status_code == 409 and 'in progress' in refused.value.detail
         with pytest.raises(HTTPException):  # a manual layout upload waits too
             await embeddings.upload_coordinates(1, FIELD, [embeddings.CoordinateUpdate(sample_id=1, x=1, y=1)], USER)
-        sdk = object.__new__(sdk_dataset.Dataset)
-        sdk._id = 1
-        sdk.client = SimpleNamespace(get_map_state=lambda dataset_id, field: {'active': True, 'model_id': None})
-        assert sdk.project_pending(FIELD, legacy) == 0
 
         await job_queue.cancel_job(database.pool, job['id'])
         await asyncio.wait_for(running, 30)
@@ -336,10 +313,18 @@ def test_projection_pauses_during_a_refit_and_resumes_after_cancel(registry_data
         assert not (await map_state(database))['active']
         points = await map_points(database)
         assert len(points) == 40 and all(x < -50 for x, _ in points.values())  # old map untouched
-        # Projection resumes with the field's existing (legacy) model.
-        async with database.pool.acquire() as connection:
-            assert await projector._project(connection, 1, FIELD, legacy, 50) == 1
+        # Placement resumes, on the map that was never re-fitted.
+        [placement] = await map_placement.schedule_placements(database.pool)
+        placer = await make_worker(
+            database,
+            {map_placement.KIND: map_placement.handler(database.pool)},
+            policies={map_placement.KIND: map_placement.POLICY},
+            placements=('server',),
+        )
+        await placer.run_once()
+        assert (await database.fetchval('SELECT state FROM jobs WHERE id=$1', placement['id'])) == 'succeeded'
         assert await pending(database) == set()
+        assert (await map_points(database))[900][0] < -50  # on the old map, among its points
         await assert_ranks_exact(database)
 
     registry_database(scenario)

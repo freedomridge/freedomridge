@@ -1,19 +1,15 @@
 """Regressions for deploying 058 and for concurrent projection."""
 
 import asyncio
-import importlib.util
 import json
 import os
-from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import asyncpg
-import numpy as np
 import pytest
-from fridge.core.dataset import Dataset
 
 from backend.routers import embeddings
-from backend.tests.test_layout_coordinates import ROOT, registry_database, seed, upload
+from backend.tests.test_layout_coordinates import registry_database, seed, upload
 
 __all__ = ['registry_database']
 pytestmark = pytest.mark.skipif(not os.getenv('FRIDGE_TEST_POSTGRES_DSN'), reason='Disposable PostgreSQL required')
@@ -33,44 +29,6 @@ def test_legacy_coordinate_writes_fail_loudly(registry_database, statement):
         await seed(db, 1)
         with pytest.raises(asyncpg.RaiseError, match='coordinates live in embedding_coordinates'):
             await db.execute(statement)
-
-    registry_database(scenario)
-
-
-def test_sdk_project_pending_passes_vector_version():
-    written = []
-    dataset = object.__new__(Dataset)
-    dataset._id = 1
-    pages = iter([{'items': [{'sample_id': 1, 'vector': [1, 2, 3], 'vector_version': '123'}]}, {'items': []}])
-    dataset.client = SimpleNamespace(
-        get_map_state=lambda dataset_id, field: {'managed': False, 'active': False, 'model_id': None},
-        get_vectors=lambda *args, **kwargs: next(pages),
-        upload_coordinates=lambda ds, field, payload: written.extend(payload),
-        recompute_viz_rank=lambda *args, **kwargs: None,
-    )
-    model = SimpleNamespace(transform=lambda vectors: np.zeros((len(vectors), 2)))
-    dataset.project_pending('clip', model)
-    assert written == [{'sample_id': 1, 'x': 0.0, 'y': 0.0, 'vector_version': '123'}]
-
-
-def test_direct_projector_rejects_reembedding_during_transform(registry_database, monkeypatch):
-    spec = importlib.util.spec_from_file_location('review_projection', ROOT / 'scripts/umap_project_job.py')
-    assert spec and spec.loader
-    worker = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(worker)
-
-    async def scenario(db):
-        await seed(db, 1)
-
-        async def reembed(*args):
-            await db.execute("UPDATE embeddings SET vector='[7,8,9]' WHERE sample_id=1")
-
-        monkeypatch.setattr(worker, 'require_free_space', reembed)
-        model = SimpleNamespace(transform=lambda vectors: np.zeros((len(vectors), 2)))
-        async with db.pool.acquire() as conn:
-            await worker._project(conn, 1, 'clip', model, 10)
-        assert await db.fetchval('SELECT count(*) FROM embedding_coordinates') == 0
-        assert await db.fetchval('SELECT count(*) FROM embedding_projection_pending') == 1
 
     registry_database(scenario)
 

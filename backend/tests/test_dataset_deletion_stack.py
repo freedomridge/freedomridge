@@ -1,6 +1,5 @@
 """Deletion fences and bounded fan-out across concepts, duplicates, coordinates and deletion."""
 
-import importlib.util
 import json
 import os
 import sys
@@ -13,6 +12,7 @@ import numpy as np
 import pytest
 
 from backend import dataset_deletion, duplicate_jobs, job_queue
+from backend.coordinates import SAVE_PROJECTED_COORDINATES
 from backend.routers import embeddings
 from backend.tests import test_field_registry_postgres
 from backend.tests.test_dataset_deletion import claim, finish, seed, step
@@ -120,12 +120,11 @@ def test_new_tables_reject_writes_after_seal(registry_database, table):
     registry_database(scenario)
 
 
-@pytest.mark.parametrize('writer', ['upload', 'projection', 'reduce', 'rank'])
+@pytest.mark.parametrize('writer', ['upload', 'placement', 'reduce', 'rank'])
 def test_coordinate_publication_rejects_seal(registry_database, monkeypatch, writer):
     from backend.tests.test_layout_coordinates import seed as seed_coordinates
 
     monkeypatch.setattr(embeddings, 'require_free_space', AsyncMock())
-    model = SimpleNamespace(n_features_in_=3, transform=lambda vectors: np.zeros((len(vectors), 2)))
 
     async def scenario(db):
         await seed_coordinates(db)
@@ -139,17 +138,8 @@ def test_coordinate_publication_rejects_seal(registry_database, monkeypatch, wri
                     [embeddings.CoordinateUpdate(sample_id=1, x=1, y=2)],
                     USER,
                 )
-            elif writer == 'projection':
-                spec = importlib.util.spec_from_file_location(
-                    'deletion_projection',
-                    DB.parents[1] / 'scripts/umap_project_job.py',
-                )
-                assert spec and spec.loader
-                worker = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(worker)
-                monkeypatch.setattr(worker, 'require_free_space', AsyncMock())
-                async with db.pool.acquire() as conn:
-                    await worker._project(conn, 1, 'clip', model, 3)
+            elif writer == 'placement':  # the statement map placement writes with (backend/map_placement.py)
+                await db.execute(SAVE_PROJECTED_COORDINATES, [1], [1.0], [2.0], 1, 'clip', [None])
             elif writer == 'reduce':
                 monkeypatch.setitem(
                     sys.modules,

@@ -152,7 +152,7 @@ services:
       DEMO_MODE: ${DEMO_MODE:-false}
       JOB_WORKER_SLOTS: ${JOB_WORKER_SLOTS:-3}
       JOB_POOL_MAX_SIZE: ${JOB_POOL_MAX_SIZE:-6}
-      # Map re-fits write their export and models here; the umap-worker projects new samples with them.
+      # Map re-fits write their export and fit outputs here (no models are kept).
       FRIDGE_UMAP_MODEL_DIR: /models
       # 'server' leaves compute work (map re-fits' fits) to compute workers (python -m fridge.worker).
       JOB_RUNNER_PLACEMENTS: ${JOB_RUNNER_PLACEMENTS:-server,compute}
@@ -190,29 +190,6 @@ services:
       AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-${S3_REGION:-us-east-1}}
     volumes:
       - ${BACKUP_VOLUME_PATH:-freedomridge_backups}:/backups
-    depends_on:
-      db:
-        condition: service_healthy
-    restart: unless-stopped
-    networks:
-      - freedomridge-network
-
-  # Incremental UMAP projection — OPT-IN ONLY: starts only with `--profile umap`.
-  # Projects newly-ingested embeddings through the saved UMAP model(s) so new points
-  # appear on the embeddings plot without a refit. Direct DB access (no API auth); the
-  # fit that PRODUCES the models is run separately via `python -m fridge.umap_worker fit`.
-  umap-worker:
-    logging: *default-logging
-    profiles: ["umap"]
-    build:
-      context: .
-      dockerfile: Dockerfile.worker
-    command: python3 scripts/umap_project_job.py
-    environment:
-      DATABASE_URL: postgresql://${POSTGRES_USER:-freedomridge}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}@db:5432/${POSTGRES_DB:-freedomridge}
-      FRIDGE_UMAP_MODEL_DIR: /models
-    volumes:
-      - umap_models:/models
     depends_on:
       db:
         condition: service_healthy
@@ -292,7 +269,7 @@ volumes:
   # backups with it). For true off-instance durability also set BACKUP_S3_URI.
   freedomridge_backups:
     driver: local
-  # Saved UMAP models, shared between the fit and the (opt-in) umap-worker.
+  # Map re-fits' work folders (the export and the fit's outputs), shared by the job-runner and the backend.
   umap_models:
     driver: local
 

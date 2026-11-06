@@ -51,10 +51,9 @@ independently of ingestion. `--retry-every 0` disables deliberate replays.
 For realistic HNSW costs, provision the two indexes on the disposable stack before
 the run. `--clip-field` and `--dino-field` can select existing indexed field names
 in a restored copy; defaults are `soak_clip_512` and `soak_dino_1024`. The harness
-does not build indexes or scan historical samples. To exercise projection, supply
-`--model-dir` containing trusted saved UMAP models named `<embedding_field>.joblib`.
-Present models are loaded once and used with `Dataset.project_pending`; missing
-files are skipped. Only load trusted joblib files. This does not fit a new model.
+does not build indexes or scan historical samples. New points are placed on a dataset's maps by the
+server's `map_place` jobs (from their nearest mapped neighbours), so placement is exercised only for a
+restored dataset that has maps (`--dataset-id`); the harness fits none.
 
 Outputs are flushed throughout the run:
 

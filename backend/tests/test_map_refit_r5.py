@@ -166,7 +166,7 @@ def test_projection_pauses_during_a_heal_jobs_rank(registry_database, tmp_path, 
 
         monkeypatch.setattr(map_refit, '_rank', observed)
         assert (await run_job(database, heal, store))['state'] == 'succeeded'
-        assert seen['active'] is True  # SDK project_pending and the projection worker wait
+        assert seen['active'] is True  # map placement waits
         state = await map_state(database)
         assert state['active'] is False and state['active_job_id'] is None
         await assert_grid_ranks(database, 300)

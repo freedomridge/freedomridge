@@ -897,7 +897,6 @@ dependencies = [
 [package.optional-dependencies]
 all = [
     { name = "imagehash" },
-    { name = "joblib" },
     { name = "opencv-python-headless" },
     { name = "psutil" },
     { name = "scikit-learn" },
@@ -914,7 +913,6 @@ all = [
     { name = "umap-learn" },
 ]
 embeddings = [
-    { name = "joblib" },
     { name = "psutil" },
     { name = "sentence-transformers" },
     { name = "umap-learn" },
@@ -951,8 +949,6 @@ quality = [
 requires-dist = [
     { name = "imagehash", marker = "extra == 'all'" },
     { name = "imagehash", marker = "extra == 'hashes'" },
-    { name = "joblib", marker = "extra == 'all'" },
-    { name = "joblib", marker = "extra == 'embeddings'" },
     { name = "numpy" },
     { name = "opencv-python-headless", marker = "extra == 'all'" },
     { name = "opencv-python-headless", marker = "extra == 'metrics'" },
@@ -1029,7 +1025,6 @@ dev = [
 examples = [
     { name = "freedomridge", extra = ["all"] },
     { name = "imagehash" },
-    { name = "joblib" },
     { name = "python-dotenv" },
     { name = "rasterio" },
     { name = "tqdm" },
@@ -1075,7 +1070,6 @@ dev = [
 examples = [
     { name = "freedomridge", extras = ["all"], editable = "python" },
     { name = "imagehash" },
-    { name = "joblib" },
     { name = "python-dotenv", specifier = ">=1.0,<2" },
     { name = "rasterio" },
     { name = "tqdm" },

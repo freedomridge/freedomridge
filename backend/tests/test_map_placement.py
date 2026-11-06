@@ -1,17 +1,18 @@
-"""New samples on a re-fitted map: placed by their nearest mapped neighbours, under the map writers' fence."""
+"""New samples on a map, re-fitted or not: placed by their nearest mapped neighbours, under the map writers' fence."""
 
 import os
+import time
 import uuid
 from datetime import timedelta
-from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import numpy as np
 import pytest
-from fridge.core import dataset as sdk_dataset
+from fastapi import HTTPException
 
 from backend import access, job_queue, job_service, map_placement
 from backend.map_artifacts import LocalArtifactStore
+from backend.routers import embeddings
 from backend.routers import jobs as jobs_router
 from backend.tests import test_field_registry_postgres
 from backend.tests.test_job_runner import make_worker
@@ -72,6 +73,16 @@ async def refitted_map(database, store, n=200):
     return ids
 
 
+async def refitted_map_points(database, ids):
+    """Give `ids` map spots again (their queue rows go), and re-rank the map."""
+    await database.execute(
+        'INSERT INTO embedding_coordinates(sample_id,field_name,x,y) SELECT i,$2,1000 + i,0 FROM unnest($1::int[]) i',
+        ids,
+        FIELD,
+    )
+    await database.execute('SELECT recompute_viz_rank(1,$1,TRUE)', FIELD)
+
+
 async def placer(database, lookups=2):
     return await make_worker(
         database,
@@ -115,6 +126,7 @@ def test_a_map_that_grows_tenfold_places_every_new_sample_with_its_group(
         await add_samples(database, new, [groups[i] for i in new], seed=1)
         assert await pending(database) == set(new)
 
+        vectors = await database.fetch('SELECT sample_id, ctid::text, xmin::text FROM embeddings ORDER BY sample_id')
         [job] = await map_placement.schedule_placements(database.pool)
         assert job['barrier'] == {'upper': 3000} and job['lane'] == 'maintenance'
         assert await map_placement.schedule_placements(database.pool) == []  # one at a time per map
@@ -126,6 +138,10 @@ def test_a_map_that_grows_tenfold_places_every_new_sample_with_its_group(
         assert finished['result'] == {'placed': 2000, 'without_neighbours': 0}
         assert finished['progress_done'] == finished['progress_total'] == 2000
         assert await pending(database) == {5000}
+        # It only reads vectors: no embedding row is rewritten (that would queue it again).
+        assert (await database.fetch('SELECT sample_id, ctid::text, xmin::text FROM embeddings ORDER BY sample_id'))[
+            : len(vectors)
+        ] == vectors
 
         points = await map_points(database)
         assert all(group_of(*points[i]) == groups[i] for i in new)  # every one with its own group
@@ -259,7 +275,7 @@ def test_a_vector_changed_after_its_lookup_is_not_placed_and_waits_for_the_next_
     registry_database(scenario)
 
 
-def test_an_empty_map_places_nothing_and_is_not_rescheduled_for_five_minutes(
+def test_an_empty_map_is_not_scheduled_and_unplaceable_samples_back_off_for_five_minutes(
     registry_database,
     tmp_path,
     fake_fit,  # noqa: F811
@@ -271,9 +287,23 @@ def test_an_empty_map_places_nothing_and_is_not_rescheduled_for_five_minutes(
         ids = await refitted_map(database, store, n=20)
         await database.execute('DELETE FROM embedding_coordinates WHERE field_name=$1', FIELD)  # queues them all
         assert await pending(database) == set(ids)
+        assert await map_placement.schedule_placements(database.pool) == []  # no map to place on
+
+        await refitted_map_points(database, ids)
+        # Zero vectors have no cosine distance to anything: nothing to place them by.
+        await database.execute(
+            "INSERT INTO samples(id,dataset_id,filepath,media_type) SELECT i,1,'image-' || i,'image' "
+            'FROM generate_series(1001, 1003) i',
+        )
+        await database.execute(
+            'INSERT INTO embeddings(sample_id,field_name,vector) '
+            'SELECT i,$1,$2::vector FROM generate_series(1001, 1003) i',
+            FIELD,
+            str([0.0] * DIM),
+        )
         [job] = await map_placement.schedule_placements(database.pool)
         finished = await run_to_end(database, await placer(database), job)
-        assert finished['result'] == {'placed': 0, 'without_neighbours': 20}
+        assert finished['result'] == {'placed': 0, 'without_neighbours': 3}
         assert await map_placement.schedule_placements(database.pool) == []
         await database.execute(
             "UPDATE jobs SET finished_at = finished_at - interval '6 minutes' WHERE id=$1",
@@ -327,10 +357,232 @@ def test_the_densest_group_wins_over_a_split_neighbourhood():
     assert tuple(map_placement.place(np.zeros((15, 2)), distances)) == (0.0, 0.0)
 
 
-def test_the_sdk_leaves_a_re_fitted_map_to_the_server():
-    sdk = object.__new__(sdk_dataset.Dataset)
-    sdk._id = 1
-    sdk.client = SimpleNamespace(
-        get_map_state=lambda dataset_id, field: {'active': False, 'model_id': str(uuid.uuid4())},
-    )
-    assert sdk.project_pending(FIELD, object()) == 0  # never reads a vector, never loads a model
+def test_a_map_never_re_fitted_gets_its_new_samples_placed_too(registry_database, free_space, monkeypatch):
+    async def scenario(database):
+        # A map made by the SDK (a full layout, no re-fit state): each image where the fake fit would put it.
+        ids = list(range(1, 201))
+        await add_samples(database, ids, ['A' if i % 2 else 'B' for i in ids])
+        await database.execute(
+            """INSERT INTO embedding_coordinates(sample_id,field_name,x,y)
+               SELECT e.sample_id, e.field_name, 1000 + (e.vector::real[])[1], (e.vector::real[])[2]
+               FROM embeddings e WHERE e.field_name = $1""",
+            FIELD,
+        )
+        await database.execute('SELECT recompute_viz_rank(1,$1,TRUE)', FIELD)
+        assert await database.fetchval('SELECT count(*) FROM embedding_map_state') == 0
+        monkeypatch.setattr(embeddings, 'db', database)
+        assert (await embeddings.get_map_state(1, FIELD, {'id': 1, 'role': 'admin'}))['current_points'] == 200
+
+        await add_samples(database, [1001, 1002], ['A', 'B'], seed=1)
+        [job] = await map_placement.schedule_placements(database.pool)
+        assert (await run_to_end(database, await placer(database), job))['result']['placed'] == 2
+        points = await map_points(database)
+        assert (group_of(*points[1001]), group_of(*points[1002])) == ('A', 'B')
+        await assert_ranks_exact(database)
+
+    registry_database(scenario)
+
+
+def test_a_sample_another_writer_placed_meanwhile_keeps_its_place(
+    registry_database,
+    tmp_path,
+    monkeypatch,
+    fake_fit,  # noqa: F811
+    free_space,
+):
+    store = LocalArtifactStore(tmp_path)
+
+    async def scenario(database):
+        await refitted_map(database, store)
+        await add_samples(database, [1001, 1002], ['A', 'B'], seed=1)
+        measure = map_placement._measure
+
+        async def measure_then_place_one(pool, job, lookups):
+            batch = await measure(pool, job, lookups)
+            if batch and batch['placed']:
+                # A full layout gives 1001 a spot between the lookup and the write (its queue row goes with it).
+                await database.execute(
+                    'INSERT INTO embedding_coordinates(sample_id,field_name,x,y) VALUES (1001,$1,-7,-7)',
+                    FIELD,
+                )
+            return batch
+
+        monkeypatch.setattr(map_placement, '_measure', measure_then_place_one)
+        [job] = await map_placement.schedule_placements(database.pool)
+        finished = await run_to_end(database, await placer(database), job)
+        assert finished['result'] == {'placed': 1, 'without_neighbours': 0}
+        points = await map_points(database)
+        assert points[1001] == (-7, -7) and group_of(*points[1002]) == 'B'
+
+    registry_database(scenario)
+
+
+def test_nothing_is_written_without_disk_space_and_the_samples_wait(
+    registry_database,
+    tmp_path,
+    monkeypatch,
+    fake_fit,  # noqa: F811
+):
+    store = LocalArtifactStore(tmp_path)
+
+    async def scenario(database):
+        await refitted_map(database, store)
+        await add_samples(database, [1001], ['A'], seed=1)
+        full = AsyncMock(side_effect=HTTPException(status_code=507, detail='Not enough disk space'))
+        monkeypatch.setattr(map_placement, 'require_free_space', full)
+        [job] = await map_placement.schedule_placements(database.pool)
+        failed = await run_to_end(database, await placer(database), job)
+        assert failed['state'] == 'failed' and await pending(database) == {1001}
+        full.assert_awaited()
+        monkeypatch.setattr(map_placement, 'require_free_space', AsyncMock())
+        await database.execute(
+            "UPDATE jobs SET finished_at = finished_at - interval '6 minutes' WHERE id=$1",
+            job['id'],
+        )
+        [job] = await map_placement.schedule_placements(database.pool)
+        assert (await run_to_end(database, await placer(database), job))['result']['placed'] == 1
+
+    registry_database(scenario)
+
+
+def test_a_full_layout_holds_placement_and_a_batch_looked_up_before_the_hold_writes_nothing(
+    registry_database,
+    tmp_path,
+    monkeypatch,
+    fake_fit,  # noqa: F811
+    free_space,
+):
+    store = LocalArtifactStore(tmp_path)
+
+    async def scenario(database):
+        await refitted_map(database, store)
+        await add_samples(database, [1001, 1002], ['A', 'B'], seed=1)
+        monkeypatch.setattr(embeddings, 'db', database)
+        user = {'id': 1, 'role': 'admin'}
+        measure = map_placement._measure
+
+        async def measure_then_hold(pool, job, lookups):
+            batch = await measure(pool, job, lookups)
+            if batch and batch['placed']:  # an SDK layout starts between the lookup and the write
+                assert (await embeddings.hold_placement(1, FIELD, user))['held_until'] is not None
+            return batch
+
+        monkeypatch.setattr(map_placement, '_measure', measure_then_hold)
+        [job] = await map_placement.schedule_placements(database.pool)
+        worker = await placer(database)
+        finished = await run_to_end(database, worker, job)
+        assert finished['result']['placed'] == 0 and await pending(database) == {1001, 1002}
+        monkeypatch.setattr(map_placement, '_measure', measure)
+        assert await map_placement.schedule_placements(database.pool) == []  # held: nothing is scheduled
+
+        # The layout ends: its writer releases the hold, and the waiting samples are placed on the new layout.
+        await embeddings.release_placement(1, FIELD, user)
+        [job] = await map_placement.schedule_placements(database.pool)
+        assert (await run_to_end(database, worker, job))['result']['placed'] == 2
+
+        # A writer that dies stops renewing: its hold lapses, and placement resumes.
+        await add_samples(database, [1003], ['A'], seed=2)
+        await embeddings.hold_placement(1, FIELD, user)
+        assert await map_placement.schedule_placements(database.pool) == []
+        await database.execute(
+            "UPDATE embedding_viz_meta SET placement_held_until = clock_timestamp() - interval '1 second'",
+        )
+        assert len(await map_placement.schedule_placements(database.pool)) == 1
+
+    registry_database(scenario)
+
+
+def test_the_sdk_holds_placement_from_before_its_vectors_until_its_layout_is_ranked(monkeypatch):
+    from backend.tests.test_map_writer_followup import sdk_fixture
+
+    sdk, _ = sdk_fixture(monkeypatch)
+    calls = []
+    record = lambda name: lambda *args, **kwargs: calls.append(name)  # noqa: E731
+    held = {'held_until': '2026-11-06T12:00:00+00:00', 'renew_seconds': 0.01}
+
+    def hold(*args):
+        calls.append('hold')
+        return held
+
+    sdk.client.hold_map_placement = Mock(side_effect=hold)
+    sdk.client.release_map_placement = Mock(side_effect=record('release'))
+    sdk.client.clone = lambda: sdk.client
+    vectors = sdk.client.get_vectors.return_value
+
+    def slow_vectors(*args, **kwargs):  # long enough for the hold to be renewed
+        calls.append('vectors')
+        time.sleep(0.1)
+        return vectors
+
+    sdk.client.get_vectors = Mock(side_effect=slow_vectors)
+    sdk.client.recompute_viz_rank = Mock(side_effect=record('rank'))
+    assert sdk.compute_visualization(FIELD, 8)['reduced'] == 8
+    assert calls[0] == 'hold' and calls[1] == 'vectors' and calls[-2:] == ['rank', 'release']
+    assert calls.count('hold') > 1  # renewed while it worked
+    renewals = calls.count('hold')
+    time.sleep(0.1)
+    assert calls.count('hold') == renewals  # and not after
+
+    # A failed upload still releases it; a field without a map has nothing to hold.
+    failing, _ = sdk_fixture(monkeypatch, refuse=True)
+    failing.client.hold_map_placement = Mock(return_value=held)
+    failing.client.clone = lambda: failing.client
+    with pytest.raises(RuntimeError, match='upload refused'):
+        failing.compute_visualization(FIELD, 8)
+    failing.client.release_map_placement.assert_called_once_with(1, FIELD)
+    unmapped, _ = sdk_fixture(monkeypatch)
+    unmapped.compute_visualization(FIELD, 8)
+    unmapped.client.hold_map_placement.assert_called_once()
+    unmapped.client.release_map_placement.assert_not_called()
+
+
+def lapsing_hold(sdk, failing):
+    """A hold that lasts 50 ms, renewed every 10 ms while `failing` is empty; then every renewal fails."""
+    held = {'held_until': '2026-11-06T12:00:00+00:00', 'hold_seconds': 0.05, 'renew_seconds': 0.01}
+
+    def hold(*args):
+        if failing:
+            raise ConnectionError('server unreachable')
+        return held
+
+    sdk.client.hold_map_placement = Mock(side_effect=hold)
+    sdk.client.clone = lambda: sdk.client
+
+
+@pytest.mark.filterwarnings('ignore:Could not renew the hold')
+def test_a_hold_that_lapses_during_the_fit_stops_the_layout_before_it_writes_anything(monkeypatch):
+    from backend.tests.test_map_writer_followup import sdk_fixture
+
+    sdk, _ = sdk_fixture(monkeypatch)
+    failing: list = []
+    lapsing_hold(sdk, failing)
+    vectors = sdk.client.get_vectors.return_value
+
+    def slow_vectors(*args, **kwargs):  # renewals stop working, and the hold lapses meanwhile
+        failing.append(True)
+        time.sleep(0.15)
+        return vectors
+
+    sdk.client.get_vectors = Mock(side_effect=slow_vectors)
+    with pytest.raises(RuntimeError, match='lapsed.*nothing was uploaded, and the map is unchanged'):
+        sdk.compute_visualization(FIELD, 8)
+    sdk.client.upload_coordinates.assert_not_called()
+    sdk.client.release_map_placement.assert_called_once_with(1, FIELD)
+
+
+@pytest.mark.filterwarnings('ignore:Could not renew the hold')
+def test_a_hold_that_lapses_during_the_upload_is_reported(monkeypatch):
+    from backend.tests.test_map_writer_followup import sdk_fixture
+
+    sdk, _ = sdk_fixture(monkeypatch)
+    failing: list = []
+    lapsing_hold(sdk, failing)
+
+    def slow_upload(*args, **kwargs):
+        failing.append(True)
+        time.sleep(0.15)
+
+    sdk.client.upload_coordinates = Mock(side_effect=slow_upload)
+    with pytest.warns(UserWarning, match='lapsed.*while the coordinates were uploaded'):
+        assert sdk.compute_visualization(FIELD, 8)['reduced'] == 8
+    sdk.client.recompute_viz_rank.assert_called_once()

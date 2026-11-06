@@ -3,7 +3,6 @@
 import asyncio
 import os
 import uuid
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -181,29 +180,20 @@ def sdk_fixture(monkeypatch, managed=False, refuse=False):
         get_vectors=Mock(return_value={'total': 8, 'items': [{'sample_id': i, 'vector': [i, 1]} for i in range(1, 9)]}),
         upload_coordinates=Mock(side_effect=RuntimeError('upload refused') if refuse else None),
         recompute_viz_rank=Mock(),
+        hold_map_placement=Mock(return_value={'held_until': None, 'renew_seconds': 120}),
+        release_map_placement=Mock(),
     )
     fit = Mock(return_value=(FakeModel(0), np.ones((8, 2))))
     monkeypatch.setattr(sdk_dataset, 'fit_reducer', fit)
     return sdk, fit
 
 
-def test_sdk_skips_managed_map_before_fetch_or_fit(monkeypatch, tmp_path, capsys):
+def test_sdk_skips_managed_map_before_fetch_or_fit(monkeypatch, capsys):
     sdk, fit = sdk_fixture(monkeypatch, managed=True)
-    result = sdk.compute_visualization(FIELD, 8, save_model_path=str(tmp_path / 'model.joblib'))
+    result = sdk.compute_visualization(FIELD, 8)
     assert result['skipped'] is True and 'managed' in capsys.readouterr().out
     fit.assert_not_called()
     sdk.client.get_vectors.assert_not_called()
-    assert not list(tmp_path.iterdir())
-
-
-def test_sdk_does_not_save_a_refused_model(monkeypatch, tmp_path):
-    sdk, _ = sdk_fixture(monkeypatch, refuse=True)
-    path = tmp_path / 'model.joblib'
-    path.write_bytes(b'previous model')
-    with pytest.raises(RuntimeError, match='upload refused'):
-        sdk.compute_visualization(FIELD, 8, save_model_path=str(path))
-    assert path.read_bytes() == b'previous model'
-    assert not Path(str(path) + '.meta.json').exists()
 
 
 def test_sdk_compute_all_continues_after_managed_map_skip(monkeypatch):
@@ -288,16 +278,6 @@ def test_reduce_waits_for_other_fields_rank_instead_of_failing_after_fit(registr
                 await asyncio.gather(task, return_exceptions=True)
 
     registry_database(scenario)
-
-
-def test_sdk_saves_model_only_after_all_uploads_succeed(monkeypatch, tmp_path):
-    sdk, _ = sdk_fixture(monkeypatch)
-    path = tmp_path / 'model.joblib'
-    sdk.client.upload_coordinates.side_effect = lambda *args, **kwargs: (
-        pytest.fail('model appeared before upload') if path.exists() else None
-    )
-    sdk.compute_visualization(FIELD, 8, save_model_path=str(path))
-    assert path.exists() and Path(str(path) + '.meta.json').exists()
 
 
 def test_sdk_skips_a_virtual_patch_fit_if_any_tile_is_managed(monkeypatch):

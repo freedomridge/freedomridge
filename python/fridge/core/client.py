@@ -800,6 +800,24 @@ class Client:
         _raise_for_status(resp)
         return Job(self, resp.json()["job_id"])
 
+    def hold_map_placement(self, dataset_id, field_name) -> dict:
+        """Hold the server's placement of new samples on a map while a full layout of it is written; call again
+        within ``renew_seconds`` to keep it. ``held_until`` is null for a field without a map."""
+        resp = self.session.put(
+            f"{self.base_url}/datasets/{dataset_id}/embeddings/placement-hold",
+            params={"field_name": field_name},
+        )
+        _raise_for_status(resp)
+        return resp.json()
+
+    def release_map_placement(self, dataset_id, field_name) -> None:
+        """Release a hold on a map's placement (hold_map_placement)."""
+        resp = self.session.delete(
+            f"{self.base_url}/datasets/{dataset_id}/embeddings/placement-hold",
+            params={"field_name": field_name},
+        )
+        _raise_for_status(resp)
+
     def recompute_viz_rank(self, dataset_id, field_name, full=True) -> dict:
         """Recompute the even-coverage scatter sample-priority (viz_cell_rank) for a
         field, so the visualization query is a fast index range scan. Call after

@@ -17,18 +17,29 @@ it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
 
 ### Changed
 
-- Map: new images on a re-fitted map are placed by the server within seconds of arriving, from the 15
-  mapped images most like them (the densest group of them on the map), by a new background job,
-  **Placing new points on the map**. Before, they waited for the optional projection worker or a
-  `Dataset.project_pending()` run with the map's saved UMAP model.
-  - A re-fit no longer saves its UMAP model, which took about as much disk as the exported vectors (tens
-    of GB for millions of images). A model kept from an earlier re-fit is deleted when its map is next
-    re-fitted.
-  - The projection worker and `Dataset.project_pending()` now leave re-fitted maps alone
-    (`project_pending()` returns 0 for them). Maps never re-fitted keep their saved model and their
-    workflow.
+- Map: new images on every map are placed by the server within seconds of arriving, from the 15 mapped
+  images most like them (the densest group of them on the map), by a new background job, **Placing new
+  points on the map**. Before, they waited for the optional projection worker or a
+  `Dataset.project_pending()` run with a saved UMAP model, and appeared only where one of those ran.
+  - It covers every whole-image map, re-fitted or made with `compute_visualization`. A field with no map
+    yet gets nothing placed until its first fit (`dataset.map_state(field)["current_points"]` says how
+    many points a map has). Patch maps aren't placed, as before.
+  - While `compute_visualization` lays out a map again, placement on that map waits, so images ingested
+    meanwhile land on the new layout. A script that dies holds placement up for at most ten minutes. Another
+    writer of a full layout can do the same with `PUT`/`DELETE /api/datasets/{id}/embeddings/placement-hold`.
+  - No map keeps a model: a re-fit no longer saves one, which took about as much disk as the exported
+    vectors (tens of GB for millions of images). A model kept from an earlier re-fit is deleted when its
+    map is next re-fitted.
   - Measured on 3.7 million images, 9 in 10 new images land within 1.3% of the map's width of where
-    UMAP's own fit put them ([JOBS.md](docs/architecture/JOBS.md), "Placing new samples").
+    UMAP's own fit put them ([JOBS.md](docs/architecture/JOBS.md), "Placing new samples"). Placed images
+    drift as a map keeps growing, so re-fit a map that has grown well past its fit.
+
+### Removed
+
+- The projection worker (`scripts/umap_project_job.py`, the `umap-worker` service and its `umap` Compose
+  profile), `Dataset.project_pending()`, and `compute_visualization(save_model_path=...)`: the server
+  places new points itself. `python -m fridge.umap_worker fit` still fits every embedding field of a
+  dataset, and no longer saves a model.
 
 ### Upgrade notes
 
@@ -43,8 +54,15 @@ it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
   placement jobs stay out of a dataset's job history like statistics and are deleted after a day. While it
   builds them, job updates wait; the indexes cover the jobs table, which stays small because automatic
   runs are pruned daily (about 1,000 rows and 15 MB on a deployment three days in).
-- Use the SDK of this release with this server: an older SDK's `Dataset.project_pending()` fails on a map
-  re-fitted by this release, which has no model file.
+- Migration `0006_map_placement_hold.sql` adds a column to `embedding_viz_meta`, and is applied like the
+  others.
+- **If you ran the projection worker** (`--profile umap`), stop and remove its container before upgrading:
+  `docker compose --profile umap rm -sf umap-worker` (or `docker compose up -d --remove-orphans` afterwards).
+  The new Compose file no longer defines it, so an upgrade would leave the old container running from its old
+  image, still projecting with saved models.
+- Saved UMAP models (`<dataset>__<field>.joblib` in `FRIDGE_UMAP_MODEL_DIR`) are no longer read; delete
+  them to free their disk. A script that called `project_pending()` after an ingest needs no step now; one
+  that made a field's first map with `compute_visualization()` keeps doing so.
 
 ## 1.4.0 (2026-11-06)
 

@@ -2,6 +2,8 @@ import io
 import numbers
 import os
 import re
+import threading
+import time
 import warnings
 from itertools import islice
 from types import SimpleNamespace
@@ -150,17 +152,102 @@ def _auto_fit_sample_size(total: int, dim: int, bytes_per_point: Optional[int] =
     return fit_n
 
 
+class _PlacementHold:
+    """While this process writes a full layout of a map, the server places no new sample on it (each would keep
+    a spot from the old layout): it holds placement, renewed from a thread until released. A process that dies
+    stops renewing, and the hold lapses on its own.
+
+    A hold that lapsed while this process was still working (renewals failing for longer than the hold lasts:
+    the server unreachable, or a long call holding the GIL) let samples be placed from the old layout meanwhile.
+    ``ensure_held`` says so: before the first coordinate is written it raises, with the old layout still whole.
+    Its deadline is kept on this machine's monotonic clock, from before each renewal's request, so a clock
+    difference with the server can't hide a lapse."""
+
+    def __init__(self, client, dataset_id, field_name, enabled=True):
+        self.client, self.dataset_id, self.field_name, self.enabled = client, dataset_id, field_name, enabled
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._state = threading.Lock()
+        self._deadline = 0.0
+        self._lapsed = False
+
+    def _renew(self, client) -> dict:
+        began = time.monotonic()
+        answer = client.hold_map_placement(self.dataset_id, self.field_name)
+        with self._state:
+            if self._deadline and began > self._deadline:
+                self._lapsed = True  # the previous hold had ended before this one began
+            self._deadline = began + (answer.get("hold_seconds") or 600)
+        return answer
+
+    def ensure_held(self, renew=True) -> None:
+        """Raise if the hold lapsed at any point so far (renewing it first, from this thread)."""
+        if not self.enabled:
+            return
+        if renew:
+            try:
+                self._renew(self.client)
+            except Exception:
+                pass  # judged by the last renewal that answered
+        with self._state:
+            lapsed = self._lapsed or time.monotonic() > self._deadline
+        if lapsed:
+            raise RuntimeError(
+                f"The hold on placement of '{self.field_name}' lapsed (renewals failed for longer than it lasts), "
+                "so new samples may have been placed from the old layout meanwhile",
+            )
+
+    def __enter__(self):
+        if not self.enabled:
+            return self
+        answer = self._renew(self.client)
+        if not answer.get("held_until"):  # a field without a map: nothing is placed on it, so nothing to hold
+            self.enabled = False
+            return self
+        renewer = self.client.clone()  # its own session, for its own thread
+        every = answer.get("renew_seconds") or 120
+
+        def renew():
+            while not self._stop.wait(every):
+                try:
+                    self._renew(renewer)
+                except Exception as error:  # the next renewal tries again; the hold outlasts a few misses
+                    warnings.warn(
+                        f"Could not renew the hold on placement of '{self.field_name}': {error}",
+                        stacklevel=2,
+                    )
+
+        self._thread = threading.Thread(target=renew, name="fridge-placement-hold", daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        if not self.enabled:
+            return False
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=30)
+        try:
+            self.client.release_map_placement(self.dataset_id, self.field_name)
+        except Exception as error:
+            warnings.warn(
+                f"Could not release the hold on placement of '{self.field_name}' (it lapses): {error}",
+                stacklevel=2,
+            )
+        return False
+
+
 def _parallel_queries(reducer):
     """Make the fitted UMAP project new points on every core: pynndescent answers a batch of queries on
     one thread unless ``parallel_batch_queries`` is set (measured 4x faster on 32 cores, 2026-10-21; the
     per-thread working memory is a visited-bitset of the index, ~n/8 bytes). The search function is
-    rebuilt lazily with the setting, and a saved model keeps it, so the projection daemon gains too.
+    rebuilt lazily with the setting.
 
     Not reproducible run to run for ~0.4% of the points (measured with a 150k fit, 30k projected,
     512-d): pynndescent's parallel search shares one random state across threads, so the hardest points
     get other neighbours, and ~0.3% land far from where another run put them. In aggregate the result
     is the same as serial (recall@15 0.974 either way). The re-fit computes coordinates once; only a
-    comparison of two runs, or the daemon re-placing a point, sees the difference. Serial is exact but
+    comparison of two runs sees the difference. Serial is exact but
     about 3x slower."""
     index = getattr(reducer, "_knn_search_index", None)  # None for small fits (exact neighbours)
     if index is None or getattr(index, "parallel_batch_queries", True):
@@ -1674,7 +1761,9 @@ class Dataset:
         return job.wait(timeout=timeout) if wait else job
 
     def map_state(self, field_name) -> dict:
-        """The field's map: current model, ``refitted_at``, and ``active`` while a re-fit runs."""
+        """The field's map: ``current_points`` (0 when the field has no map yet: new samples are placed only on
+        a map, so a field needs a first ``compute_visualization`` or re-fit), its version ``model_id`` and
+        ``refitted_at`` after a scheduled re-fit, and ``active`` while one runs."""
         return self.client.get_map_state(self._id, field_name)
 
     def refresh_stats(self, *, wait=True, timeout=1800, force=False):
@@ -2318,13 +2407,14 @@ class Dataset:
                 raise
             return {}
 
-    def compute_visualization(self, field_name="clip", fit_sample_size="auto", method="umap", save_model_path=None):
+    def compute_visualization(self, field_name="clip", fit_sample_size="auto", method="umap"):
         """Compute 2D coordinates for embedding visualization.
 
         Fetches vectors via API, reduces them locally, uploads coordinates back.
         Works over the network — no direct database connection needed.
         Managed maps are skipped before fetching vectors or fitting: run a scheduled re-fit to
-        change their layout. Incremental placement uses ``project_pending``.
+        change their layout. New samples are placed on any map by the server, from their nearest mapped
+        neighbours, so no model is kept.
 
         Args:
             field_name: Embedding field name (default: "clip")
@@ -2334,9 +2424,6 @@ class Dataset:
                 — a big-memory host fits on more (better fidelity), up to all.
                 Pass an int to fix it, or -1 to fit on all. Ignored by t-SNE.
             method: "umap" (default), "pca" (cheap/deterministic), or "tsne".
-            save_model_path: if set (umap only), the fitted reducer is saved with
-                joblib to this path (+ a .meta.json sidecar) so new points can later
-                be projected via reducer.transform() without refitting.
 
         Returns:
             Counts in total_embeddings, reduced (points placed), and fit_sample_size
@@ -2346,7 +2433,6 @@ class Dataset:
         Example:
             dataset.compute_visualization(field_name="embeddings_clip_vit_base32_torch")
         """
-        import numpy as np
 
         method = method.lower()
 
@@ -2383,6 +2469,15 @@ class Dataset:
                     'total_embeddings': 0,
                     'reduced': 0,
                 }
+
+        # From before the vectors are read until the new layout is ranked, the server places no new sample on this
+        # map: those arriving meanwhile wait, and are placed on the new layout. Patch maps aren't placed.
+        with _PlacementHold(self.client, self._id, field_name, enabled=not is_patch) as hold:
+            return self._lay_out(field_name, fit_sample_size, method, fetch_fields, is_patch, tqdm, hold)
+
+    def _lay_out(self, field_name, fit_sample_size, method, fetch_fields, is_patch, tqdm, hold):
+        """compute_visualization's fetch, fit, upload and ranking of every vector of the field (or patch tiles)."""
+        import numpy as np
 
         suffix = f" ({len(fetch_fields)} tiles)" if is_patch else ""
         print(f"Fetching embeddings for field '{field_name}'{suffix}...")
@@ -2463,6 +2558,12 @@ class Dataset:
         del all_vectors_np
 
         # --- Step 3: Upload coordinates via API ---
+        # Nothing is written yet, so the old layout is still whole: if the hold on placement lapsed during the fit,
+        # samples may have been placed from it meanwhile, and writing the new layout would keep them there.
+        try:
+            hold.ensure_held()
+        except RuntimeError as error:
+            raise RuntimeError(f"{error}; nothing was uploaded, and the map is unchanged: run it again") from None
         print(f"Uploading {total:,} 2D coordinates...")
         upload_batch = 5000
         pbar = tqdm(total=total, desc="Uploading") if tqdm else None
@@ -2499,40 +2600,19 @@ class Dataset:
         if pbar:
             pbar.close()
 
-        # Publish model files only after every coordinate batch was accepted. A refusal must
-        # leave the last usable model intact, never install a model for an unpublished layout.
-        if save_model_path and method == "umap":
-            import json
-            from datetime import datetime, timezone
-
-            import joblib
-
-            os.makedirs(os.path.dirname(save_model_path) or ".", exist_ok=True)
-            tmp_path = save_model_path + ".tmp"
-            joblib.dump(reducer, tmp_path)
-            os.replace(tmp_path, save_model_path)  # atomic: serve never reads a half-written model
-            with open(save_model_path + ".meta.json", "w") as f:
-                json.dump(
-                    {
-                        "field_name": field_name,
-                        "method": method,
-                        "n_total": int(total),
-                        "fit_size": int(fit_sample_size) if fit_sample_size != -1 else int(total),
-                        "dim": int(dim),
-                        "n_neighbors": int(min(15, total - 1)),
-                        "min_dist": 0.1,
-                        "metric": "cosine",
-                        "fitted_at": datetime.now(timezone.utc).isoformat(),
-                    },
-                    f,
-                    indent=2,
-                )
-            print(f"Saved fitted UMAP model → {save_model_path}")
-
         # Precompute the even-coverage scatter sample-priority (viz_cell_rank) so the visualization
         # query is an index range scan instead of a per-request grid window-sort. full=True re-ranks
         # all points for this fresh projection. A patch-scale reduce spans many tile fields with no
         # single field to rank (the patch scatter uses the grid sampler), so skip it for patches.
+        try:
+            hold.ensure_held()
+        except RuntimeError as error:
+            message = (
+                f"{error} while the coordinates were uploaded: samples placed then may sit where the old layout "
+                f"had their neighbours. Run compute_visualization('{field_name}') again to lay them out"
+            )
+            print(f"  Warning: {message}")
+            warnings.warn(message, stacklevel=3)
         ranked = True
         if not is_patch:
             try:
@@ -2636,97 +2716,6 @@ class Dataset:
         forward by id instead, skipping samples that could not be filled.
         """
         return self.client.get_missing(self._id, kind, field=field, limit=limit, offset=offset, after_id=after_id)
-
-    def project_pending(self, field_name, model=None, batch=5000):
-        """Project samples that still lack 2D coords for ``field_name`` through a
-        fitted ``model`` (e.g. one saved by ``compute_visualization(save_model_path=...)``
-        and reloaded with joblib), and upload the coordinates. Returns the count.
-
-        This is the incremental-ingestion path: newly-added samples get a position via
-        ``model.transform()`` without refitting, so existing points don't move.
-
-        A map with scheduled re-fits (Jobs → Schedules) is not projected here (returns 0): the server
-        places its new samples from their nearest mapped neighbours, and after a re-fit, on the new map.
-        """
-        if _patch_tile_fields(field_name):
-            # A patch-scale field's data lives across per-tile fields; exact-matching the virtual
-            # name would silently find nothing and report moved=0 (failure disguised as no-op).
-            raise ValueError(
-                f"'{field_name}' is a patch-scale field (data lives in per-tile fields like "
-                f"{field_name}_r0c0); project_pending operates per sample. Project tiles via "
-                f"compute_visualization(field_name='{field_name}'), which expands them.",
-            )
-        import numpy as np
-
-        state = self._map_state(field_name)
-        if state.get("active"):
-            print(f"  A map re-fit of '{field_name}' is running; new points are placed when it finishes")
-            return 0
-        if state.get("model_id"):
-            print(f"  '{field_name}' has scheduled map re-fits: the server places its new points")
-            return 0
-        if model is None:
-            raise ValueError(f"'{field_name}' has no re-fitted map: pass the fitted model to project with")
-
-        moved = 0
-        last_first = -1
-        last_id = None
-        while True:
-            data = self.client.get_vectors(
-                self._id,
-                field_name=field_name,
-                limit=batch,
-                after_id=last_id,
-                pending_only=True,
-            )
-            items = data.get("items", [])
-            if not items:
-                break
-            first = items[0]["sample_id"]
-            if first <= last_first:
-                # The previous batch didn't drop out of "pending" — stop, don't loop.
-                break
-            last_first = first
-            X = np.asarray([it["vector"] for it in items], dtype=np.float32)
-            expected_dim = getattr(model, "n_features_in_", None)
-            if expected_dim is not None and X.shape[1] != expected_dim:
-                raise ValueError(
-                    f"Vector dim {X.shape[1]} for field '{field_name}' != the model's "
-                    f"fitted dim {expected_dim} — pass the model fit on this field.",
-                )
-            coords = model.transform(X)
-            payload = [
-                {
-                    "sample_id": it["sample_id"],
-                    "x": float(c[0]),
-                    "y": float(c[1]),
-                    **({"vector_version": it["vector_version"]} if "vector_version" in it else {}),
-                }
-                for it, c in zip(items, coords)
-            ]
-            try:
-                self.client.upload_coordinates(self._id, field_name, payload)
-            except requests.HTTPError as error:
-                if error.response is None or error.response.status_code != 409:
-                    raise
-                # A re-fit started, or a new map was published, meanwhile: the next pass uses it.
-                print(f"  Stopped projecting '{field_name}': {error}")
-                break
-            moved += len(items)
-            last_id = items[-1]["sample_id"]
-
-        # Triggers already rank these points in ranked fields. Keep the compatibility
-        # refresh also heals a failed initial rank.
-        if moved:
-            try:
-                self.client.recompute_viz_rank(self._id, field_name, full=False)
-            except Exception as e:
-                print(f"  Warning: incremental viz_cell_rank failed: {e}")
-        return moved
-
-    # =========================================================================
-    # DATASET QUALITY & DEDUP
-    # =========================================================================
 
     def set_values_per_sample(self, field: str, values_by_id: dict, batch_size: int = 5000, *, wait=True, timeout=1800):
         """Set values in bounded requests; completed batches survive a later failure."""

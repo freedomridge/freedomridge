@@ -1,6 +1,7 @@
-"""Placing new samples on re-fitted maps (kind ``map_place``), from their nearest already-mapped neighbours.
+"""Placing new samples on maps (kind ``map_place``), from their nearest already-mapped neighbours.
 
-A re-fitted map keeps no model. Each sample waiting in the projection queue of a re-fitted map goes where the
+No map keeps a model. Each sample waiting in the projection queue of a field with a map (an
+``embedding_viz_meta`` row with points: every whole-image map; patch maps are not placed) goes where the
 images most like it already are: the vector index finds the ``NEIGHBOURS`` mapped samples of the dataset with
 the closest vectors (cosine). On the map they usually sit together, but can be split between groups, so the
 sample goes to the densest group: the neighbour whose similarity-weighted map distances to the others are
@@ -13,8 +14,11 @@ A scheduler (``schedule_placements``) queues one job per map with samples waitin
 waiting then (its barrier), so a job ends even while ingest continues and the dataset's other maintenance
 work gets its turn. Each step places one batch: the lookups run in parallel, one batch of samples per
 connection, and the coordinates are written under the fence every map writer takes (``check_map_fence``).
-Nothing is placed while the map is being re-fitted, and a batch looked up on a map that was replaced
-meanwhile is dropped: its samples stay queued, for the new map.
+Nothing is placed while the map is being re-fitted, or while a full layout of it is being written
+(``placement_held_until``: the SDK's ``compute_visualization`` holds placement from before it fetches the vectors
+until it has ranked the new layout, renewing the hold as it goes). A batch looked up on a map that was replaced
+or held meanwhile is dropped (its samples stay queued, for the new map), and a sample another writer gave a
+place meanwhile keeps it.
 """
 
 import asyncio
@@ -39,6 +43,10 @@ LOOKUP_BATCH = 64
 # iterative scan may walk the graph to find enough of this dataset's mapped samples.
 EF_SEARCH = 100
 MAX_SCAN_TUPLES = 200_000
+# How long a hold on a map's placement lasts unless its writer renews it (the SDK renews every
+# HOLD_RENEW_SECONDS): a script that dies holds placement up for at most this long.
+PLACEMENT_HOLD_SECONDS = 600
+HOLD_RENEW_SECONDS = 120
 logger = logging.getLogger(__name__)
 
 _LOOKUP = """
@@ -118,6 +126,36 @@ async def _neighbours(pool, sample_ids, field, dataset_id, dimension, lookups):
     return found
 
 
+# Hold placement on a map for PLACEMENT_HOLD_SECONDS from now (taking or renewing the hold), and release it. A
+# field without a map (no embedding_viz_meta row) has nothing placed on it, so nothing to hold.
+HOLD_SQL = """UPDATE embedding_viz_meta SET placement_held_until = clock_timestamp() + $3 * interval '1 second'
+              WHERE dataset_id = $1 AND field_name = $2 RETURNING placement_held_until"""
+RELEASE_SQL = 'UPDATE embedding_viz_meta SET placement_held_until = NULL WHERE dataset_id = $1 AND field_name = $2'
+
+
+async def hold(connection, dataset_id, field):
+    """Hold the map's placement (or renew the hold); its end, or None for a field without a map."""
+    return await connection.fetchval(HOLD_SQL, dataset_id, field, PLACEMENT_HOLD_SECONDS)
+
+
+async def release(connection, dataset_id, field) -> None:
+    await connection.execute(RELEASE_SQL, dataset_id, field)
+
+
+async def _held(connection, dataset_id, field, *, lock=False) -> bool:
+    """Whether a full layout of the map holds its placement now. With `lock`, the row stays share-locked until
+    the commit, so a hold taken meanwhile waits for this transaction's write (whose samples its layout then
+    covers) or is seen."""
+    return bool(
+        await connection.fetchval(
+            f"""SELECT placement_held_until > clock_timestamp() FROM embedding_viz_meta
+                WHERE dataset_id = $1 AND field_name = $2{' FOR SHARE' if lock else ''}""",
+            dataset_id,
+            field,
+        ),
+    )
+
+
 async def _measure(pool, job, lookups):
     """The next batch of the job's samples and where each goes, or None when the map can't take any now."""
     dataset_id, field = job['dataset_id'], job['args']['field']
@@ -125,17 +163,26 @@ async def _measure(pool, job, lookups):
     after, upper = checkpoint.get('after', 0), job['barrier']['upper']
     async with pool.acquire(timeout=30) as connection:
         state = await connection.fetchrow(
-            """SELECT m.model_id::text AS model_id, m.dimension,
-                      (j.state IN ('queued','running')) IS TRUE AS active
+            """SELECT m.model_id::text AS model_id, (j.state IN ('queued','running')) IS TRUE AS active
                FROM embedding_map_state m LEFT JOIN jobs j ON j.id = m.active_job_id
                WHERE m.dataset_id = $1 AND m.field_name = $2""",
             dataset_id,
             field,
         )
-        if state is None or state['model_id'] is None or state['active']:
+        if (state is not None and state['active']) or await _held(connection, dataset_id, field):
             return None
+        # The map's dimension, from one of its points, once per job: a field's vectors share it (ingest refuses
+        # another), and one that doesn't (older data) is left unplaced.
+        dimension = checkpoint.get('dimension') or await connection.fetchval(
+            """SELECT vector_dims(e.vector) FROM samples s
+               JOIN embedding_coordinates c ON c.sample_id = s.id AND c.field_name = $2
+               JOIN embeddings e ON e.sample_id = s.id AND e.field_name = $2
+               WHERE s.dataset_id = $1 LIMIT 1""",
+            dataset_id,
+            field,
+        )
         waiting = await connection.fetch(
-            """SELECT p.sample_id, e.xmin::text AS vector_version
+            """SELECT p.sample_id, e.xmin::text AS vector_version, vector_dims(e.vector) AS dimension
                FROM embedding_projection_pending p
                JOIN embeddings e ON e.sample_id = p.sample_id AND e.field_name = p.field_name
                WHERE p.dataset_id = $1 AND p.field_name = $2 AND p.sample_id > $3 AND p.sample_id <= $4
@@ -159,7 +206,8 @@ async def _measure(pool, job, lookups):
         if waiting:
             await require_free_space(connection, len(waiting) * COORDINATE_ROW_BYTES, f'placing {len(waiting)} points')
     sample_ids = [row['sample_id'] for row in waiting]
-    found = await _neighbours(pool, sample_ids, field, dataset_id, state['dimension'], lookups) if waiting else {}
+    matching = [row['sample_id'] for row in waiting if row['dimension'] == dimension]
+    found = await _neighbours(pool, matching, field, dataset_id, dimension, lookups) if matching else {}
     placed, versions, unplaced = [], [], 0
     for row in waiting:
         neighbours = np.array(found.get(row['sample_id'], ()), dtype=np.float64).reshape(-1, 3)
@@ -171,7 +219,8 @@ async def _measure(pool, job, lookups):
         placed.append((row['sample_id'], float(x), float(y)))
         versions.append(row['vector_version'])
     return {
-        'model_id': state['model_id'],
+        'model_id': state['model_id'] if state else None,  # None: a map never re-fitted
+        'dimension': dimension,
         'last': sample_ids[-1] if sample_ids else None,
         'total': total,
         'placed': placed,
@@ -193,6 +242,7 @@ def handler(pool, lookups: int = 1):
             return StepResult(finished=True, result=done, message=f'Placed {done["placed"]} new points')
         following = {
             **checkpoint,
+            'dimension': batch['dimension'],
             'after': batch['last'],
             'total': batch['total'],
             'without_neighbours': done['without_neighbours'] + batch['unplaced'],
@@ -208,7 +258,28 @@ def handler(pool, lookups: int = 1):
                 # Looked up on a map that is being re-fitted or was replaced: these samples stay queued.
                 logger.info('Map placement on dataset %s, %s: %s', dataset_id, field, error)
                 return
-            ids, xs, ys = zip(*batch['placed'])
+            if await _held(connection, dataset_id, field, lock=True):
+                logger.info(
+                    'Map placement on dataset %s, %s: a full layout holds it; samples stay queued',
+                    dataset_id,
+                    field,
+                )
+                return
+            # Only samples still waiting, held until the commit: one another writer placed meanwhile keeps its
+            # place, and one it is placing now (its queue row locked) is left to it.
+            waiting = {
+                row['sample_id']
+                for row in await connection.fetch(
+                    """SELECT sample_id FROM embedding_projection_pending
+                       WHERE sample_id = ANY($1::int[]) AND field_name = $2 FOR SHARE SKIP LOCKED""",
+                    [sample_id for sample_id, _, _ in batch['placed']],
+                    field,
+                )
+            }
+            kept = [(spot, version) for spot, version in zip(batch['placed'], batch['versions']) if spot[0] in waiting]
+            if not kept:
+                return
+            ids, xs, ys = zip(*(spot for spot, _ in kept))
             status = await connection.execute(
                 SAVE_PROJECTED_COORDINATES,
                 list(ids),
@@ -216,7 +287,7 @@ def handler(pool, lookups: int = 1):
                 list(ys),
                 dataset_id,
                 field,
-                batch['versions'],
+                [version for _, version in kept],
             )
             # Runs before the checkpoint is saved, in its transaction: count only what was written (a sample
             # whose vector changed since the lookup is skipped, and queued again).
@@ -234,28 +305,30 @@ def handler(pool, lookups: int = 1):
 
 
 async def schedule_placements(pool, limit: int = 10):
-    """Queue a placement for each re-fitted map with samples waiting, up to the newest one waiting now. Skipped:
-    a map being re-fitted (its samples wait for the new map), one whose placement is queued or running, and,
-    for 5 minutes, one whose last placement failed or found no neighbours for anything (an empty map)."""
+    """Queue a placement for each map with samples waiting, up to the newest one waiting now. Skipped: a map
+    being re-fitted (its samples wait for the new map), one whose placement is queued or running, and, for 5
+    minutes, one whose last placement failed or found no neighbours for anything."""
     async with job_queue._transaction(pool) as connection:
         maps = await connection.fetch(
-            """SELECT m.dataset_id, m.field_name,
+            """SELECT v.dataset_id, v.field_name,
                       (SELECT max(p.sample_id) FROM embedding_projection_pending p
-                       WHERE p.dataset_id = m.dataset_id AND p.field_name = m.field_name) AS upper
-               FROM embedding_map_state m JOIN datasets d ON d.id = m.dataset_id AND NOT d.deleting
-               WHERE m.model_id IS NOT NULL
+                       WHERE p.dataset_id = v.dataset_id AND p.field_name = v.field_name) AS upper
+               FROM embedding_viz_meta v JOIN datasets d ON d.id = v.dataset_id AND NOT d.deleting
+               LEFT JOIN embedding_map_state m ON m.dataset_id = v.dataset_id AND m.field_name = v.field_name
+               WHERE v.total_points > 0
+                 AND (v.placement_held_until IS NULL OR v.placement_held_until <= clock_timestamp())
                  AND NOT EXISTS(SELECT 1 FROM jobs a WHERE a.id = m.active_job_id AND a.state IN ('queued','running'))
                  AND EXISTS(SELECT 1 FROM embedding_projection_pending p
-                            WHERE p.dataset_id = m.dataset_id AND p.field_name = m.field_name)
+                            WHERE p.dataset_id = v.dataset_id AND p.field_name = v.field_name)
                  AND NOT EXISTS(
-                     SELECT 1 FROM jobs j WHERE j.kind = $1 AND j.dataset_id = m.dataset_id
-                       AND j.args->>'field' = m.field_name
+                     SELECT 1 FROM jobs j WHERE j.kind = $1 AND j.dataset_id = v.dataset_id
+                       AND j.args->>'field' = v.field_name
                        AND (j.state IN ('queued','running')
                             OR (j.finished_at > clock_timestamp() - interval '5 minutes'
                                 AND (j.state = 'failed'
                                      OR (j.state = 'succeeded' AND (j.result->>'placed')::int = 0
                                          AND (j.result->>'without_neighbours')::int > 0)))))
-               ORDER BY m.dataset_id, m.field_name LIMIT $2""",
+               ORDER BY v.dataset_id, v.field_name LIMIT $2""",
             KIND,
             limit,
         )
