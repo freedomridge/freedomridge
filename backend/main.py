@@ -39,6 +39,7 @@ from .routers import (
     users,
     versions,
     views,
+    workers,
 )
 from .security import production
 
@@ -212,6 +213,7 @@ app.include_router(jobs.router, prefix="/api")
 app.include_router(backup_settings.router, prefix="/api")
 app.include_router(schedules.router, prefix="/api")
 app.include_router(index_advisor.router, prefix="/api")
+app.include_router(workers.router, prefix="/api")
 
 
 @app.get("/api/health")

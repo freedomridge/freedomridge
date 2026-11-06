@@ -4,6 +4,22 @@ Freedom Ridge has one version for the server, the web app and the Python SDK (th
 file), following [Semantic Versioning](https://semver.org). A release lists **upgrade notes** when
 it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
 
+## Unreleased
+
+### Added
+
+- Compute workers, first part: a worker token (`"scope": "worker"` in `POST /api/tokens`,
+  `client.create_token(name, scope="worker")`), which only the new worker endpoints accept, and
+  `python -m fridge.worker`, which registers a machine with the server and keeps it online.
+  `GET /api/workers` lists workers (an admin sees all of them), and System status counts them.
+
+### Upgrade notes
+
+- One database migration, `0003_compute_worker_tokens.sql`, which adds a column to `api_tokens` and
+  two to `workers`. Apply it with `scripts/apply_migrations.sh`, as step 4 of
+  [Upgrading](docs/UPGRADING.md) describes. It waits at most 2 seconds for its locks: if it stops with
+  a lock timeout, run it again.
+
 ## 1.3.1 (2026-11-06)
 
 ### Fixed

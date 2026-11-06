@@ -100,6 +100,10 @@ Details:
   disables a token immediately. Users can list and revoke only their own tokens
   (`client.list_tokens()`, `GET /api/tokens`).
 - A deactivated user's tokens stop working (403).
+- A **worker token** (`"scope": "worker"`, `client.create_token(name, scope="worker")`) is for a compute
+  worker, a machine that runs jobs for the server (`python -m fridge.worker`). Only the worker endpoints
+  accept it; everywhere else it gets a 403, so the token kept on a worker machine can do only what a
+  worker does. A full token or a session doesn't work on the worker endpoints either.
 
 The SDK's `client.login(username, password)` also works, but it keeps the password in your script
 and uses a cookie session that expires when idle. Prefer a token.
@@ -194,6 +198,9 @@ the variable.
 | `/api/tokens` | POST | power_user, admin | Create a token |
 | `/api/tokens` | GET | signed in | List your tokens (never their values) |
 | `/api/tokens/{id}` | DELETE | owner | Revoke one of your tokens |
+| `/api/workers/register` | POST | worker token of a power_user or admin | Register a compute worker |
+| `/api/workers/{id}/heartbeat` | POST | its owner's worker token | Keep a compute worker online |
+| `/api/workers` | GET | power_user (own workers), admin (all) | List compute workers and job runners |
 
 ## Troubleshooting
 
