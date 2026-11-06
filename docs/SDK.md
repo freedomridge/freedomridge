@@ -2033,7 +2033,6 @@ class Sample:
         metadata: dict = None,
         location: dict | tuple = None,     # GeoJSON Point or (lon, lat)
         heading: float = None,
-        embedding: list[float] = None,     # shorthand for embeddings={"clip": ...}
         embeddings: dict[str, list[float]] = None,
         hashes: dict[str, str] = None,
         array_fields: dict[str, list[str]] = None,

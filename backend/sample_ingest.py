@@ -37,7 +37,7 @@ async def insert_samples(connection, dataset_id, samples, on_duplicate, array_fi
     for sample in samples:
         row = sample.model_dump(mode='json')
         row['media_type'] = sample.media_type or media_type(sample.filepath)
-        row['embeddings'] = sample.embeddings or ({'clip': sample.embedding} if sample.embedding else {})
+        row['embeddings'] = sample.embeddings or {}
         previous = grouped.get(sample.filepath)
         if previous is None:
             grouped[sample.filepath] = row

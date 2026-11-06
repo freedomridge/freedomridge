@@ -1034,12 +1034,16 @@ def run_tests():
 
     _()
 
-    @test("Sample backward compat: single embedding → embeddings dict")
+    @test("Sample takes named embeddings only (the single embedding= is gone in 2.0)")
     def _():
-        s = Sample(filepath='s3://test/emb_compat.jpg', embedding=[0.5] * 8)
-        assert s.embeddings == {'clip': [0.5] * 8}
-        d = s.to_dict()
-        assert d['embeddings'] == {'clip': [0.5] * 8}
+        s = Sample(filepath='s3://test/emb_named.jpg', embeddings={'clip': [0.5] * 8})
+        assert s.to_dict()['embeddings'] == {'clip': [0.5] * 8}
+        try:
+            Sample(filepath='s3://test/emb_single.jpg', embedding=[0.5] * 8)  # type: ignore[call-arg]
+        except TypeError:
+            pass
+        else:
+            raise AssertionError("Sample(embedding=...) was accepted")
 
     _()
 

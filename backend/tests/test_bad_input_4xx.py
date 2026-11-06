@@ -55,8 +55,6 @@ def test_good_locations_are_normalised():
 def test_non_finite_embeddings_are_refused(bad):
     with pytest.raises(ValidationError):
         SampleCreate(filepath="x.jpg", embeddings={"clip": [0.1, bad]})
-    with pytest.raises(ValidationError):
-        SampleCreate(filepath="x.jpg", embedding=[bad, 0.2])
     assert SampleCreate(filepath="x.jpg", embeddings={"clip": [0.1, 0.2]}).embeddings == {"clip": [0.1, 0.2]}
 
 
@@ -79,3 +77,12 @@ def test_postgres_data_errors_are_a_400_without_row_data():
     body = json.loads(resp.body)
     assert body["detail"].startswith("Invalid input: invalid input for query argument $1")
     assert "more" not in body["detail"]
+
+
+def test_the_single_embedding_field_is_refused_with_the_fix():
+    """Removed in 2.0: it was stored as 'clip' whatever model made it. Refused, so an old client's vectors are
+    not silently dropped."""
+    with pytest.raises(ValidationError) as refused:
+        SampleCreate(filepath="x.jpg", embedding=[0.1, 0.2])
+    assert "'embedding' was removed in 2.0: send 'embeddings': {field name: vector}" in str(refused.value)
+    assert SampleCreate(filepath="x.jpg").embedding is None

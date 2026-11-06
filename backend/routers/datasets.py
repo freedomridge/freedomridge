@@ -6216,8 +6216,10 @@ class SampleCreate(BaseModel):
 
     @field_validator('embedding')
     @classmethod
-    def _embedding(cls, v: Optional[List[float]]) -> Optional[List[float]]:
-        return None if v is None else _finite_vector('embedding', v)
+    def _embedding(cls, v: Any) -> None:
+        if v is not None:
+            raise ValueError("'embedding' was removed in 2.0: send 'embeddings': {field name: vector}")
+        return None
 
     @field_validator('embeddings')
     @classmethod
@@ -6234,7 +6236,9 @@ class SampleCreate(BaseModel):
     metadata: Dict[str, Any] = {}
     location: Optional[Dict[str, Any]] = None
     heading: Optional[float] = None
-    embedding: Optional[List[float]] = None  # Backward compat: single vector (stored as field_name='clip')
+    # Removed in 2.0: a single vector was stored as 'clip' whatever model made it. Refused with the fix, so an
+    # old client's vectors aren't silently dropped.
+    embedding: Any = None
     embeddings: Optional[Dict[str, List[float]]] = None  # Named embeddings: {"clip": [...], "dinov2": [...]}
     hashes: Optional[Dict[str, str]] = None  # Named hashes (hex): {"phash": "ff00...", "dhash": "0a1b..."}
     array_fields: Optional[Dict[str, List[str]]] = None  # Dynamic array fields
@@ -6363,8 +6367,7 @@ async def add_samples(id: int, payload: Any = Body(...), user: dict = Depends(re
     # and check once per field; a mismatch 422s the whole request rather than corrupting data.
     _emb_field_dims: Dict[str, set] = {}
     for s in samples:
-        _embs = s.embeddings if s.embeddings else ({"clip": s.embedding} if s.embedding else {})
-        for _fn, _vec in (_embs or {}).items():
+        for _fn, _vec in (s.embeddings or {}).items():
             try:
                 _emb_field_dims.setdefault(_fn, set()).add(len(_vec))
             except TypeError:
@@ -6378,10 +6381,7 @@ async def add_samples(id: int, payload: Any = Body(...), user: dict = Depends(re
     async with db.pool.acquire() as conn:
         # A full disk mid-ingest PANICs Postgres and can leave it down: refuse
         # the batch with a 507 while there is still room. Rows = each sample + its embeddings + hashes.
-        rows = sum(
-            1 + len(s.embeddings or ({"clip": s.embedding} if s.embedding else {})) + len(s.hashes or {})
-            for s in samples
-        )
+        rows = sum(1 + len(s.embeddings or {}) + len(s.hashes or {}) for s in samples)
         await require_free_space(conn, rows * INGEST_ROW_BYTES, f"adding {len(samples)} samples")
         async with conn.transaction():
             await lock_field_lifecycle(conn, id, exclusive=on_duplicate == 'update', wait=on_duplicate != 'update')

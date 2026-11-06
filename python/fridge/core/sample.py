@@ -51,7 +51,6 @@ class Sample:
         metadata: Optional[Dict[str, Any]] = None,
         location: Optional[tuple] = None,
         heading: Optional[float] = None,
-        embedding: Optional[List[float]] = None,
         embeddings: Optional[Dict[str, List[float]]] = None,
         hashes: Optional[Dict[str, str]] = None,
         array_fields: Optional[Dict[str, List[str]]] = None,
@@ -71,10 +70,7 @@ class Sample:
         self.distance = None
 
         # Named embeddings: {"clip": [vector], "dinov2": [vector]}
-        # Backward compat: single `embedding` list is stored as {"clip": vector}
         self.embeddings = embeddings or {}
-        if embedding is not None and not self.embeddings:
-            self.embeddings = {"clip": embedding}
 
         self._dataset = _dataset
         self._snapshot_version_id = None
@@ -160,7 +156,6 @@ class Sample:
             'metadata',
             'location',
             'heading',
-            'embedding',
             'embeddings',
             'hashes',
             'array_fields',
