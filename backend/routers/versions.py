@@ -1,5 +1,6 @@
 """Dataset versioning — create snapshots, view history, compare diffs."""
 
+import asyncio
 import json
 import secrets
 from typing import Any, Optional
@@ -1149,6 +1150,12 @@ async def _diff_current(conn, id: int, version_id: int):
     }
 
 
+# The restore is one SERIALIZABLE transaction, so a writer that commits during it (an edit, an
+# ingest, the statistics refresh the previous restore queued) rolls the whole restore back. It is
+# run again after each of these pauses (seconds), and reports 409 only when the last attempt fails.
+_RESTORE_RETRY_DELAYS = (0.1, 0.2)
+
+
 @router.post("/{version_id}/revert")
 async def revert_to_version(
     id: int,
@@ -1157,15 +1164,18 @@ async def revert_to_version(
     user: dict = Depends(require_role("power_user")),
     exact_membership: bool = False,
 ):
-    try:
-        return await _restore_version(id, version_id, restore_deleted, user, exact_membership)
-    except asyncpg.SerializationError:
-        raise HTTPException(status_code=409, detail="Dataset changed during restore; retry the operation")
-    except asyncpg.UniqueViolationError:
-        raise HTTPException(
-            status_code=409,
-            detail="A sample filepath conflicts with the snapshot; restore was rolled back",
-        )
+    for delay in (*_RESTORE_RETRY_DELAYS, None):
+        try:
+            return await _restore_version(id, version_id, restore_deleted, user, exact_membership)
+        except asyncpg.SerializationError:
+            if delay is None:
+                raise HTTPException(status_code=409, detail="Dataset changed during restore; retry the operation")
+            await asyncio.sleep(delay)
+        except asyncpg.UniqueViolationError:
+            raise HTTPException(
+                status_code=409,
+                detail="A sample filepath conflicts with the snapshot; restore was rolled back",
+            )
 
 
 async def _restore_version(
