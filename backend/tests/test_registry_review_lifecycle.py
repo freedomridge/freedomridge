@@ -640,3 +640,51 @@ def test_statistics_refresh_skips_active_restore(registry_database, monkeypatch)
         )
 
     registry_database(scenario)
+
+
+async def revert_with_conflicts(database, monkeypatch, conflicts):
+    """Edit a sample, then revert it while the first `conflicts` restore attempts each have a write
+    committed after the attempt's SERIALIZABLE snapshot, to the row the attempt then updates.
+    Returns the sample id, the restore attempts made and the revert's HTTPException (or None)."""
+    sample_id = (await ingest([{'score': 1}]))['ids'][0]
+    version = await versions.create_version(1, versions.CreateVersionRequest(name='before-edit'))
+    await datasets.update_sample(1, sample_id, datasets.SampleUpdate(metadata={'score': 2}), USER)
+    original = versions._snapshot_arrays
+    attempts = 0
+
+    async def write_during_restore(*args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts <= conflicts:
+            await database.execute("UPDATE samples SET tags = ARRAY['concurrent'] WHERE id=$1", sample_id)
+        return await original(*args, **kwargs)
+
+    monkeypatch.setattr(versions, '_snapshot_arrays', write_during_restore)
+    try:
+        await asyncio.wait_for(versions.revert_to_version(1, version['id'], user=USER), 10)
+    except HTTPException as error:
+        return sample_id, attempts, error
+    return sample_id, attempts, None
+
+
+def test_restore_retries_after_a_concurrent_write(registry_database, monkeypatch):
+    async def scenario(database):
+        sample_id, attempts, error = await revert_with_conflicts(database, monkeypatch, conflicts=1)
+        assert error is None and attempts == 2
+        sample = await database.fetchrow("SELECT metadata->'score' AS score, tags FROM samples WHERE id=$1", sample_id)
+        assert sample['score'] == 1 and sample['tags'] == []
+        # The failed attempt's auto-snapshot rolled back with it: one undo point, not two.
+        assert await database.fetchval("SELECT count(*) FROM dataset_versions WHERE name LIKE 'auto-%'") == 1
+
+    registry_database(scenario)
+
+
+def test_restore_reports_409_when_every_attempt_conflicts(registry_database, monkeypatch):
+    async def scenario(database):
+        sample_id, attempts, error = await revert_with_conflicts(database, monkeypatch, conflicts=3)
+        assert error is not None and error.status_code == 409 and attempts == 3
+        sample = await database.fetchrow("SELECT metadata->'score' AS score, tags FROM samples WHERE id=$1", sample_id)
+        assert sample['score'] == 2 and sample['tags'] == ['concurrent']
+        assert await database.fetchval("SELECT count(*) FROM dataset_versions WHERE name LIKE 'auto-%'") == 0
+
+    registry_database(scenario)
