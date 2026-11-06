@@ -7,7 +7,8 @@ Three steps with file handoffs, so the heavy middle one can later move to a comp
    the field's active re-fit (``embedding_map_state.active_job_id``); projection for that field pauses
    until the job ends, so new samples wait in the projection queue for the new model.
 2. **Fit and transform** (pure computation): ``python -m fridge.map_fit`` in its own memory-capped
-   scope (``systemd-run --user --scope -p MemoryMax=…``). The cap keeps ~20% of host RAM free; an
+   scope (``systemd-run --user --scope -p MemoryMax=…``), or in a container without systemd, within the
+   container's own memory limit (``containment``). The cap keeps ~20% of host RAM free; an
    out-of-memory kill ends only that process. Too little memory skips the run with the reason. It runs
    on one CPU per core and keeps at least 20% of the cores (rounded up) entirely free for the database and
    the app (``fit_cpus``).
@@ -206,10 +207,51 @@ def host_memory() -> Tuple[int, int]:
     return values['MemTotal'], values['MemAvailable']
 
 
+def host_swap() -> int:
+    """The host's swap space in bytes, from /proc/meminfo."""
+    with open('/proc/meminfo') as meminfo:
+        return next((int(line.split()[1]) * 1024 for line in meminfo if line.startswith('SwapTotal:')), 0)
+
+
+def _cgroup_folder(pid) -> Optional[str]:
+    """The cgroup v2 folder of a process ('self' for this one), or None outside cgroup v2."""
+    try:
+        with open(f'/proc/{pid}/cgroup') as cgroup:
+            path = next(line.split(':', 2)[2].strip() for line in cgroup if line.startswith('0::'))
+    except (OSError, StopIteration):
+        return None
+    return os.path.join('/sys/fs/cgroup', path.lstrip('/'))
+
+
+def cgroup_headroom() -> Optional[int]:
+    """What this process's own cgroup may still allocate, or None without a memory limit. Page cache counts as
+    free, as the kernel reclaims it before an out-of-memory kill (the SDK's _cgroup_headroom_bytes, which sizes
+    the fit the same way)."""
+    folder = _cgroup_folder('self')
+    if folder is None:
+        return None
+    try:
+        with open(os.path.join(folder, 'memory.max')) as limit_file:
+            limit = limit_file.read().strip()
+        if limit == 'max':
+            return None
+        with open(os.path.join(folder, 'memory.current')) as current:
+            used = int(current.read().strip())
+        with open(os.path.join(folder, 'memory.stat')) as stat_file:
+            stat = dict(line.split() for line in stat_file)
+    except (OSError, ValueError):
+        return None
+    cached = int(stat.get('active_file', 0)) + int(stat.get('inactive_file', 0))
+    return max(0, int(limit) - used + cached)
+
+
 def fit_allowance() -> Tuple[int, int]:
-    """(allowance, total): what the fit may use while KEEP_FREE_FRACTION of host RAM stays free."""
+    """(allowance, total): what the fit may use while KEEP_FREE_FRACTION of host RAM stays free, and never more
+    than this process's own memory limit leaves (a container's: the fit shares it when there is no systemd)."""
     total, available = host_memory()
-    return available - int(KEEP_FREE_FRACTION * total), total
+    allowance = available - int(KEEP_FREE_FRACTION * total)
+    headroom = cgroup_headroom()
+    return (allowance if headroom is None else min(allowance, headroom)), total
 
 
 def _core_of(cpu: int) -> str:
@@ -253,9 +295,43 @@ class ContainmentUnavailable(RuntimeError):
 
 
 def containment(allowance: int) -> list:
-    """The command prefix that runs the fit in its own memory-capped scope (memory.max = the allowance,
-    no swap). Verified from inside a probe scope: systemd-run succeeds even where the user manager does
-    not delegate the memory controller, and then nothing is capped."""
+    """The command prefix that runs the fit memory-capped: its own systemd scope (_systemd_scope), or, where
+    there is no systemd (a container), an empty prefix when this process's own cgroup has a memory limit
+    without swap, a container's mem_limit. The fit then shares that limit: fit_allowance keeps it within what
+    the limit leaves, and the fit makes itself the kernel's first choice for an out-of-memory kill
+    (fridge.map_fit), so the runner survives one."""
+    try:
+        return _systemd_scope(allowance)
+    except ContainmentUnavailable as error:
+        problem = _shared_limit_problem()
+        if problem:
+            raise ContainmentUnavailable(f'{error}; {problem}') from None
+        return []
+
+
+def _shared_limit_problem() -> Optional[str]:
+    """Why the fit cannot share this process's memory limit, or None when it can."""
+    folder = _cgroup_folder('self')
+    if folder is None or cgroup_headroom() is None:
+        return 'this process has no memory limit of its own to share (in Docker, set JOB_RUNNER_MEMORY_LIMIT)'
+    try:
+        with open(os.path.join(folder, 'memory.swap.max')) as swap_file:
+            swap = swap_file.read().strip()
+    except OSError:
+        swap = None  # swap is not accounted per cgroup on this kernel
+    if swap != '0' and host_swap():
+        # A fit that swaps instead of being stopped at the limit slows the whole host for hours.
+        return (
+            f'its memory limit allows swap (memory.swap.max={swap or "not accounted"}): set the swap limit to 0 '
+            '(in Docker, memswap_limit equal to mem_limit)'
+        )
+    return None
+
+
+def _systemd_scope(allowance: int) -> list:
+    """The prefix that runs the fit in its own memory-capped scope (memory.max = the allowance, no swap).
+    Verified from inside a probe scope: systemd-run succeeds even where the user manager does not delegate
+    the memory controller, and then nothing is capped."""
     if shutil.which('systemd-run') is None:
         raise ContainmentUnavailable('systemd-run is not installed')
     command = ['systemd-run', '--user', '--scope', '--quiet', '-p', f'MemoryMax={allowance}', '-p', 'MemorySwapMax=0']
@@ -337,10 +413,11 @@ def _memory_check(rows: int, dim: int, bytes_per_point: Optional[int] = None) ->
     allowance, total = fit_allowance()
     needed = minimum_fit_bytes(rows, dim, bytes_per_point)
     if allowance < needed:
+        within = ", within this process's memory limit" if cgroup_headroom() is not None else ''
         return (
             f'Not enough memory to fit this map: it needs at least {gigabytes(needed)} and '
             f'{gigabytes(max(0, allowance))} is available while keeping {KEEP_FREE_FRACTION:.0%} of '
-            f'{gigabytes(total)} RAM free'
+            f'{gigabytes(total)} RAM free{within}'
         ), allowance
     return None, allowance
 
@@ -504,15 +581,11 @@ def _scope_folder(pid: int) -> Optional[str]:
     """The cgroup folder of the fit's own scope (systemd-run's transient `run-*.scope`), or None: while
     systemd-run starts, the child still runs in the caller's session cgroup, whose memory is not the
     fit's."""
-    try:
-        with open(f'/proc/{pid}/cgroup') as cgroup:
-            path = next(line.split(':', 2)[2].strip() for line in cgroup if line.startswith('0::'))
-    except (OSError, StopIteration):
-        return None
-    name = os.path.basename(path)
+    folder = _cgroup_folder(pid)
+    name = os.path.basename(folder or '')
     if not (name.startswith('run-') and name.endswith('.scope')):
         return None
-    return os.path.join('/sys/fs/cgroup', path.lstrip('/'))
+    return folder
 
 
 def _memory_value(path: str, key: str) -> Optional[int]:
@@ -532,9 +605,12 @@ async def run_fit(
     allowance: int,
     bytes_per_point: Optional[int] = None,
     max_fit_size: Optional[int] = None,
+    shared: bool = False,
 ) -> Optional[int]:
     """Run `python -m fridge.map_fit` under the containment prefix; raise unless it succeeded. Returns the
-    scope's peak anonymous memory (sampled every second), which sizes the next fit of this map."""
+    scope's peak anonymous memory (sampled every second), which sizes the next fit of this map. `shared`: the
+    fit has no scope of its own and shares this process's memory-limited cgroup (an empty prefix), which is
+    read instead; the runner's own memory in it cancels out, as the fit's anon_before_fit counts it too."""
     environment = {
         **os.environ,
         'PYTHONPATH': os.pathsep.join(filter(None, [str(SDK_ROOT), os.getenv('PYTHONPATH')])),
@@ -549,8 +625,11 @@ async def run_fit(
         pinned = []
         logger.warning('Map re-fit: taskset is not installed, so the fit runs on every CPU and keeps none free')
     peak = None
-    scope = None  # the fit's scope folder, once the child is in it
-    kills_before = None  # out-of-memory kills under the scope's parent before this fit
+    # The fit's cgroup folder: a scope once the child is in it, or this process's own when shared. A scope's
+    # out-of-memory kills are counted in its parent, which outlives the scope; a shared cgroup counts its own.
+    scope = await asyncio.to_thread(_cgroup_folder, 'self') if shared else None
+    events = os.path.join(scope, 'memory.events') if scope else None
+    kills_before = await asyncio.to_thread(_memory_value, events, 'oom_kill') if events else None
     with open(log_path, 'ab') as log:
         process = await asyncio.create_subprocess_exec(
             *command,
@@ -577,8 +656,8 @@ async def run_fit(
                     if scope is None:
                         scope = await asyncio.to_thread(_scope_folder, process.pid)
                         if scope is not None:
-                            parent = os.path.join(os.path.dirname(scope), 'memory.events')
-                            kills_before = await asyncio.to_thread(_memory_value, parent, 'oom_kill')
+                            events = os.path.join(os.path.dirname(scope), 'memory.events')
+                            kills_before = await asyncio.to_thread(_memory_value, events, 'oom_kill')
                     if scope is not None:
                         anon = await asyncio.to_thread(_memory_value, os.path.join(scope, 'memory.stat'), 'anon')
                         if anon is not None:
@@ -586,14 +665,11 @@ async def run_fit(
         except BaseException:  # cancelled, timed out, lease lost or runner shutdown
             await asyncio.shield(_stop(process))
             raise
-    if code == -signal.SIGKILL and scope is not None and kills_before is not None:
-        # memory.events counts the scope's kills in its parent too (hierarchical), and the parent outlives
-        # the scope: no new kill there means something else stopped the fit (kill -9, a scope stop).
-        kills_after = await asyncio.to_thread(
-            _memory_value,
-            os.path.join(os.path.dirname(scope), 'memory.events'),
-            'oom_kill',
-        )
+    if code == -signal.SIGKILL and events is not None and kills_before is not None:
+        # memory.events counts a scope's kills in its parent too (hierarchical), and the parent outlives
+        # the scope; a shared cgroup counts its own. No new kill there means something else stopped the fit
+        # (kill -9, a scope stop).
+        kills_after = await asyncio.to_thread(_memory_value, events, 'oom_kill')
         if kills_after is not None and kills_after == kills_before:
             raise ConnectionError('The fit was killed, not for lack of memory; the re-fit runs it again')
     if code == -signal.SIGKILL:
@@ -654,7 +730,14 @@ async def _fit(pool, job, store):
     work = store.work_dir(job['id'])
     # One folder per attempt: a child orphaned by a killed runner never writes into a retry's outputs.
     output = work / f"fit-{job['attempt']}"
-    logger.info('Map re-fit %s: fitting %s rows of %s-d in a %s scope', job['id'], rows, dim, gigabytes(allowance))
+    logger.info(
+        'Map re-fit %s: fitting %s rows of %s-d in %s %s',
+        job['id'],
+        rows,
+        dim,
+        gigabytes(allowance),
+        'of a shared memory limit' if not command else 'scope',
+    )
     try:
         peak = await run_fit(
             command,
@@ -664,6 +747,7 @@ async def _fit(pool, job, store):
             allowance,
             bytes_per_point,
             max_fit_size=max_fit_size,
+            shared=not command,
         )
     except FitOutOfMemory as error:
         return await _after_out_of_memory(job, output, error)

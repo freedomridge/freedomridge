@@ -263,6 +263,7 @@ The generated values include:
 | `DATA_VOLUME_PATH`, `FRIDGE_DATA_ROOT` | Both `/data/datasets`; mounted at the **same absolute path** in backend and job-runner |
 | `POSTGRES_VOLUME_PATH` | `/data/postgres`, outside the media root |
 | `CACHE_VOLUME_PATH` | `/cache`, including `/cache/huggingface` |
+| `JOB_RUNNER_MEMORY_LIMIT` | Optional. The job-runner container's memory limit, within which map re-fits run. Unset, there is no limit and re-fits are skipped. Leave it unset on a t3.large, which has no room beside PostgreSQL, and build maps with the SDK (`compute_visualization`) |
 | `BACKUP_VOLUME_PATH` | `/data/backups`, outside the media root |
 | `TLS_STATE_PATH` | `/data/tls`; entire Let's Encrypt directory, including symlinks |
 | `BACKUP_S3_URI` | Terraform-created `s3://…/database` |

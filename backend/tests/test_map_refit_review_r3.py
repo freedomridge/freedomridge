@@ -74,7 +74,7 @@ def test_a_fit_of_every_point_does_not_bound_the_next_one(registry_database, tmp
     store = LocalArtifactStore(tmp_path)
     sizes = []
 
-    async def fit(command, source, output, log_path, allowance, bytes_per_point=None, max_fit_size=None):
+    async def fit(command, source, output, log_path, allowance, bytes_per_point=None, max_fit_size=None, shared=False):
         sizes.append(max_fit_size)
         monkeypatch.setattr(sdk_dataset, 'fit_reducer', fake_reducer)
         await asyncio.to_thread(map_fit.main, ['--input', str(source), '--output', str(output)])
@@ -117,7 +117,7 @@ def test_the_retry_runs_with_the_retry_size(registry_database, tmp_path, monkeyp
     store = LocalArtifactStore(tmp_path)
     attempts = []
 
-    async def fit(command, source, output, log_path, allowance, bytes_per_point=None, max_fit_size=None):
+    async def fit(command, source, output, log_path, allowance, bytes_per_point=None, max_fit_size=None, shared=False):
         attempts.append((bytes_per_point, max_fit_size))
         if len(attempts) == 1:
             Path(output).mkdir(parents=True, exist_ok=True)

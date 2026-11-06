@@ -149,8 +149,16 @@ services:
       DEMO_MODE: ${DEMO_MODE:-false}
       JOB_WORKER_SLOTS: ${JOB_WORKER_SLOTS:-3}
       JOB_POOL_MAX_SIZE: ${JOB_POOL_MAX_SIZE:-6}
+      # Map re-fits write their export and models here; the umap-worker projects new samples with them.
+      FRIDGE_UMAP_MODEL_DIR: /models
+    # There is no systemd in this container, so a map re-fit runs within the container's own memory limit,
+    # which every job here shares. Unset (the default), there is no limit and re-fits are skipped. The swap
+    # limit is the same value, so a fit is stopped at the limit instead of swapping.
+    mem_limit: ${JOB_RUNNER_MEMORY_LIMIT:-0}
+    memswap_limit: ${JOB_RUNNER_MEMORY_LIMIT:-0}
     volumes:
       - ${DATA_VOLUME_PATH:-./data}:${FRIDGE_DATA_ROOT:-/data}:ro
+      - umap_models:/models
     depends_on:
       db:
         condition: service_healthy
