@@ -101,12 +101,23 @@ for name in children:
 """
 
 
+def _keep_running_after_an_oom_kill() -> list:
+    """The scope stands in for a container's cgroup, where the kernel kills only the fit and the runner goes on.
+    systemd 253 and later stop a whole scope after an out-of-memory kill in it (OOMPolicy=stop), which ended this
+    test's own process with SIGTERM on CI; older systemd has no OOMPolicy for scopes and keeps them running."""
+    probe = subprocess.run(
+        ['systemd-run', '--user', '--scope', '--quiet', '-p', 'OOMPolicy=continue', '--', 'true'],
+        capture_output=True,
+    )
+    return ['-p', 'OOMPolicy=continue'] if probe.returncode == 0 else []
+
+
 def test_a_fit_sharing_a_real_memory_limit_is_measured_and_its_out_of_memory_kill_detected(tmp_path):
     map_refit._systemd_scope(400 * 1024**2)  # this machine applies a scope's memory limit
     # A scope of its own name: a container's cgroup is not a systemd-run `run-*.scope` either, so the fit
     # is measured only by reading the shared cgroup.
     limited = ['systemd-run', '--user', '--scope', '--quiet', '--unit', f'fridge-shared-limit-test-{uuid.uuid4().hex}']
-    limited += ['-p', f'MemoryMax={400 * 1024**2}', '-p', 'MemorySwapMax=0', '--']
+    limited += ['-p', f'MemoryMax={400 * 1024**2}', '-p', 'MemorySwapMax=0', *_keep_running_after_an_oom_kill(), '--']
     finished = subprocess.run(
         [*limited, sys.executable, '-c', RUN_FITS, str(tmp_path)],
         capture_output=True,
