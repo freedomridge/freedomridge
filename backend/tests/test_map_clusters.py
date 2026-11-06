@@ -1,10 +1,12 @@
 """The map's clustered view: a cluster bubble takes in the loose points it is drawn over
-(docs/MAP_REQUIREMENTS.md #2)."""
+(docs/MAP_REQUIREMENTS.md #2), and the query is planned for every run (#11)."""
 
 import os
 
+import asyncpg
 import pytest
 
+from backend.database import Database, init_connection
 from backend.routers import datasets
 from backend.tests.test_field_registry_postgres import registry_database
 
@@ -75,6 +77,37 @@ def test_a_loose_point_under_two_bubbles_counts_in_the_nearer_one(registry_datab
             if item.get('id') is None
         }
         assert counts == {west: 150, east: 154}
+
+    registry_database(scenario)
+
+
+def test_the_clustered_view_never_runs_on_a_generic_plan(registry_database, monkeypatch):
+    """From a prepared statement's 6th run on a connection PostgreSQL may switch to a generic plan,
+    which for this query was about 9 times slower. pg_prepared_statements counts the plans used."""
+
+    async def scenario(database_):
+        await _add(database_, 'dense', DENSE, 150)
+        # One connection, as a busy backend reuses one, so all eight runs share its prepared statement.
+        single = Database()
+        single.pool = await asyncpg.create_pool(
+            os.environ['FRIDGE_TEST_POSTGRES_DSN'],
+            min_size=1,
+            max_size=1,
+            init=init_connection,
+            server_settings={'search_path': await database_.fetchval('SHOW search_path')},
+        )
+        monkeypatch.setattr(datasets, 'db', single)
+        try:
+            for _ in range(8):
+                await datasets._get_dataset_map_points_impl(1, None, zoom=ZOOM)
+            # This lookup is a prepared statement too, and its own text contains the pattern.
+            plans = await single.fetch(
+                "SELECT generic_plans, custom_plans FROM pg_prepared_statements "
+                "WHERE statement LIKE '%array_agg(id)%' AND statement NOT LIKE '%pg_prepared_statements%'",
+            )
+        finally:
+            await single.pool.close()
+        assert [(row['generic_plans'], row['custom_plans']) for row in plans] == [(0, 8)]
 
     registry_database(scenario)
 

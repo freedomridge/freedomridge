@@ -131,7 +131,7 @@ seconds; it is **not** acceptable to cap the view to make it fast (see #0).
 The clustered query groups on the stored `samples.lon`/`lat` columns (schema.sql,
 trigger-maintained from `location` — never stale) so the whole-world view runs as an
 **index-only scan** over `idx_samples_lonlat_cover` (~750ms vs the old ~2.6s geometry
-scan). Two things this depends on — don't undo them:
+scan). Three things this depends on — don't undo them:
 - `_hybrid_items` must group with `round(lon/cell)` / `round(lat/cell)` (pure arithmetic
   on the columns), NOT `ST_SnapToGrid(location...)` — referencing `location` drops the
   index-only scan back to a full heap scan. `round()` matches the grid `ST_SnapToGrid`
@@ -141,6 +141,13 @@ scan). Two things this depends on — don't undo them:
   it heavy ingestion lets the visibility map go stale and the query slows (heap fetches).
   This affects speed only, never which samples appear (see the lon/lat columns are
   trigger-maintained, so a new sample is on the map the instant it commits).
+- `_hybrid_items` runs with `SET LOCAL plan_cache_mode = force_custom_plan`. asyncpg keeps the
+  query as a prepared statement on each pooled connection, and from its 6th run PostgreSQL may
+  switch to a generic plan, one not made for that run's cell size and bbox. For this query the
+  generic plan was about 9 times slower: 14 s instead of 1.5 s on 3.75M samples at zoom 4.5,
+  and 0.75 s instead of 0.22 s at zoom 7.5. So the map got slow after its first few views on
+  each connection. `test_the_clustered_view_never_runs_on_a_generic_plan` checks
+  `pg_prepared_statements` after 8 runs.
 
 ## 12. Selecting samples fits the map to them  ← was undocumented, got dropped
 
