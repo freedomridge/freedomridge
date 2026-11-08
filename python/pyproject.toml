@@ -6,7 +6,10 @@ build-backend = "setuptools.build_meta"
 name = "freedomridge"
 version = "2.1.1"
 license = "MIT"
+license-files = ["LICENSE"]  # a copy of the repository's LICENSE: a package can hold only files under python/
 description = "Python SDK for Freedom Ridge Dataset Explorer"
+readme = "README.md"
+requires-python = ">=3.12"
 dependencies = [
     "requests",
     "numpy",
@@ -41,6 +44,12 @@ all = [
     "imagehash",
     "scikit-learn",
 ]
+
+[project.urls]
+Homepage = "https://github.com/freedomridge/freedomridge"
+Documentation = "https://github.com/freedomridge/freedomridge/blob/main/docs/SDK.md"
+Changelog = "https://github.com/freedomridge/freedomridge/blob/main/CHANGELOG.md"
+Issues = "https://github.com/freedomridge/freedomridge/issues"
 
 [tool.setuptools.packages.find]
 include = ["fridge*"]

@@ -190,11 +190,9 @@ def _check_server_version(resp) -> None:
 
 
 def install_command(version: str) -> str:
-    """How to install the SDK of a server's release (the repository's tag; the SDK isn't on PyPI)."""
-    return (
-        f'pip install "freedomridge @ git+https://github.com/freedomridge/freedomridge.git@v{version}'
-        '#subdirectory=python"'
-    )
+    """How to install the SDK of a server's release. Releases from 2.1.1 on are on PyPI (2.0.0 and 2.1.0 only as
+    the repository's tags), and a server before 2.0 sends no version to name."""
+    return f'pip install "freedomridge=={version}"'
 
 
 class _BearerAuth(requests.auth.AuthBase):

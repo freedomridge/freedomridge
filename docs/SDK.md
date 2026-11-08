@@ -5,11 +5,12 @@ Complete API reference for the Freedom Ridge Python SDK.
 ## Installation
 
 ```bash
-# Install from source (the SDK lives in python/)
-cd /path/to/freedomridge
-pip install -e python/
+pip install freedomridge
 
 # Compute helpers need extras; install only what you use, or everything with [all]:
+pip install "freedomridge[all]"
+
+# Or from a clone (the SDK lives in python/):
 pip install -e "python/[all]"
 ```
 
@@ -80,8 +81,8 @@ client.revoke_token(tok["id"])
 - **The SDK's version:** every request says which release it is (`X-Fridge-SDK-Version`). The server refuses an
   SDK of another major version with HTTP 426.
 
-Either way, the message names both versions and the SDK to install, from the server's release:
-`pip install "freedomridge @ git+https://github.com/freedomridge/freedomridge.git@v2.0.0#subdirectory=python"`.
+Either way, the message names both versions and the SDK to install, the server's release:
+`pip install "freedomridge==2.0.0"`.
 SDKs before 2.0 send no version, so a 2.x server can't refuse them. Upgrade the SDK when you upgrade the
 server.
 
