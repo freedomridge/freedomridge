@@ -78,9 +78,9 @@ jobs:
           HF_HUB_OFFLINE: '1'
           TRANSFORMERS_OFFLINE: '1'
           OMP_NUM_THREADS: '4'
-        # This job has the ML extras: exercise real CLIP tower loading offline,
+        # This job has the ML extras: exercise real CLIP tower loading and patch vectors offline,
         # in addition to the mocked regressions in the lean backend job.
-        run: python -m pytest examples backend/tests/test_encoders.py -q
+        run: python -m pytest examples backend/tests/test_encoders.py backend/tests/test_patch_vectors.py -q
 
   backend-tests:
     if: ${{ !github.event.repository.private || github.event_name == 'workflow_dispatch' }}

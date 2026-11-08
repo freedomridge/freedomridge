@@ -4,6 +4,38 @@ Freedom Ridge has one version for the server, the web app and the Python SDK (th
 file), following [Semantic Versioning](https://semver.org). A release lists **upgrade notes** when
 it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
 
+## 2.3.0 (2026-11-08)
+
+2.3.0 adds what a follower instance needs first: one image's patch vectors computed without a server, and a
+job that imports such vectors from Parquet files in S3, so no image has to be downloaded to get its patches.
+There is no migration; the upgrade note concerns the job runner's environment.
+
+### Upgrade notes
+
+- `docker-compose.prod.yml` now also gives the job runner `STORAGE_ENCRYPTION_KEY`, which it needs to read
+  a storage configuration's credentials for the import. It's the same variable the backend already requires,
+  so a deployment changes nothing. A deployment with its own compose file should add it to the job runner.
+
+### Added
+
+- **One image's patch vectors without a server:** `fridge.compute_image_patch_vectors(image, scale="4x4")`
+  returns the vectors `compute_patch_embeddings` stores for that image (16 × 512 float32 for `4x4`), with no
+  client or network, so a batch job next to the images can compute them for a server to import.
+  `fridge.load_patch_model()` loads the model, offline from a warmed cache. `PATCH_MODEL_ID`,
+  `PATCH_MODEL_REVISION` and `PATCH_CROP_VERSION` say which vectors are interchangeable.
+- **Import patch vectors from S3:** `dataset.import_patch_vectors(prefix)` (admin;
+  `POST /api/datasets/{id}/embeddings/patches/import`) loads vectors computed elsewhere from Parquet files
+  under an S3 prefix, as a resumable server job. Rows match samples by filepath, unmatched rows and unreadable
+  files are counted with examples, and each tile position's search index is queued afterwards (docs/SDK.md,
+  "Importing patch vectors computed elsewhere"). The bucket must be served to the dataset by a storage
+  configuration.
+
+### Changed
+
+- `compute_patch_embeddings` loads its default model, `openai/clip-vit-base-patch32`, at a pinned Hugging Face
+  revision, the one that has been current since 2024-02, so its vectors stay the same as those computed
+  elsewhere.
+
 ## 2.2.0 (2026-11-08)
 
 2.2.0 is the first release with published Docker images: a server upgrades by pulling them instead of

@@ -251,7 +251,7 @@ def _covers(row: Any, bucket: str) -> bool:
     return row['bucket_name'] == bucket or any(fnmatch.fnmatchcase(bucket, p) for p in row['bucket_patterns'] or [])
 
 
-async def route_s3_bucket(dataset_id: int, bucket: str) -> Optional[StorageRoute]:
+async def route_s3_bucket(dataset_id: int, bucket: str, source=None) -> Optional[StorageRoute]:
     """Which credentials serve s3://{bucket}/... for this dataset, or None when it may not read the bucket.
 
     This is the SSRF / confused-deputy guard as well as the router: a user who can set a sample's media
@@ -262,11 +262,12 @@ async def route_s3_bucket(dataset_id: int, bucket: str) -> Optional[StorageRoute
     wins: the dataset's own config (datasets.storage_config_id), then a restricted config listing it,
     then one serving every dataset; an exact bucket_name beats a pattern; then the oldest. With no
     candidate, the env-var backend serves its own bucket, but only to a dataset that has neither a
-    config of its own nor a default config to fall back to.
+    config of its own nor a default config to fall back to. ``source`` is the pool or connection to read
+    the configs from (the API's by default; a job runner passes its own).
     """
     from .database import db
 
-    rows = await db.fetch(_ROUTE_SQL, dataset_id)
+    rows = await (source or db).fetch(_ROUTE_SQL, dataset_id)
     usable = [r for r in rows if _covers(r, bucket) and (not r['restricted'] or r['listed'])]
     if usable:
         best = min(usable, key=lambda r: (not r['assigned'], not r['restricted'], r['bucket_name'] != bucket, r['id']))
@@ -276,9 +277,10 @@ async def route_s3_bucket(dataset_id: int, bucket: str) -> Optional[StorageRoute
     return ENV_ROUTE if storage.config.s3_bucket == bucket else None
 
 
-async def backend_for_route(route: StorageRoute) -> Optional[StorageBackend]:
+async def backend_for_route(route: StorageRoute, source=None) -> Optional[StorageBackend]:
     """The StorageBackend for a route just chosen by route_s3_bucket (one cached S3 client per config,
-    rebuilt when the row's updated_at changes), or None if the config was deleted in between."""
+    rebuilt when the row's updated_at changes), or None if the config was deleted in between. ``source``
+    is as for route_s3_bucket."""
     if route.config_id is None:
         return storage
     cached = _backend_cache.get(route.config_id)
@@ -289,7 +291,7 @@ async def backend_for_route(route: StorageRoute) -> Optional[StorageBackend]:
     from .crypto import decrypt_secret
     from .database import db
 
-    row = await db.fetchrow(
+    row = await (source or db).fetchrow(
         """
         SELECT bucket_name, region, access_key_id, secret_access_key_encrypted, endpoint_url,
                is_public_bucket, updated_at

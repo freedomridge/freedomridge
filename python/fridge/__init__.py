@@ -18,6 +18,13 @@ from .core.labels import (
     Segmentation,
 )
 from .core.objects import objects_from_cuboids
+from .core.patches import (
+    PATCH_CROP_VERSION,
+    PATCH_MODEL_ID,
+    PATCH_MODEL_REVISION,
+    compute_image_patch_vectors,
+    load_patch_model,
+)
 from .core.sample import Sample
 from .core.version_view import VersionReadOnlyError, VersionView
 from .core.view import (
@@ -49,6 +56,11 @@ __all__ = [
     'JobTimeout',
     # Image metrics
     'compute_image_metrics',
+    'compute_image_patch_vectors',
+    'load_patch_model',
+    'PATCH_MODEL_ID',
+    'PATCH_MODEL_REVISION',
+    'PATCH_CROP_VERSION',
     # Query building
     'SampleQuery',
     'Condition',
