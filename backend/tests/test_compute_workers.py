@@ -182,8 +182,8 @@ class FakeServer:
         self.answer('register')
         return {'worker_id': f'compute-{len(self.calls)}', 'heartbeat_seconds': 20}
 
-    def worker_heartbeat(self, worker_id):
-        self.answer(f'heartbeat {worker_id}')
+    def claim_worker_job(self, worker_id, wait_seconds):
+        self.answer(f'claim {worker_id}')  # no job came within the wait
 
 
 def test_the_worker_retries_registers_again_when_dropped_and_stops_on_a_refused_token():
@@ -194,16 +194,17 @@ def test_the_worker_retries_registers_again_when_dropped_and_stops_on_a_refused_
     assert server.calls == [
         'register',  # the server is down: try again
         'register',
-        'heartbeat compute-2',
-        'heartbeat compute-2',  # 503 while the server restarts: keep the registration
-        'heartbeat compute-2',  # no answer in time
-        'heartbeat compute-2',  # 429, busy
-        'heartbeat compute-2',  # 404: the server dropped it
+        'claim compute-2',  # each claim waits on the server and keeps the worker online
+        'claim compute-2',  # 503 while the server restarts: keep the registration
+        'claim compute-2',  # no answer in time
+        'claim compute-2',  # 429, busy
+        'claim compute-2',  # 404: the server dropped it
         'register',
-        'heartbeat compute-8',
-        'heartbeat compute-8',  # 401: the token was revoked
+        'claim compute-8',
+        'claim compute-8',  # 401: the token was revoked
     ]
-    assert waits == [sdk_worker.RETRY_SECONDS, 20, 20, 20, 20, 20, sdk_worker.RETRY_SECONDS, 20, 20]
+    # A wait only after a failure: a claim that found no job already waited on the server.
+    assert waits == [sdk_worker.RETRY_SECONDS] * 5
 
 
 def test_the_worker_stops_on_a_mistake_only_a_person_can_fix():

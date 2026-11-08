@@ -98,11 +98,21 @@ token = client.create_token("my desktop", scope="worker")["token"]
 FRIDGE_API_URL=https://YOUR_DOMAIN/api FRIDGE_API_TOKEN=<worker token> python -m fridge.worker
 ```
 
-The worker registers with the server and keeps a heartbeat, so **Settings → Compute Workers** and
-`client.list_workers()` list it, and System status counts it online. It keeps going while the server is
-down, restarting or slow to answer, and registers again if the server dropped it. A refusal only a
-person can fix, such as a revoked token or an unknown `--kinds`, stops it with the reason. `--name` sets how
-the server lists it (default: the host name). Taking map re-fit jobs follows.
+The worker registers with the server, then claims compute work again and again (each claim waits up to 25 s on
+the server and keeps it online), so **Settings → Compute Workers** and `client.list_workers()` list it, and
+System status counts it online. It keeps going while the server is down, restarting or slow to answer, and
+registers again if the server dropped it. A refusal only a person can fix, such as a revoked token or an
+unknown `--kinds`, stops it with the reason. `--name` sets how the server lists it (default: the host name).
+
+The work it takes is a **map re-fit's fit**, on a server whose job runner leaves fits to workers
+(`JOB_RUNNER_PLACEMENTS=server`; by default the server fits maps itself). The server exports the vectors; the
+worker downloads them, runs `python -m fridge.map_fit` in a child process, uploads the new coordinates (never
+a model) and the server checks them and swaps the map in. The worker needs the fit's packages: install the
+SDK with the `embeddings` extra. The fit sizes itself to this machine's free memory, and an out-of-memory kill
+stops only the child: it runs again on 75% of the points, down to the smallest useful fit. A thread renews the
+job's lease meanwhile; if the lease is lost, or someone cancels the job, the fit stops at once. Ctrl-C (or
+SIGTERM) gives the job back. Work files live in `FRIDGE_WORKER_DIR` (default `~/.fridge/worker`), one folder
+per job, removed when it ends.
 
 ## Core Classes
 

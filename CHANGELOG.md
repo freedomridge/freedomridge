@@ -4,6 +4,19 @@ Freedom Ridge has one version for the server, the web app and the Python SDK (th
 file), following [Semantic Versioning](https://semver.org). A release lists **upgrade notes** when
 it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
 
+## Unreleased
+
+### Added
+
+- `python -m fridge.worker` fits maps: on a server whose job runner leaves fits to compute workers
+  (`JOB_RUNNER_PLACEMENTS=server`), a worker claims a map re-fit's fit, downloads the exported vectors, runs
+  the fit on its own machine and uploads the new coordinates, and the server swaps the map in. A server too
+  small to fit its maps (such as a t3.large) can have them fitted on a desktop instead.
+  - The fit sizes itself to the worker's free memory. An out-of-memory kill stops only the fit, which runs
+    again on 75% of the points, down to the smallest useful fit.
+  - A lost lease or a cancel stops the fit at once, Ctrl-C or SIGTERM gives the job back, and a transfer that
+    fails for a moment is tried again. Install the SDK with the `embeddings` extra on the worker.
+
 ## 2.0.0 (2026-11-06)
 
 2.0 removes old forms of the API that 1.x still accepted, and new images now appear on every map by

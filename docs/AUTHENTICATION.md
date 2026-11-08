@@ -201,6 +201,9 @@ the variable.
 | `/api/tokens/{id}` | DELETE | owner | Revoke one of your tokens |
 | `/api/workers/register` | POST | worker token of a power_user or admin | Register a compute worker |
 | `/api/workers/{id}/heartbeat` | POST | its owner's worker token | Keep a compute worker online |
+| `/api/workers/{id}/claim` | POST | its owner's worker token | Claim compute work (long poll; only datasets its owner can access) |
+| `/api/workers/{id}/jobs/{job_id}/heartbeat`, `.../complete`, `.../fail`, `.../release` | POST | its owner's worker token, with the job's lease | Renew, finish, fail or give back a claimed job |
+| `/api/workers/{id}/jobs/{job_id}/files/{name}` | GET, PUT | its owner's worker token, with the job's lease (`X-Fridge-Lease`) | Download a job's inputs, upload its outputs |
 | `/api/workers` | GET | power_user (own workers), admin (all) | List compute workers and job runners |
 
 ## Troubleshooting
