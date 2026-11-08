@@ -21,6 +21,7 @@ from . import (
     job_queue,
     map_placement,
     map_refit,
+    patch_import,
     schema_check,
     statistics,
 )
@@ -251,6 +252,9 @@ async def run_service(dsn=DATABASE_URL):
         # Each slot's share of the runner's connections, for lookups at once.
         return await map_placement.handler(pool, lookups=(pool.get_max_size() - 1) // len(runner.workers))(job)
 
+    async def handle_patch_import(job):
+        return await patch_import.handler(pool)(job)
+
     async def handle_index_review(job):
         return await index_advisor.handler(pool)(job)
 
@@ -280,6 +284,7 @@ async def run_service(dsn=DATABASE_URL):
         map_refit.KIND: handle_map_refit,
         map_placement.KIND: handle_map_place,
         index_advisor.KIND: handle_index_review,
+        patch_import.KIND: handle_patch_import,
         index_actions.DROP_KIND: handle_index_drop,
         index_actions.RESTORE_KIND: handle_index_restore,
     }
@@ -302,6 +307,7 @@ async def run_service(dsn=DATABASE_URL):
                 map_refit.KIND: map_refit.POLICY,
                 map_placement.KIND: map_placement.POLICY,
                 index_advisor.KIND: index_advisor.POLICY,
+                patch_import.KIND: patch_import.POLICY,
                 index_actions.DROP_KIND: index_actions.POLICY,
                 index_actions.RESTORE_KIND: index_actions.POLICY,
             },

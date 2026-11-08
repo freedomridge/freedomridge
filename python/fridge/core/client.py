@@ -733,6 +733,28 @@ class Client:
             "patch_embeddings",
         )
 
+    def import_patch_vectors(
+        self,
+        dataset_id,
+        prefix,
+        *,
+        field_name="clip",
+        build_indexes=True,
+        wait=True,
+        timeout=86400,
+    ):
+        """Import patch vectors from Parquet files under an S3 prefix, as a server job (admin only).
+
+        Returns the job's result with ``wait=True`` (``timeout`` seconds at most; a timeout never cancels the
+        import), or the Job.
+        """
+        response = self.session.post(
+            f"{self.base_url}/datasets/{dataset_id}/embeddings/patches/import",
+            json={"prefix": prefix, "field_name": field_name, "build_indexes": build_indexes},
+            timeout=(10, 120),
+        )
+        return self._bulk_result(response, wait=wait, timeout=timeout)
+
     def reduce_embeddings(self, dataset_id, field_name="clip", max_embeddings=100000):
         """
         Compute UMAP-reduced 2D embedding coordinates for visualization.

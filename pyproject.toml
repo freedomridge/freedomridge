@@ -24,6 +24,8 @@ dependencies = [
     "Pillow",
     "umap-learn",
     "boto3",
+    # Reads Parquet: the patch-vector import (backend/patch_import.py)
+    "pyarrow",
     "httpx",
     "cryptography",
     # Python SDK (python/)

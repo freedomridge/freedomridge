@@ -6,6 +6,12 @@ it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
 
 ## Unreleased
 
+### Upgrade notes
+
+- `docker-compose.prod.yml` now also gives the job runner `STORAGE_ENCRYPTION_KEY`, which it needs to read
+  a storage configuration's credentials for the import. It's the same variable the backend already requires,
+  so a deployment changes nothing. A deployment with its own compose file should add it to the job runner.
+
 ### Added
 
 - **One image's patch vectors without a server:** `fridge.compute_image_patch_vectors(image, scale="4x4")`
@@ -13,6 +19,12 @@ it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
   client or network, so a batch job next to the images can compute them for a server to import.
   `fridge.load_patch_model()` loads the model, offline from a warmed cache. `PATCH_MODEL_ID`,
   `PATCH_MODEL_REVISION` and `PATCH_CROP_VERSION` say which vectors are interchangeable.
+- **Import patch vectors from S3:** `dataset.import_patch_vectors(prefix)` (admin;
+  `POST /api/datasets/{id}/embeddings/patches/import`) loads vectors computed elsewhere from Parquet files
+  under an S3 prefix, as a resumable server job. Rows match samples by filepath, unmatched rows and unreadable
+  files are counted with examples, and each tile position's search index is queued afterwards (docs/SDK.md,
+  "Importing patch vectors computed elsewhere"). The bucket must be served to the dataset by a storage
+  configuration.
 
 ### Changed
 

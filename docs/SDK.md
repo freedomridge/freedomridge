@@ -2286,6 +2286,44 @@ vectors.shape  # (16, 512)
 
 Install the `patch-embeddings` extra.
 
+### Importing patch vectors computed elsewhere
+
+`dataset.import_patch_vectors(prefix)` (admin) loads patch vectors written to S3, for example by a batch
+job running `compute_image_patch_vectors` next to the images, so no image is downloaded twice. It runs as a
+server job and returns its result, or its `Job` with `wait=False`.
+
+```python
+result = dataset.import_patch_vectors("s3://my-patches/patch-vectors/openai-clip-vit-base-patch32@3d74acf/4x4/v1/")
+result["images"], result["unmatched"], result["bad_files"]
+```
+
+The prefix holds:
+
+- **`info.json`**, written once, describing the vectors:
+  - required: `scale` (`"4x4"`), `shape` (`[16, 512]`: tiles, then values), and `dtype` (`"float32"`);
+  - anything else, such as `model`, `revision`, `crop_version` and `sdk_version`, is kept in the job's
+    result.
+- **Parquet files** (`*.parquet`, one per image or many images each) with the columns:
+  - `filepath`: the sample's full `s3://bucket/key`;
+  - `vectors`: a `fixed_size_list<float32, 8192>` for `4x4` (tiles × values), in tile order r0c0, r0c1, …;
+  - `scale`.
+
+The bucket must be one a storage configuration serves to this dataset (Settings → Storage
+Configuration). Before anything is queued, the import checks the `info.json` and that the fields'
+vector length matches what they already hold.
+
+The job reads the files in key order, a batch at a time, and matches each row to an image sample by
+`filepath`. Each tile becomes `<field_name>_patch_<scale>_r{row}c{col}`, replacing a vector already
+there. A stopped or restarted job resumes after the last batch it committed.
+
+Rows that match no sample, and files that can't be read, are counted, with up to five examples each, but
+they don't fail the import. With `build_indexes=True` (the default) the job then queues each tile
+position's search index, as `build_ann_index` would.
+
+The import runs in the dataset's maintenance lane, so statistics refreshes and map placement on that
+dataset wait until it ends. Bulk edits don't. `timeout` (a day by default) only limits the wait; it never
+cancels the import.
+
 ### Patch Similarity Search (SDK)
 
 ```python

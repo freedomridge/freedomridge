@@ -13,7 +13,7 @@ import numpy as np
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from pydantic import BaseModel, Field, FiniteFloat, model_validator
 
-from .. import map_placement
+from .. import map_placement, patch_import
 from ..access import require_dataset_access
 from ..api_errors import CodedHTTPException
 from ..coordinates import (
@@ -288,6 +288,32 @@ async def validate_embedding_dims(field_dims: Dict[str, Set[int]]) -> None:
                     f"different model/dimension."
                 ),
             )
+
+
+class PatchVectorImport(BaseModel):
+    prefix: str  # s3://bucket/path/ holding info.json and the Parquet files (backend/patch_import.py)
+    field_name: str = "clip"
+    build_indexes: bool = True
+
+    @model_validator(mode='after')
+    def validate_field(self):
+        if not _SAFE_FIELD_RE.match(self.field_name):
+            raise ValueError(f"Invalid field_name: {self.field_name}")
+        return self
+
+
+@router.post("/patches/import", status_code=202)
+async def import_patch_vectors(id: int, request: PatchVectorImport, user: dict = Depends(require_role("admin"))):
+    """Import patch vectors computed elsewhere from Parquet files under an S3 prefix, as a background job (202 with
+    its id). The bucket must be one this dataset may read, its info.json valid, and the vector length the one its
+    fields already have; the import then matches rows to samples by filepath."""
+    from ..job_wait import accepted
+
+    prefix, info = await patch_import.check_prefix(db.pool, id, request.prefix)
+    fields = patch_import.patch_fields(request.field_name, info['scale'])
+    await validate_embedding_dims({field: {info['shape'][1]} for field in fields})
+    job = await patch_import.enqueue(db.pool, id, user['id'], prefix, info, request.field_name, request.build_indexes)
+    return accepted(job)
 
 
 @router.post("/patches")

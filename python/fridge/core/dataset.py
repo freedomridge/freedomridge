@@ -2047,6 +2047,29 @@ class Dataset:
             "dropped_sample_ids": sorted(dropped_sample_ids),
         }
 
+    def import_patch_vectors(self, prefix, *, field_name="clip", build_indexes=True, wait=True, timeout=86400):
+        """Import patch vectors computed elsewhere (``fridge.compute_image_patch_vectors``, say in a batch job next
+        to the images) from Parquet files under an S3 prefix, as a server job. Admin only.
+
+        The prefix (``s3://bucket/path/``) holds an ``info.json`` (``scale``, ``shape`` [tiles, values], ``dtype``
+        float32) and Parquet files with ``filepath``, ``vectors`` and ``scale`` columns. The bucket must be one a
+        storage configuration serves to this dataset. Rows match samples by filepath, and their tiles become
+        ``<field_name>_patch_<scale>_r{row}c{col}``. With ``build_indexes`` the job then queues each tile
+        position's search index.
+
+        Returns the job's result with ``wait=True`` (files, images, unmatched and bad files with examples,
+        fields, index_jobs), or its Job with ``wait=False``. ``timeout`` is in seconds, a day by default; a
+        timeout never cancels the import, which ``Job(client, id).wait()`` can follow again.
+        """
+        return self.client.import_patch_vectors(
+            self._id,
+            prefix,
+            field_name=field_name,
+            build_indexes=build_indexes,
+            wait=wait,
+            timeout=timeout,
+        )
+
     def compute_patch_embeddings(
         self,
         model_name="openai/clip-vit-base-patch32",
