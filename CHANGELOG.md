@@ -4,7 +4,10 @@ Freedom Ridge has one version for the server, the web app and the Python SDK (th
 file), following [Semantic Versioning](https://semver.org). A release lists **upgrade notes** when
 it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
 
-## Unreleased
+## 2.1.1 (2026-11-07)
+
+2.1.1 moves to transformers 5 for its security fixes. Embeddings are unchanged, so nothing needs
+recomputing, and it needs only the standard upgrade steps (no migration).
 
 ### Security
 
