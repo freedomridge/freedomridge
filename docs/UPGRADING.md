@@ -26,12 +26,14 @@ From the checkout the server runs, with `docker-compose.prod.yml`:
 1. Read the CHANGELOG entries between your version and the new one.
 2. Back up the database as in [Backup and migration](BACKUP_AND_MIGRATION.md), and keep the dump
    until you're happy with the new version.
-3. Check out the release and build it:
+3. Check out the release and pull its images from ghcr.io (each release publishes them):
    ```bash
    git fetch --tags
    git checkout vX.Y.Z
-   docker compose -f docker-compose.prod.yml build --pull
+   docker compose -f docker-compose.prod.yml pull
    ```
+   To build them from the checkout instead, as releases before 2.2.0 need, run
+   `docker compose -f docker-compose.prod.yml build --pull`.
 4. Apply the migrations, then recreate the containers:
    ```bash
    FRIDGE_DB_CONTAINER=$(docker compose -f docker-compose.prod.yml ps -q db) \

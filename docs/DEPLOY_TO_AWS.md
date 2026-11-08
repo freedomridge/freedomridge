@@ -50,10 +50,10 @@ inviting visitors.
   a fine-grained token restricted to that repository with **Contents: read-only**,
   and follow the token-file/retry procedure in section 3. Never embed a token in
   the URL, tfvars, user-data, or a command argument.
-- A Mapbox public `pk.` token for `NEXT_PUBLIC_MAPBOX_TOKEN`. It is compiled into
-  browser JavaScript, so it is not a secret, but anyone can copy it. In your Mapbox
-  account, **restrict the token's allowed URLs to `https://YOUR_DOMAIN`** before you
-  build the frontend. If the same token is used in CI, the Playwright traces of failed
+- A Mapbox public `pk.` token for `NEXT_PUBLIC_MAPBOX_TOKEN`. Browsers receive it,
+  so it is not a secret, but anyone can copy it. In your Mapbox account, **restrict
+  the token's allowed URLs to `https://YOUR_DOMAIN`** before you start the
+  frontend. If the same token is used in CI, the Playwright traces of failed
   end-to-end runs also contain it.
 - An email address for certificate notices, AWS Budget alerts and SNS notifications.
   Confirm the SNS subscription email after applying.
@@ -259,7 +259,7 @@ The generated values include:
 | `SESSION_COOKIE_SECURE` | `true` (also the production Compose default) |
 | `DOMAIN_NAME` | `YOUR_DOMAIN` |
 | `LETSENCRYPT_EMAIL` | Your notification email |
-| `NEXT_PUBLIC_MAPBOX_TOKEN` | **Fill this in before building the frontend**, after restricting the token to `https://YOUR_DOMAIN` |
+| `NEXT_PUBLIC_MAPBOX_TOKEN` | After restricting the token to `https://YOUR_DOMAIN`. The frontend reads it when it starts: after a change, `docker compose -f docker-compose.prod.yml up -d frontend` |
 | `DATA_VOLUME_PATH`, `FRIDGE_DATA_ROOT` | Both `/data/datasets`; mounted at the **same absolute path** in backend and job-runner |
 | `POSTGRES_VOLUME_PATH` | `/data/postgres`, outside the media root |
 | `CACHE_VOLUME_PATH` | `/cache`, including `/cache/huggingface` |
@@ -317,8 +317,12 @@ again on a working site just to renew it.
 
 ## 6. Start HTTPS and renewal
 
+`pull` fetches the release's images from ghcr.io. For a revision that isn't a release, build
+them from the checkout with `docker compose -f docker-compose.prod.yml build --pull` instead.
+
 ```bash
-docker compose -f docker-compose.prod.yml up -d --build
+docker compose -f docker-compose.prod.yml pull
+docker compose -f docker-compose.prod.yml up -d
 docker compose -f docker-compose.prod.yml ps
 docker compose -f docker-compose.prod.yml logs --tail=100 backend nginx backup
 sudo systemctl enable --now freedomridge-cert-renew.timer
@@ -972,14 +976,14 @@ CPU alarms trigger above 85% for three 5-minute periods. Disk alarms trigger abo
 also alarm, including during first boot and when the agent stops. Confirm the SNS email subscription and look for agent errors if disk
 metrics are absent. The module does not add a 5xx alarm or demo-login dashboard.
 
-Review security updates and rebuild images monthly and after relevant advisories.
-OS unattended upgrades do not rebuild containers. Back up first, review a pinned
-revision, build with `docker compose -f docker-compose.prod.yml build --pull`,
-apply migrations using the explicit production DB container, and recreate with
+Review security updates monthly and after relevant advisories. OS unattended
+upgrades do not update containers. Back up first, check out the release that has
+the fixes, pull its images with `docker compose -f docker-compose.prod.yml pull`
+(between releases, rebuild from the checkout with `build --pull`), apply migrations using the explicit production DB container, and recreate with
 `up -d`. nginx re-resolves Docker service IPs every 10 seconds; allow startup
 health checks and that DNS window after recreation. A single-instance restart still
-has downtime; this is not a rolling deployment. Rebuild the frontend whenever the Mapbox
-token changes. Editing the top-level `nginx.conf` template needs
+has downtime; this is not a rolling deployment. After changing the Mapbox token, recreate
+the frontend (`docker compose -f docker-compose.prod.yml up -d frontend`). Editing the top-level `nginx.conf` template needs
 `docker compose -f docker-compose.prod.yml up -d --no-deps --force-recreate nginx`
 because envsubst runs at container start. Edits to `ops/nginx/*.conf` need only
 `exec nginx nginx -t` followed by `exec nginx nginx -s reload`. Check migrations

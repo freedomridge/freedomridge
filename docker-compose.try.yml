@@ -1,0 +1,89 @@
+# Try Freedom Ridge on one machine with only Docker: this release's published images, at
+# http://localhost:3000. No domain, TLS, Python or Node. From the release's folder:
+#
+#   docker compose -f docker-compose.try.yml up -d
+#
+# Log in as admin / admin123 and set a new password. For local use only: the credentials are the
+# development ones, and the ports listen on 127.0.0.1. Put images in ./data. It is mounted at the same
+# path in the containers (FRIDGE_DATA_ROOT), so paths you give the SDK on this machine work as they are.
+# Run Compose from this folder: the path comes from the shell's $PWD. MAPBOX_TOKEN in the environment or
+# a .env file turns the map on. A server needs docker-compose.prod.yml (docs/DOCKER_DEPLOYMENT.md).
+name: freedomridge-try
+
+services:
+  db:
+    image: ghcr.io/freedomridge/db:2.1.2
+    environment:
+      POSTGRES_USER: freedomridge
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: freedomridge
+    command: postgres -c config_file=/etc/postgresql/postgresql.conf -c max_connections=250
+    shm_size: '1g'
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      # Loaded once, when the volume is empty.
+      - ./backend/db/schema.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro
+      - ./backend/db/postgresql.conf:/etc/postgresql/postgresql.conf:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U freedomridge"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+
+  backend:
+    image: ghcr.io/freedomridge/backend:2.1.2
+    environment:
+      DATABASE_URL: postgresql://freedomridge:password@db:5432/freedomridge
+      FRIDGE_ENV: development
+      FRIDGE_DATA_ROOT: ${PWD}/data
+      HF_HOME: /cache/huggingface
+      S3_LOCAL_CACHE_PATH: /cache/s3
+      FRIDGE_COMPOSITE_CACHE_PATH: /cache/composite
+      FRIDGE_CROP_CACHE_PATH: /cache/crop
+      FRIDGE_UMAP_MODEL_DIR: /models
+    ports:
+      - "127.0.0.1:8000:8000"  # the API, for the SDK: fridge.connect("http://localhost:8000/api", ...)
+    volumes:
+      - ./data:${PWD}/data:ro
+      - cache:/cache
+      - umap_models:/models
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+  job-runner:
+    image: ghcr.io/freedomridge/worker:2.1.2
+    command: python3 -m backend.job_service
+    init: true
+    environment:
+      DATABASE_URL: postgresql://freedomridge:password@db:5432/freedomridge
+      FRIDGE_ENV: development
+      FRIDGE_DATA_ROOT: ${PWD}/data
+      FRIDGE_UMAP_MODEL_DIR: /models
+    volumes:
+      - ./data:${PWD}/data:ro
+      - umap_models:/models
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+    stop_grace_period: 30s
+
+  frontend:
+    image: ghcr.io/freedomridge/frontend:2.1.2
+    environment:
+      # Next standalone otherwise binds to Docker's hostname and its localhost healthcheck fails.
+      HOSTNAME: 0.0.0.0
+      MAPBOX_TOKEN: ${MAPBOX_TOKEN:-}
+    ports:
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  cache:
+  umap_models:

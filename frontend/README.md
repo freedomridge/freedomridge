@@ -20,7 +20,8 @@ The app runs at http://localhost:3000.
 
 | Variable | Read | Purpose |
 |---|---|---|
-| `NEXT_PUBLIC_MAPBOX_TOKEN` | at build time (baked into the bundle) | Mapbox public token for the map panel. Everything else works without it. Use a public token with URL restrictions |
+| `MAPBOX_TOKEN` | when the server runs (`/runtime-config`) | Mapbox public token for the map panel. Everything else works without it. Use a public token with URL restrictions |
+| `NEXT_PUBLIC_MAPBOX_TOKEN` | at build time (compiled in) | The map's token when `MAPBOX_TOKEN` isn't set: in `.env.local` for development |
 | `FRIDGE_BACKEND_URL` | when `next.config.ts` loads (dev server start or build) | Where `/api` is forwarded; default `http://localhost:8000`. The Docker image bakes it in at build time |
 | `ALLOWED_DEV_ORIGINS` | dev server only | Comma-separated hosts or IPs allowed to load `next dev` from another machine |
 | `NEXT_DIST_DIR` | dev server and build | Output directory instead of `.next`, so a second dev server can run from the same checkout. Next.js then adds that directory to `tsconfig.json`; do not commit that change |

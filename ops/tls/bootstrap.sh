@@ -10,4 +10,4 @@ NGINX_CONFIG_TEMPLATE=./ops/nginx/bootstrap.conf "${compose[@]}" up -d --no-deps
         --cert-name "$DOMAIN_NAME" -d "$DOMAIN_NAME" \
         --email "$LETSENCRYPT_EMAIL" --agree-tos --non-interactive
 '
-echo 'Certificate ready. Start HTTPS with: docker compose -f docker-compose.prod.yml up -d --build'
+echo 'Certificate ready. Start HTTPS with: docker compose -f docker-compose.prod.yml pull && docker compose -f docker-compose.prod.yml up -d'
