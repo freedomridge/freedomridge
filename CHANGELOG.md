@@ -4,6 +4,28 @@ Freedom Ridge has one version for the server, the web app and the Python SDK (th
 file), following [Semantic Versioning](https://semver.org). A release lists **upgrade notes** when
 it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
 
+## Unreleased
+
+### Added
+
+- **The Python SDK is on PyPI:** `pip install freedomridge`, or `pip install "freedomridge==X.Y.Z"` for a
+  given release, from 2.1.1 on. The version messages of the SDK and the server name that command instead
+  of an install from GitHub.
+
+### Fixed
+
+- **Index review:** **Review now** could stay on "Not reviewed yet" for good. A review that finished just as
+  the page read its state showed as neither running nor done, and the page stopped checking. The state is now
+  read at one moment.
+- **Saving a version** right after an import or edit, or while data was coming in, could fail with "Dataset
+  changed during snapshot creation". Every statistics refresh records its run on the dataset, and the snapshot
+  took that for a change; with data coming in, one finished during every attempt on a big dataset. A snapshot
+  now conflicts only when the dataset's settings change while it copies, and is then taken again, up to twice,
+  as a restore is. A field renamed or retyped during the copy no longer restarts it either: like other field
+  and sample changes made meanwhile, it's left out of the version.
+- **Tagging from the single-image view:** the Tag dialog read the image's tags again after every read, so the
+  list flickered until the server refused with "too many requests" (#10). It reads them once.
+
 ## 2.1.1 (2026-11-07)
 
 2.1.1 moves to transformers 5 for its security fixes. Embeddings are unchanged, so nothing needs

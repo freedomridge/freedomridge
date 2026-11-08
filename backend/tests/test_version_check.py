@@ -46,8 +46,7 @@ def test_a_server_of_another_major_version_is_refused_with_what_to_install(monke
         session.request('GET', 'https://fridge.example/api/datasets')
     assert str(refused.value) == (
         f'This Freedom Ridge SDK is 2.0.0, and the server at https://fridge.example runs {server}. '
-        'An SDK works only with a server of its own major version: pip install '
-        f'"freedomridge @ git+https://github.com/freedomridge/freedomridge.git@v{server}#subdirectory=python"'
+        f'An SDK works only with a server of its own major version: pip install "freedomridge=={server}"'
     )
 
 
@@ -71,6 +70,5 @@ def test_the_sdk_says_its_version_and_the_server_refuses_another_major_one(monke
     assert (refused.status_code, refused.headers['x-fridge-version']) == (426, VERSION)
     assert refused.json()['detail'] == (
         f'This server runs Freedom Ridge {VERSION}, and this SDK is {other}. An SDK works only with a server of '
-        'its own major version: pip install '
-        f'"freedomridge @ git+https://github.com/freedomridge/freedomridge.git@v{VERSION}#subdirectory=python"'
+        f'its own major version: pip install "freedomridge=={VERSION}"'
     )

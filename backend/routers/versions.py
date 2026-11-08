@@ -1,6 +1,7 @@
 """Dataset versioning — create snapshots, view history, compare diffs."""
 
 import asyncio
+import contextlib
 import json
 import secrets
 from typing import Any, Optional
@@ -113,6 +114,29 @@ def _dataset_snapshot_sql(dataset_param: str) -> str:
             ), '[]'::jsonb)
         ) FROM datasets d WHERE d.id = {dataset_param}
     """
+
+
+# The dataset's row ($1) without the stats_ columns: those are statistics bookkeeping, written by every refresh
+# and full-refresh request.
+_SETTINGS_SQL = """
+    SELECT jsonb_object_agg(key, value) FROM datasets d, jsonb_each(to_jsonb(d))
+    WHERE d.id = $1 AND NOT starts_with(key, 'stats_')
+"""
+
+
+async def _hold_unchanged_settings(conn, dataset_id: int, held: contextlib.AsyncExitStack) -> None:
+    """Lock the dataset row until `held` closes, on a second connection, and raise SerializationError
+    if the row `conn`'s snapshot read (_SETTINGS_SQL) is no longer the committed one.
+
+    Locking the row in `conn`'s own repeatable-read transaction fails on any update since its snapshot
+    began, statistics bookkeeping included, and a refresh finishes every few seconds while data comes in.
+    """
+    guard = await held.enter_async_context(db.pool.acquire())
+    await held.enter_async_context(guard.transaction())
+    # SHARE waits out a writer in progress; holding it, no update commits before `conn` does.
+    await guard.fetchval('SELECT id FROM datasets WHERE id = $1 FOR SHARE', dataset_id)
+    if await guard.fetchval(_SETTINGS_SQL, dataset_id) != await conn.fetchval(_SETTINGS_SQL, dataset_id):
+        raise asyncpg.SerializationError('Dataset settings changed during the snapshot')
 
 
 def _media_compare_sql(snapshot='v', other='s', pair=False):
@@ -456,16 +480,27 @@ async def list_versions(id: int):
     return [dict(r) for r in rows]
 
 
+# A full snapshot rolls back if the dataset's row (its settings) changed while it copied, statistics
+# bookkeeping aside (see _hold_unchanged_settings). It is taken again after each of these pauses (seconds),
+# as a restore is, and reports 409 only when the last attempt fails.
+_CREATE_RETRY_DELAYS = (0.1, 0.2)
+
+
 @router.post("", dependencies=[Depends(require_role("power_user"))])
 async def create_version(id: int, request: CreateVersionRequest):
     """Capture a consistent snapshot, or report a retryable concurrent-write conflict."""
-    try:
-        return await _create_version(id, request)
-    except asyncpg.SerializationError:
-        raise HTTPException(
-            status_code=409,
-            detail="Dataset changed during snapshot creation; retry after the concurrent writer finishes",
-        )
+    for delay in (*_CREATE_RETRY_DELAYS, None):
+        try:
+            return await _create_version(id, request)
+        except asyncpg.SerializationError:
+            if delay is None:
+                # Rolled back, nothing kept: a retryable refusal, marked with Retry-After like the others.
+                raise HTTPException(
+                    status_code=409,
+                    detail="Dataset changed during snapshot creation; retry after the concurrent writer finishes",
+                    headers={'Retry-After': '1'},
+                )
+            await asyncio.sleep(delay)
 
 
 async def _create_version(id: int, request: CreateVersionRequest):
@@ -486,7 +521,7 @@ async def _create_version(id: int, request: CreateVersionRequest):
     # so they see the same MVCC snapshot. Otherwise concurrent ingestion between
     # the COUNT and the INSERT...SELECT would record a sample_count that disagrees
     # with the number of snapshot rows actually captured.
-    async with db.pool.acquire() as conn:
+    async with db.pool.acquire() as conn, contextlib.AsyncExitStack() as held:
         if request.include_metadata:
             # A full snapshot is a multi-GB single transaction on a big dataset: refuse (507)
             # rather than let it fill the volume mid-write (Postgres would PANIC).
@@ -551,11 +586,10 @@ async def _create_version(id: int, request: CreateVersionRequest):
                 )
 
             if request.include_metadata:
-                # Check settings again just before commit. The FK's KEY SHARE lock no
-                # longer detects renames with the partial active-name unique index.
-                # SHARE detects updates since our RR snapshot and prevents another
-                # update until commit, without locking settings during the large copy.
-                await conn.fetchval('SELECT id FROM datasets WHERE id = $1 FOR SHARE', id)
+                # Check settings again just before commit (the FK's KEY SHARE lock doesn't detect renames
+                # with the partial active-name unique index), without locking them during the large copy.
+                # The lock is held until `held` closes, after this transaction commits.
+                await _hold_unchanged_settings(conn, id, held)
 
     result = dict(version)
     result['include_metadata'] = request.include_metadata

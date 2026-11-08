@@ -43,7 +43,8 @@ From the checkout the server runs, with `docker-compose.prod.yml`:
    `pending_migrations` or `stale_functions` (run step 4 again), or `unknown_migrations` (the
    database is newer than the code that's running).
 
-Machines that use the Python SDK should install it from the same release.
+Machines that use the Python SDK should install it from the same release:
+`pip install "freedomridge==X.Y.Z"`.
 
 Each build leaves layers in Docker's build cache, which Docker trims once it passes its
 garbage-collection limits (`docker buildx inspect` shows them). To free the disk space sooner, run

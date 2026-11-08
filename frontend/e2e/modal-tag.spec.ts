@@ -60,3 +60,22 @@ test('tag the image shown in the single-image view without leaving it', async ({
     await expect(page.getByText('Tag — 1 Sample')).toHaveCount(0);
     await expect(next).toBeVisible();
 });
+
+// Regression (#10): opened from the single-image view, the tag dialog read its tags again after every
+// read, so the list flickered until the server refused with "too many requests".
+test('the tag dialog reads the image\'s tags once', async ({ page }) => {
+    let reads = 0;
+    page.on('request', request => {
+        if (request.method() === 'POST' && request.url().includes(`/datasets/${datasetId}/samples/tag-counts`)) reads += 1;
+    });
+    await gotoDataset(page, datasetId);
+    await page.getByTestId('grid-cell').nth(3).click();
+    await page.getByTestId('modal-tag').click();
+    await expect(page.getByText('Tag — 1 Sample')).toBeVisible();
+    await expect(page.getByPlaceholder('Enter tag name...')).toBeVisible();
+    await page.waitForTimeout(1_000);
+    const settled = reads;
+    await page.waitForTimeout(2_000);
+    expect(reads).toBe(settled);  // none once it has loaded (it was hundreds a second)
+    expect(settled).toBeLessThanOrEqual(2);  // `next dev` runs a mount effect twice (React Strict Mode)
+});

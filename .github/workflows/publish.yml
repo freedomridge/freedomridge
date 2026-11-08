@@ -1,0 +1,70 @@
+# Publishes the Python SDK (python/) to PyPI as freedomridge when a release is tagged. PyPI trusts this
+# workflow in this repository through OpenID Connect (trusted publishing), so no token is stored, and the
+# upload waits for a maintainer's approval in the pypi environment: PyPI never takes a version number twice,
+# so an upload can't be replaced. Only freedomridge/freedomridge publishes; the development repository and
+# forks skip both jobs.
+#
+# A release tagged before this workflow is published by starting it by hand with the tag.
+#
+# Unlike ci.yml, every action is pinned to a commit (Dependabot updates the pins): this workflow can
+# publish, so a moved tag must not change what runs. For the same reason it restores no cache that
+# another run could have written.
+name: Publish SDK
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to publish (vX.Y.Z)'
+        required: true
+
+permissions: {}
+
+jobs:
+  build:
+    if: github.repository == 'freedomridge/freedomridge'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: refs/tags/${{ inputs.tag || github.ref_name }}
+          persist-credentials: false
+      - name: The tag is the release in VERSION
+        run: |
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "$TAG is not a release tag vX.Y.Z" >&2; exit 1; }
+          [ "$TAG" = "v$(cat VERSION)" ] || { echo "$TAG does not match VERSION $(cat VERSION)" >&2; exit 1; }
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2  # v10.3.3
+        with:
+          python-version: '3.14'
+          enable-cache: false
+      - run: uv build --out-dir dist python/
+      - name: The packages carry that version
+        run: ls "dist/freedomridge-${TAG#v}-py3-none-any.whl" "dist/freedomridge-${TAG#v}.tar.gz"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: sdk
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: pypi
+      url: https://pypi.org/project/freedomridge/
+    permissions:
+      id-token: write  # trusted publishing
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          name: sdk
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086  # v1.14.3

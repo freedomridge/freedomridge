@@ -55,6 +55,9 @@ test.describe('dataset job indicator', () => {
         await page.getByPlaceholder('Enter tag name...').fill(tag);
         await page.getByRole('button', { name: 'Add', exact: true }).click();
         await page.getByRole('button', { name: 'Apply Changes' }).click();
+        // Saving, the Tag dialog shows the tag twice (its row and the pending "+1"): check it once the dialog
+        // has closed, in the single-image view that stays open.
+        await expect(page.getByText('Tag — 1 Sample')).toHaveCount(0);
         await expect(page.getByRole('dialog').getByText(tag)).toBeVisible();
         await page.keyboard.press('Escape');
         await expect(page.getByTestId('total-samples')).toBeVisible();

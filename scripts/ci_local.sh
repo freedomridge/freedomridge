@@ -307,6 +307,9 @@ if want e2e; then
   E2E_BASE_URL=http://localhost:$FEPORT E2E_API_URL=http://localhost:$APIPORT/api \
     npx playwright test ${E2E_SPECS:-} > "$L/e2e.log" 2>&1
   status=$?
+  # A failed test's trace (its network requests too) and page snapshot, kept with the logs, so they outlive
+  # the clone; ci.yml uploads the same folder.
+  if [ "$status" != 0 ] && [ -d test-results ]; then cp -r test-results "$L/e2e-test-results"; fi
   counts=$(grep -E '^ *[0-9]+ (passed|failed|skipped|flaky)' "$L/e2e.log" | tr -s ' \n' ' ')
   result "e2e (next start)" $status "${counts:-$(tail -1 "$L/e2e.log")}"
   cd "$W" || exit 1
