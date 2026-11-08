@@ -113,7 +113,8 @@ serves only HTTPS, even for the first login.
 ```bash
 docker compose -f docker-compose.prod.yml config -q
 bash ops/tls/bootstrap.sh
-docker compose -f docker-compose.prod.yml up -d --build
+docker compose -f docker-compose.prod.yml pull   # a release; any other revision: build --pull
+docker compose -f docker-compose.prod.yml up -d
 docker compose -f docker-compose.prod.yml ps
 ```
 
@@ -220,8 +221,8 @@ migrations before starting clients. Use the exact commands in the
 docker compose -f docker-compose.prod.yml logs --tail=100 backend nginx backup
 docker compose -f docker-compose.prod.yml exec db pg_isready -U freedomridge
 docker compose -f docker-compose.prod.yml exec nginx nginx -t
-# After backing up and checking out a reviewed revision:
-docker compose -f docker-compose.prod.yml build --pull
+# After backing up and checking out a release (a revision that isn't one: build --pull instead):
+docker compose -f docker-compose.prod.yml pull
 FRIDGE_DB_CONTAINER=$(docker compose -f docker-compose.prod.yml ps -q db) \
   bash scripts/apply_migrations.sh
 docker compose -f docker-compose.prod.yml up -d

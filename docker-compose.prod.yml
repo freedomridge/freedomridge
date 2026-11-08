@@ -6,10 +6,15 @@ x-logging: &default-logging
     max-size: "50m"
     max-file: "5"
 
+# Each release's images are on ghcr.io (.github/workflows/images.yml), so an upgrade pulls them:
+# `docker compose -f docker-compose.prod.yml pull`. The tags name this checkout's VERSION (the release
+# pull request moves them). `build:` stays, so `docker compose -f docker-compose.prod.yml build --pull`
+# builds them from this checkout instead, for a revision that isn't a release.
 services:
   # PostgreSQL Database with PostGIS and pgvector
   db:
     logging: *default-logging
+    image: ghcr.io/freedomridge/db:2.1.2
     build:
       context: .
       dockerfile: Dockerfile.db
@@ -47,6 +52,7 @@ services:
   # Backend API (FastAPI)
   backend:
     logging: *default-logging
+    image: ghcr.io/freedomridge/backend:2.1.2
     build:
       context: .
       dockerfile: Dockerfile.backend
@@ -120,6 +126,7 @@ services:
   # Database upkeep runs in job-runner. Shares the cache volume with the backend.
   worker:
     logging: *default-logging
+    image: ghcr.io/freedomridge/worker:2.1.2
     build:
       context: .
       dockerfile: Dockerfile.worker
@@ -140,6 +147,7 @@ services:
 
   job-runner:
     logging: *default-logging
+    image: ghcr.io/freedomridge/worker:2.1.2
     build:
       context: .
       dockerfile: Dockerfile.worker
@@ -177,6 +185,7 @@ services:
   # instance role for off-box copies. The application Backups card is separate.
   backup:
     logging: *default-logging
+    image: ghcr.io/freedomridge/backup:2.1.2
     build:
       context: .
       dockerfile: Dockerfile.backup
@@ -200,6 +209,7 @@ services:
     # Frontend (Next.js)
   frontend:
     logging: *default-logging
+    image: ghcr.io/freedomridge/frontend:2.1.2
     build:
       context: .
       dockerfile: Dockerfile.frontend

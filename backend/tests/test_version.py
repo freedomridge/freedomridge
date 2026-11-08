@@ -37,3 +37,19 @@ def test_images_that_run_backend_code_ship_the_version_file():
         text = dockerfile.read_text()
         if re.search(r"^COPY backend ", text, re.M):
             assert re.search(r"^COPY VERSION ", text, re.M), f"{dockerfile.name} copies backend/ but not VERSION"
+
+
+def test_production_compose_pulls_this_release_s_published_images():
+    # docker-compose.prod.yml names each release's images (.github/workflows/images.yml publishes them), so the
+    # tags must move with VERSION, and every image it names must be one the workflow builds.
+    compose = (ROOT / "docker-compose.prod.yml").read_text()
+    named = re.findall(r"^\s+image: ghcr\.io/freedomridge/([a-z-]+):(\S+)$", compose, re.M)
+    assert len(named) == 6, named  # db, backend, worker, job-runner, backup, frontend
+    assert {f"{image}:{tag}" for image, tag in named if tag != VERSION} == set()
+    workflow = (ROOT / ".github/workflows/images.yml").read_text()
+    built = re.search(r"^\s+image: \[([a-z, -]+)\]$", workflow, re.M)
+    assert built, "images.yml has no image matrix"
+    published = {name.strip() for name in built.group(1).split(",")}
+    assert {image for image, _ in named} <= published
+    for image in published:
+        assert (ROOT / f"Dockerfile.{image}").is_file(), f"images.yml builds {image} from a missing Dockerfile.{image}"

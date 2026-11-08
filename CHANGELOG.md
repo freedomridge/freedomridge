@@ -6,6 +6,14 @@ it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
 
 ## Unreleased
 
+### Added
+
+- **Release images:** each release publishes its Docker images to
+  `ghcr.io/freedomridge/{backend,worker,db,backup,frontend}:X.Y.Z`, and `docker-compose.prod.yml` names them.
+  An upgrade pulls them (`docker compose -f docker-compose.prod.yml pull`) instead of building on the server,
+  which took about an hour on a small host and filled its disk with build cache. `build:` stays, so a
+  revision that isn't a release still builds from its checkout.
+
 ### Changed
 
 - The map's Mapbox token is read when the frontend starts, from `MAPBOX_TOKEN` (`docker-compose.prod.yml` sets

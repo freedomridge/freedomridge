@@ -1,0 +1,76 @@
+# Builds the release's Docker images when a release is tagged, and pushes them to the GitHub Container
+# Registry as ghcr.io/freedomridge/<image>:X.Y.Z (docker-compose.prod.yml names them), so a server
+# upgrades by pulling instead of building. Only freedomridge/freedomridge builds them: the images hold
+# only what this repository publishes, and the development repository and forks skip the job. It logs
+# in with the workflow's own token; nothing is stored.
+#
+# Started by hand with a tag, it builds that release again; with push off it only builds, to check the
+# workflow and the Dockerfiles. Images are linux/amd64.
+#
+# Like publish.yml, every action is pinned to a commit (Dependabot updates the pins) and no build cache
+# is restored: what these images contain must not depend on another run.
+name: Release images
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to build (vX.Y.Z)'
+        required: true
+      push:
+        description: 'Push the images (off: build only)'
+        type: boolean
+        default: true
+
+permissions: {}
+
+jobs:
+  image:
+    if: github.repository == 'freedomridge/freedomridge'
+    name: ${{ matrix.image }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        # Each is built from Dockerfile.<image>. The worker image also runs the job runner.
+        image: [backend, worker, db, backup, frontend]
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+      PUSH: ${{ github.event_name == 'push' || inputs.push }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: refs/tags/${{ inputs.tag || github.ref_name }}
+          persist-credentials: false
+      - name: The tag is the release in VERSION
+        id: release
+        run: |
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "$TAG is not a release tag vX.Y.Z" >&2; exit 1; }
+          [ "$TAG" = "v$(cat VERSION)" ] || { echo "$TAG does not match VERSION $(cat VERSION)" >&2; exit 1; }
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+          echo "revision=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069  # v4.4.1
+      - if: env.PUSH == 'true'
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6  # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc  # v7.4.0
+        with:
+          context: .
+          file: Dockerfile.${{ matrix.image }}
+          platforms: linux/amd64
+          push: ${{ env.PUSH == 'true' }}
+          tags: ghcr.io/freedomridge/${{ matrix.image }}:${{ steps.release.outputs.version }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/freedomridge/freedomridge
+            org.opencontainers.image.version=${{ steps.release.outputs.version }}
+            org.opencontainers.image.revision=${{ steps.release.outputs.revision }}
+            org.opencontainers.image.licenses=MIT

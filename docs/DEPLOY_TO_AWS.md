@@ -317,8 +317,12 @@ again on a working site just to renew it.
 
 ## 6. Start HTTPS and renewal
 
+`pull` fetches the release's images from ghcr.io. For a revision that isn't a release, build
+them from the checkout with `docker compose -f docker-compose.prod.yml build --pull` instead.
+
 ```bash
-docker compose -f docker-compose.prod.yml up -d --build
+docker compose -f docker-compose.prod.yml pull
+docker compose -f docker-compose.prod.yml up -d
 docker compose -f docker-compose.prod.yml ps
 docker compose -f docker-compose.prod.yml logs --tail=100 backend nginx backup
 sudo systemctl enable --now freedomridge-cert-renew.timer
@@ -972,10 +976,10 @@ CPU alarms trigger above 85% for three 5-minute periods. Disk alarms trigger abo
 also alarm, including during first boot and when the agent stops. Confirm the SNS email subscription and look for agent errors if disk
 metrics are absent. The module does not add a 5xx alarm or demo-login dashboard.
 
-Review security updates and rebuild images monthly and after relevant advisories.
-OS unattended upgrades do not rebuild containers. Back up first, review a pinned
-revision, build with `docker compose -f docker-compose.prod.yml build --pull`,
-apply migrations using the explicit production DB container, and recreate with
+Review security updates monthly and after relevant advisories. OS unattended
+upgrades do not update containers. Back up first, check out the release that has
+the fixes, pull its images with `docker compose -f docker-compose.prod.yml pull`
+(between releases, rebuild from the checkout with `build --pull`), apply migrations using the explicit production DB container, and recreate with
 `up -d`. nginx re-resolves Docker service IPs every 10 seconds; allow startup
 health checks and that DNS window after recreation. A single-instance restart still
 has downtime; this is not a rolling deployment. After changing the Mapbox token, recreate
