@@ -4,7 +4,11 @@ Freedom Ridge has one version for the server, the web app and the Python SDK (th
 file), following [Semantic Versioning](https://semver.org). A release lists **upgrade notes** when
 it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
 
-## Unreleased
+## 2.3.0 (2026-11-08)
+
+2.3.0 adds what a follower instance needs first: one image's patch vectors computed without a server, and a
+job that imports such vectors from Parquet files in S3, so no image has to be downloaded to get its patches.
+There is no migration; the upgrade note concerns the job runner's environment.
 
 ### Upgrade notes
 
