@@ -4,6 +4,7 @@ import { useEffect, useMemo, useState, useCallback, useRef } from 'react';
 import Map, { Source, Layer, ScaleControl, MapRef, type MapEvent, type MapMouseEvent, type LayerProps } from 'react-map-gl/mapbox';
 import { useQuery } from '@tanstack/react-query';
 import { getMapPoints, getMapExtent, getDatasetCoverage, type ComplexFilter } from '@/lib/api';
+import { useRuntimeConfig } from '@/lib/runtime-config';
 import type { Feature, FeatureCollection, Point, Polygon } from 'geojson';
 import mapboxgl, { type LngLatBounds } from 'mapbox-gl';
 import type MapboxDraw from '@mapbox/mapbox-gl-draw';
@@ -14,7 +15,6 @@ import 'mapbox-gl/dist/mapbox-gl.css';
 // Bubbles and unselected points are amber (Tailwind amber-500, used across the UI) so they stand
 // out on the dark basemap and contrast with the blue selected-point highlight.
 const DEFAULT_MAP_CONFIG = {
-    mapboxAccessToken: process.env.NEXT_PUBLIC_MAPBOX_TOKEN,
     clusterColor: '#f59e0b',
 };
 
@@ -55,7 +55,6 @@ type MapItem = MapPointItem | MapClusterItem;
 const EMPTY_ITEMS: MapItem[] = [];
 
 interface MapPanelConfig {
-    mapboxAccessToken?: string;
     clusterColor?: string;
 }
 
@@ -78,6 +77,11 @@ export function MapPanel({
     const [mounted, setMounted] = useState(false);
     // eslint-disable-next-line react-hooks/set-state-in-effect -- Mount the browser-only map after hydration.
     useEffect(() => { setMounted(true); }, []);
+
+    // The Mapbox token comes from the frontend server when it runs (lib/runtime-config.ts), so a published
+    // image needs no token at build time. mapbox-gl reads it once, so the map waits for it.
+    const runtimeConfig = useRuntimeConfig();
+    const mapboxToken = runtimeConfig.data?.mapboxToken;
 
     const mapRef = useRef<MapRef>(null);
     const containerRef = useRef<HTMLDivElement>(null);
@@ -605,14 +609,14 @@ export function MapPanel({
                 </div>
             )}
 
-            <Map
+            {mapboxToken && (<Map
                 ref={mapRef}
                 {...viewState}
                 onMove={evt => setViewState(evt.viewState)}
                 onMoveEnd={handleMoveEnd}
                 onLoad={(e) => { onMapLoad(e); setMapInstance(e.target); }}
                 mapStyle="mapbox://styles/mapbox/dark-v11"
-                mapboxAccessToken={process.env.NEXT_PUBLIC_MAPBOX_TOKEN}
+                mapboxAccessToken={mapboxToken}
                 onClick={onMapClick}
                 interactiveLayerIds={['clusters', 'cluster-count', 'unclustered-point-circle', 'unclustered-point-arrow']}
                 cursor={isDrawing ? 'crosshair' : 'auto'}
@@ -626,7 +630,7 @@ export function MapPanel({
                     <Layer {...pointCircleLayer} />
                     <Layer {...pointArrowLayer} />
                 </Source>
-            </Map>
+            </Map>)}
 
             <div className="absolute top-3 right-3 flex flex-col items-end gap-1">
                 <div className="flex gap-2">
@@ -681,11 +685,28 @@ export function MapPanel({
                 </div>
             )}
 
-            {!process.env.NEXT_PUBLIC_MAPBOX_TOKEN && (
+            {runtimeConfig.isSuccess && !mapboxToken && (
                 <div className="absolute inset-0 flex items-center justify-center bg-black/80 text-white p-4 text-center">
                     <div>
                         <p className="font-bold text-red-500 mb-2">Missing Mapbox Token</p>
-                        <p className="text-sm">Please add NEXT_PUBLIC_MAPBOX_TOKEN to your .env.local file.</p>
+                        <p className="text-sm">
+                            Set MAPBOX_TOKEN on the frontend server, or NEXT_PUBLIC_MAPBOX_TOKEN in frontend/.env.local
+                            for development.
+                        </p>
+                    </div>
+                </div>
+            )}
+            {runtimeConfig.isError && (
+                <div className="absolute inset-0 flex items-center justify-center bg-black/80 text-white p-4 text-center">
+                    <div>
+                        <p className="font-bold text-red-500 mb-2">The map&apos;s settings didn&apos;t load</p>
+                        <p className="text-sm mb-3">{runtimeConfig.error.message}</p>
+                        <button
+                            onClick={() => runtimeConfig.refetch()}
+                            className="px-3 py-1.5 rounded bg-cyan-600 hover:bg-cyan-500 text-white text-sm font-medium"
+                        >
+                            Retry
+                        </button>
                     </div>
                 </div>
             )}

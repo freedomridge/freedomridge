@@ -210,7 +210,8 @@ services:
     environment:
       # Next standalone otherwise binds to Docker's hostname and its localhost healthcheck fails.
       HOSTNAME: 0.0.0.0
-      NEXT_PUBLIC_MAPBOX_TOKEN: ${NEXT_PUBLIC_MAPBOX_TOKEN}
+      # The map's token, read when the frontend starts: changing it needs `up -d frontend`, not a rebuild.
+      MAPBOX_TOKEN: ${NEXT_PUBLIC_MAPBOX_TOKEN}
     depends_on:
       - backend
     restart: unless-stopped

@@ -4,6 +4,16 @@ Freedom Ridge has one version for the server, the web app and the Python SDK (th
 file), following [Semantic Versioning](https://semver.org). A release lists **upgrade notes** when
 it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
 
+## Unreleased
+
+### Changed
+
+- The map's Mapbox token is read when the frontend starts, from `MAPBOX_TOKEN` (`docker-compose.prod.yml` sets
+  it from `NEXT_PUBLIC_MAPBOX_TOKEN` in `.env`, as before), instead of being compiled in when the frontend is
+  built. Changing the token needs `docker compose -f docker-compose.prod.yml up -d frontend`, not a rebuild, and
+  one frontend image serves any deployment. In development, `NEXT_PUBLIC_MAPBOX_TOKEN` in `frontend/.env.local`
+  still works.
+
 ## 2.1.2 (2026-11-08)
 
 2.1.2 puts the Python SDK on PyPI and fixes saving a version while data is coming in, index review

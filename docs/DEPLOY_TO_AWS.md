@@ -50,10 +50,10 @@ inviting visitors.
   a fine-grained token restricted to that repository with **Contents: read-only**,
   and follow the token-file/retry procedure in section 3. Never embed a token in
   the URL, tfvars, user-data, or a command argument.
-- A Mapbox public `pk.` token for `NEXT_PUBLIC_MAPBOX_TOKEN`. It is compiled into
-  browser JavaScript, so it is not a secret, but anyone can copy it. In your Mapbox
-  account, **restrict the token's allowed URLs to `https://YOUR_DOMAIN`** before you
-  build the frontend. If the same token is used in CI, the Playwright traces of failed
+- A Mapbox public `pk.` token for `NEXT_PUBLIC_MAPBOX_TOKEN`. Browsers receive it,
+  so it is not a secret, but anyone can copy it. In your Mapbox account, **restrict
+  the token's allowed URLs to `https://YOUR_DOMAIN`** before you start the
+  frontend. If the same token is used in CI, the Playwright traces of failed
   end-to-end runs also contain it.
 - An email address for certificate notices, AWS Budget alerts and SNS notifications.
   Confirm the SNS subscription email after applying.
@@ -259,7 +259,7 @@ The generated values include:
 | `SESSION_COOKIE_SECURE` | `true` (also the production Compose default) |
 | `DOMAIN_NAME` | `YOUR_DOMAIN` |
 | `LETSENCRYPT_EMAIL` | Your notification email |
-| `NEXT_PUBLIC_MAPBOX_TOKEN` | **Fill this in before building the frontend**, after restricting the token to `https://YOUR_DOMAIN` |
+| `NEXT_PUBLIC_MAPBOX_TOKEN` | After restricting the token to `https://YOUR_DOMAIN`. The frontend reads it when it starts: after a change, `docker compose -f docker-compose.prod.yml up -d frontend` |
 | `DATA_VOLUME_PATH`, `FRIDGE_DATA_ROOT` | Both `/data/datasets`; mounted at the **same absolute path** in backend and job-runner |
 | `POSTGRES_VOLUME_PATH` | `/data/postgres`, outside the media root |
 | `CACHE_VOLUME_PATH` | `/cache`, including `/cache/huggingface` |
@@ -978,8 +978,8 @@ revision, build with `docker compose -f docker-compose.prod.yml build --pull`,
 apply migrations using the explicit production DB container, and recreate with
 `up -d`. nginx re-resolves Docker service IPs every 10 seconds; allow startup
 health checks and that DNS window after recreation. A single-instance restart still
-has downtime; this is not a rolling deployment. Rebuild the frontend whenever the Mapbox
-token changes. Editing the top-level `nginx.conf` template needs
+has downtime; this is not a rolling deployment. After changing the Mapbox token, recreate
+the frontend (`docker compose -f docker-compose.prod.yml up -d frontend`). Editing the top-level `nginx.conf` template needs
 `docker compose -f docker-compose.prod.yml up -d --no-deps --force-recreate nginx`
 because envsubst runs at container start. Edits to `ops/nginx/*.conf` need only
 `exec nginx nginx -t` followed by `exec nginx nginx -s reload`. Check migrations

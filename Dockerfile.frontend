@@ -10,9 +10,9 @@ RUN npm ci
 # Copy source code
 COPY frontend/ ./
 
-# NEXT_PUBLIC_* vars are inlined into the client bundle at BUILD time, so they must be present
-# during `npm run build` — a runtime env var can't fix a value baked as `undefined`. Pass via
-# `--build-arg NEXT_PUBLIC_MAPBOX_TOKEN=...` (docker-compose.prod.yml forwards it).
+# The map's Mapbox token is read when the frontend runs, from MAPBOX_TOKEN (app/runtime-config/route.ts),
+# so an image built without one serves any deployment. A token passed here with
+# `--build-arg NEXT_PUBLIC_MAPBOX_TOKEN=...` is compiled in as the fallback.
 ARG NEXT_PUBLIC_MAPBOX_TOKEN
 ENV NEXT_PUBLIC_MAPBOX_TOKEN=$NEXT_PUBLIC_MAPBOX_TOKEN
 # The /api rewrite destination is resolved AT BUILD TIME (output: 'standalone' bakes

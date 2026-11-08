@@ -174,7 +174,7 @@ docker compose -f docker-compose.prod.yml up -d --no-deps --force-recreate backe
 | Service | Responsibility |
 |---|---|
 | nginx | TLS, request/connection limits, body limits, proxy timeouts |
-| frontend | Next.js production server; Mapbox token baked at build time |
+| frontend | Next.js production server; reads the Mapbox token when it starts |
 | backend | API, media access checks, lazy CPU CLIP text/image inference |
 | db | PostgreSQL 18, PostGIS and pgvector |
 | worker | Hourly pruning of media caches only |
@@ -228,7 +228,7 @@ docker compose -f docker-compose.prod.yml up -d
 docker compose -f docker-compose.prod.yml exec nginx nginx -s reload
 ```
 
-Rebuild the frontend when changing the Mapbox token. nginx uses Docker DNS with
+After changing the Mapbox token, recreate the frontend (`up -d frontend`). nginx uses Docker DNS with
 a 10-second cache for recreated services; allow health checks and DNS expiry.
 Editing `nginx.conf` requires `docker compose -f docker-compose.prod.yml up -d
 --no-deps --force-recreate nginx` to render the template. Included `ops/nginx/*.conf`
