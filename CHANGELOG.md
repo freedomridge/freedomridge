@@ -13,6 +13,9 @@ it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
   An upgrade pulls them (`docker compose -f docker-compose.prod.yml pull`) instead of building on the server,
   which took about an hour on a small host and filled its disk with build cache. `build:` stays, so a
   revision that isn't a release still builds from its checkout.
+- **Try it with only Docker:** `docker-compose.try.yml` starts a release's published images on one machine, at
+  http://localhost:3000, with no domain, TLS, Python or Node (README, "Try it locally"). After pushing a
+  release's images, the workflow starts it from them without logging in to ghcr.io and logs in as admin.
 
 ### Changed
 

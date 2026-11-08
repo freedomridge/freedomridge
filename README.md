@@ -46,7 +46,21 @@ and enforced on the server: you get to see all of it.
 
 ## Try it locally
 
-The [Quick Start](docs/QUICK_START.md) is the way to try Freedom Ridge. It needs no domain name
+**With only Docker** (from 2.2.0): download a release and start its published images.
+
+```bash
+curl -L https://github.com/freedomridge/freedomridge/archive/refs/tags/vX.Y.Z.tar.gz | tar xz
+cd freedomridge-X.Y.Z
+docker compose -f docker-compose.try.yml up -d
+```
+
+Open http://localhost:3000 and log in as `admin` / `admin123`, then set a new password. Put
+images in the folder's `data/`; the SDK (`pip install "freedomridge==X.Y.Z"`) connects to
+`http://localhost:8000/api`. Set `MAPBOX_TOKEN` (in the shell or a `.env` file) for the map. It's
+for one machine only: the credentials are the development ones and the ports listen on
+`127.0.0.1`.
+
+**To develop**, follow the [Quick Start](docs/QUICK_START.md). It needs no domain name
 and no TLS certificate: PostgreSQL runs in Docker, and the backend and frontend run from your
 checkout. You need Docker with Compose v2, Python 3.14 with [uv](https://docs.astral.sh/uv/),
 and Node.js 26.

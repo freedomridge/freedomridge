@@ -39,12 +39,17 @@ def test_images_that_run_backend_code_ship_the_version_file():
             assert re.search(r"^COPY VERSION ", text, re.M), f"{dockerfile.name} copies backend/ but not VERSION"
 
 
-def test_production_compose_pulls_this_release_s_published_images():
-    # docker-compose.prod.yml names each release's images (.github/workflows/images.yml publishes them), so the
-    # tags must move with VERSION, and every image it names must be one the workflow builds.
-    compose = (ROOT / "docker-compose.prod.yml").read_text()
-    named = re.findall(r"^\s+image: ghcr\.io/freedomridge/([a-z-]+):(\S+)$", compose, re.M)
-    assert len(named) == 6, named  # db, backend, worker, job-runner, backup, frontend
+def test_compose_files_pull_this_release_s_published_images():
+    # docker-compose.prod.yml and docker-compose.try.yml name each release's images
+    # (.github/workflows/images.yml publishes them), so the tags must move with VERSION, and every image they
+    # name must be one the workflow builds.
+    named = []
+    # prod: db, backend, worker, job-runner, backup, frontend; try: db, backend, job-runner, frontend
+    for compose_file, services in (("docker-compose.prod.yml", 6), ("docker-compose.try.yml", 4)):
+        compose = (ROOT / compose_file).read_text()
+        found = re.findall(r"^\s+image: ghcr\.io/freedomridge/([a-z-]+):(\S+)$", compose, re.M)
+        assert len(found) == services, (compose_file, found)
+        named += found
     assert {f"{image}:{tag}" for image, tag in named if tag != VERSION} == set()
     workflow = (ROOT / ".github/workflows/images.yml").read_text()
     built = re.search(r"^\s+image: \[([a-z, -]+)\]$", workflow, re.M)
