@@ -58,6 +58,8 @@ dev = [
     "ruff==0.17.3",
     "flake8==7.5.0",
     "mypy==2.4.1",
+    # Reads the SDK package as PyPI will (ci.yml, lint).
+    "twine==7.0.0",
     "pip-audit",
 ]
 

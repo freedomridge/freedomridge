@@ -29,7 +29,7 @@
 #
 # The steps follow ci.yml. When ci.yml changes, update them to match and set CI_YML_SHA256 to its
 # `sha256sum`; a run stops while the two disagree.
-CI_YML_SHA256=42c5f176f999657fe68f227ca6db962c3fd605940e8bdbb0ad46fbe1ffce86bd
+CI_YML_SHA256=3e54e799daa5bf1ec54ca9d40059790b2b4e64c35243012f566877d8d4105af1
 set -u
 
 JOBS=${2:-lint,example-tests,backend-tests,db-recovery,frontend,quality,e2e}
@@ -164,7 +164,9 @@ fi
 if want lint; then
   ("$CPU/ruff" check backend/ python/ scripts/ examples/ &&
     "$CPU/ruff" format --check backend/ python/ scripts/ examples/ &&
-    "$CPU/flake8" backend/ python/ scripts/ examples/) > "$L/lint.log" 2>&1
+    "$CPU/flake8" backend/ python/ scripts/ examples/ &&
+    uv build --out-dir "$L/sdk" python/ &&
+    "$CPU/twine" check --strict "$L"/sdk/*) > "$L/lint.log" 2>&1
   result lint $?
 fi
 

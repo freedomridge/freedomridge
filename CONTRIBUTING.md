@@ -45,6 +45,7 @@ ruff check backend/ python/ scripts/ examples/
 ruff format --check backend/ python/ scripts/ examples/
 flake8 backend/ python/ scripts/ examples/
 mypy backend/ python/ examples/
+uv build --out-dir /tmp/fridge-sdk python/ && twine check --strict /tmp/fridge-sdk/*  # the SDK package, as PyPI reads it
 ```
 
 Fix lint and formatting with `ruff check --fix` and `ruff format` on the same paths.
