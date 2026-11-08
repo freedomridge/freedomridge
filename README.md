@@ -69,16 +69,16 @@ with disk sizes, import times and each dataset's licence.
 
 ## Python SDK
 
-The SDK is not on PyPI yet; a release will come later. `uv sync` in a clone installs it. To
-install it elsewhere, from a clone or straight from GitHub:
-
 ```bash
-pip install -e "python/[all]"
-pip install "freedomridge[all] @ git+https://github.com/freedomridge/freedomridge.git#subdirectory=python"
+pip install freedomridge
 ```
 
+Install a release of your server's major version: an SDK and a server of different major versions
+refuse each other. In a clone, `uv sync` installs the SDK from `python/`.
+
 The base package needs only `requests`, `numpy`, `Pillow` and `tqdm`. The extras are
-`embeddings`, `patch-embeddings`, `metrics`, `hashes`, `quality` and `all`.
+`embeddings`, `huggingface-embeddings`, `patch-embeddings`, `metrics`, `hashes`, `quality` and `all`
+(`pip install "freedomridge[all]"`).
 
 Create a token in **Settings → API Tokens**, then:
 

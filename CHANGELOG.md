@@ -6,6 +6,12 @@ it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
 
 ## Unreleased
 
+### Added
+
+- **The Python SDK is on PyPI:** `pip install freedomridge`, or `pip install "freedomridge==X.Y.Z"` for a
+  given release, from 2.1.1 on. The version messages of the SDK and the server name that command instead
+  of an install from GitHub.
+
 ### Fixed
 
 - **Index review:** **Review now** could stay on "Not reviewed yet" for good. A review that finished just as

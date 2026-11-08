@@ -71,13 +71,9 @@ class VersionHeaderMiddleware:
             return await self.app(scope, receive, send)
         sdk = dict(scope.get('headers') or []).get(b'x-fridge-sdk-version', b'').decode('latin-1')
         if sdk and sdk.split('.')[0] != VERSION.split('.')[0]:
-            install = (
-                f'pip install "freedomridge @ git+https://github.com/freedomridge/freedomridge.git@v{VERSION}'
-                '#subdirectory=python"'
-            )
             detail = (
                 f'This server runs Freedom Ridge {VERSION}, and this SDK is {sdk}. An SDK works only with a server '
-                f'of its own major version: {install}'
+                f'of its own major version: pip install "freedomridge=={VERSION}"'
             )
             response = JSONResponse(status_code=426, content={'detail': detail})
             response.headers['X-Fridge-Version'] = VERSION
