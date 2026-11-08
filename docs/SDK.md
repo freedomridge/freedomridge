@@ -956,6 +956,59 @@ Each `fields` entry may also set its own `opacity`. Without colours, classes tak
 distinct colours from a built-in palette. Colours can also be edited in the
 **Segmentation Settings** panel of the web app.
 
+### Model predictions as mask overlays
+
+Freedom Ridge never runs a model. Run it yourself, save its predictions as masks, and
+add them as a mask field: each model version becomes an overlay you can switch on
+next to the image's other masks.
+
+- **Masks:** one index-mask PNG per image, at the model's output size; it is scaled
+  to the image without blending classes. Put them where the server can read them:
+  inside `FRIDGE_DATA_ROOT`, or in an S3 bucket that a storage configuration serving
+  the dataset covers ([S3 permissions](S3_PERMISSIONS.md)). Give each model version
+  a folder of its own and never overwrite a mask in place, since the server and
+  browsers cache media by its path. Keep a record of the model (its source, commit,
+  checksum, classes) in that folder too; Freedom Ridge does not store one.
+- **The field name says which model it is.** The name is what the web app shows of
+  a prediction, so make it complete, for example task, version and commit:
+  `prediction_roads_v1_4_0_1a2b3c4`. Two models must never share a name. Field names
+  are letters, digits and `_` (at most 128, starting with a letter or `_`). A `.`
+  makes a nested field, so write a version's dots, and any `-`, as `_`.
+
+```python
+from pathlib import Path
+from fridge import Segmentation
+
+folder = "s3://my-predictions/roads/1a2b3c4"      # this model version's masks
+field = "prediction_roads_v1_4_0_1a2b3c4"
+dataset.set_values_per_sample_multi({          # the images the model ran on
+    s.id: {field: Segmentation(f"{folder}/masks/{Path(s.filepath).stem}.png")}
+    for s in view.iter_samples()
+})
+
+# Class names and colours: add this field's entries. update_dataset replaces the whole
+# segmentation_config, so start from the current one.
+config = dataset.client.get_dataset_by_id(dataset.id).get("segmentation_config") or {}
+config.setdefault("mask_targets", {})[field] = {"1": "road", "2": "car"}
+config.setdefault("color_scheme", {}).setdefault("fields", {})[field] = {
+    "colorByAttribute": "label",
+    "idColors": {"1": "#22c55e", "2": "#3b82f6"},
+}
+dataset.client.update_dataset(dataset.id, segmentation_config=config)
+```
+
+Each version is its own toggle under **Overlays** in the sample view, so versions are
+compared by switching them on one at a time or together. To remove one, call
+`dataset.clear_field(field)` and then delete its entries from `segmentation_config`
+the same way: clearing a field leaves them, so a field that is cleared and written
+again keeps its class names and colours. `rename_field` carries them to the new name
+and `clone_field` copies them.
+
+A prediction field is a value in each predicted sample's metadata. Predicting the
+images you will review (a view of thousands) is cheap; writing a field for every
+model version across millions of samples rewrites all those rows and grows the
+metadata indexes each time.
+
 ### Per-object filtering
 
 Filter on label fields — by label, and by multiple per-object fields together:
@@ -1042,7 +1095,9 @@ method waits for it and returns `{"message": ...}` (`timeout=3600`), or the `Job
 with `wait=False`. Another index operation on the dataset still answers 409.
 
 ```python
-# Bulk metadata-key ops across every sample (one query each)
+# Bulk metadata-key ops across every sample (one query each). A mask or label field's class
+# names and colours (segmentation_config) move with a rename and are copied by a clone; a clear
+# leaves them.
 dataset.rename_field("conf", "confidence")
 dataset.clone_field("predictions", "predictions_backup")
 dataset.clear_field("scratch_field")

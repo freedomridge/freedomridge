@@ -7074,6 +7074,41 @@ async def _invalidate_field_derivations(connection, dataset_id: int, field_names
     )
 
 
+async def _carry_segmentation_entries(
+    connection,
+    dataset_id: int,
+    field: str,
+    new_name: Optional[str],
+    *,
+    keep_source: bool,
+) -> None:
+    """Give new_name the field's class names and colours: its segmentation_config entries
+    (mask_targets and color_scheme.fields, nested fields included), which are keyed by field name.
+    new_name None only drops them; keep_source leaves the field's own entries in place."""
+    # NO KEY UPDATE serializes with PATCH /datasets/{id} but not with writers' KEY SHARE dataset lock.
+    config = await connection.fetchval(
+        'SELECT segmentation_config FROM datasets WHERE id = $1 FOR NO KEY UPDATE',
+        dataset_id,
+    )
+    if isinstance(config, str):
+        config = json.loads(config)
+    changed = False
+    for section in ((config or {}).get('mask_targets'), ((config or {}).get('color_scheme') or {}).get('fields')):
+        if not isinstance(section, dict):
+            continue
+        keys = [key for key in section if key == field or key.startswith(f'{field}.')]
+        if not keys:
+            continue
+        carried = {} if new_name is None else {new_name + key[len(field) :]: section[key] for key in keys}
+        if not keep_source:
+            for key in keys:
+                del section[key]
+        section.update(carried)
+        changed = True
+    if changed:
+        await connection.execute('UPDATE datasets SET segmentation_config = $2 WHERE id = $1', dataset_id, config)
+
+
 async def _check_field_target(
     dataset_id: int,
     field_name: str,
@@ -7244,6 +7279,7 @@ async def rename_field(
                     request.new_name,
                 )
             await copy_discovery(conn, id, field_name, request.new_name)
+            await _carry_segmentation_entries(conn, id, field_name, request.new_name, keep_source=False)
             await _invalidate_field_derivations(conn, id, [field_name, request.new_name])
             await conn.execute(
                 REQUEST_FULL_REFRESH,
@@ -7322,6 +7358,7 @@ async def clone_field(
                     request.new_name,
                 )
             await copy_discovery(conn, id, field_name, request.new_name)
+            await _carry_segmentation_entries(conn, id, field_name, request.new_name, keep_source=True)
             await _invalidate_field_derivations(conn, id, [request.new_name])
             await conn.execute(
                 REQUEST_FULL_REFRESH,

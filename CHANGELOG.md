@@ -37,6 +37,8 @@ it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
 - **Excluding a map region or an embeddings lasso removes what is inside it and keeps everything else**, images
   with no location (or no point on that map) included. Excluding a map region used to drop the images with no
   location too.
+- [SDK.md](docs/SDK.md) has a section on showing a model's predictions as mask overlays: one mask field per
+  model version, named so that it says which model it is, its class names and colours, and removing it.
 
 ### Fixed
 
@@ -44,6 +46,10 @@ it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
   now says which map the lasso was drawn on and, like a map region, a click toggles it between including and
   excluding its area (the new `embedding_polygon_exclude` filter operator).
 - Clicking a text or image search's chip to exclude its results changed only its label. It now excludes them.
+- A renamed mask or label field kept no class names or colours: its `segmentation_config` entries
+  (`mask_targets` and `color_scheme.fields`) stayed under the old name. `rename_field` now moves them to the new
+  name and `clone_field` copies them. `clear_field` still leaves them, so a field cleared and written again keeps
+  its class names and colours.
 
 ## 2.0.0 (2026-11-06)
 
