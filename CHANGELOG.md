@@ -4,6 +4,20 @@ Freedom Ridge has one version for the server, the web app and the Python SDK (th
 file), following [Semantic Versioning](https://semver.org). A release lists **upgrade notes** when
 it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
 
+## 2.1.1 (2026-11-07)
+
+2.1.1 moves to transformers 5 for its security fixes. Embeddings are unchanged, so nothing needs
+recomputing, and it needs only the standard upgrade steps (no migration).
+
+### Security
+
+- The server and the SDK's embedding extras use transformers 5 (5.21 or newer; it was 4.57), which fixes six
+  advisories CI had accepted for transformers 4 (PYSEC-2025-217, PYSEC-2026-2288, -2289, -2290, -3929 and -4174).
+  Embeddings are unchanged, so stored ones stay valid: text and image search, `compute_embeddings` (with
+  sentence-transformers, or Hugging Face models such as DINOv3) and `compute_patch_embeddings` give vectors that
+  match transformers 4.57's to a cosine of at least 0.99997. 5.21 is the oldest 5.x whose image processor takes
+  the server's query images.
+
 ## 2.1.0 (2026-11-07)
 
 2.1 lets a compute worker fit a server's maps, lays out the dataset page's top bar again, and keeps a

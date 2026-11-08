@@ -41,7 +41,8 @@ def _clip_image_embeddings(filepaths: List[str], batch_size: int = 32) -> List[l
 
     model_id = "openai/clip-vit-base-patch32"
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = CLIPModel.from_pretrained(model_id).to(device).eval()
+    # transformers 5's @wraps(Module.to) hides the bound self from mypy.
+    model = CLIPModel.from_pretrained(model_id).to(device).eval()  # type: ignore[arg-type]
     proc = CLIPProcessor.from_pretrained(model_id)
     vecs: List[list] = []
     for i in range(0, len(filepaths), batch_size):

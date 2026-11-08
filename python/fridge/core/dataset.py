@@ -2121,7 +2121,8 @@ class Dataset:
         # Load model
         print(f"Loading CLIP model {model_name}...")
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        model = CLIPModel.from_pretrained(model_name).to(device)
+        # transformers 5's @wraps(Module.to) hides the bound self from mypy.
+        model = CLIPModel.from_pretrained(model_name).to(device)  # type: ignore[arg-type]
         processor = CLIPProcessor.from_pretrained(model_name)
         print(f"Using device: {device}")
 

@@ -108,7 +108,7 @@ def test_huggingface_model_uploads_its_pooled_output_as_is(transformers_calls):
     client = FakeClient(range(1, 6))
     result, _ = run(client, batch_size=2)
     assert transformers_calls["model"] == MODEL
-    assert transformers_calls["processor_kwargs"] == {"name": MODEL, "use_fast": True}
+    assert transformers_calls["processor_kwargs"] == {"name": MODEL, "backend": "torchvision"}
     # Batched through the checkpoint's processor, with no channel-format hint (wrong for fast processors).
     assert transformers_calls["processor"] == [{"n": n, "return_tensors": "pt"} for n in (2, 2, 1)]
     rows = [row for batch in client.uploads for row in batch]
