@@ -7,7 +7,7 @@
 # Always pass one of the two extras: they choose which PyTorch build is installed.
 [project]
 name = "freedomridge-app"
-version = "2.1.2"
+version = "2.2.0"
 requires-python = ">=3.12"
 dependencies = [
     # API server

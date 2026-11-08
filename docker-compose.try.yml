@@ -12,7 +12,7 @@ name: freedomridge-try
 
 services:
   db:
-    image: ghcr.io/freedomridge/db:2.1.2
+    image: ghcr.io/freedomridge/db:2.2.0
     environment:
       POSTGRES_USER: freedomridge
       POSTGRES_PASSWORD: password
@@ -32,7 +32,7 @@ services:
     restart: unless-stopped
 
   backend:
-    image: ghcr.io/freedomridge/backend:2.1.2
+    image: ghcr.io/freedomridge/backend:2.2.0
     environment:
       DATABASE_URL: postgresql://freedomridge:password@db:5432/freedomridge
       FRIDGE_ENV: development
@@ -54,7 +54,7 @@ services:
     restart: unless-stopped
 
   job-runner:
-    image: ghcr.io/freedomridge/worker:2.1.2
+    image: ghcr.io/freedomridge/worker:2.2.0
     command: python3 -m backend.job_service
     init: true
     environment:
@@ -72,7 +72,7 @@ services:
     stop_grace_period: 30s
 
   frontend:
-    image: ghcr.io/freedomridge/frontend:2.1.2
+    image: ghcr.io/freedomridge/frontend:2.2.0
     environment:
       # Next standalone otherwise binds to Docker's hostname and its localhost healthcheck fails.
       HOSTNAME: 0.0.0.0
