@@ -690,45 +690,92 @@ def test_restore_reports_409_when_every_attempt_conflicts(registry_database, mon
     registry_database(scenario)
 
 
-async def create_with_conflicts(database, monkeypatch, conflicts):
-    """Save a full version while the first `conflicts` attempts each have the dataset row updated after
-    the attempt's snapshot, as the statistics refresh an ingest queues does when it finishes.
-    Returns the attempts made and the create's HTTPException (or None)."""
+async def create_with_conflicts(database, monkeypatch, conflicts, change):
+    """Save a full version, awaiting `change(attempt)` in each of the first `conflicts` attempts after the
+    attempt's snapshot began. Returns the attempts made and the create's HTTPException (or None)."""
     await ingest([{'score': 1}])
     original = versions._snapshot_arrays
     attempts = 0
 
-    async def refresh_during_snapshot(*args, **kwargs):
+    async def change_during_snapshot(*args, **kwargs):
         nonlocal attempts
         attempts += 1
         if attempts <= conflicts:
-            await database.execute('UPDATE datasets SET stats_last_updated = clock_timestamp() WHERE id = 1')
+            await change(attempts)
         return await original(*args, **kwargs)
 
-    monkeypatch.setattr(versions, '_snapshot_arrays', refresh_during_snapshot)
+    monkeypatch.setattr(versions, '_snapshot_arrays', change_during_snapshot)
     try:
-        await asyncio.wait_for(versions.create_version(1, versions.CreateVersionRequest(name='saved')), 10)
+        await asyncio.wait_for(versions.create_version(1, versions.CreateVersionRequest(name='saved')), 30)
     except HTTPException as error:
         return attempts, error
     return attempts, None
 
 
-def test_saving_a_version_retries_after_a_statistics_refresh(registry_database, monkeypatch):
+def edit_description(database):
+    async def edit(attempt):
+        await database.execute('UPDATE datasets SET description = $1 WHERE id = 1', f'edit {attempt}')
+
+    return edit
+
+
+def test_saving_a_version_retries_after_a_settings_edit(registry_database, monkeypatch):
     async def scenario(database):
-        attempts, error = await create_with_conflicts(database, monkeypatch, conflicts=1)
+        attempts, error = await create_with_conflicts(database, monkeypatch, 1, edit_description(database))
         assert error is None and attempts == 2
         saved = await database.fetchrow("SELECT id, sample_count FROM dataset_versions WHERE name = 'saved'")
         assert saved['sample_count'] == 1
         assert await database.fetchval('SELECT count(*) FROM version_snapshots WHERE version_id=$1', saved['id']) == 1
+        assert (await versions.get_version(1, saved['id']))['dataset_snapshot']['description'] == 'edit 1'
 
     registry_database(scenario)
 
 
 def test_saving_a_version_reports_a_retryable_409_when_every_attempt_conflicts(registry_database, monkeypatch):
     async def scenario(database):
-        attempts, error = await create_with_conflicts(database, monkeypatch, conflicts=3)
+        attempts, error = await create_with_conflicts(database, monkeypatch, 3, edit_description(database))
         assert error is not None and error.status_code == 409 and attempts == 3
         assert error.headers == {'Retry-After': '1'}
         assert await database.fetchval('SELECT count(*) FROM dataset_versions') == 0
+
+    registry_database(scenario)
+
+
+def test_a_statistics_refresh_during_a_version_save_does_not_conflict(registry_database, monkeypatch):
+    """A refresh records its run on the dataset row (and a forced one bumps the full-refresh request count
+    first). While data is coming in one finishes every few seconds, so a long copy met one on every attempt."""
+
+    async def scenario(database):
+        async def refresh(attempt):
+            await run_refresh(database, 1, force=True)
+
+        before = await database.fetchrow('SELECT stats_last_updated, stats_full_requests FROM datasets WHERE id = 1')
+        attempts, error = await create_with_conflicts(database, monkeypatch, 3, refresh)
+        after = await database.fetchrow('SELECT stats_last_updated, stats_full_requests FROM datasets WHERE id = 1')
+        assert after['stats_full_requests'] > before['stats_full_requests']
+        assert after['stats_last_updated'] != before['stats_last_updated']
+        assert error is None and attempts == 1
+        saved = await database.fetchval("SELECT id FROM dataset_versions WHERE name = 'saved'")
+        assert await database.fetchval('SELECT count(*) FROM version_snapshots WHERE version_id=$1', saved) == 1
+
+    registry_database(scenario)
+
+
+def test_a_field_renamed_during_a_version_save_leaves_one_consistent_state(registry_database, monkeypatch):
+    """A rename writes the dataset row only through its full-refresh request (bookkeeping). The version keeps
+    the fields and samples as its snapshot read them, as it does for any other field change during the copy."""
+
+    async def scenario(database):
+        async def rename(attempt):
+            await datasets.rename_field(1, 'score', datasets.FieldRenameRequest(new_name='renamed'), USER)
+
+        attempts, error = await create_with_conflicts(database, monkeypatch, 1, rename)
+        assert error is None and attempts == 1
+        saved = await database.fetchval("SELECT id FROM dataset_versions WHERE name = 'saved'")
+        fields = {field['field_name'] for field in (await versions.get_version(1, saved))['dataset_snapshot']['fields']}
+        assert 'score' in fields and 'renamed' not in fields
+        metadata = await database.fetchval('SELECT metadata FROM version_snapshots WHERE version_id=$1', saved)
+        assert metadata == {'score': 1}
+        assert await database.fetchval("SELECT count(*) FROM dataset_fields WHERE field_name = 'renamed'") == 1
 
     registry_database(scenario)

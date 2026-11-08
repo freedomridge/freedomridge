@@ -329,9 +329,13 @@ def test_snapshot_settings_conflict_is_retryable(snapshot_database, monkeypatch)
     async def scenario(database):
         await add_sample(database)
         read_arrays = versions._snapshot_arrays
+        renames = 0
 
         async def concurrent_settings(conn):
-            await database.execute("UPDATE datasets SET name = 'renamed' WHERE id = 1")
+            # A new name each attempt: an update that leaves the settings as the snapshot read them isn't a conflict.
+            nonlocal renames
+            renames += 1
+            await database.execute('UPDATE datasets SET name = $1 WHERE id = 1', f'renamed {renames}')
             return await read_arrays(conn)
 
         monkeypatch.setattr(versions, '_snapshot_arrays', concurrent_settings)
@@ -343,7 +347,7 @@ def test_snapshot_settings_conflict_is_retryable(snapshot_database, monkeypatch)
         assert await database.fetchval('SELECT count(*) FROM version_snapshots') == 0
         monkeypatch.setattr(versions, '_snapshot_arrays', read_arrays)
         version_id = await snapshot('during-settings-change')
-        assert (await versions.get_version(1, version_id))['dataset_snapshot']['name'] == 'renamed'
+        assert (await versions.get_version(1, version_id))['dataset_snapshot']['name'] == 'renamed 3'
 
     snapshot_database(scenario)
 

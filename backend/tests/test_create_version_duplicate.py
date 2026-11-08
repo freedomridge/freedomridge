@@ -124,4 +124,5 @@ def test_new_name_still_creates_the_version(monkeypatch):
     out = _create(monkeypatch, conn, name="v2")
     assert out["id"] == 7 and out["name"] == "v2" and out["sample_count"] == 3
     assert len(conn.executed) == 1, "snapshot rows are written once"
-    assert conn.tx_exit_exc == [None]
+    # The snapshot commits, then the settings lock (the fake pool's second connection is the same one) ends.
+    assert conn.tx_exit_exc == [None, None]

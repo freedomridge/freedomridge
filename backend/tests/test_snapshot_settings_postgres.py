@@ -65,3 +65,29 @@ def test_snapshot_settings_match_committed_dataset(registry_database, monkeypatc
         assert count == 1
 
     registry_database(scenario)
+
+
+def test_a_settings_update_waits_until_the_snapshot_commits(registry_database, monkeypatch):
+    """Once the settings are checked, an update must not commit before the snapshot does."""
+
+    async def scenario(database):
+        await ingest([{'label': 'original'}])
+        hold = versions._hold_unchanged_settings
+        blocked = []
+
+        async def hold_then_rename(conn, dataset_id, held):
+            await hold(conn, dataset_id, held)
+            async with database.pool.acquire() as other:
+                await other.execute("SET lock_timeout = '100ms'")
+                with pytest.raises(asyncpg.LockNotAvailableError):
+                    await other.execute("UPDATE datasets SET name = 'late' WHERE id = 1")
+                await other.execute('RESET lock_timeout')
+            blocked.append(dataset_id)
+
+        monkeypatch.setattr(versions, '_hold_unchanged_settings', hold_then_rename)
+        record = await versions.create_version(1, versions.CreateVersionRequest(name='held'))
+        assert blocked == [1]
+        saved = (await versions.get_version(1, record['id']))['dataset_snapshot']
+        assert saved['name'] == await database.fetchval('SELECT name FROM datasets WHERE id = 1') != 'late'
+
+    registry_database(scenario)
