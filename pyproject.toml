@@ -7,7 +7,7 @@
 # Always pass one of the two extras: they choose which PyTorch build is installed.
 [project]
 name = "freedomridge-app"
-version = "2.1.1"
+version = "2.1.2"
 requires-python = ">=3.12"
 dependencies = [
     # API server
@@ -58,6 +58,8 @@ dev = [
     "ruff==0.17.3",
     "flake8==7.5.0",
     "mypy==2.4.1",
+    # Reads the SDK package as PyPI will (ci.yml, lint).
+    "twine==7.0.0",
     "pip-audit",
 ]
 

@@ -50,6 +50,12 @@ jobs:
         run: ruff format --check backend/ python/ scripts/ examples/
       - name: flake8
         run: flake8 backend/ python/ scripts/ examples/
+      - name: SDK package
+        # The SDK as publish.yml builds it for PyPI at a release, read as PyPI will read it, so a change that
+        # breaks the package fails here instead of on release day. Nothing is uploaded.
+        run: |
+          uv build --out-dir "$RUNNER_TEMP/sdk" python/
+          twine check --strict "$RUNNER_TEMP"/sdk/*
 
   example-tests:
     if: ${{ !github.event.repository.private || github.event_name == 'workflow_dispatch' }}

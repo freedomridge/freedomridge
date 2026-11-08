@@ -4,7 +4,11 @@ Freedom Ridge has one version for the server, the web app and the Python SDK (th
 file), following [Semantic Versioning](https://semver.org). A release lists **upgrade notes** when
 it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
 
-## Unreleased
+## 2.1.2 (2026-11-08)
+
+2.1.2 puts the Python SDK on PyPI and fixes saving a version while data is coming in, index review
+waiting for good, and the single-image view's Tag dialog. It needs only the standard upgrade steps
+(no migration).
 
 ### Added
 
