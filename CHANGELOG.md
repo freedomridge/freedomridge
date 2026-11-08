@@ -4,7 +4,12 @@ Freedom Ridge has one version for the server, the web app and the Python SDK (th
 file), following [Semantic Versioning](https://semver.org). A release lists **upgrade notes** when
 it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
 
-## Unreleased
+## 2.1.0 (2026-11-07)
+
+2.1 lets a compute worker fit a server's maps, lays out the dataset page's top bar again, and keeps a
+field's class names and colours through a rename. It needs only the standard upgrade steps (no migration),
+and a 2.0 SDK works with it. Two changes return different images than 2.0: excluding a map region now keeps
+the images with no location, and a search keeps the applied filters unless you choose **whole dataset**.
 
 ### Added
 
@@ -46,6 +51,10 @@ it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
   now says which map the lasso was drawn on and, like a map region, a click toggles it between including and
   excluding its area (the new `embedding_polygon_exclude` filter operator).
 - Clicking a text or image search's chip to exclude its results changed only its label. It now excludes them.
+- On a dataset with objects, a `created_at` filter matched through an image's objects (or an object's image)
+  compared the outer row's date instead of the object's (or image's) in similarity search, duplicate and
+  hash-stats, sparse-sample and embeddings requests. It now compares the right row's date, so such a filter can
+  match more images there.
 - A renamed mask or label field kept no class names or colours: its `segmentation_config` entries
   (`mask_targets` and `color_scheme.fields`) stayed under the old name. `rename_field` now moves them to the new
   name and `clone_field` copies them. `clear_field` still leaves them, so a field cleared and written again keeps
