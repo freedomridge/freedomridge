@@ -14,6 +14,8 @@ it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
 - **Saving a version** right after an import or edit could fail with "Dataset changed during snapshot
   creation". The statistics refresh that the import queued records its run on the dataset, and the snapshot
   took that for a change. A conflicting snapshot is now taken again, up to twice, as a restore is.
+- **Tagging from the single-image view:** the Tag dialog read the image's tags again after every read, so the
+  list flickered until the server refused with "too many requests" (#10). It reads them once.
 
 ## 2.1.1 (2026-11-07)
 
