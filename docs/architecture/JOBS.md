@@ -1042,13 +1042,20 @@ maps are not covered by the automatic managed-map heal; retry ranking without re
 scatter uses its existing grid sampler. The SDK checks management before fitting and skips managed
 maps; `compute_all` still completes hashes and metrics. Saved model files are published only after
 all coordinate batches succeed.
-Both SDK visualization and incremental projection treat a server without `/map-state` (404) as unmanaged.
+SDK visualization treats a server without `/map-state` (404) as unmanaged.
 
-Still to build for remote compute workers: the worker's own loop that claims and runs a fit (today
-`python -m fridge.worker` registers and heartbeats), object storage behind `map_artifacts` (the database
-already stores keys, not paths), and starting/stopping machines. The worker credentials and the
-claim/heartbeat/upload/complete API exist (**Remote compute workers over HTTP**, above). The export and publish steps stay on
-the server; only `fit` moves.
+**The worker** (`python/fridge/worker.py`) claims in a loop (each claim long-polls and counts as its
+heartbeat). For a map re-fit's fit it downloads `vectors.bin` (resuming with Range), runs `fridge.map_fit` in
+a child process (which sizes itself to the machine's free memory and sets `oom_score_adj=1000`), and after an
+out-of-memory kill runs it again on 75% of the planned points, as the server's runner does, failing at the
+smallest useful fit. It uploads `REMOTE_OUTPUTS` in chunks (resuming at the size the server reports) and
+completes with each one's sha256. A thread renews the lease every `heartbeat_seconds`; a lost lease or a
+cancel kills the child at once (a lost lease reports nothing; a cancel releases the job), and Ctrl-C or
+SIGTERM releases it. A transfer or report that fails for a moment is tried again while the lease lasts.
+
+Still to build for remote compute workers: object storage behind `map_artifacts` (the database already
+stores keys, not paths), and starting/stopping machines on demand. The export and publish steps stay on the
+server; only `fit` moves.
 
 ## Index advisor: the review
 

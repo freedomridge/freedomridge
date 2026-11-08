@@ -202,6 +202,14 @@ async def submit(pool, dataset_id, user_id, operation, payload):
                         field,
                         payload['new_name'],
                     )
+                    # Copied now like the definition; a rename drops the old name's entries when it is gone.
+                    await datasets._carry_segmentation_entries(
+                        connection,
+                        dataset_id,
+                        field,
+                        payload['new_name'],
+                        keep_source=True,
+                    )
             cutoff = (
                 await connection.fetchval(
                     'SELECT id FROM samples WHERE dataset_id=$1 ORDER BY id DESC LIMIT 1',
@@ -509,6 +517,16 @@ def handler(pool):
                                 job['dataset_id'],
                                 names[index],
                             )
+                            if request['operation'] == 'rename' and names[index] == request['field_name']:
+                                from .routers import datasets
+
+                                await datasets._carry_segmentation_entries(
+                                    connection,
+                                    job['dataset_id'],
+                                    names[index],
+                                    None,
+                                    keep_source=False,
+                                )
                     else:
                         await prune_fields(connection, job['dataset_id'], [names[index]])
 

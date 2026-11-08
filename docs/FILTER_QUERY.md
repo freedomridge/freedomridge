@@ -2,7 +2,7 @@
 
 A filter written as text. The same text works in three places:
 
-- **The app's filter bar:** **Query** shows the current filters as text. You can read, copy, paste or edit them, then press **Apply** (or Ctrl+Enter).
+- **The app's filter cards:** each filter's card, and the **Add Filter** card, switch between **Builder** (the form) and **Query** (the filter as text). You can read, copy, paste or edit it, then press **Apply** (or Ctrl+Enter).
 - **The SDK:** `dataset.query("...")` returns a view, and `dataset.create_view(name, query="...")` saves one.
 - **The HTTP API:** `POST /api/datasets/{id}/filter_query/parse` and `.../format` convert between text and filters, for scripts and for AI tools.
 
@@ -14,18 +14,21 @@ AND split = "train"
 AND NOT (score < 0.2 OR note exists)
 ```
 
-## In the filter bar
+## In the filter cards
 
-**Query**, next to **Add Filter**, opens the current filters as text.
+The filter bar shows the filters as chips. Click a chip and its card opens; **Builder | Query** at the top switches
+between the form and that filter as text. The **Add Filter** card has the same switch beside its field search, so a
+filter can be typed or pasted instead of picked.
 
-- **Each chip is one line**, joined with `AND`.
-- **Chips with no text form** stay as they are. They show as `# kept: …` lines, and editing those lines does nothing.
-- **Apply replaces your chips with the text's parts.** A part identical to a chip you had keeps that chip, with its name and, for the dataset's default view, its ★. Deleting a default-view line is the same as removing its chip.
+- **Query shows the filter as the server writes it**, one rule per line joined with `AND`: `idx in (0 1 2)` comes back as `idx in (0, 1, 2)`.
+- **Apply** (or Ctrl+Enter) applies the text to that chip, or on the Add Filter card adds it as a new chip. **Cancel** leaves the filter as it was.
+- **A card holds one chip.** `a = 1 AND b = 2` typed in one card is one chip with both rules.
+- **Switching back to Builder keeps the edit:** the text is read into the form. An empty Add Filter query goes back to the field list.
 - **A mistake** shows its line, column and suggestion under the text, puts the cursor on it, and changes nothing.
 
 ## Parts and chips
 
-A query is an AND of parts. Each top-level `AND` part becomes one stage: one chip in the filter bar, one stage in a saved view. Brackets keep a group together as one part. In the example above, `(score < 0.2 OR note exists)` is one part, and `NOT (...)` is one part.
+A query is an AND of parts. In the SDK and the API, each top-level `AND` part becomes one stage: one chip in the filter bar, one stage in a saved view. (In the app, the text in one filter card stays one chip.) Brackets keep a group together as one part. In the example above, `(score < 0.2 OR note exists)` is one part, and `NOT (...)` is one part.
 
 `AND` binds tighter than `OR`, as in SQL. So `a = 1 OR b = 2 AND c = 3` means `a = 1 OR (b = 2 AND c = 3)`. Use brackets when you mean the other one.
 
@@ -74,7 +77,7 @@ A query takes at most 500 comparisons, and brackets and `NOT` nest at most 100 d
 
 ## What stays a chip
 
-These filters have no text form: concept scores, map regions, lassos, selections and similarity searches. Their values are ids, polygons or tokens rather than something to type. `format` returns `null` for each of them, and they stay stages of their own. The filter bar's editor shows them as `# kept:` comment lines and leaves them as they are when you apply your text.
+These filters have no text form: concept scores, map regions, lassos, selections and similarity searches. Their values are ids, polygons or tokens rather than something to type. `format` returns `null` for each of them, and they stay stages of their own. Their chips have no card: a click on a map region, a lasso, a selection or a search toggles it between including and excluding what it holds.
 
 ## HTTP API
 

@@ -3672,6 +3672,7 @@ async def get_promoted_numeric_fields(dataset_id: int) -> set:
 # never vacuously leaks the whole grain, so the cross-grain presence guard must NOT suppress it.
 _CROSSGRAIN_SKIP_OPS = {
     'embedding_polygon',
+    'embedding_polygon_exclude',
     'in_selection',
     'concept_select',
     'concept_exclude',
@@ -3843,6 +3844,12 @@ SAMPLES_JOIN_FIELD_MAPPING: Dict[str, str] = {
 }
 
 
+def _realiased(field_mapping: Optional[Dict[str, str]], alias: str) -> Dict[str, str]:
+    """`field_mapping` for a subquery over samples aliased `alias`: every mapped column on the inner alias. A
+    cross-grain subquery that kept the outer `s.created_at` compared the outer row's date on every partner."""
+    return {key: f"{alias}.{column.rsplit('.', 1)[-1]}" for key, column in (field_mapping or {}).items()}
+
+
 def _lasso_maps(node: Any) -> set:
     """(field, model_id) of every whole-image lasso polygon in a filter tree, nested ones included."""
     found: set = set()
@@ -3853,7 +3860,7 @@ def _lasso_maps(node: Any) -> set:
         if operator in ('cg_self', 'parent_matches', 'has_matching_object'):
             found |= _lasso_maps(node.get('value'))
         elif (
-            operator == 'embedding_polygon'
+            operator in ('embedding_polygon', 'embedding_polygon_exclude')
             and isinstance(node.get('field'), str)  # a malformed field is the compiler's 400 to give
             and node['field']
             and not re.search(r'_patch_\d+x\d+$', node['field'])
@@ -4103,7 +4110,7 @@ def _compile_filter_node(
             # forces a single materialization, so the join can't degenerate (measured: 35s -> ~25ms).
             if op == 'has_matching_object':
                 # IMAGE row matches if its id is the parent of an object satisfying the sub-filter.
-                sub_map = {**(field_mapping or {}), 'id': 'o.id'}
+                sub_map = {**_realiased(field_mapping, 'o'), 'id': 'o.id'}
                 sub_sql, arg_idx = _compile_filter_node(
                     strict,
                     args,
@@ -4120,7 +4127,7 @@ def _compile_filter_node(
                     f"AND o.metadata->>'parent_id' ~ '^-?[0-9]+$' AND ({sub_sql})))"
                 ), arg_idx
             # parent_matches: OBJECT row matches if its parent image satisfies the sub-filter.
-            sub_map = {**(field_mapping or {}), 'id': 's2.id'}
+            sub_map = {**_realiased(field_mapping, 's2'), 'id': 's2.id'}
             sub_sql, arg_idx = _compile_filter_node(
                 strict,
                 args,
@@ -4512,11 +4519,11 @@ def _compile_filter_node(
 
             wkt = f"POLYGON(({coords}))"
             args.append(wkt)
-            # Include path uses ST_Within (spatial index). Exclude needs location set
-            # AND NOT ST_Within — bbox pre-filter keeps it fast on large datasets.
+            # Include path uses ST_Within (spatial index). Exclude removes what is inside and keeps everything
+            # else, samples with no location included (NOT ST_Within alone is NULL for them, which drops them).
             if op == 'geo_polygon_exclude':
                 return (
-                    f"(location IS NOT NULL AND NOT ST_Within(location, ST_GeomFromText(${arg_idx}, 4326)))",
+                    f"(location IS NULL OR NOT ST_Within(location, ST_GeomFromText(${arg_idx}, 4326)))",
                     arg_idx + 1,
                 )
             return f"ST_Within(location, ST_GeomFromText(${arg_idx}, 4326))", arg_idx + 1
@@ -4558,14 +4565,14 @@ def _compile_filter_node(
                 "AND rs.created_at > statement_timestamp() - interval '2 hours')"
             ), arg_idx + 1
 
-        elif op == 'embedding_polygon':
+        elif op in ('embedding_polygon', 'embedding_polygon_exclude'):
             # value = polygon [[x, y], ...] in the field's reduced 2D coords. Matches
             # samples that have an embedding point for `field` inside the polygon —
             # applied SERVER-SIDE so an embeddings-lasso selection is never
             # materialized or capped into an id list (mirrors /select-region's
             # bbox-pre-filter + point-in-polygon test). `field` was validated above.
             if not isinstance(val, list) or len(val) < 3:
-                return "FALSE", arg_idx
+                return ("TRUE" if op == 'embedding_polygon_exclude' else "FALSE"), arg_idx
             try:
                 pts = [(float(p[0]), float(p[1])) for p in val]
             except (TypeError, ValueError, IndexError):
@@ -4613,11 +4620,16 @@ def _compile_filter_node(
             # for clip_img/patch); cross-grain linking (object<->image) is applied uniformly
             # one level up by withGrain's parent_matches/has_matching_object wrappers, so it
             # is NOT duplicated here.
-            sql = (
-                f"{current_map}EXISTS (SELECT 1 FROM embedding_coordinates ep WHERE ep.sample_id = {outer_id} "
+            inside = (
+                f"EXISTS (SELECT 1 FROM embedding_coordinates ep WHERE ep.sample_id = {outer_id} "
                 f"AND {field_match} AND ep.x IS NOT NULL {bbox})"
             )
-            return sql, arg_idx
+            if op == 'embedding_polygon_exclude':
+                # Exclude removes what is inside the polygon and keeps everything else, samples with no point on
+                # this map included (as geo_polygon_exclude keeps samples with no location). The inside test keeps
+                # its bbox index, and a lasso on a re-fitted map is still refused.
+                return f"({current_map}NOT {inside})", arg_idx
+            return f"{current_map}{inside}", arg_idx
 
         else:
             # A field leaf with an unrecognized operator must not silently match
@@ -7062,6 +7074,41 @@ async def _invalidate_field_derivations(connection, dataset_id: int, field_names
     )
 
 
+async def _carry_segmentation_entries(
+    connection,
+    dataset_id: int,
+    field: str,
+    new_name: Optional[str],
+    *,
+    keep_source: bool,
+) -> None:
+    """Give new_name the field's class names and colours: its segmentation_config entries
+    (mask_targets and color_scheme.fields, nested fields included), which are keyed by field name.
+    new_name None only drops them; keep_source leaves the field's own entries in place."""
+    # NO KEY UPDATE serializes with PATCH /datasets/{id} but not with writers' KEY SHARE dataset lock.
+    config = await connection.fetchval(
+        'SELECT segmentation_config FROM datasets WHERE id = $1 FOR NO KEY UPDATE',
+        dataset_id,
+    )
+    if isinstance(config, str):
+        config = json.loads(config)
+    changed = False
+    for section in ((config or {}).get('mask_targets'), ((config or {}).get('color_scheme') or {}).get('fields')):
+        if not isinstance(section, dict):
+            continue
+        keys = [key for key in section if key == field or key.startswith(f'{field}.')]
+        if not keys:
+            continue
+        carried = {} if new_name is None else {new_name + key[len(field) :]: section[key] for key in keys}
+        if not keep_source:
+            for key in keys:
+                del section[key]
+        section.update(carried)
+        changed = True
+    if changed:
+        await connection.execute('UPDATE datasets SET segmentation_config = $2 WHERE id = $1', dataset_id, config)
+
+
 async def _check_field_target(
     dataset_id: int,
     field_name: str,
@@ -7232,6 +7279,7 @@ async def rename_field(
                     request.new_name,
                 )
             await copy_discovery(conn, id, field_name, request.new_name)
+            await _carry_segmentation_entries(conn, id, field_name, request.new_name, keep_source=False)
             await _invalidate_field_derivations(conn, id, [field_name, request.new_name])
             await conn.execute(
                 REQUEST_FULL_REFRESH,
@@ -7310,6 +7358,7 @@ async def clone_field(
                     request.new_name,
                 )
             await copy_discovery(conn, id, field_name, request.new_name)
+            await _carry_segmentation_entries(conn, id, field_name, request.new_name, keep_source=True)
             await _invalidate_field_derivations(conn, id, [request.new_name])
             await conn.execute(
                 REQUEST_FULL_REFRESH,

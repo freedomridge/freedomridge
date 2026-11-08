@@ -48,8 +48,8 @@ test('guest at 100k can browse and save a view without calling selection_token',
             await route.fulfill({ response, json: { ...json, total: 100_000 } });
         });
         await gotoDataset(page);
-        await page.getByTestId('image-search-trigger').click();
-        await expect(page.getByRole('button', { name: 'Upload image…' })).toBeVisible();
+        await page.getByTestId('search-open').click();
+        await expect(page.getByRole('button', { name: 'Upload…' })).toBeVisible();
         await expect(page.getByTestId('image-search-url')).toHaveCount(0);
         await page.keyboard.press('Escape');
         const select = page.getByTestId('grid-select-all');

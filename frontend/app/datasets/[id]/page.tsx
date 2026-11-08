@@ -5,7 +5,8 @@ import { toggleOverlayField } from '@/lib/labels';
 import { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import type { Feature, Polygon } from 'geojson';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { ApiError, isRescoringRefusal, getSamples, getDatasetSchema, getDataset, getEmbeddingFields, searchSimilar, searchByImage, searchObjectToPatches, updateDataset, sampleDuplicates, notifySamplesMutated, createSelectionToken, type Dataset, type Filters, type Sample, type SchemaField, type ComplexFilter } from '@/lib/api';
+import { ApiError, isRescoringRefusal, getSamples, getDatasetSchema, getDataset, getEmbeddingFields, searchSimilar, searchByImage, searchObjectToPatches, updateDataset, sampleDuplicates, notifySamplesMutated, createSelectionToken, type Dataset, type Filters, type Sample, type SchemaField, type ComplexFilter, type ViewStage } from '@/lib/api';
+import { describeFilter, convertSimpleFiltersToComplex } from '@/lib/filter-utils';
 import { usePatchState } from '@/hooks/usePatchState';
 import { useSampleCount } from '@/hooks/useSampleCount';
 import Link from 'next/link';
@@ -22,6 +23,8 @@ import ViewManager from '@/components/ViewManager';
 import { GearIcon, CheckIcon, Cross2Icon } from '@radix-ui/react-icons';
 import { PanelLayout } from '@/components/panel-layout';
 import { QueryBuilderBar } from '@/components/query-builder-bar';
+import { FindSimilar, DEFAULT_SEARCH_LIMIT, searchLimitOf, type ImageSearchInput, type SearchScope } from '@/components/find-similar';
+import { Rocket } from 'lucide-react';
 import dynamic from 'next/dynamic';
 const MapPanel = dynamic(() => import('@/components/map-panel').then(mod => mod.MapPanel), { ssr: false });
 
@@ -157,6 +160,11 @@ function DatasetPageContent() {
     const [findUnlabeled, setFindUnlabeled] = useState<{ objectId: number; panelId: string } | null>(null);
     const [isSearching, setIsSearching] = useState(false);
     const textSearchSeq = useRef(0);
+    // Find similar: how many of the closest images to show (shared with the search's chip), whether a search stays
+    // within the filters, and the latest search, which its chip's "top N" runs again.
+    const [searchLimit, setSearchLimit] = useState(DEFAULT_SEARCH_LIMIT);
+    const [searchScope, setSearchScope] = useState<SearchScope>('filtered');
+    const [lastSearch, setLastSearch] = useState<{ id: string; scope: SearchScope; text?: string; image?: ImageSearchInput } | null>(null);
     const [showTagModal, setShowTagModal] = useState(false);
     // Tag dialog opened from the single-image view: tags exactly the image shown (without it,
     // tagging it meant closing the view, ticking its tile, using the grid's Tag).
@@ -176,7 +184,6 @@ function DatasetPageContent() {
         setViewStages,
         addStage,
         removeStage,
-        replaceStages,
         updateStage,
         filterMode,
         setFilterMode,
@@ -222,19 +229,13 @@ function DatasetPageContent() {
         refetchOnWindowFocus: false,
     });
 
-    const [gridMediaField, setGridMediaFieldLocal] = useState<string>('filepath');
     const [modalMediaField, setModalMediaFieldLocal] = useState<string>('filepath');
     const [activeOverlayFields, setActiveOverlayFields] = useState<string[]>([]);
 
-    // Persist media field changes to dataset
-    const setGridMediaField = (field: string) => {
-        setGridMediaFieldLocal(field);
-        if (datasetId) {
-            updateDataset(datasetId, { grid_media_field: field }).catch(() => {});
-            queryClient.setQueryData(['dataset', datasetId], (old: Dataset | undefined) =>
-                old ? { ...old, grid_media_field: field } : old
-            );
-        }
+    // A grid's View choice is saved as the field the dataset's grids open on next time. The cached dataset is left
+    // as it is, so the other open grids keep their own choice.
+    const saveGridMediaField = (field: string) => {
+        if (datasetId) updateDataset(datasetId, { grid_media_field: field }).catch(() => {});
     };
     const setModalMediaField = (field: string) => {
         setModalMediaFieldLocal(field);
@@ -253,7 +254,6 @@ function DatasetPageContent() {
     useEffect(() => {
         if (dataset) {
             // eslint-disable-next-line react-hooks/set-state-in-effect -- synchronize existing per-view UI state after a prop or client-mount change
-            setGridMediaFieldLocal(dataset.grid_media_field || 'filepath');
             setModalMediaFieldLocal(dataset.modal_media_field || 'filepath');
         }
     }, [dataset]);
@@ -816,10 +816,54 @@ function DatasetPageContent() {
     };
 
 
+    // A text or image search stays within the applied filters (an earlier search excepted: a new one replaces it),
+    // or searches the whole dataset and replaces them (showResultsAsView).
+    const searchKept = (scope: SearchScope) => (scope === 'filtered' ? viewStages.filter(s => s.type !== 'similarity') : []);
+    const searchFilters = (kept: ViewStage[]) => (kept.length
+        ? withGrain({ logic: 'AND', filters: kept.map(s => s.filter) }, 'image', null, hasObjects)
+        : undefined);
+    // The search's chip. Its label, the count it asked for and the count it found are kept, so the page's latest
+    // search can offer "top N" on its chip.
+    const searchStage = (label: string, kept: ViewStage[], resultIds: number[], limit: number, searchId: string): ViewStage => {
+        const scoped = kept.length ? `${label} · within filters` : label;
+        const got = resultIds.length < limit ? `${resultIds.length} of ${limit} requested` : `${resultIds.length}`;
+        return {
+            type: 'similarity',
+            description: `${scoped} · top ${got}`,
+            filter: { logic: 'AND', filters: [{ field: 'id', operator: 'in', value: resultIds }] },
+            metadata: { search: { id: searchId, label: scoped, found: resultIds.length, limit } },
+        };
+    };
+    // The results land on the stages as they are when they arrive, so a chip added or removed while the search ran
+    // stays that way. A re-run (the chip's "top N") replaces only its own chip, whatever its scope.
+    const showSearchResults = (stage: ViewStage, scope: SearchScope, rerun: boolean) => {
+        const searchId = stage.metadata?.search?.id;
+        if (rerun) {
+            setViewStages(current => {
+                const at = current.findIndex(s => s.metadata?.search?.id === searchId);
+                return at < 0 ? [...current, stage] : current.map((s, i) => (i === at ? stage : s));
+            });
+            return;
+        }
+        if (scope === 'all') {
+            showResultsAsView(stage);
+            return;
+        }
+        // As showResultsAsView, but the filters it searched within stay.
+        setViewStages(current => [...current.filter(s => s.type !== 'similarity'), stage]);
+        setSimpleFilters({});
+        setAdvancedFilters({ logic: 'AND', filters: [] });
+        setBrushedIds([]);
+        setCurrentPolygon(null);
+        setCurrentEmbeddingRegion(null);
+        clearSelection();
+    };
+
     // Natural-language search: the server CLIP-text-encodes the prompt and returns the
     // closest samples; shown as a similarity stage (same ranked-grid path as Find Similar).
-    const handleTextSearch = async (prompt: string, limit: number = 100) => {
+    const handleTextSearch = async (prompt: string, limit: number, scope: SearchScope, searchId: string, rerun = false) => {
         if (!datasetId) return;
+        const kept = searchKept(scope);
         setIsSearching(true);
         // Sequence guard: a slow earlier query must not clobber a newer one's results.
         const seq = ++textSearchSeq.current;
@@ -827,17 +871,10 @@ function DatasetPageContent() {
             const field = (embeddingFields || []).includes('clip')
                 ? 'clip'
                 : (embeddingFields || []).find(f => !f.includes('_patch_') && f !== 'clip_obj') || (embeddingFields || [])[0];
-            const results = await searchSimilar({ datasetId, text: prompt, embeddingField: field, limit });
+            const results = await searchSimilar({ datasetId, text: prompt, embeddingField: field, limit, filters: searchFilters(kept) });
             if (seq !== textSearchSeq.current) return;
             const resultIds = results.map(s => s.id);
-            clearSelection();
-            setBrushedIds([]);
-            const got = resultIds.length < limit ? `${resultIds.length} of ${limit} requested` : `${resultIds.length}`;
-            showResultsAsView({
-                type: 'similarity',
-                description: `“${prompt}” (${got})`,
-                filter: { logic: 'AND', filters: [{ field: 'id', operator: 'in', value: resultIds }] },
-            });
+            showSearchResults(searchStage(`Similar to “${prompt}”`, kept, resultIds, limit, searchId), scope, rerun);
         } catch (error) {
             // The server explains 501 (encoder not installed) / 400 (non-CLIP field) precisely.
             alert(`❌ Text search failed: ${error instanceof Error ? error.message : error}`);
@@ -849,8 +886,9 @@ function DatasetPageContent() {
     // Reverse image search: rank the grid by CLIP similarity to an uploaded image or an
     // image URL. Mirrors handleTextSearch (same CLIP field pick, sequence guard, and
     // 'similarity' view stage), differing only in the query source.
-    const handleImageSearch = async (input: { imageBase64?: string; imageUrl?: string; label: string }, limit: number = 100) => {
+    const handleImageSearch = async (input: ImageSearchInput, limit: number, scope: SearchScope, searchId: string, rerun = false) => {
         if (!datasetId) return;
+        const kept = searchKept(scope);
         setIsSearching(true);
         const seq = ++textSearchSeq.current;
         try {
@@ -863,18 +901,12 @@ function DatasetPageContent() {
                 imageUrl: input.imageUrl,
                 embeddingField: field,
                 limit,
+                filters: searchFilters(kept),
             });
             if (seq !== textSearchSeq.current) return;
             const resultIds = results.map(s => s.id);
-            clearSelection();
-            setBrushedIds([]);
             const shortLabel = input.label.length > 40 ? `${input.label.slice(0, 37)}…` : input.label;
-            const got = resultIds.length < limit ? `${resultIds.length} of ${limit} requested` : `${resultIds.length}`;
-            showResultsAsView({
-                type: 'similarity',
-                description: `🖼 ${shortLabel} (${got})`,
-                filter: { logic: 'AND', filters: [{ field: 'id', operator: 'in', value: resultIds }] },
-            });
+            showSearchResults(searchStage(`Similar to 🖼 ${shortLabel}`, kept, resultIds, limit, searchId), scope, rerun);
         } catch (error) {
             // The server explains 501 (encoder not installed) / 400 (non-CLIP field / bad image) precisely.
             alert(`❌ Image search failed: ${error instanceof Error ? error.message : error}`);
@@ -922,6 +954,7 @@ function DatasetPageContent() {
                     <GridPanel
                         datasetId={datasetId!}
                         dataset={dataset}
+                        onMediaFieldChange={saveGridMediaField}
                         filters={withGrain(stagedFilters, g.grain, g.pivot, hasObjects)}
                         filtersReady={grainKnown || !stagedFilters.filters?.length}
                         grainMode={g.grain}
@@ -1177,6 +1210,26 @@ function DatasetPageContent() {
         }
     };
 
+    // Find similar: a search remembers what it searched for, so its chip's "top N" can run it again.
+    const searchable = (embeddingFields || []).some(f => !f.includes('_patch_') && f !== 'clip_obj');
+    const newSearchId = () => `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+    const runTextSearch = (prompt: string) => {
+        const search = { id: newSearchId(), scope: searchScope, text: prompt };
+        setLastSearch(search);
+        void handleTextSearch(prompt, searchLimitOf(searchLimit), search.scope, search.id);
+    };
+    const runImageSearch = (input: ImageSearchInput) => {
+        const search = { id: newSearchId(), scope: searchScope, image: input };
+        setLastSearch(search);
+        void handleImageSearch(input, searchLimitOf(searchLimit), search.scope, search.id);
+    };
+    const changeSearchLimit = (limit: number) => {
+        setSearchLimit(limit);
+        if (lastSearch?.text != null) void handleTextSearch(lastSearch.text, limit, lastSearch.scope, lastSearch.id, true);
+        else if (lastSearch?.image) void handleImageSearch(lastSearch.image, limit, lastSearch.scope, lastSearch.id, true);
+    };
+    const hasDraft = hasUnappliedChanges || brushedIds.length > 0 || selectedIds.length > 0 || !!currentPolygon;
+
     if (!isMounted) return null;
 
     // No access (403) or no such dataset (404): one clear page, instead of every panel repeating
@@ -1201,10 +1254,10 @@ function DatasetPageContent() {
             {dataset && datasetId != null && <DatasetJobs key={datasetId} datasetId={datasetId} onShowHistory={() => setIsJobHistoryOpen(true)} />}
             {dataset?.deleting && <DatasetDeletion dataset={dataset} />}
 
-            {/* Sub-header for Dataset context */}
+            {/* Sub-header: the dataset, its draft (not yet applied) filters, and its tools */}
             <div className="border-b border-zinc-800 bg-zinc-900/50 shrink-0">
-                <div className="px-6 py-3 flex flex-wrap items-center gap-4">
-                    <Link href="/" className="text-zinc-400 hover:text-white transition-colors flex items-center gap-1 text-sm font-medium">
+                <div className="px-6 py-2.5 flex items-center gap-4">
+                    <Link href="/" className="text-zinc-400 hover:text-white transition-colors flex items-center gap-1 text-sm font-medium shrink-0">
                         ← Back
                     </Link>
                     <div className="h-4 w-px bg-zinc-800" />
@@ -1216,110 +1269,93 @@ function DatasetPageContent() {
                         {selectionNotice?.view === stagedViewKey && <p role="status" className="text-xs text-zinc-400">{selectionNotice.message}</p>}
                     </div>
 
-                    {isMounted && dataset?.media_fields && dataset.media_fields.length > 1 && (
-                        <select
-                            value={gridMediaField}
-                            onChange={(e) => setGridMediaField(e.target.value)}
-                            className="ml-4 bg-zinc-800 border border-zinc-700 text-zinc-200 rounded px-2 py-1 text-xs focus:outline-none focus:border-cyan-500"
-                        >
-                            {dataset.media_fields.map(field => (
-                                <option key={field} value={field}>{field}</option>
-                            ))}
-                        </select>
-                    )}
-
-                    {/* Filter Status Indicators */}
-                    <div className="ml-auto flex items-center gap-3">
-                        <div className="flex items-center gap-2">
-
-
-                            {/* Transient State Indicators (Draft) — one chip per concern,
-                                each independently clearable (✕). */}
+                    {/* Draft (not yet applied) filters: one chip each, each clearable (✕), then Clear Draft / Apply. */}
+                    {hasDraft && (
+                        <div data-testid="draft-filters" className="flex flex-wrap items-center justify-end gap-2 text-xs">
+                            <span className="text-[11px] text-zinc-500">Not applied:</span>
+                            {/* Embeddings lasso = an AREA. Always shown as a "region" chip
+                                (never individual points), whether or not the server token
+                                has resolved yet. */}
+                            {(currentEmbeddingRegion || (selectionSource === 'Embeddings' && brushedIds.length > 0)) && (
+                                <DraftChip
+                                    tone="indigo"
+                                    label="Embeddings region"
+                                    onClear={() => { setCurrentEmbeddingRegion(null); setBrushedIds([]); }}
+                                />
+                            )}
+                            {/* Brush/point selection from other panels (map / duplicates / sparse) */}
+                            {brushedIds.length > 0 && selectionSource !== 'Embeddings' && !currentEmbeddingRegion && (
+                                <DraftChip
+                                    tone={selectionSource === 'Map' ? 'purple' : 'indigo'}
+                                    label={`${selectionSource && selectionSource !== 'Manual' ? selectionSource : 'Selection'} (${brushedIds.length.toLocaleString()} selected)`}
+                                    onClear={() => setBrushedIds([])}
+                                />
+                            )}
+                            {/* Grid checkbox selection */}
+                            {selectedIds.length > 0 && (
+                                <DraftChip
+                                    tone="cyan"
+                                    label={`Grid (${selectedIds.length.toLocaleString()} selected)`}
+                                    onClear={clearSelection}
+                                />
+                            )}
+                            {/* Token Select-All (large selection held server-side; selectedIds is empty) */}
+                            {selectAll && (
+                                <DraftChip
+                                    tone="cyan"
+                                    label={`Select All (${selectionCount.toLocaleString()} selected)`}
+                                    onClear={clearSelection}
+                                />
+                            )}
+                            {/* Map polygon region */}
+                            {currentPolygon && (
+                                <DraftChip tone="purple" label="Map region" onClear={() => setCurrentPolygon(null)} />
+                            )}
+                            {/* The sidebar's picks, one chip per field, so each says what it is and can go alone */}
+                            {Object.entries(simpleFilters).map(([key, value]) => {
+                                // One filter comes back as itself; nothing as an empty AND group.
+                                const filter = convertSimpleFiltersToComplex({ [key]: value });
+                                if (filter.filters && filter.filters.length === 0) return null;
+                                return (
+                                    <DraftChip
+                                        key={key}
+                                        tone="zinc"
+                                        label={describeFilter(filter)}
+                                        onClear={() => setSimpleFilters(Object.fromEntries(Object.entries(simpleFilters).filter(([other]) => other !== key)))}
+                                    />
+                                );
+                            })}
+                            {(advancedFilters.filters?.length ?? 0) > 0 && (
+                                <DraftChip tone="zinc" label="Advanced filters" onClear={() => setAdvancedFilters({ logic: 'AND', filters: [] })} />
+                            )}
+                            <button
+                                onClick={() => {
+                                    setSimpleFilters({});
+                                    setAdvancedFilters({ logic: 'AND', filters: [] });
+                                    setBrushedIds([]);
+                                    setCurrentPolygon(null);
+                                    setCurrentEmbeddingRegion(null);
+                                    clearSelection();
+                                }}
+                                className="px-3 py-1.5 text-xs font-medium text-zinc-400 hover:text-white bg-zinc-800 hover:bg-zinc-700 rounded transition-colors flex items-center gap-1"
+                            >
+                                <Cross2Icon className="w-3 h-3" />
+                                Clear Draft
+                            </button>
                             {hasUnappliedChanges && (
-                                <div className="flex items-center gap-2 text-xs border-l border-zinc-800 pl-3 ml-1">
-                                    {/* Embeddings lasso = an AREA. Always shown as a "region" chip
-                                        (never individual points), whether or not the server token
-                                        has resolved yet. */}
-                                    {(currentEmbeddingRegion || (selectionSource === 'Embeddings' && brushedIds.length > 0)) && (
-                                        <DraftChip
-                                            tone="indigo"
-                                            label="Embeddings region"
-                                            onClear={() => { setCurrentEmbeddingRegion(null); setBrushedIds([]); }}
-                                        />
-                                    )}
-                                    {/* Brush/point selection from other panels (map / duplicates / sparse) */}
-                                    {brushedIds.length > 0 && selectionSource !== 'Embeddings' && !currentEmbeddingRegion && (
-                                        <DraftChip
-                                            tone={selectionSource === 'Map' ? 'purple' : 'indigo'}
-                                            label={`${selectionSource && selectionSource !== 'Manual' ? selectionSource : 'Selection'} (${brushedIds.length.toLocaleString()} selected)`}
-                                            onClear={() => setBrushedIds([])}
-                                        />
-                                    )}
-                                    {/* Grid checkbox selection */}
-                                    {selectedIds.length > 0 && (
-                                        <DraftChip
-                                            tone="cyan"
-                                            label={`Grid (${selectedIds.length.toLocaleString()} selected)`}
-                                            onClear={clearSelection}
-                                        />
-                                    )}
-                                    {/* Token Select-All (large selection held server-side; selectedIds is empty) */}
-                                    {selectAll && (
-                                        <DraftChip
-                                            tone="cyan"
-                                            label={`Select All (${selectionCount.toLocaleString()} selected)`}
-                                            onClear={clearSelection}
-                                        />
-                                    )}
-                                    {/* Map polygon region */}
-                                    {currentPolygon && (
-                                        <DraftChip tone="purple" label="Map region" onClear={() => setCurrentPolygon(null)} />
-                                    )}
-                                    {/* Unapplied simple/advanced filter edits */}
-                                    {(Object.keys(simpleFilters).length > 0 || (advancedFilters.filters?.length ?? 0) > 0) && (
-                                        <DraftChip
-                                            tone="zinc"
-                                            label="Unapplied filters"
-                                            onClear={() => { setSimpleFilters({}); setAdvancedFilters({ logic: 'AND', filters: [] }); }}
-                                        />
-                                    )}
-                                </div>
+                                <button
+                                    onClick={applyFilters}
+                                    data-testid="apply-filters"
+                                    className="px-3 py-1.5 text-xs font-medium text-white bg-cyan-600 hover:bg-cyan-500 rounded transition-colors flex items-center gap-1"
+                                >
+                                    <CheckIcon className="w-3 h-3" />
+                                    Apply
+                                </button>
                             )}
                         </div>
+                    )}
 
-                        {/* Apply/Reset Buttons */}
-                        {(hasUnappliedChanges || brushedIds.length > 0 || selectedIds.length > 0 || currentPolygon) && (
-                            <div className="flex items-center gap-2">
-
-                                <button
-                                    onClick={() => {
-                                        setSimpleFilters({});
-                                        setAdvancedFilters({ logic: 'AND', filters: [] });
-                                        setBrushedIds([]);
-                                        setCurrentPolygon(null);
-                                        setCurrentEmbeddingRegion(null);
-                                        clearSelection();
-                                    }}
-                                    className="px-3 py-1.5 text-xs font-medium text-zinc-400 hover:text-white bg-zinc-800 hover:bg-zinc-700 rounded transition-colors flex items-center gap-1"
-                                >
-                                    <Cross2Icon className="w-3 h-3" />
-                                    Clear Draft
-                                </button>
-                                {hasUnappliedChanges && (
-                                    <button
-                                        onClick={applyFilters}
-                                        data-testid="apply-filters"
-                                        className="px-3 py-1.5 text-xs font-medium text-white bg-cyan-600 hover:bg-cyan-500 rounded transition-colors flex items-center gap-1"
-                                    >
-                                        <CheckIcon className="w-3 h-3" />
-                                        Apply
-                                    </button>
-                                )}
-                            </div>
-                        )}
-                    </div>
-
-                    <div className="flex items-center gap-4">
+                    <div className="flex shrink-0 items-center gap-2">
                         {datasetId && (
                             <ViewManager
                                 datasetId={datasetId}
@@ -1334,16 +1370,6 @@ function DatasetPageContent() {
                                 }}
                             />
                         )}
-                        <div data-testid="total-samples" className="text-sm text-zinc-400">
-                            {/* While the COUNT runs this said "0 samples" — 13 s on main for one filter.
-                                On a dataset with object rows it counts the IMAGE grain, so
-                                say images: "2000 samples" sat next to "11,072 objects". */}
-                            {appliedCount !== undefined
-                                ? `${appliedCount} ${hasObjects ? 'images' : 'samples'}`
-                                : isRescoringRefusal(globalCountFailure)
-                                    ? 'Waiting for concept scoring…'
-                                    : 'Counting…'}
-                        </div>
                         <button
                             onClick={() => setIsJobHistoryOpen(true)}
                             data-testid="open-job-history"
@@ -1359,34 +1385,58 @@ function DatasetPageContent() {
                         >
                             <GearIcon className="w-5 h-5" />
                         </button>
+                        <button
+                            onClick={() => setLightningMode(prev => !prev)}
+                            className={`p-1.5 rounded-md transition-colors ${lightningMode
+                                ? 'text-yellow-400 bg-yellow-400/10 hover:bg-yellow-400/20'
+                                : 'text-zinc-600 hover:bg-zinc-900 hover:text-zinc-300'
+                            }`}
+                            title={`Fast mode: ${lightningMode ? 'ON' : 'OFF'}`}
+                        >
+                            <Rocket className="w-4 h-4" />
+                        </button>
                     </div>
                 </div>
 
-                {/* Query Builder Row - Dedicated Space */}
+                {/* Filter bar: Add Filter and Find similar, the applied filters as chips, and what they come to */}
                 <div className="px-6 pb-3 pt-0">
                     <QueryBuilderBar
-                        isSearching={isSearching}
-                        allowImageUrl={user?.role !== 'guest'}
                         stages={viewStages}
-                        onRemoveStage={(index) => {
-                            // Only handle real stages since transient ones are gone from here
-                            removeStage(index);
-                        }}
-                        onUpdateStage={(index, stage) => {
-                            // Only handle real updates
-                            updateStage(index, stage);
-                        }}
+                        onRemoveStage={removeStage}
+                        onUpdateStage={updateStage}
                         onAddStage={addStage}
-                        onReplaceStages={replaceStages}
                         onClearAll={resetFilters}
                         defaultView={defaultView}
                         onShowAll={showAllImages}
-                        onTextSearch={(embeddingFields || []).some(f => !f.includes('_patch_') && f !== 'clip_obj') ? handleTextSearch : undefined}
-                        onImageSearch={(embeddingFields || []).some(f => !f.includes('_patch_') && f !== 'clip_obj') ? handleImageSearch : undefined}
                         datasetId={datasetId!}
                         schema={schema || []}
-                        lightningMode={lightningMode}
-                        onToggleLightningMode={() => setLightningMode(prev => !prev)}
+                        actions={
+                            <FindSimilar
+                                onTextSearch={searchable ? runTextSearch : undefined}
+                                onImageSearch={searchable ? runImageSearch : undefined}
+                                isSearching={isSearching}
+                                allowImageUrl={user?.role !== 'guest'}
+                                limit={searchLimit}
+                                onLimitChange={setSearchLimit}
+                                scope={searchScope}
+                                onScopeChange={setSearchScope}
+                                hasFilters={viewStages.some(s => s.type !== 'similarity')}
+                            />
+                        }
+                        trailing={
+                            <div data-testid="total-samples" className="whitespace-nowrap px-2 text-sm text-zinc-300">
+                                {/* While the COUNT runs this said "0 samples" — 13 s on main for one filter.
+                                    On a dataset with object rows it counts the IMAGE grain, so
+                                    say images: "2000 samples" sat next to "11,072 objects". */}
+                                {appliedCount !== undefined
+                                    ? `${appliedCount} ${hasObjects ? 'images' : 'samples'}`
+                                    : isRescoringRefusal(globalCountFailure)
+                                        ? 'Waiting for concept scoring…'
+                                        : 'Counting…'}
+                            </div>
+                        }
+                        activeSearchId={lastSearch?.id ?? null}
+                        onSearchLimit={changeSearchLimit}
                     />
                 </div>
             </div>

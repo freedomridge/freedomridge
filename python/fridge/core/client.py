@@ -6,6 +6,7 @@ import struct
 import time
 import warnings
 from importlib import metadata
+from pathlib import Path
 from typing import Any, Dict, Optional
 from urllib.parse import urlsplit
 
@@ -137,6 +138,27 @@ class _Session(requests.Session):
             resp = super().request(*args, **kwargs)
         _check_server_version(resp)
         return resp
+
+
+class WorkerLeaseLost(RuntimeError):
+    """The server says a compute worker no longer holds the job (its lease expired, or the job ended): stop
+    working on it, without reporting."""
+
+
+def _json_detail(resp):
+    """The ``detail`` of a JSON error body; None for any other body."""
+    try:
+        body = resp.json()
+    except ValueError:
+        return None
+    return body.get("detail") if isinstance(body, dict) else None
+
+
+def _raise_lease_lost(resp) -> None:
+    if resp.status_code == 409:
+        detail = _json_detail(resp)
+        if isinstance(detail, dict) and detail.get("code") == "lease_lost":
+            raise WorkerLeaseLost(detail.get("message") or "lease lost")
 
 
 class IncompatibleServerError(RuntimeError):
@@ -353,6 +375,88 @@ class Client:
         resp = self.session.get(f"{self.base_url}/workers")
         _raise_for_status(resp)
         return resp.json()
+
+    def claim_worker_job(self, worker_id, wait_seconds=25):
+        """The next compute job for a registered worker, waiting up to ``wait_seconds`` for one (long polling);
+        None when none came. Each claim also keeps the worker online. The job comes with its ``lease_token``,
+        renewed with ``worker_job_heartbeat`` every ``heartbeat_seconds``."""
+        resp = self.session.post(f"{self.base_url}/workers/{worker_id}/claim", json={"wait_seconds": wait_seconds})
+        _raise_for_status(resp)
+        return None if resp.status_code == 204 else resp.json()
+
+    def _worker_job(self, worker_id, job_id, action, body):
+        resp = self.session.post(f"{self.base_url}/workers/{worker_id}/jobs/{job_id}/{action}", json=body)
+        _raise_lease_lost(resp)
+        _raise_for_status(resp)
+        return resp.json()
+
+    def worker_job_heartbeat(self, worker_id, job_id, lease_token, *, done=None, total=None, message=None):
+        """Renew a claimed job's lease, with progress. ``cancel_requested`` in the answer: stop and release it.
+        Raises WorkerLeaseLost when the job is no longer this worker's."""
+        body = {"lease_token": lease_token, "done": done, "total": total, "message": message}
+        return self._worker_job(worker_id, job_id, "heartbeat", body)
+
+    def complete_worker_job(self, worker_id, job_id, lease_token, result=None):
+        """Finish a claimed job's step with its result (a map re-fit's fit: each output's sha256)."""
+        return self._worker_job(worker_id, job_id, "complete", {"lease_token": lease_token, "result": result})
+
+    def fail_worker_job(self, worker_id, job_id, lease_token, error_type, message, retryable=False):
+        """Record a claimed job's error; a retryable one queues it again after the kind's retry delay."""
+        body = {
+            "lease_token": lease_token,
+            "error": {"type": error_type[:100], "message": message[:2000]},
+            "retryable": retryable,
+        }
+        return self._worker_job(worker_id, job_id, "fail", body)
+
+    def release_worker_job(self, worker_id, job_id, lease_token):
+        """Give a claimed job back, queued again at its last checkpoint (or cancelled, if that was asked)."""
+        return self._worker_job(worker_id, job_id, "release", {"lease_token": lease_token})
+
+    def download_worker_file(self, worker_id, job_id, lease_token, name, path, block_bytes=8 * 1024**2):
+        """Download one of a claimed job's inputs to ``path``, resuming a partial file with a Range request.
+        Returns its size."""
+        path = Path(path)
+        have = path.stat().st_size if path.exists() else 0
+        headers = {"X-Fridge-Lease": str(lease_token), **({"Range": f"bytes={have}-"} if have else {})}
+        url = f"{self.base_url}/workers/{worker_id}/jobs/{job_id}/files/{name}"
+        with self.session.get(url, headers=headers, stream=True) as resp:
+            if resp.status_code == 416:  # nothing past what is already here
+                return have
+            _raise_lease_lost(resp)
+            _raise_for_status(resp)
+            with open(path, "ab" if resp.status_code == 206 else "wb") as target:
+                for block in resp.iter_content(block_bytes):
+                    target.write(block)
+        return path.stat().st_size
+
+    def upload_worker_file(self, worker_id, job_id, lease_token, name, path, chunk_bytes=64 * 1024**2):
+        """Upload one of a claimed job's outputs in chunks of at most ``chunk_bytes`` (the server takes 64 MiB).
+        A chunk the server refuses for its offset (sent twice, or after a dropped connection) resumes at the size
+        the server has."""
+        path = Path(path)
+        size = path.stat().st_size
+        url = f"{self.base_url}/workers/{worker_id}/jobs/{job_id}/files/{name}"
+        offset = 0
+        with open(path, "rb") as source:
+            while True:
+                source.seek(offset)
+                chunk = source.read(chunk_bytes)
+                resp = self.session.put(
+                    url,
+                    params={"offset": offset},
+                    data=chunk,
+                    headers={"X-Fridge-Lease": str(lease_token)},
+                )
+                _raise_lease_lost(resp)
+                detail = _json_detail(resp) if resp.status_code == 409 else None
+                if isinstance(detail, dict) and detail.get("code") == "offset":
+                    offset = int(detail["size"])
+                else:
+                    _raise_for_status(resp)
+                    offset = int(resp.json()["size"])
+                if offset >= size:
+                    return offset
 
     def get_datasets(self):
         # FastAPI requires trailing slash for this endpoint

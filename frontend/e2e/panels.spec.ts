@@ -15,7 +15,8 @@ test('filter sidebar: enum checkbox scopes the grid via Apply', async ({ page })
     const sidebar = page.getByTestId('panel-filters');
     await expandField(page, 'split');
     await sidebar.getByRole('checkbox', { name: 'train' }).check();
-    await expect(page.getByText('Unapplied filters')).toBeVisible();
+    // The draft says what it is: one chip per sidebar field.
+    await expect(page.getByTestId('draft-filters')).toContainText('split');
     await page.getByTestId('apply-filters').click();
     await expectTotal(page, 6);
     await expect(page.getByTestId('grid-view-count')).toHaveText(/^\s*6 images\s*$/);

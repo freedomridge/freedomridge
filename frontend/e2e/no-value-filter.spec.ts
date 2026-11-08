@@ -23,7 +23,7 @@ test('filter sidebar: "(no value)" shows only for partial fields and applies is_
 
     // Applying it reaches the server as is_null → the 6 samples without `note`.
     await noValue.click();
-    await expect(page.getByText('Unapplied filters')).toBeVisible();
+    await expect(page.getByTestId('draft-filters')).toBeVisible();
     await page.getByTestId('apply-filters').click();
     await expectTotal(page, 6);
 

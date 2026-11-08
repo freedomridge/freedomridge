@@ -92,15 +92,18 @@ host's RAM free. A re-fit holds every vector of the field plus its fit sample: a
 DINOv3 field above. There is no systemd in the job-runner container, so the fit runs within the
 container's own memory limit, `JOB_RUNNER_MEMORY_LIMIT` in `.env` (for example `24g`), which every
 job in that container shares. The fit is sized to what the limit leaves; if it still runs out, the
-kernel stops only the fit, and the runner retries it with fewer points. Exports and models go to the
+kernel stops only the fit, and the runner retries it with fewer points. Exports and fit outputs go to the
 `umap_models` volume. Unset (the default), there is no limit and the runner skips re-fits with
-"Memory containment is not available"; build maps with the SDK instead (`compute_visualization`).
+"Memory containment is not available": build maps with the SDK instead (`compute_visualization`), or let a
+compute worker fit them (below).
 
 **Heavy computation runs where the SDK runs.** Embeddings, image metrics and maps are computed by
 the SDK on the machine that calls it, which only uploads the results. Run those from a machine
-with the RAM, CPU or GPU for them; the server does not need to be sized for that work. A separate
-compute worker that claims jobs from the server is designed but not built yet (see
-[Jobs](architecture/JOBS.md)).
+with the RAM, CPU or GPU for them; the server does not need to be sized for that work. Map re-fits can
+work the same way: set `JOB_RUNNER_PLACEMENTS=server` in `.env` and run `python -m fridge.worker` on a
+machine with the memory ([SDK](SDK.md), "Compute workers"). The server still exports the vectors and swaps
+the new map in; only the fit moves, so the server needs no `JOB_RUNNER_MEMORY_LIMIT` for it. A fit that no
+worker claims within 12 hours is cancelled, and the old map stays.
 
 ## TLS, startup and admin login
 

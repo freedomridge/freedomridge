@@ -4,6 +4,62 @@ Freedom Ridge has one version for the server, the web app and the Python SDK (th
 file), following [Semantic Versioning](https://semver.org). A release lists **upgrade notes** when
 it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
 
+## 2.1.0 (2026-11-07)
+
+2.1 lets a compute worker fit a server's maps, lays out the dataset page's top bar again, and keeps a
+field's class names and colours through a rename. It needs only the standard upgrade steps (no migration),
+and a 2.0 SDK works with it. Two changes return different images than 2.0: excluding a map region now keeps
+the images with no location, and a search keeps the applied filters unless you choose **whole dataset**.
+
+### Added
+
+- `python -m fridge.worker` fits maps: on a server whose job runner leaves fits to compute workers
+  (`JOB_RUNNER_PLACEMENTS=server`), a worker claims a map re-fit's fit, downloads the exported vectors, runs
+  the fit on its own machine and uploads the new coordinates, and the server swaps the map in. A server too
+  small to fit its maps (such as a t3.large) can have them fitted on a desktop instead.
+  - The fit sizes itself to the worker's free memory. An out-of-memory kill stops only the fit, which runs
+    again on 75% of the points, down to the smallest useful fit.
+  - A lost lease or a cancel stops the fit at once, Ctrl-C or SIGTERM gives the job back, and a transfer that
+    fails for a moment is tried again. Install the SDK with the `embeddings` extra on the worker.
+
+### Changed
+
+- The dataset page's top bar is laid out again.
+  - **Add Filter** and **Find similar** start the filter bar, before the chips they make, and the image count
+    ends it. The dataset's name, its draft filters, Saved Views, Jobs, settings and fast mode share the row above.
+  - **Each filter's card switches between Builder and Query.** Click a chip, or Add Filter, and edit the filter
+    as a form or as text, such as a pasted list (docs/FILTER_QUERY.md). The bar always shows chips; the
+    **Query** button is gone.
+  - **Find similar** opens a panel: describe what you want, or upload or paste an example image, and choose how
+    many of the closest images to show. With filters applied, it searches **within your filters** (they stay, as
+    a chip beside the search's) or the **whole dataset** (the results replace them, as every search did before).
+    A new search replaces the previous search. The search's chip offers **top N**, which runs it again. Find
+    similar from images selected in the grid is unchanged.
+  - **Draft filters** show one chip per sidebar field, saying what each one is, and each can be removed on its
+    own.
+  - The header's image-field dropdown is gone. The grid's **View** picker now also saves the field every grid
+    opens on.
+- **Excluding a map region or an embeddings lasso removes what is inside it and keeps everything else**, images
+  with no location (or no point on that map) included. Excluding a map region used to drop the images with no
+  location too.
+- [SDK.md](docs/SDK.md) has a section on showing a model's predictions as mask overlays: one mask field per
+  model version, named so that it says which model it is, its class names and colours, and removing it.
+
+### Fixed
+
+- An embeddings lasso's chip opened the field form, which could show only the field's name (such as `clip`). It
+  now says which map the lasso was drawn on and, like a map region, a click toggles it between including and
+  excluding its area (the new `embedding_polygon_exclude` filter operator).
+- Clicking a text or image search's chip to exclude its results changed only its label. It now excludes them.
+- On a dataset with objects, a `created_at` filter matched through an image's objects (or an object's image)
+  compared the outer row's date instead of the object's (or image's) in similarity search, duplicate and
+  hash-stats, sparse-sample and embeddings requests. It now compares the right row's date, so such a filter can
+  match more images there.
+- A renamed mask or label field kept no class names or colours: its `segmentation_config` entries
+  (`mask_targets` and `color_scheme.fields`) stayed under the old name. `rename_field` now moves them to the new
+  name and `clone_field` copies them. `clear_field` still leaves them, so a field cleared and written again keeps
+  its class names and colours.
+
 ## 2.0.0 (2026-11-06)
 
 2.0 removes old forms of the API that 1.x still accepted, and new images now appear on every map by
