@@ -17,6 +17,12 @@ it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
   - A lost lease or a cancel stops the fit at once, Ctrl-C or SIGTERM gives the job back, and a transfer that
     fails for a moment is tried again. Install the SDK with the `embeddings` extra on the worker.
 
+### Changed
+
+- The filters are edited as text in the filter bar itself, not in a popup. **Text** at the bar's left, or a click
+  on its empty part, turns the bar into the query; **Apply** turns it back into chips, and **Chips**, **Cancel**
+  or Esc goes back without applying. An empty bar says so and offers a query. The **Query** button is gone.
+
 ## 2.0.0 (2026-11-06)
 
 2.0 removes old forms of the API that 1.x still accepted, and new images now appear on every map by

@@ -7,15 +7,13 @@ interface FilterQueryEditorProps {
     stages: ViewStage[];
     onApply: (stages: ViewStage[]) => void;
     onClose: () => void;
-    // Whether the text differs from the filters it opened with, so a stray click doesn't throw an edit away.
-    onDirtyChange?: (dirty: boolean) => void;
 }
 
-// The filters as text (docs/FILTER_QUERY.md): read, copy, paste or edit them, then Apply. The server checks
-// the text against the dataset's fields; a mistake is shown with its line and column, and nothing changes.
-export function FilterQueryEditor({ datasetId, stages, onApply, onClose, onDirtyChange }: FilterQueryEditorProps) {
+// The filters as text, in the filter bar (docs/FILTER_QUERY.md): read, copy, paste or edit them, then Apply. The
+// server checks the text against the dataset's fields; a mistake is shown with its line and column, and nothing
+// changes.
+export function FilterQueryEditor({ datasetId, stages, onApply, onClose }: FilterQueryEditorProps) {
     const [text, setText] = useState<string | null>(null);  // null until the current filters are written out
-    const [opened, setOpened] = useState<string | null>(null);  // the text the editor opened with
     const [problem, setProblem] = useState<FilterQueryProblem | null>(null);
     const [failure, setFailure] = useState<string | null>(null);
     const [applying, setApplying] = useState(false);
@@ -26,9 +24,7 @@ export function FilterQueryEditor({ datasetId, stages, onApply, onClose, onDirty
         formatFilterQuery(datasetId, stages.map(stage => stage.filter))
             .then(({ parts }) => {
                 if (cancelled) return;
-                const written = queryEditorText(stages, parts);
-                setText(written);
-                setOpened(written);
+                setText(queryEditorText(stages, parts));
             })
             .catch((error: unknown) => {
                 if (cancelled) return;
@@ -39,11 +35,6 @@ export function FilterQueryEditor({ datasetId, stages, onApply, onClose, onDirty
         // Written once, when the editor opens: later chip changes must not overwrite what is being typed.
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, []);
-
-    useEffect(() => {
-        onDirtyChange?.(text != null && opened != null && text !== opened);
-    }, [text, opened, onDirtyChange]);
-    useEffect(() => () => onDirtyChange?.(false), [onDirtyChange]);
 
     const apply = async () => {
         if (text == null || applying) return;
@@ -74,28 +65,26 @@ export function FilterQueryEditor({ datasetId, stages, onApply, onClose, onDirty
     };
 
     return (
-        <div data-testid="filter-query-editor" className="flex w-[640px] max-w-[90vw] flex-col gap-3 p-4">
-            <div className="flex items-baseline justify-between gap-3">
-                <span className="text-sm font-medium text-zinc-200">Filters as a query</span>
-                <span className="text-[11px] text-zinc-500">
-                    = != &gt; &lt; · in (a b c) · contains · between · exists · is null · AND OR NOT ( )
-                </span>
-            </div>
+        <div data-testid="filter-query-editor" className="flex w-full flex-col gap-1.5">
             {text == null ? (
-                <div className="h-40 animate-pulse rounded-lg bg-zinc-900" />
+                <div className="h-16 animate-pulse rounded-lg bg-zinc-900" />
             ) : (
                 <textarea
                     ref={textArea}
                     data-testid="filter-query-text"
                     autoFocus
                     spellCheck={false}
-                    rows={8}
+                    // Grows with the text, up to 12 lines; drag the corner for more.
+                    rows={Math.min(12, Math.max(3, text.split('\n').length))}
                     value={text}
                     onChange={event => { setText(event.target.value); setProblem(null); }}
                     onKeyDown={event => {
                         if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) {
                             event.preventDefault();
                             void apply();
+                        } else if (event.key === 'Escape') {
+                            event.preventDefault();
+                            onClose();
                         }
                     }}
                     placeholder={'serial in (103000752 103001025)\nAND split = "train"'}
@@ -111,7 +100,9 @@ export function FilterQueryEditor({ datasetId, stages, onApply, onClose, onDirty
             {failure && <div data-testid="filter-query-failure" className="text-xs text-red-300">{failure}</div>}
             <div className="flex items-center justify-between gap-3">
                 <span className="text-[11px] text-zinc-500">
-                    Each top-level AND part is one filter. Values in a list can be separated by spaces, so a pasted column works. Ctrl+Enter applies.
+                    = != &gt; &lt; · in (a b c) · contains · between · exists · is null · AND OR NOT ( ) ·
+                    Each top-level AND part is one filter. Values in a list can be separated by spaces, so a pasted
+                    column works. Ctrl+Enter applies, Esc cancels.
                 </span>
                 <div className="flex shrink-0 gap-2">
                     <button

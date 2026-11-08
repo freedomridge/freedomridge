@@ -2,7 +2,7 @@
 
 A filter written as text. The same text works in three places:
 
-- **The app's filter bar:** **Query** shows the current filters as text. You can read, copy, paste or edit them, then press **Apply** (or Ctrl+Enter).
+- **The app's filter bar:** click **Text** (or the bar's empty part) and the bar shows the current filters as text. You can read, copy, paste or edit them, then press **Apply** (or Ctrl+Enter).
 - **The SDK:** `dataset.query("...")` returns a view, and `dataset.create_view(name, query="...")` saves one.
 - **The HTTP API:** `POST /api/datasets/{id}/filter_query/parse` and `.../format` convert between text and filters, for scripts and for AI tools.
 
@@ -16,7 +16,9 @@ AND NOT (score < 0.2 OR note exists)
 
 ## In the filter bar
 
-**Query**, next to **Add Filter**, opens the current filters as text.
+**Text**, at the left of the filter bar, turns the bar into the current filters as text; so does a click on the
+bar's empty part. **Apply** (or Ctrl+Enter) turns the text back into chips. **Cancel**, **Chips** or Esc goes back
+without applying it. The text grows with what you paste, and **Add Filter** is hidden while you edit.
 
 - **Each chip is one line**, joined with `AND`.
 - **Chips with no text form** stay as they are. They show as `# kept: …` lines, and editing those lines does nothing.

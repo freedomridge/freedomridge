@@ -65,8 +65,8 @@ export function QueryBuilderBar({
     const safeLimit = Number.isFinite(resultLimit) && resultLimit > 0 ? Math.min(Math.round(resultLimit), MAX_SEARCH_LIMIT) : DEFAULT_SEARCH_LIMIT;
     const [editingIndex, setEditingIndex] = useState<number | null>(null);
     const [isAdding, setIsAdding] = useState(false);
-    const [queryOpen, setQueryOpen] = useState(false);
-    const [queryEdited, setQueryEdited] = useState(false);  // the query editor's text was changed
+    // The bar shows the filters as text to edit instead of as chips (docs/FILTER_QUERY.md).
+    const [editingText, setEditingText] = useState(false);
     const [searchTerm, setSearchTerm] = useState('');
     const [selectedFieldForAdd, setSelectedFieldForAdd] = useState<string | null>(null);
     const [imageSearchOpen, setImageSearchOpen] = useState(false);
@@ -102,10 +102,49 @@ export function QueryBuilderBar({
     };
 
     return (
-        <div className="flex items-center w-full bg-zinc-950 border border-zinc-800 rounded-lg p-1 shadow-sm">
+        <div className={`flex ${editingText ? 'items-start' : 'items-center'} w-full bg-zinc-950 border border-zinc-800 rounded-lg p-1 shadow-sm`}>
 
-            {/* --- Existing Filters (Pipeline) --- */}
-            <div className="flex items-center flex-1 overflow-x-auto no-scrollbar gap-1">
+            {/* --- Chips or text: the filters as a query (docs/FILTER_QUERY.md) --- */}
+            {onReplaceStages && (
+                <button
+                    type="button"
+                    data-testid="filter-query-trigger"
+                    onClick={() => setEditingText(editing => !editing)}
+                    title={editingText ? 'Back to the chips, without applying the text' : 'Edit the filters as text: read, paste or edit them'}
+                    className={`mr-1 flex shrink-0 items-center gap-1.5 rounded border px-2.5 py-2 text-xs font-medium transition-colors ${editingText
+                        ? 'border-cyan-600 bg-zinc-900 text-cyan-300'
+                        : 'border-zinc-800 text-zinc-400 hover:border-zinc-700 hover:text-zinc-200'
+                    }`}
+                >
+                    <CodeIcon className="h-4 w-4" />
+                    <span>{editingText ? 'Chips' : 'Text'}</span>
+                </button>
+            )}
+            {editingText && onReplaceStages ? (
+                <div className="min-w-0 flex-1">
+                    <FilterQueryEditor
+                        datasetId={datasetId}
+                        stages={stages}
+                        onApply={onReplaceStages}
+                        onClose={() => setEditingText(false)}
+                    />
+                </div>
+            ) : (
+            /* --- Existing Filters (Pipeline); a click on the bar's empty part edits them as text --- */
+            <div
+                className={`flex items-center flex-1 self-stretch overflow-x-auto no-scrollbar gap-1 ${onReplaceStages ? 'cursor-text' : ''}`}
+                onClick={(e) => { if (onReplaceStages && e.target === e.currentTarget) setEditingText(true); }}
+            >
+                {stages.length === 0 && onReplaceStages && (
+                    <button
+                        type="button"
+                        data-testid="filter-query-placeholder"
+                        onClick={() => setEditingText(true)}
+                        className="flex-1 cursor-text truncate px-2 text-left text-xs text-zinc-600 hover:text-zinc-400"
+                    >
+                        No filters. Click to type a query, e.g. serial in (103000752 103001025) AND split = train
+                    </button>
+                )}
                 {hasDefaultFilters && defaultView && (
                     <span
                         data-testid="default-view-label"
@@ -235,6 +274,7 @@ export function QueryBuilderBar({
 
                 {/* End of stages map */}
             </div>
+            )}
 
             {/* --- Right Actions (Add, Clear, Lightning) --- */}
             <div className="flex items-center gap-2 border-l border-zinc-800 pl-3">
@@ -391,45 +431,8 @@ export function QueryBuilderBar({
                     </Popover.Root>
                 )}
 
-                {/* --- The filters as text (docs/FILTER_QUERY.md) --- */}
-                {onReplaceStages && (
-                    <Popover.Root open={queryOpen} onOpenChange={setQueryOpen}>
-                        <Popover.Trigger asChild>
-                            <button
-                                data-testid="filter-query-trigger"
-                                title="The filters as text: read, paste or edit them"
-                                className={`flex items-center gap-1.5 rounded border px-3 py-2 text-xs font-medium transition-colors ${queryOpen
-                                    ? 'border-cyan-600 bg-zinc-900 text-cyan-300'
-                                    : 'border-zinc-800 text-zinc-400 hover:border-zinc-700 hover:text-zinc-200'
-                                }`}
-                            >
-                                <CodeIcon className="h-4 w-4" />
-                                <span>Query</span>
-                            </button>
-                        </Popover.Trigger>
-                        <Popover.Portal>
-                            <Popover.Content
-                                className="z-[100] rounded-xl border border-zinc-800 bg-zinc-950 shadow-2xl animate-in fade-in zoom-in-95"
-                                sideOffset={5}
-                                align="end"
-                                avoidCollisions={true}
-                                // A click outside keeps an edited query open (a pasted list isn't lost to a stray
-                                // click); Escape and Cancel still close it.
-                                onInteractOutside={(event) => { if (queryEdited) event.preventDefault(); }}
-                            >
-                                <FilterQueryEditor
-                                    datasetId={datasetId}
-                                    stages={stages}
-                                    onApply={onReplaceStages}
-                                    onClose={() => setQueryOpen(false)}
-                                    onDirtyChange={setQueryEdited}
-                                />
-                            </Popover.Content>
-                        </Popover.Portal>
-                    </Popover.Root>
-                )}
-
-                {/* --- Add Filter Button --- */}
+                {/* --- Add Filter Button: hidden while the text is edited, as Apply replaces the chips --- */}
+                {!editingText && (
                 <Popover.Root open={isAdding} onOpenChange={setIsAdding}>
                     <Popover.Trigger asChild>
                         <button
@@ -513,6 +516,7 @@ export function QueryBuilderBar({
                         </Popover.Content>
                     </Popover.Portal>
                 </Popover.Root>
+                )}
 
                 <div className="h-4 w-px bg-zinc-800 mx-1" />
 
