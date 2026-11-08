@@ -98,11 +98,15 @@ export function TagManagementModal({
         }
     }
 
+    // Keyed on the ids, not the arrays: the single-image view passes a new [id] on every render and the
+    // excludedIds default is a new [] on every render, so array deps reloaded after every load (#10).
+    const sampleKey = selectedSampleIds.join(',');
+    const excludedKey = excludedIds.join(',');
     useEffect(() => {
         // eslint-disable-next-line react-hooks/set-state-in-effect -- reset request state when the tag target changes
         loadTagCounts();
         // eslint-disable-next-line react-hooks/exhaustive-deps -- reload tag counts only when the target samples/dataset change; loadTagCounts is recreated every render and adding it would refetch on every render
-    }, [selectedSampleIds, selectionToken, excludedIds, datasetId]);
+    }, [sampleKey, selectionToken, excludedKey, datasetId]);
 
     // Stage tag change (don't apply yet)
     function handleTagToggle(tag: string, newChecked: boolean) {
