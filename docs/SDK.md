@@ -1494,8 +1494,10 @@ replacing the bytes at an existing path changes what any version can display.
 dataset.create_version("v1.0", description="Initial annotated dataset")
 ```
 
-Creation captures one consistent database state. A conflicting concurrent dataset
-update returns HTTP 409 without saving a partial version; retry after the writer finishes.
+Creation captures one consistent database state. When a concurrent dataset update conflicts
+with it, such as the statistics refresh after an import, the server takes the snapshot again,
+up to twice. If every attempt conflicts, it returns HTTP 409 with `Retry-After` and saves no
+partial version; retry after the writer finishes.
 
 ### List Versions
 

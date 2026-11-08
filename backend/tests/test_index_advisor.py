@@ -423,6 +423,46 @@ def test_review_job_is_lane_free_joins_and_records_observations(registry_databas
 
 
 @requires_database
+def test_a_review_finishing_while_its_state_is_read_is_still_seen(registry_database):
+    """The views stop polling when a read shows no review running. A review that finished between the
+    read's queries used to show neither running nor done ("Not reviewed yet", for good)."""
+
+    class FinishAfterFirstQuery:
+        def __init__(self, connection, finish):
+            self._connection, self._finish, self._queries = connection, finish, 0
+
+        def __getattr__(self, name):
+            return getattr(self._connection, name)
+
+        async def fetchrow(self, *args):
+            row = await self._connection.fetchrow(*args)
+            self._queries += 1
+            if self._queries == 1:
+                await self._finish()
+            return row
+
+    async def scenario(database):
+        await ingest([{'country': 'US'}])
+        await index_advisor.submit(database.pool, 1, ADMIN['id'])
+        running = await job_queue.claim_job(database.pool, 'test', kinds=[index_advisor.KIND])
+
+        async def finish():
+            finished = await job_helpers.step(database, running, index_advisor.handler(database.pool))
+            assert finished['state'] == 'succeeded'
+
+        async with database.pool.acquire() as connection:
+            state = await index_advisor.latest(FinishAfterFirstQuery(connection, finish), 1)
+        # One moment: the review was still running when the read began.
+        assert state['active_job'] is not None and state['active_job']['state'] == 'running'
+        assert state['review'] is None
+        async with database.pool.acquire() as connection:
+            state = await index_advisor.latest(connection, 1)
+        assert state['active_job'] is None and state['review']['dataset_id'] == 1
+
+    registry_database(scenario)
+
+
+@requires_database
 def test_review_of_a_deleted_dataset_finishes_skipped(registry_database):
     async def scenario(database):
         await ingest([{'country': 'US'}])

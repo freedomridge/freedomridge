@@ -459,7 +459,7 @@ def test_ingest_and_bulk_append_before_locking_value_rows(registry_database, mon
 
     from backend import sample_ingest
     from backend.field_registry import lock_value_rows
-    from backend.tests.test_bulk_jobs import finish
+    from backend.tests.test_bulk_jobs import finish_retrying_contention
 
     async def scenario(database):
         sid = (await ingest([{'score': 1, 'vehicles': BOX}]))['ids'][0]
@@ -482,7 +482,9 @@ def test_ingest_and_bulk_append_before_locking_value_rows(registry_database, mon
         editing = None
         try:
             await asyncio.wait_for(appended.wait(), 3)
-            editing = asyncio.create_task(finish(database))
+            # The edit's append waits for the paused ingest's row lock. The queue's 100 ms lock timeout can
+            # end that wait first on a busy machine; the runner then runs the unit again, and so does this.
+            editing = asyncio.create_task(finish_retrying_contention(database))
             await asyncio.sleep(0.1)
             release.set()
             await asyncio.wait_for(asyncio.gather(inserting, editing), 5)

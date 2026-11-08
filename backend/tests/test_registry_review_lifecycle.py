@@ -688,3 +688,47 @@ def test_restore_reports_409_when_every_attempt_conflicts(registry_database, mon
         assert await database.fetchval("SELECT count(*) FROM dataset_versions WHERE name LIKE 'auto-%'") == 0
 
     registry_database(scenario)
+
+
+async def create_with_conflicts(database, monkeypatch, conflicts):
+    """Save a full version while the first `conflicts` attempts each have the dataset row updated after
+    the attempt's snapshot, as the statistics refresh an ingest queues does when it finishes.
+    Returns the attempts made and the create's HTTPException (or None)."""
+    await ingest([{'score': 1}])
+    original = versions._snapshot_arrays
+    attempts = 0
+
+    async def refresh_during_snapshot(*args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts <= conflicts:
+            await database.execute('UPDATE datasets SET stats_last_updated = clock_timestamp() WHERE id = 1')
+        return await original(*args, **kwargs)
+
+    monkeypatch.setattr(versions, '_snapshot_arrays', refresh_during_snapshot)
+    try:
+        await asyncio.wait_for(versions.create_version(1, versions.CreateVersionRequest(name='saved')), 10)
+    except HTTPException as error:
+        return attempts, error
+    return attempts, None
+
+
+def test_saving_a_version_retries_after_a_statistics_refresh(registry_database, monkeypatch):
+    async def scenario(database):
+        attempts, error = await create_with_conflicts(database, monkeypatch, conflicts=1)
+        assert error is None and attempts == 2
+        saved = await database.fetchrow("SELECT id, sample_count FROM dataset_versions WHERE name = 'saved'")
+        assert saved['sample_count'] == 1
+        assert await database.fetchval('SELECT count(*) FROM version_snapshots WHERE version_id=$1', saved['id']) == 1
+
+    registry_database(scenario)
+
+
+def test_saving_a_version_reports_a_retryable_409_when_every_attempt_conflicts(registry_database, monkeypatch):
+    async def scenario(database):
+        attempts, error = await create_with_conflicts(database, monkeypatch, conflicts=3)
+        assert error is not None and error.status_code == 409 and attempts == 3
+        assert error.headers == {'Retry-After': '1'}
+        assert await database.fetchval('SELECT count(*) FROM dataset_versions') == 0
+
+    registry_database(scenario)

@@ -67,6 +67,16 @@ async def finish(database, job=None):
     pytest.fail('Bulk operation did not finish')
 
 
+async def finish_retrying_contention(database, job=None):
+    """finish(), each unit run again while it meets QueueContended, as the runner does."""
+    job = job or await claim(database)
+    for _ in range(10000):
+        job = await step_retrying_contention(database, job)
+        if job['state'] == 'succeeded':
+            return job
+    pytest.fail('Bulk operation did not finish')
+
+
 def test_submit_freezes_filter_and_rechecks_locked_rows(registry_database, monkeypatch):
     from backend import bulk_jobs
 
