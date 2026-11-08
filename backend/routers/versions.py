@@ -456,16 +456,28 @@ async def list_versions(id: int):
     return [dict(r) for r in rows]
 
 
+# A full snapshot re-checks the dataset row before it commits, so a write to that row during the
+# snapshot rolls it back, including the statistics refresh an ingest or edit queued, which records its
+# run there. It is taken again after each of these pauses (seconds), as a restore is, and reports 409
+# only when the last attempt fails.
+_CREATE_RETRY_DELAYS = (0.1, 0.2)
+
+
 @router.post("", dependencies=[Depends(require_role("power_user"))])
 async def create_version(id: int, request: CreateVersionRequest):
     """Capture a consistent snapshot, or report a retryable concurrent-write conflict."""
-    try:
-        return await _create_version(id, request)
-    except asyncpg.SerializationError:
-        raise HTTPException(
-            status_code=409,
-            detail="Dataset changed during snapshot creation; retry after the concurrent writer finishes",
-        )
+    for delay in (*_CREATE_RETRY_DELAYS, None):
+        try:
+            return await _create_version(id, request)
+        except asyncpg.SerializationError:
+            if delay is None:
+                # Rolled back, nothing kept: a retryable refusal, marked with Retry-After like the others.
+                raise HTTPException(
+                    status_code=409,
+                    detail="Dataset changed during snapshot creation; retry after the concurrent writer finishes",
+                    headers={'Retry-After': '1'},
+                )
+            await asyncio.sleep(delay)
 
 
 async def _create_version(id: int, request: CreateVersionRequest):

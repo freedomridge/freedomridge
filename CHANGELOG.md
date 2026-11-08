@@ -4,6 +4,17 @@ Freedom Ridge has one version for the server, the web app and the Python SDK (th
 file), following [Semantic Versioning](https://semver.org). A release lists **upgrade notes** when
 it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
 
+## Unreleased
+
+### Fixed
+
+- **Index review:** **Review now** could stay on "Not reviewed yet" for good. A review that finished just as
+  the page read its state showed as neither running nor done, and the page stopped checking. The state is now
+  read at one moment.
+- **Saving a version** right after an import or edit could fail with "Dataset changed during snapshot
+  creation". The statistics refresh that the import queued records its run on the dataset, and the snapshot
+  took that for a change. A conflicting snapshot is now taken again, up to twice, as a restore is.
+
 ## 2.1.1 (2026-11-07)
 
 2.1.1 moves to transformers 5 for its security fixes. Embeddings are unchanged, so nothing needs

@@ -114,7 +114,8 @@ def test_concurrent_settings_change_is_a_409_and_rolls_back(monkeypatch):
         _create(monkeypatch, conn)
     assert error.value.status_code == 409
     assert "retry" in error.value.detail
-    assert conn.tx_exit_exc == [asyncpg.SerializationError]
+    # Each attempt (the first and its two retries) rolled back.
+    assert conn.tx_exit_exc == [asyncpg.SerializationError] * 3
     assert conn.executed == []
 
 

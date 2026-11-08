@@ -811,20 +811,22 @@ def handler(pool):
 
 async def latest(connection, dataset_id: Optional[int]) -> Dict[str, Any]:
     """The newest review of a scope, the one queued or running now, and the newest that ended without a
-    result (failed or cancelled), for the advisor's views."""
+    result (failed or cancelled), for the advisor's views. Read in one snapshot: a review that finished
+    between the queries would show as neither running nor done, and the views stop polling."""
     args = scope_args(dataset_id)
     rows = {}
-    for name, condition in (
-        ('review', "state = 'succeeded'"),
-        ('active', "state IN ('queued', 'running')"),
-        ('last', "state IN ('succeeded', 'failed', 'cancelled')"),
-    ):
-        rows[name] = await connection.fetchrow(
-            f"""SELECT id, state, result, error, message, created_at, started_at, finished_at FROM jobs
-                WHERE kind = $1 AND args = $2::jsonb AND {condition} ORDER BY created_at DESC LIMIT 1""",
-            KIND,
-            args,
-        )
+    async with connection.transaction(isolation='repeatable_read', readonly=True):
+        for name, condition in (
+            ('review', "state = 'succeeded'"),
+            ('active', "state IN ('queued', 'running')"),
+            ('last', "state IN ('succeeded', 'failed', 'cancelled')"),
+        ):
+            rows[name] = await connection.fetchrow(
+                f"""SELECT id, state, result, error, message, created_at, started_at, finished_at FROM jobs
+                    WHERE kind = $1 AND args = $2::jsonb AND {condition} ORDER BY created_at DESC LIMIT 1""",
+                KIND,
+                args,
+            )
     review = rows['review']
     active = rows['active']
     last = rows['last']
