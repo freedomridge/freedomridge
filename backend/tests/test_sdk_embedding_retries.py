@@ -155,8 +155,8 @@ def test_compute_continues_after_deletion_and_reports_drops(monkeypatch, patches
         sys.modules,
         'transformers',
         SimpleNamespace(
-            CLIPModel=SimpleNamespace(from_pretrained=lambda name: Model()),
-            CLIPProcessor=SimpleNamespace(from_pretrained=lambda name: Processor()),
+            CLIPModel=SimpleNamespace(from_pretrained=lambda name, **kwargs: Model()),
+            CLIPProcessor=SimpleNamespace(from_pretrained=lambda name, **kwargs: Processor()),
         ),
     )
     monkeypatch.setitem(

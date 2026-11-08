@@ -4,6 +4,22 @@ Freedom Ridge has one version for the server, the web app and the Python SDK (th
 file), following [Semantic Versioning](https://semver.org). A release lists **upgrade notes** when
 it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
 
+## Unreleased
+
+### Added
+
+- **One image's patch vectors without a server:** `fridge.compute_image_patch_vectors(image, scale="4x4")`
+  returns the vectors `compute_patch_embeddings` stores for that image (16 × 512 float32 for `4x4`), with no
+  client or network, so a batch job next to the images can compute them for a server to import.
+  `fridge.load_patch_model()` loads the model, offline from a warmed cache. `PATCH_MODEL_ID`,
+  `PATCH_MODEL_REVISION` and `PATCH_CROP_VERSION` say which vectors are interchangeable.
+
+### Changed
+
+- `compute_patch_embeddings` loads its default model, `openai/clip-vit-base-patch32`, at a pinned Hugging Face
+  revision, the one that has been current since 2024-02, so its vectors stay the same as those computed
+  elsewhere.
+
 ## 2.2.0 (2026-11-08)
 
 2.2.0 is the first release with published Docker images: a server upgrades by pulling them instead of

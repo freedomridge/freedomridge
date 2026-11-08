@@ -2087,14 +2087,21 @@ class Dataset:
             dataset.compute_patch_embeddings(partition=2, total_partitions=10)
         """
         try:
-            import re as _re
             import threading
             from concurrent.futures import ThreadPoolExecutor, as_completed
 
-            import torch
-            from transformers import CLIPModel, CLIPProcessor
+            import torch  # noqa: F401 — load_patch_model and encode_patches use it
+            import transformers  # noqa: F401
         except ImportError:
             raise ImportError("pip install transformers torch Pillow")
+        from .patches import (
+            PATCH_MODEL_ID,
+            PATCH_MODEL_REVISION,
+            encode_patches,
+            load_patch_model,
+            parse_scale,
+            patch_boxes,
+        )
 
         tqdm: Any
         try:
@@ -2111,19 +2118,12 @@ class Dataset:
             if partition < 1 or partition > total_partitions:
                 raise ValueError(f"partition must be 1..{total_partitions}, got {partition}")
 
-        parsed_scales = []
-        for s in scales:
-            if not _re.match(r'^\d+x\d+$', s):
-                raise ValueError(f"Invalid scale format '{s}', expected NxN (e.g. '2x2', '4x4')")
-            parts = s.split("x")
-            parsed_scales.append((int(parts[0]), int(parts[1]), s))
+        parsed_scales = [(*parse_scale(s), s) for s in scales]
 
-        # Load model
+        # The default model loads at its pinned revision, so these vectors match compute_image_patch_vectors'.
         print(f"Loading CLIP model {model_name}...")
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        # transformers 5's @wraps(Module.to) hides the bound self from mypy.
-        model = CLIPModel.from_pretrained(model_name).to(device)  # type: ignore[arg-type]
-        processor = CLIPProcessor.from_pretrained(model_name)
+        revision = PATCH_MODEL_REVISION if model_name == PATCH_MODEL_ID else None
+        model, processor, device = load_patch_model(model_name, revision)
         print(f"Using device: {device}")
 
         # Reuse the shared loader (handles s3:// and local
@@ -2185,14 +2185,8 @@ class Dataset:
             w, h = img.size
             patches = []
             for rows, cols, scale_str in parsed_scales:
-                pw, ph = w // cols, h // rows
-                for r in range(rows):
-                    for c in range(cols):
-                        x0, y0 = c * pw, r * ph
-                        x1 = w if c == cols - 1 else x0 + pw
-                        y1 = h if r == rows - 1 else y0 + ph
-                        crop = img.crop((x0, y0, x1, y1))
-                        patches.append((crop, item["id"], r, c, scale_str))
+                for index, box in enumerate(patch_boxes(w, h, rows, cols)):
+                    patches.append((img.crop(box), item["id"], index // cols, index % cols, scale_str))
             return patches, None
 
         offset = start_offset
@@ -2239,15 +2233,7 @@ class Dataset:
                     raise RuntimeError(f"Upload failed: {upload_error}")
 
             # Stage 2: Encode on GPU
-            patch_images = [p[0] for p in all_patches]
-            from .clip import pixel_inputs
-
-            inputs = pixel_inputs(processor, patch_images, padding=True).to(device)
-            with torch.no_grad():
-                from .clip import image_vectors
-
-                image_features = image_vectors(model.get_image_features(**inputs))
-                embeddings = (image_features / image_features.norm(dim=-1, keepdim=True)).cpu().numpy()
+            embeddings = encode_patches(model, processor, device, [p[0] for p in all_patches])
 
             # Build payload using the dedicated patch format
             payload = []

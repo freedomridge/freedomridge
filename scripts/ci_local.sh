@@ -29,7 +29,7 @@
 #
 # The steps follow ci.yml. When ci.yml changes, update them to match and set CI_YML_SHA256 to its
 # `sha256sum`; a run stops while the two disagree.
-CI_YML_SHA256=3e54e799daa5bf1ec54ca9d40059790b2b4e64c35243012f566877d8d4105af1
+CI_YML_SHA256=148f1fc11b779d5ff1c9c0a58b481304850e7c550b1bb4c6849e1cf08c9501b0
 set -u
 
 JOBS=${2:-lint,example-tests,backend-tests,db-recovery,frontend,quality,e2e}
@@ -174,7 +174,7 @@ if want example-tests; then
   (env -u PYTHONPATH -u FRIDGE_DATA_ROOT "$CPU/python" -m pytest -p no:cacheprovider \
     examples/test_review_regressions.py -k script_help -q &&
     env -u FRIDGE_DATA_ROOT PYTHONPATH=python:. HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 OMP_NUM_THREADS=4 \
-      "$CPU/python" -m pytest -p no:cacheprovider examples backend/tests/test_encoders.py -q) \
+      "$CPU/python" -m pytest -p no:cacheprovider examples backend/tests/test_encoders.py backend/tests/test_patch_vectors.py -q) \
     > "$L/example-tests.log" 2>&1
   result example-tests $? "$(tail -1 "$L/example-tests.log")"
 fi

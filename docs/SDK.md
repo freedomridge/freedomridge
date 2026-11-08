@@ -2258,6 +2258,34 @@ for r in range(4):
         dataset.build_ann_index(f"clip_patch_4x4_r{r}c{c}")
 ```
 
+### One image's patch vectors, without a server
+
+`fridge.compute_image_patch_vectors(image, scale="4x4")` returns one PIL RGB image's patch vectors: a
+float32 array of `rows × cols` rows (16 × 512 for `4x4`), L2-normalised, in tile order r0c0, r0c1, …,
+r3c3. They are exactly the vectors `compute_patch_embeddings` stores as `clip_patch_4x4_r{row}c{col}`.
+It needs no client and no network beyond loading the model once, so it can run where the images are (a
+batch job next to the bucket, say) and write vectors a server imports later.
+
+```python
+import fridge
+from PIL import Image
+
+vectors = fridge.compute_image_patch_vectors(Image.open("field.jpg").convert("RGB"), "4x4")
+vectors.shape  # (16, 512)
+```
+
+- **Tiles.** Each tile is `width // cols` by `height // rows` pixels. The last column and row reach the
+  image's edges, so every pixel is in exactly one tile, whatever the size.
+- **Model.** CLIP `fridge.PATCH_MODEL_ID` at Hugging Face revision `fridge.PATCH_MODEL_REVISION`, the
+  revision `compute_patch_embeddings` loads too. `fridge.load_patch_model()` loads it, on CUDA when there
+  is one. Call it once in a Dockerfile to warm the Hugging Face cache (`HF_HOME`), then run with
+  `HF_HUB_OFFLINE=1`. Pass its result as `model=` to reuse it; by default the function loads it once.
+- **Compatibility.** Vectors are interchangeable when `PATCH_MODEL_ID`, `PATCH_MODEL_REVISION` and
+  `fridge.PATCH_CROP_VERSION` match. The crop version changes only when the tiles or their preprocessing
+  do.
+
+Install the `patch-embeddings` extra.
+
 ### Patch Similarity Search (SDK)
 
 ```python
