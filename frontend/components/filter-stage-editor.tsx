@@ -1,7 +1,8 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
-import { ViewStage, ComplexFilter, SchemaField, getDatasetCoverage, derivedFieldNames } from '@/lib/api';
-import { PlusIcon, TrashIcon } from '@radix-ui/react-icons';
+import { ViewStage, ComplexFilter, SchemaField, getDatasetCoverage, derivedFieldNames, formatFilterQuery, parseFilterQuery, FilterQueryProblem } from '@/lib/api';
+import { PlusIcon, TrashIcon, CodeIcon } from '@radix-ui/react-icons';
+import { offsetOf } from '@/lib/filter-query';
 import { SearchableSelect } from './searchable-select';
 
 // Datetime rule value input. `<input type="datetime-local">` only emits a value once BOTH the
@@ -44,6 +45,35 @@ interface FilterStageEditorProps {
     datasetId: number;
     schema: SchemaField[];
     className?: string; // Allow custom styling from parent
+    // Builder (the form) or Query (this filter as text, docs/FILTER_QUERY.md); the card can switch between them.
+    initialMode?: 'builder' | 'query';
+    // The Add Filter card: Builder with no text goes back to picking a field.
+    onEmptyBuilder?: () => void;
+}
+
+// Builder | Query: how the filter card edits its filter.
+export function FilterModeSwitch({ mode, onChange, busy = false }: { mode: 'builder' | 'query'; onChange: (mode: 'builder' | 'query') => void; busy?: boolean }) {
+    return (
+        <div role="group" aria-label="Edit the filter as" className="flex shrink-0 rounded-md border border-zinc-800 p-0.5 text-xs font-medium">
+            {(['builder', 'query'] as const).map(option => (
+                <button
+                    key={option}
+                    type="button"
+                    data-testid={`filter-mode-${option}`}
+                    aria-pressed={mode === option}
+                    disabled={busy}
+                    onClick={() => { if (mode !== option) onChange(option); }}
+                    title={option === 'query'
+                        ? 'Type the filter in the query language: paste a list, e.g. serial in (103000752 103001025)'
+                        : 'Build the filter by picking a field, an operator and values'}
+                    className={`flex items-center gap-1.5 rounded px-2.5 py-1 transition-colors ${mode === option ? 'bg-zinc-800 text-zinc-100' : 'text-zinc-500 hover:text-zinc-200'}`}
+                >
+                    {option === 'query' && <CodeIcon className="h-3.5 w-3.5" />}
+                    {option === 'query' ? 'Query' : 'Builder'}
+                </button>
+            ))}
+        </div>
+    );
 }
 
 // Operators definitions
@@ -72,7 +102,7 @@ function opsForType(t: string): string[] {
 // (MultiValueSelect was replaced by the shared SearchableSelect — cached-first with a
 //  server-autocomplete fallback for high-cardinality fields, consistent with the sidebar.)
 
-export function FilterStageEditor({ stage, onSave, onCancel, onDelete, datasetId, schema, className }: FilterStageEditorProps) {
+export function FilterStageEditor({ stage, onSave, onCancel, onDelete, datasetId, schema, className, initialMode = 'builder', onEmptyBuilder }: FilterStageEditorProps) {
     // Always wrap in a logic group to enable "building" (add rule/group) features immediately
     const initialState = stage.filter.logic
         ? JSON.parse(JSON.stringify(stage.filter))
@@ -98,9 +128,119 @@ export function FilterStageEditor({ stage, onSave, onCancel, onDelete, datasetId
         setDraftFilter({ ...newFilter });
     };
 
+    // --- Query mode: this filter as text. Its rules are written one per line, joined with AND. ---
+    const [mode, setMode] = useState<'builder' | 'query'>(initialMode);
+    const [text, setText] = useState('');
+    const [problem, setProblem] = useState<string | null>(null);
+    const [busy, setBusy] = useState(false);
+    const textArea = useRef<HTMLTextAreaElement>(null);
+    const applying = useRef(false);  // Ctrl+Enter twice before the parse answers must not save twice
+    const rules = (f: ComplexFilter): ComplexFilter[] =>
+        (f.logic === 'AND' ? (f.filters ?? []) : [f]).filter(rule => rule.logic || rule.field);
+    const showQuery = async () => {
+        setBusy(true);
+        setProblem(null);
+        try {
+            const { parts } = await formatFilterQuery(datasetId, rules(draftFilter));
+            if (parts.some(part => part == null)) {
+                setProblem("Part of this filter can't be written as text yet; edit it in the builder.");
+                return;
+            }
+            setText(parts.join('\nAND '));
+            setMode('query');
+        } catch (error) {
+            setProblem(error instanceof Error ? error.message : String(error));
+        } finally {
+            setBusy(false);
+        }
+    };
+    // The text as filters, or null with the mistake shown (line and column, the cursor put on it).
+    const readText = async (): Promise<ComplexFilter[] | null> => {
+        setBusy(true);
+        setProblem(null);
+        try {
+            return (await parseFilterQuery(datasetId, text, [])).filters;
+        } catch (error) {
+            if (error instanceof FilterQueryProblem) {
+                const hint = error.suggestions.length ? ` (did you mean ${error.suggestions.map(n => `'${n}'`).join(' or ')}?)` : '';
+                setProblem(`Line ${error.line}, column ${error.column}: ${error.message}${hint}`);
+                const at = offsetOf(text, error.line, error.column);
+                textArea.current?.focus();
+                textArea.current?.setSelectionRange(at, at);
+            } else {
+                setProblem(error instanceof Error ? error.message : String(error));
+            }
+            return null;
+        } finally {
+            setBusy(false);
+        }
+    };
+    const showBuilder = async () => {
+        if (!text.trim()) {
+            if (onEmptyBuilder) {
+                onEmptyBuilder();
+                return;
+            }
+            setDraftFilter({ logic: 'AND', filters: [] });
+            setMode('builder');
+            return;
+        }
+        const filters = await readText();
+        if (!filters) return;
+        setDraftFilter({ logic: 'AND', filters });
+        setMode('builder');
+    };
+    const apply = async () => {
+        if (mode === 'builder') {
+            onSave({ ...stage, filter: draftFilter });
+            return;
+        }
+        if (applying.current) return;
+        applying.current = true;
+        try {
+            const filters = text.trim() ? await readText() : [];
+            if (!filters) return;
+            if (filters.length === 0) {
+                setProblem('Type a filter, e.g. split = train');
+                return;
+            }
+            onSave({ ...stage, filter: filters.length === 1 ? filters[0] : { logic: 'AND', filters } });
+        } finally {
+            applying.current = false;
+        }
+    };
+
     return (
         <div className={`p-4 bg-zinc-950 rounded-lg flex flex-col gap-4 ${className || ''}`}>
-
+            <div className="flex items-center gap-3">
+                <FilterModeSwitch mode={mode} busy={busy} onChange={next => void (next === 'query' ? showQuery() : showBuilder())} />
+                {mode === 'query' && <span className="text-[11px] text-zinc-500">This filter as text. Ctrl+Enter applies.</span>}
+            </div>
+            {mode === 'query' ? (
+                <div className="flex flex-col gap-2">
+                    <textarea
+                        ref={textArea}
+                        data-testid="filter-card-query"
+                        autoFocus
+                        spellCheck={false}
+                        rows={Math.min(10, Math.max(3, text.split('\n').length))}
+                        value={text}
+                        onChange={e => { setText(e.target.value); setProblem(null); }}
+                        onKeyDown={e => {
+                            if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
+                                e.preventDefault();
+                                void apply();
+                            }
+                        }}
+                        placeholder="e.g. serial in (103000752 103001025)   or   split = train"
+                        className="w-full resize-y rounded-lg border border-zinc-800 bg-zinc-900 px-3 py-2 font-mono text-xs leading-relaxed text-zinc-200 placeholder-zinc-600 outline-none focus:border-cyan-600"
+                    />
+                    <div className="text-[11px] text-zinc-500">
+                        = != &gt; &lt; · in (a b c) · contains · between · exists · is null · AND OR NOT ( ). Values in a list can be
+                        separated by spaces or new lines, so a pasted column works.
+                    </div>
+                </div>
+            ) : (
             <div className="max-h-[60vh] overflow-y-auto pr-2">
                 <FilterNode
                     node={draftFilter}
@@ -135,6 +275,8 @@ export function FilterStageEditor({ stage, onSave, onCancel, onDelete, datasetId
                     }}
                 />
             </div>
+            )}
+            {problem && <div data-testid="filter-card-problem" className="text-xs text-red-300">{problem}</div>}
 
             <div className="flex justify-between items-center pt-2 border-t border-zinc-900">
                 <div>
@@ -156,8 +298,10 @@ export function FilterStageEditor({ stage, onSave, onCancel, onDelete, datasetId
                         Cancel
                     </button>
                     <button
-                        onClick={() => onSave({ ...stage, filter: draftFilter })}
-                        className="text-xs px-3 py-1.5 bg-cyan-600 text-white rounded hover:bg-cyan-500 font-medium transition-colors"
+                        data-testid="filter-card-apply"
+                        onClick={() => void apply()}
+                        disabled={busy}
+                        className="text-xs px-3 py-1.5 bg-cyan-600 text-white rounded hover:bg-cyan-500 font-medium transition-colors disabled:opacity-50"
                     >
                         Apply
                     </button>

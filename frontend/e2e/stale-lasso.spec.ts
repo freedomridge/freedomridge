@@ -38,7 +38,7 @@ test.afterAll(async () => {
     if (dsId) await deleteDatasetAndWait(cookie, dsId, 120_000);
 });
 
-async function applyPolygonStage(page: Page, modelId: string | null) {
+async function applyPolygonStage(page: Page, modelId: string | null, polygon: number[][] = POLYGON) {
     // Written from another page: on the dataset page the app's own (debounced) save could overwrite it.
     await page.goto('/');
     await page.evaluate(({ key, stage }) => {
@@ -50,7 +50,7 @@ async function applyPolygonStage(page: Page, modelId: string | null) {
         key: `fridge-filters-${dsId}`,
         stage: {
             type: 'filter', description: 'Embeddings Region',
-            filter: { field: FIELD, operator: 'embedding_polygon', value: POLYGON, model_id: modelId },
+            filter: { field: FIELD, operator: 'embedding_polygon', value: polygon, model_id: modelId },
         },
     });
     await page.goto(`/datasets/${dsId}`);
@@ -80,6 +80,24 @@ async function drawLasso(page: Page): Promise<number> {
     expect(selected).toBeGreaterThan(0);
     return selected;
 }
+
+// Before the re-fit test below, which makes every polygon on this map stale.
+test('a lasso chip says which map it is on, opens no form, and a click excludes it', async ({ page }) => {
+    await page.goto(`/datasets/${dsId}`);
+    await expect(page.getByTestId('embeddings-point-count')).toHaveText(/^60(\s|\/|$).*points/, { timeout: 30_000 });
+    // x 0..1, y 0..5: 12 of the 60 points.
+    await applyPolygonStage(page, null, [[-0.5, -0.5], [1.5, -0.5], [1.5, 5.5], [-0.5, 5.5]]);
+    await expectTotal(page, 12);
+    const chip = page.getByTestId('query-stage-chip');
+    await expect(chip).toContainText(`Embeddings region · ${FIELD} map`);
+    // A click excludes it (it used to open the field form, showing only the field name), and another includes it.
+    await chip.click();
+    await expect(page.getByTestId('filter-mode-builder')).toHaveCount(0);
+    await expect(chip).toContainText(`Exclude Embeddings region · ${FIELD} map`);
+    await expectTotal(page, 48);
+    await chip.click();
+    await expectTotal(page, 12);
+});
 
 test('a lasso drawn on the previous map is dropped, the map renders, and the selection is drawn again', async ({ page }) => {
     test.setTimeout(300_000);

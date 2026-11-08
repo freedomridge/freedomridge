@@ -23,14 +23,14 @@ test('a draft sidebar filter does not shrink Find Similar results: the results r
     // Leave a DRAFT filter in place (the "(no value)" toggle on `note`, 6 of 12) without applying it.
     await expandField(page, 'note');
     await page.getByTestId('panel-filters').locator('label', { hasText: '(no value)' }).click();
-    await expect(page.getByText('Unapplied filters')).toBeVisible();
+    await expect(page.getByTestId('draft-filters')).toBeVisible();
     await findSimilarFromFirstTile(page, 12, 'entire');
     // The modal says drafts will be replaced by the results.
     await expect(page.getByTestId('similarity-draft-note')).toBeVisible();
     await page.getByRole('button', { name: 'Search' }).click();
     // All 12 results are shown — not 12 ∩ draft(6).
     await expectTotal(page, 12);
-    await expect(page.getByText('Unapplied filters')).toHaveCount(0);
+    await expect(page.getByTestId('draft-filters')).toHaveCount(0);
     await expect(page.getByTestId('query-stage-chip').filter({ hasText: 'Similarity Search (12)' })).toBeVisible();
 });
 

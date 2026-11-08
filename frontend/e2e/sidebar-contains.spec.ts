@@ -220,7 +220,7 @@ test.describe('sidebar text combinations', () => {
         await picker.fill('   ');
         await expect(page.locator('[data-searchable-dropdown]').getByRole('button', { name: /^Contains/ })).toHaveCount(0);
         await picker.press('Enter');
-        await expect(page.getByText('Unapplied filters')).toHaveCount(0);
+        await expect(page.getByTestId('draft-filters')).toHaveCount(0);
         await picker.fill('%_');
         await picker.press('Enter');
         await expectPreview(page, 1);

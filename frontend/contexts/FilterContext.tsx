@@ -111,11 +111,9 @@ interface FilterContextType {
 
     // View Stages
     viewStages: ViewStage[];
-    setViewStages: (stages: ViewStage[]) => void;
+    setViewStages: React.Dispatch<React.SetStateAction<ViewStage[]>>;
     addStage: (stage: ViewStage) => void;
     removeStage: (index: number) => void;
-    // The query editor's chips, replacing every chip (docs/FILTER_QUERY.md).
-    replaceStages: (stages: ViewStage[]) => void;
     updateStage: (index: number, stage: ViewStage) => void;
 
     // Staged filters (affects grid preview only)
@@ -235,8 +233,15 @@ export function withGrain(
     const fieldGrain = (f: string | undefined): Grain => (f === 'clip_obj' ? 'object' : 'image');
     const isOffGrainEmb = (f: ComplexFilter): boolean =>
         f.operator === 'embedding_polygon' && fieldGrain(f.field) !== grain;
-    const offGrainEmb = baseFilters.filter(isOffGrainEmb);
-    const rest = baseFilters.filter((f) => !isOffGrainEmb(f));
+    // An excluded region (a map region or a lasso, excluded) keeps the rows with no location or no point on its map.
+    // Coupled like the other leaves, such a row on the partner grain (an object with no point on an image map) would
+    // vacuously let its partner through. So it is coupled as NOT (the row or its partner is inside the region).
+    const isRegionExclude = (f: ComplexFilter): boolean =>
+        f.operator === 'geo_polygon_exclude' || f.operator === 'embedding_polygon_exclude';
+    // One with fewer than 3 points is no polygon and excludes nothing, as the server's own exclude does.
+    const excluded = baseFilters.filter((f) => isRegionExclude(f) && Array.isArray(f.value) && f.value.length >= 3);
+    const offGrainEmb = baseFilters.filter((f) => !isRegionExclude(f) && isOffGrainEmb(f));
+    const rest = baseFilters.filter((f) => !isRegionExclude(f) && !isOffGrainEmb(f));
     const parts: ComplexFilter[] = [...grainPredicate(grain, pivot)];
     if (rest.length > 0) {
         // A row matches if its OWN grain matches (cg_self — guarded so an exclusion on a field this
@@ -255,6 +260,22 @@ export function withGrain(
     for (const emb of offGrainEmb) {
         parts.push({ field: '_crossemb', operator: crossOp, value: { logic: 'AND', filters: [emb] } });
     }
+    for (const region of excluded) {
+        const inside: ComplexFilter = {
+            logic: 'AND',
+            filters: [{ ...region, operator: region.operator === 'geo_polygon_exclude' ? 'geo_polygon' : 'embedding_polygon' }],
+        };
+        parts.push({
+            logic: 'NOT',
+            filters: [{
+                logic: 'OR',
+                filters: [
+                    { field: '_cgself', operator: 'cg_self', value: inside },
+                    { field: '_crossgrain', operator: crossOp, value: inside },
+                ],
+            }],
+        });
+    }
     return { logic: 'AND', filters: parts };
 }
 
@@ -262,7 +283,7 @@ export function withGrain(
 // one)? Such a polygon would select other samples now; the server refuses it (409 map_refitted).
 function holdsStaleLasso(node: ComplexFilter | undefined, field: string, modelId: string | null): boolean {
     if (!node) return false;
-    if (node.operator === 'embedding_polygon' && node.field === field && (node.model_id ?? null) !== modelId) return true;
+    if ((node.operator === 'embedding_polygon' || node.operator === 'embedding_polygon_exclude') && node.field === field && (node.model_id ?? null) !== modelId) return true;
     if ((node.filters ?? []).some((child) => holdsStaleLasso(child, field, modelId))) return true;
     const value = node.value as unknown;
     return typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -303,14 +324,6 @@ export function FilterProvider({ children, datasetId }: { children: React.ReactN
         // Removing a default-view filter is choosing to see past it, also after a reload.
         if (defaultView && isDefaultViewStage(viewStages[index], defaultView)) setDismissedDefaultViewId(defaultView.id);
         setViewStages(prev => prev.filter((_, i) => i !== index));
-    }, [viewStages, defaultView]);
-
-    const replaceStages = useCallback((stages: ViewStage[]) => {
-        // Leaving a default-view filter out of the text is choosing to see past it, as removing its chip is.
-        if (defaultView && viewStages.some(stage => isDefaultViewStage(stage, defaultView) && !stages.includes(stage))) {
-            setDismissedDefaultViewId(defaultView.id);
-        }
-        setViewStages(stages);
     }, [viewStages, defaultView]);
 
     const updateStage = useCallback((index: number, newStage: ViewStage) => {
@@ -739,7 +752,6 @@ export function FilterProvider({ children, datasetId }: { children: React.ReactN
         addStage,
 
         removeStage,
-        replaceStages,
         updateStage,
         stagedFilters,
         activeFilters: globalFilters,

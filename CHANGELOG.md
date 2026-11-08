@@ -19,9 +19,31 @@ it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
 
 ### Changed
 
-- The filters are edited as text in the filter bar itself, not in a popup. **Text** at the bar's left, or a click
-  on its empty part, turns the bar into the query; **Apply** turns it back into chips, and **Chips**, **Cancel**
-  or Esc goes back without applying. An empty bar says so and offers a query. The **Query** button is gone.
+- The dataset page's top bar is laid out again.
+  - **Add Filter** and **Find similar** start the filter bar, before the chips they make, and the image count
+    ends it. The dataset's name, its draft filters, Saved Views, Jobs, settings and fast mode share the row above.
+  - **Each filter's card switches between Builder and Query.** Click a chip, or Add Filter, and edit the filter
+    as a form or as text, such as a pasted list (docs/FILTER_QUERY.md). The bar always shows chips; the
+    **Query** button is gone.
+  - **Find similar** opens a panel: describe what you want, or upload or paste an example image, and choose how
+    many of the closest images to show. With filters applied, it searches **within your filters** (they stay, as
+    a chip beside the search's) or the **whole dataset** (the results replace them, as every search did before).
+    A new search replaces the previous search. The search's chip offers **top N**, which runs it again. Find
+    similar from images selected in the grid is unchanged.
+  - **Draft filters** show one chip per sidebar field, saying what each one is, and each can be removed on its
+    own.
+  - The header's image-field dropdown is gone. The grid's **View** picker now also saves the field every grid
+    opens on.
+- **Excluding a map region or an embeddings lasso removes what is inside it and keeps everything else**, images
+  with no location (or no point on that map) included. Excluding a map region used to drop the images with no
+  location too.
+
+### Fixed
+
+- An embeddings lasso's chip opened the field form, which could show only the field's name (such as `clip`). It
+  now says which map the lasso was drawn on and, like a map region, a click toggles it between including and
+  excluding its area (the new `embedding_polygon_exclude` filter operator).
+- Clicking a text or image search's chip to exclude its results changed only its label. It now excludes them.
 
 ## 2.0.0 (2026-11-06)
 

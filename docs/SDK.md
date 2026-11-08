@@ -311,7 +311,7 @@ view = s[
 
 ###### Method 2: Filter Query Strings (Most Readable)
 
-The same filter query language the app's filter bar takes ([FILTER_QUERY.md](FILTER_QUERY.md)). The
+The same filter query language the app's filter cards take ([FILTER_QUERY.md](FILTER_QUERY.md)). The
 server parses it and checks every field, operator and value against the dataset, so a misspelt field
 raises `ValueError` with the line, the column and a suggestion instead of matching nothing.
 

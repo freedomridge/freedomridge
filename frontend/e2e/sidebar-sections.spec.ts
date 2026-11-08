@@ -324,7 +324,7 @@ test.describe('sidebar field sections', () => {
         const sidebar = page.getByTestId('panel-filters');
         await expandField(page, 'batch');
         await sidebar.getByRole('checkbox', { name: 'late', exact: true }).check();
-        await expect(page.getByText('Unapplied filters')).toBeVisible();
+        await expect(page.getByTestId('draft-filters')).toBeVisible();
         await expect(sidebar.getByTestId('field-section-batch')).toHaveAttribute('data-filtered', 'true');
         // Collapsing a filtered field is the user's choice for this page...
         await fieldToggle(page, 'batch').click();

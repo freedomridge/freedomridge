@@ -32,6 +32,8 @@ interface GridPanelProps {
     filtersReady?: boolean;  // false: the filters' final shape is not known yet; hold the grid's requests
     grainMode?: 'image' | 'object';  // 'object' shows per-detection crop rows (the patch view)
     onGrainModeChange?: (mode: 'image' | 'object') => void;
+    // The View picker's choice is saved as the dataset's grid media field (the field every grid opens on).
+    onMediaFieldChange?: (field: string) => void;
     onShowObjects?: () => void;  // image grain: pivot to the objects of the selected images
     onShowImages?: () => void;  // object grain: pivot to the parent images of the selected objects
     onFindUnlabeledClick?: () => void;  // object grain: find unlabeled patch look-alikes of the selected object
@@ -74,6 +76,7 @@ export function GridPanel({
     datasetId,
     dataset,
     filters,
+    onMediaFieldChange,
     filtersReady = true,
     grainMode = 'image',
     onGrainModeChange,
@@ -419,7 +422,7 @@ export function GridPanel({
                             <label className="text-[11px] text-zinc-500">View:</label>
                             <select
                                 value={mediaField}
-                                onChange={(e) => setMediaField(e.target.value)}
+                                onChange={(e) => { setMediaField(e.target.value); onMediaFieldChange?.(e.target.value); }}
                                 className="text-xs bg-zinc-800 border border-zinc-700 rounded px-2 py-1 text-white focus:outline-none focus:border-zinc-500"
                             >
                                 {dataset.media_fields.map(field => (

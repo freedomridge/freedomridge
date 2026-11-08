@@ -460,7 +460,7 @@ export interface ComplexFilter {
 
     // Leaf Node
     field?: string;
-    operator?: '=' | '!=' | '>' | '<' | '>=' | '<=' | 'in' | 'not in' | 'contains' | 'geo_polygon' | 'geo_polygon_exclude' | 'embedding_polygon' | 'in_selection' | 'is_null' | 'is_not_null' | 'exists' | 'not_exists' | 'concept_select' | 'concept_exclude' | 'parent_matches' | 'has_matching_object' | 'cg_self';
+    operator?: '=' | '!=' | '>' | '<' | '>=' | '<=' | 'in' | 'not in' | 'contains' | 'geo_polygon' | 'geo_polygon_exclude' | 'embedding_polygon' | 'embedding_polygon_exclude' | 'in_selection' | 'is_null' | 'is_not_null' | 'exists' | 'not_exists' | 'concept_select' | 'concept_exclude' | 'parent_matches' | 'has_matching_object' | 'cg_self';
     // Leaf value shape depends on the operator: scalar for comparisons, an array
     // for in/not-in, a ring of [lon,lat]/[x,y] points for geo_/embedding_polygon, a
     // string token for in_selection, an object {concept_id, op, threshold} for

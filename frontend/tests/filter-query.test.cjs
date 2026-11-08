@@ -23,69 +23,25 @@ for (const extension of ['.ts', '.tsx']) {
     };
 }
 
-const { isKeptStage, queryEditorText, stagesFromQuery, offsetOf } = require('../lib/filter-query.ts');
+const { isLassoStage, isReadOnlyStage, offsetOf } = require('../lib/filter-query.ts');
 
 const SPLIT = { type: 'filter', description: 'My split', filter: { field: 'split', operator: '==', value: 'train' } };
-const DEFAULT = {
-    type: 'filter',
-    description: 'Clean images',
-    filter: { field: 'score', operator: '>', value: 0.2 },
-    metadata: { defaultViewId: 7 },
-};
+const REGION = { type: 'map_region', description: 'Map region', filter: { field: 'location', operator: 'geo_polygon', value: [] } };
+const LASSO = { type: 'filter', description: 'Embeddings Region', filter: { field: 'clip', operator: 'embedding_polygon', value: [[0, 0], [1, 0], [1, 1]] } };
 const CONCEPT = {
     type: 'filter',
     description: 'Not black',
     filter: { field: '_concept', operator: 'concept_exclude', value: { concept_id: 3, threshold: 0.9 } },
     metadata: { concept: true },
 };
-const REGION = { type: 'map_region', description: 'Map region', filter: { field: 'location', operator: 'geo_polygon', value: [] } };
-const STAGES = [SPLIT, CONCEPT, DEFAULT, REGION];
-// What the server writes for them: no text for the concept or the region.
-const PARTS = ['split = "train"', null, 'score > 0.2', 'location geo_polygon'];
 
-test('the editor shows each chip as a part, and the chips it keeps as comments', () => {
-    assert.equal(
-        queryEditorText(STAGES, PARTS),
-        '# kept: Not black\n# kept: Map region\nsplit = "train"\nAND score > 0.2',
-    );
-    assert.equal(queryEditorText([], []), '');
-    // A read-only chip is kept even when the server could write it.
-    assert.equal(isKeptStage(REGION, 'location geo_polygon'), true);
-    assert.equal(isKeptStage(SPLIT, 'split = "train"'), false);
-    assert.equal(isKeptStage(SPLIT, null), true);
-});
-
-test('applying keeps the uneditable chips, reuses unchanged ones and makes the rest new', () => {
-    const parsed = {
-        filters: [
-            { field: 'score', operator: '>', value: 0.2 },
-            { field: 'serial', operator: 'in', value: ['103000752', '103001025'] },
-        ],
-        parts: ['score > 0.2', 'serial in ("103000752", "103001025")'],
-        reuse: [2, null],  // the default view's chip, unchanged; the split chip was deleted from the text
-    };
-    const stages = stagesFromQuery(STAGES, PARTS, parsed);
-    assert.equal(stages.length, 4);
-    // Every chip that stays keeps its place; the new one comes last.
-    assert.equal(stages[0], CONCEPT);
-    assert.equal(stages[1], DEFAULT);  // the same object: its label and its default-view mark stay
-    assert.equal(stages[2], REGION);
-    assert.deepEqual(stages[3], {
-        type: 'filter',
-        description: 'serial: 103000752, 103001025',
-        filter: parsed.filters[1],
-    });
-    // A reuse index pointing at a kept chip is never taken as an edit of it.
-    const odd = stagesFromQuery(STAGES, PARTS, { filters: [parsed.filters[0]], parts: ['x'], reuse: [1] });
-    assert.deepEqual(odd.slice(0, 2), [CONCEPT, REGION]);
-    assert.equal(odd[2].type, 'filter');
-    assert.notEqual(odd[2], CONCEPT);
-});
-
-test('applying the text unchanged changes nothing', () => {
-    const unchanged = { filters: [SPLIT.filter, DEFAULT.filter], parts: [PARTS[0], PARTS[2]], reuse: [0, 2] };
-    assert.deepEqual(stagesFromQuery(STAGES, PARTS, unchanged), STAGES);
-    stagesFromQuery(STAGES, PARTS, unchanged).forEach((stage, index) => assert.equal(stage, STAGES[index]));
+test('a lasso, included or excluded, has no card to edit; a plain filter does', () => {
+    const excluded = { ...LASSO, filter: { ...LASSO.filter, operator: 'embedding_polygon_exclude' } };
+    assert.equal(isLassoStage(LASSO), true);
+    assert.equal(isLassoStage(excluded), true);
+    assert.equal(isLassoStage(REGION), false);
+    for (const stage of [LASSO, excluded, REGION, CONCEPT]) assert.equal(isReadOnlyStage(stage), true);
+    assert.equal(isReadOnlyStage(SPLIT), false);
 });
 
 test('a mistake\'s line and column become a cursor position', () => {
