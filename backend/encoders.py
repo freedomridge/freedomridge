@@ -112,7 +112,7 @@ def has_image_tower(registered_model: Optional[str]) -> bool:
 def _encode_sync(prompt: str, checkpoint: str) -> List[float]:
     try:
         import torch
-        from transformers import CLIPTextConfig, CLIPTextModelWithProjection, CLIPTokenizerFast
+        from transformers import CLIPTextConfig, CLIPTextModelWithProjection, CLIPTokenizer
     except ImportError:
         raise HTTPException(
             status_code=501,
@@ -127,7 +127,7 @@ def _encode_sync(prompt: str, checkpoint: str) -> List[float]:
     with _lock:
         cached = _cache.get(checkpoint)
     if cached is None:
-        tokenizer = CLIPTokenizerFast.from_pretrained(checkpoint)
+        tokenizer = CLIPTokenizer.from_pretrained(checkpoint)  # the fast tokenizer in transformers 5
         # Pass the tower's own config. transformers 4.57 takes each class's config_class from
         # its `config:` annotation in cls.__dict__, which Python 3.14's lazy annotations leave
         # empty, so the towers inherit the full CLIPConfig and loading fails (no hidden_size).

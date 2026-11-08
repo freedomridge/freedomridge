@@ -34,7 +34,9 @@ hand. Pull requests that change `.github/workflows/` can only be merged by someo
 access includes the `workflow` permission (merging in the web UI works).
 
 These moves are never proposed automatically, because they must be made by hand (below):
-the Python minor version, Node.js and PostgreSQL major versions, and transformers 5.
+the Python minor version, Node.js and PostgreSQL major versions, and transformers major versions
+(a new one can change image preprocessing: before upgrading, check that query embeddings computed
+with it still match the stored ones, through every path that encodes text or images).
 Two frontend versions are skipped too:
 
 - TypeScript 7 waits for typescript-eslint and the unit tests' `ts.transpileModule`: 7.0 ships
@@ -80,5 +82,4 @@ in the last column is met.
 
 | Package | Advisories | Why it is accepted | Remove when |
 |---|---|---|---|
-| transformers 4.x | PYSEC-2025-217, PYSEC-2026-2288, PYSEC-2026-2289, PYSEC-2026-2290, PYSEC-2026-3929, PYSEC-2026-4174 | Each needs a malicious model repository or config, the `Trainer`, a conversion script, `save_pretrained` on attacker input, or custom generation code. Freedom Ridge only loads the CLIP and DINOv3 checkpoints that an admin or writer registered. The fixes exist only in transformers 5, which changes image preprocessing: before upgrading, check that new query embeddings still match the stored ones. | transformers 5 is adopted |
 | setuptools 81 | PYSEC-2026-3447, GHSA-xmj3-9gf7-h52w | PyTorch requires `setuptools<82`. The advisories concern building source distributions (`MANIFEST.in`) and legacy Windows egg installs, neither of which happens when running Freedom Ridge. | PyTorch allows setuptools 84.1 or newer |

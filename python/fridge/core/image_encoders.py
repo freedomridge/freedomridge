@@ -45,7 +45,7 @@ def _huggingface_encoder(model_name):
     from .clip import image_vectors
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    processor = AutoProcessor.from_pretrained(model_name, use_fast=True)
+    processor = AutoProcessor.from_pretrained(model_name, backend='torchvision')  # the fast processor
     model = AutoModel.from_pretrained(model_name).to(device).eval()
 
     def encode(images):

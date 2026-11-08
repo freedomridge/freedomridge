@@ -44,7 +44,7 @@ async def test_explicit_tower_config_and_cached_projected_embedding(monkeypatch,
     processor_class = Mock()
     processor_class.from_pretrained.return_value = Mock(return_value={'input': object()})
     prefix = 'Text' if tower == 'text' else 'Vision'
-    processor_name = 'CLIPTokenizerFast' if tower == 'text' else 'CLIPImageProcessor'
+    processor_name = 'CLIPTokenizer' if tower == 'text' else 'CLIPImageProcessor'
     monkeypatch.setitem(sys.modules, 'torch', SimpleNamespace(no_grad=nullcontext))
     monkeypatch.setitem(
         sys.modules,
@@ -104,13 +104,14 @@ def test_real_towers_match_full_clip_checkpoint(tmp_path, monkeypatch):
     text_inputs = {'input_ids': torch.tensor([[1, 3, 2]])}
     image_inputs = processor(images=image, return_tensors='pt')
     monkeypatch.setattr(
-        transformers.CLIPTokenizerFast,
+        transformers.CLIPTokenizer,
         'from_pretrained',
         lambda *args: lambda *args, **kwargs: text_inputs,
     )
     with torch.no_grad():
-        expected_text = model.get_text_features(**text_inputs)[0].tolist()
-        expected_image = model.get_image_features(**image_inputs)[0].tolist()
+        # transformers 5 returns the model output, with the projected embedding as pooler_output.
+        expected_text = model.get_text_features(**text_inputs).pooler_output[0].tolist()
+        expected_image = model.get_image_features(**image_inputs).pooler_output[0].tolist()
     # The towers and CLIPModel compute the same values through separate modules, so float noise
     # varies by CPU (3.6e-7 relative locally, just over the default 1e-6 on a CI runner).
     assert encoders._encode_sync('a mountain', str(tmp_path)) == pytest.approx(expected_text, abs=1e-5)

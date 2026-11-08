@@ -35,8 +35,8 @@ dependencies = [
 # torchvision is here only so it is installed from the same PyTorch build as torch (see
 # [tool.uv.sources]); the SDK's huggingface-embeddings extra uses it, the server does not.
 [project.optional-dependencies]
-cpu = ["torch>=2.9", "torchvision", "transformers>=4.57.1,<5"]
-cuda = ["torch>=2.9", "torchvision", "transformers>=4.57.1,<5"]
+cpu = ["torch>=2.9", "torchvision", "transformers>=5.21"]
+cuda = ["torch>=2.9", "torchvision", "transformers>=5.21"]
 
 [dependency-groups]
 # Example importers (examples/): the SDK with every optional feature plus their own needs.
