@@ -4,7 +4,21 @@ Freedom Ridge has one version for the server, the web app and the Python SDK (th
 file), following [Semantic Versioning](https://semver.org). A release lists **upgrade notes** when
 it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
 
-## Unreleased
+## 2.2.0 (2026-11-08)
+
+2.2.0 is the first release with published Docker images: a server upgrades by pulling them instead of
+building, and anyone can try the app with only Docker. The map's Mapbox token is now read when the
+frontend starts. There is no migration; the upgrade notes cover the switch to pulling images.
+
+### Upgrade notes
+
+- Step 3 of [Upgrading](docs/UPGRADING.md) now pulls: after `git checkout v2.2.0`, run
+  `docker compose -f docker-compose.prod.yml pull` instead of `build --pull`. 2.2.0's images are the first
+  on ghcr.io, so this upgrade can already pull them.
+- Nothing changes for the Mapbox token: `NEXT_PUBLIC_MAPBOX_TOKEN` in `.env` keeps working.
+- Once the server runs the pulled images, the images it built for earlier releases and Docker's build cache
+  are unused. `docker images` lists the old ones by your Compose project's name (`<project>-backend` and so
+  on); remove them with `docker image rm`, and the build cache with `docker builder prune -a`.
 
 ### Added
 
