@@ -50,6 +50,10 @@ it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
 - **Followers: feed pages are bounded by their vector changes.** A large embedding job on the primary made pages
   of up to about a million changes, which the follower rewrote in its checkpoint on every step. A follower now
   asks for pages of at most 20,000 (`vector_limit`, in whole transactions); an older primary ignores it.
+- **The embeddings panel no longer warns of a crash that didn't happen.** Searching (Find similar, say) before
+  the scatter had finished loading remounted the panel, which took its own load marker for a crash: it dropped to
+  a small sample and said the previous load may have run out of memory. Only a marker from another page load
+  counts now, since a real crash always means a new page load.
 - **Followers: only the primary's own refusal stops the mirrors.** It now says, with a code, when the follower was
   removed or its token deleted. Before, any 401 or 403, from a proxy say, stopped every mirror, and a new copy of
   each started once the primary answered again.

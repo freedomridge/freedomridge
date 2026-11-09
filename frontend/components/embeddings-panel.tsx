@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState, useMemo, useCallback } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { getEmbeddings, getEmbeddingFields, reduceEmbeddings, selectEmbeddingRegion, lookupEmbeddingCoordinates, lookupPatchCoordinates, MAP_REFITTED_EVENT, type MapRefitted, type SchemaField, type ComplexFilter, type EmbeddingsResponse } from '@/lib/api';
+import { crashedBefore, currentPageLoad, loadMarker } from '@/lib/load-marker';
 import { useUser } from '@/contexts/UserContext';
 import { withGrain } from '@/contexts/FilterContext';
 
@@ -70,13 +71,15 @@ export function EmbeddingsPanel({ datasetId, schema, onSelection, selectedIds, f
     // recover with a small sample instead of re-loading the same amount and crashing again.
     const storageKey = `fridge:samplePct:${user?.id ?? 'anon'}:${datasetId}`;
     const attemptKey = `fridge:samplePctAttempt:${user?.id ?? 'anon'}:${datasetId}`;
+    // Only a marker from another page load is a crash (lib/load-marker.ts): this mount's init runs before the
+    // previous instance's cleanup, so a remount mid-load (a Find similar search) still sees that instance's marker.
     const [crashedWarning, setCrashedWarning] = useState<boolean>(
-        () => typeof window !== 'undefined' && localStorage.getItem(attemptKey) !== null,
+        () => typeof window !== 'undefined' && crashedBefore(sessionStorage.getItem(attemptKey), currentPageLoad()),
     );
     const [samplePct, setSamplePct] = useState<number>(() => {
         if (typeof window === 'undefined') return 30;
-        if (localStorage.getItem(attemptKey) !== null) {
-            localStorage.removeItem(attemptKey);  // last load didn't finish -> recover small
+        if (crashedBefore(sessionStorage.getItem(attemptKey), currentPageLoad())) {
+            sessionStorage.removeItem(attemptKey);  // last load didn't finish -> recover small
             return 5;
         }
         const stored = localStorage.getItem(storageKey);
@@ -143,7 +146,7 @@ export function EmbeddingsPanel({ datasetId, schema, onSelection, selectedIds, f
         queryFn: () => {
             // Mark this load in-progress; cleared on successful render / normal unmount. A
             // leftover marker on the next mount means the tab crashed mid-load (see init).
-            try { localStorage.setItem(attemptKey, String(samplePct)); } catch { /* ignore */ }
+            try { sessionStorage.setItem(attemptKey, loadMarker(samplePct, currentPageLoad())); } catch { /* ignore */ }
             // patch_position is a synthetic field added by the backend for patch queries — don't request it as include_field
             const includeFields = colorField && colorField !== 'patch_position' ? [colorField] : undefined;
             return getEmbeddings(datasetId, embeddingField, scatterFilters, includeFields, samplePct);
@@ -695,14 +698,17 @@ export function EmbeddingsPanel({ datasetId, schema, onSelection, selectedIds, f
     useEffect(() => {
         if (!isFetching && norm.nx.length > 0) {
             localStorage.setItem(storageKey, String(samplePct));
-            try { localStorage.removeItem(attemptKey); } catch { /* ignore */ }
+            try { sessionStorage.removeItem(attemptKey); } catch { /* ignore */ }
         }
     }, [samplePct, storageKey, attemptKey, norm.nx.length, isFetching]);
 
     // Normal teardown clears the attempt sentinel; a crash (tab killed) skips this cleanup,
-    // so the leftover sentinel triggers small-sample recovery on the next mount.
+    // so the leftover sentinel triggers small-sample recovery on the next mount. A reload or
+    // navigation mid-load skips React's cleanup too, but fires pagehide, which a crash doesn't.
     useEffect(() => {
-        return () => { try { localStorage.removeItem(attemptKey); } catch { /* ignore */ } };
+        const clear = () => { try { sessionStorage.removeItem(attemptKey); } catch { /* ignore */ } };
+        window.addEventListener('pagehide', clear);
+        return () => { window.removeEventListener('pagehide', clear); clear(); };
     }, [attemptKey]);
 
     // Interaction Handlers
