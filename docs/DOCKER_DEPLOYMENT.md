@@ -10,7 +10,10 @@ imports, patch embeddings, guest checks, backup recovery and teardown.
 ## Production prerequisites and environment
 
 Use Docker with Compose v2, a public DNS hostname, inbound 80/443 and outbound
-access for images, ACME and model weights. Plan for at least 8 GiB of RAM: the
+access for images, ACME and model weights. The release images run on Arm64 (AWS
+Graviton, Ampere, Apple silicon) and x86_64 alike; on AWS, Arm is the cheaper choice
+for the same speed ([moving an existing server](DEPLOY_TO_AWS.md#moving-an-x86_64-instance-to-arm)).
+Plan for at least 8 GiB of RAM: the
 backend alone uses about 3.4 GiB with search warm, so 16 GiB gives headroom. Larger
 datasets need more; see [Sizing](#sizing). The full
 four-dataset CPU import takes a day or more on a small host; see the import plan in

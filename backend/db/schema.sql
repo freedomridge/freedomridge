@@ -2562,6 +2562,7 @@ CREATE TABLE IF NOT EXISTS follower_datasets (
     start_txid BIGINT,
     acked_txid BIGINT,
     subscribed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    images BOOLEAN NOT NULL DEFAULT FALSE,  -- serve the dataset's images to the follower (0012)
     PRIMARY KEY (follower_id, dataset_id)
 );
 CREATE INDEX IF NOT EXISTS follower_datasets_dataset ON follower_datasets (dataset_id);
@@ -2615,7 +2616,8 @@ CREATE TABLE IF NOT EXISTS mirrors (
     concept_views TEXT[] NOT NULL DEFAULT '{}',
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     last_synced_at TIMESTAMPTZ,
-    last_error TEXT
+    last_error TEXT,
+    images BOOLEAN NOT NULL DEFAULT FALSE  -- the primary serves its images to this instance (0012)
 );
 -- One live mirror per primary dataset; a stopped one stays beside a new copy.
 CREATE UNIQUE INDEX IF NOT EXISTS mirrors_live_origin ON mirrors (link_id, origin_dataset_id) WHERE state <> 'stopped';
@@ -2807,5 +2809,6 @@ INSERT INTO schema_migrations (filename) VALUES
     ('0008_followers.sql'),
     ('0009_mirrors.sql'),
     ('0010_compute_launcher.sql'),
-    ('0011_compute_launcher_arm.sql')
+    ('0011_compute_launcher_arm.sql'),
+    ('0012_follower_images.sql')
 ON CONFLICT (filename) DO NOTHING;

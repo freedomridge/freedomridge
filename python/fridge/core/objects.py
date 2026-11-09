@@ -47,8 +47,10 @@ def objects_from_cuboids(
         digest = hashlib.sha256(f'{parent_filepath}\0{field}\0{cuboid["id"]}'.encode()).hexdigest()
         filepath = directory / f'{digest}.jpg'
         if write_crops:
+            from .image_modes import to_rgb
+
             with image.crop((math.floor(x), math.floor(y), math.ceil(x + w), math.ceil(y + h))) as crop:
-                with crop.convert('RGB') as rgb:
+                with to_rgb(crop) as rgb:
                     rgb.save(filepath, format='JPEG')
         metadata = {
             **cuboid.get('attributes', {}),

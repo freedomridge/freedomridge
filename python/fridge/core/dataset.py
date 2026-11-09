@@ -449,8 +449,10 @@ def compute_image_metrics(img):
     import numpy as np
     from PIL import ImageStat
 
+    from .image_modes import to_rgb
+
     if img.mode != "RGB":
-        img = img.convert("RGB")
+        img = to_rgb(img)
     gray = img.convert("L")
 
     stat = ImageStat.Stat(img)
@@ -503,11 +505,13 @@ def _default_s3_image_loader():
     """
     from PIL import Image
 
+    from .image_modes import to_rgb
+
     s3_client = None
 
     def open_rgb(path):
         with Image.open(path) as image:
-            return image.convert('RGB')
+            return to_rgb(image)
 
     def loader(filepath: str) -> Image.Image | None:
         nonlocal s3_client
@@ -1699,7 +1703,9 @@ class Dataset:
                     counts['errors'] += 1
                     continue
                 if img.mode != 'RGB':
-                    rgb = img.convert('RGB')
+                    from .image_modes import to_rgb
+
+                    rgb = to_rgb(img)
                     img.close()
                     img = rgb
                 failed = False
@@ -1899,7 +1905,9 @@ class Dataset:
                     errors += 1
                     continue
                 if img.mode != "RGB":
-                    img = img.convert("RGB")
+                    from .image_modes import to_rgb
+
+                    img = to_rgb(img)
             except Exception as e:
                 print(f"  Error loading {sample.filepath}: {e}")
                 errors += 1
@@ -2027,7 +2035,9 @@ class Dataset:
                     errors += 1
                     continue
                 if img.mode != "RGB":
-                    img = img.convert("RGB")
+                    from .image_modes import to_rgb
+
+                    img = to_rgb(img)
             except Exception as e:
                 errors += 1
                 if errors <= 3:

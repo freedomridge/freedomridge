@@ -4,6 +4,49 @@ Freedom Ridge has one version for the server, the web app and the Python SDK (th
 file), following [Semantic Versioning](https://semver.org). A release lists **upgrade notes** when
 it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
 
+## 2.6.0 (2026-11-09)
+
+2.6.0 lets a primary serve a followed dataset's images to its follower, an option off by default, and shows 16-bit
+and float greyscale images (multispectral bands, thermal frames) instead of a white picture. The AWS guide shows how
+to move an x86_64 server to Arm. One migration.
+
+### Upgrade notes
+
+- One database migration, `0012_follower_images.sql`, applied with `scripts/apply_migrations.sh` (step 4 of
+  [Upgrading](docs/UPGRADING.md)): the followers' images option, off.
+- Only for datasets with 16-bit or float greyscale images (see Fixed). Their white thumbnails stay in the server's
+  caches until removed: delete the dataset's folder, `<dataset id>/`, under `FRIDGE_CROP_CACHE_PATH` and, if it
+  has overlays, under `FRIDGE_COMPOSITE_CACHE_PATH`. A browser that already showed one may keep it until a hard
+  refresh. Embeddings, hashes and image metrics computed for those images described a white image: compute them
+  again (`compute_embeddings`, `compute_hashes(overwrite=True)`, `compute_metrics(skip_existing=False)`).
+
+### Added
+
+- **A primary can serve a followed dataset's images to its follower** ([FOLLOWERS.md](docs/FOLLOWERS.md)). With
+  the dataset's new **Serve images** option on (Settings → Followers, off by default), a follower that can't read
+  an image itself, on the primary's disk or in a bucket it has no credentials for, gets the image, thumbnail,
+  crop or overlay from the primary and caches it. The primary serves only that dataset's samples, through a
+  follower-only endpoint (`GET /api/follower/datasets/{id}/samples/{sample}/media`) with the usual media checks.
+  The Primaries page shows the option on each mirror.
+- **Moving an x86_64 server to Arm** ([DEPLOY_TO_AWS.md](docs/DEPLOY_TO_AWS.md#moving-an-x86_64-instance-to-arm)),
+  without a dump and restore: PostgreSQL's data directory moves as it is, checked with `amcheck` on the demo's
+  database. Copy `/data` to new disks with rsync while the server runs, then again after stopping it. Not onto
+  a disk restored from an EBS snapshot, which loads each block lazily and stalls queries. Arm is now stated as
+  supported and recommended in the deployment guides.
+
+### Fixed
+
+- **16-bit and float greyscale images** (a multispectral band or a thermal frame, saved as a 16-bit PNG or TIFF or
+  a float TIFF) showed as pure white in grid thumbnails, crops and overlays, and search by image, image metrics,
+  hashes, embeddings and 3D-object crops saw a white image too: converting to 8-bit RGB clipped every value above
+  255.
+  - Each such image is now stretched: its 0.5th to 99.5th percentile spans 0..255, so a 10-, 12- or 14-bit
+    sensor's images are neither dark nor white, and a few hot pixels don't set the range. Each image gets its own
+    contrast.
+  - The full view of such a sample image is converted the same way, since a browser shows a 16-bit PNG by its top
+    8 bits and most can't show a TIFF. Masks and heatmaps keep their raw values.
+  - 8-bit images are converted exactly as before.
+
 ## 2.5.0 (2026-11-09)
 
 2.5.0 runs on Arm: the release images are built for `linux/arm64` as well, the AWS module defaults to a Graviton

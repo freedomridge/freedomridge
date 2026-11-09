@@ -19,10 +19,10 @@ copy it reads the feed from start_txid - 1.
 
 import base64
 import secrets
-from typing import List, Literal
+from typing import List, Literal, Optional
 
 import numpy as np
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
@@ -52,6 +52,9 @@ class FollowerCreate(BaseModel):
 class FollowOptions(BaseModel):
     tags: Literal['primary', 'both'] = 'primary'
     views: Literal['primary', 'both'] = 'primary'
+    # Serve the dataset's images, thumbnails and overlays to the follower, for one that can't read them itself:
+    # files on this server's disk, or a bucket it has no credentials for.
+    images: bool = False
 
 
 class BlockRequest(BaseModel):
@@ -155,7 +158,8 @@ async def list_followers(user: dict = Depends(require_role('admin'))):
         for table in LOG_TABLES
     )
     datasets = await db.fetch(
-        f"""SELECT f.follower_id, f.dataset_id, d.name, f.tags, f.views, f.start_txid, f.acked_txid, f.subscribed_at,
+        f"""SELECT f.follower_id, f.dataset_id, d.name, f.tags, f.views, f.images, f.start_txid, f.acked_txid,
+                   f.subscribed_at,
                    {held} AS held_rows
             FROM follower_datasets f JOIN datasets d ON d.id = f.dataset_id ORDER BY d.name""",
     )
@@ -197,12 +201,15 @@ async def follow_dataset(
                     detail="A mirror can't be followed: follow the dataset on its primary instead",
                 )
             await connection.execute(
-                """INSERT INTO follower_datasets (follower_id, dataset_id, tags, views) VALUES ($1, $2, $3, $4)
-                   ON CONFLICT (follower_id, dataset_id) DO UPDATE SET tags = EXCLUDED.tags, views = EXCLUDED.views""",
+                """INSERT INTO follower_datasets (follower_id, dataset_id, tags, views, images)
+                   VALUES ($1, $2, $3, $4, $5)
+                   ON CONFLICT (follower_id, dataset_id)
+                   DO UPDATE SET tags = EXCLUDED.tags, views = EXCLUDED.views, images = EXCLUDED.images""",
                 follower_id,
                 dataset_id,
                 options.tags,
                 options.views,
+                options.images,
             )
         # A new transaction, after the subscription is visible: every transaction that could have missed it has an
         # id below this snapshot's xmax.
@@ -290,7 +297,7 @@ async def follower_config(follower: dict = Depends(current_follower)):
     might have written to it without logging has ended."""
     xmin = await db.fetchval('SELECT txid_snapshot_xmin(txid_current_snapshot())')
     rows = await db.fetch(
-        """SELECT f.dataset_id, d.name, f.tags, f.views, f.start_txid, f.acked_txid
+        """SELECT f.dataset_id, d.name, f.tags, f.views, f.images, f.start_txid, f.acked_txid
            FROM follower_datasets f JOIN datasets d ON d.id = f.dataset_id WHERE f.follower_id = $1 ORDER BY d.name""",
         follower['id'],
     )
@@ -513,6 +520,52 @@ async def follower_ack(dataset_id: int, ack: Ack, follower: dict = Depends(curre
         )
         await prune(connection, dataset_id)
     return {'acked': ack.cursor}
+
+
+# --- Images, for a dataset whose images option is on ----------------------------------------------------------------
+
+
+@router.get('/follower/datasets/{dataset_id}/samples/{sample_id}/media')
+async def follower_media(
+    dataset_id: int,
+    sample_id: int,
+    request: Request,
+    field: str = 'filepath',
+    overlay: Optional[str] = None,
+    colormap: Optional[str] = None,
+    alpha: float = 0.6,
+    range_start: Optional[float] = None,
+    range_end: Optional[float] = None,
+    crop: Optional[str] = None,
+    w: Optional[int] = None,
+    follower: dict = Depends(current_follower),
+):
+    """A sample's image, thumbnail, crop or overlay, as GET /samples/{id}/media serves it here, for a follower that
+    can't read the image itself. Only for a dataset it follows with images on, and only that dataset's samples."""
+    sub = await subscription(db, follower, dataset_id)
+    if not sub['images']:
+        raise HTTPException(
+            status_code=403,
+            detail="This dataset's images aren't served to this follower: its images option is off on the primary",
+        )
+    if not await db.fetchval('SELECT 1 FROM samples WHERE id = $1 AND dataset_id = $2', sample_id, dataset_id):
+        raise HTTPException(status_code=404, detail='No such sample in this dataset')
+    from backend.main import serve_media  # main imports this router
+
+    return await serve_media(
+        sample_id,
+        request,
+        field=field,
+        overlay=overlay,
+        colormap=colormap,
+        alpha=alpha,
+        range_start=range_start,
+        range_end=range_end,
+        crop=crop,
+        w=w,
+        version_id=None,
+        check_access=False,
+    )
 
 
 # --- Edits a follower sends up (its tags and views options both ways) ---------------------------------------------

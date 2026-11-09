@@ -9,6 +9,10 @@ TLD such as `.dev`, browsers also require a valid certificate from the first vis
 Local development uses `docker-compose.yml` and `scripts/run_backend.sh` over HTTP;
 see the [quick start](QUICK_START.md).
 
+It runs on Arm (Graviton) or x86_64: the release images are built for both. **Arm is the default and the
+recommendation**: `t4g.large` costs about 19% less than `t3.large` for the same 8 GiB, and in our test the
+demo's searches ran as fast. An x86_64 deployment can move to Arm (section 13).
+
 The backend enforces the public-demo protections: the `FRIDGE_ADMIN_PASSWORD` admin
 bootstrap, guests limited to browsing and private saved views, and removal of expired
 demo accounts. The smoke tests in section 11 are a release gate: run them before
@@ -907,6 +911,44 @@ four datasets including archives and 64 GB for COCO and KITTI. S3 Standard costs
 $0.023 per GB-month: about $1.15/month for the full demo's ~50 GB of media. Uploading
 it is roughly 550,000 PUT requests, under $3 once. The instance reads media in its
 own region with no transfer charge, and `/cache/s3` keeps recently viewed files local.
+
+### Moving an x86_64 instance to Arm
+
+An x86_64 deployment moves to Arm without a dump and restore: PostgreSQL's data directory is the same on both
+(64-bit little-endian, with the same PostgreSQL major version and the same Debian `db` image). We checked it on
+this demo's 11 GB database, from a `t3.large` to a `t4g.large`: PostgreSQL 18 started on the copied files,
+every count matched, and `amcheck` found every B-tree index sound. A dump and restore would work too, but it
+rebuilds every vector index, which takes hours on two vCPUs.
+
+EC2 can't change an instance's architecture (its disk holds that architecture's Ubuntu), so the move is to a new
+instance:
+
+1. **Back up first** (section 12): a verified dump in S3. Keep the old instance until the new one has run for a
+   while.
+2. **A new Arm instance** (`t4g.large`, Ubuntu 26.04 arm64) with the same security group and instance role, and
+   **new, empty** data and cache disks at `/data` and `/cache`. Install Docker, check out the release you run,
+   and pull its images. Any AZ with capacity will do: the Elastic IP moves between AZs in a region.
+   - Don't run the database on a disk **restored from an EBS snapshot** without initializing it first. Such a disk
+     loads each block from S3 the first time it's read, at a few MB/s, and queries wait on it: in our test, patch
+     search timed out while PostgreSQL waited on disk reads with the CPU idle. A new empty disk has no such delay.
+     Neither does attaching the old disks themselves to the new instance, which works only within their AZ.
+3. **Copy `/data` while the old server runs**, as root, keeping owners (PostgreSQL's files belong to uid 999),
+   for example from the new instance: `sudo rsync -aHAX --numeric-ids --rsync-path='sudo rsync'
+   ubuntu@OLD_PRIVATE_IP:/data/ /data/`. This copy of a running database isn't consistent; it moves the bulk.
+   A temporary security group rule lets the new instance reach the old one over SSH; remove it afterwards.
+4. **Stop the old stack** (`docker compose -f docker-compose.prod.yml stop`), so PostgreSQL shuts down cleanly,
+   and **run the same rsync again with `--delete`**: only what changed since moves, so this, the downtime, is short.
+5. **Start the stack on the new instance**, apply migrations if its release is newer, check `/api/health`, then
+   move the Elastic IP (`aws ec2 associate-address --allocation-id EIP_ALLOCATION --instance-id NEW_INSTANCE
+   --allow-reassociation`) and run the smoke checks (section 11). TLS state and secrets come with `/data`.
+6. **To roll back**, start the old stack again and move the Elastic IP back: its disks were only read.
+7. **Afterwards**, terminate the old instance and its disks, and update the Terraform state: the instance, the
+   disks and their attachments, and `availability_zone` if it changed.
+
+To check the copy's indexes yourself, on the new instance:
+`CREATE EXTENSION IF NOT EXISTS amcheck;` then
+`SELECT count(bt_index_check(i.indexrelid, true)) FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid JOIN pg_am a ON a.oid = c.relam WHERE a.amname = 'btree' AND i.indisvalid;`
+(an error names any index that isn't sound).
 
 ### Archives in Glacier Instant Retrieval
 

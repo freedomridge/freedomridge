@@ -1,10 +1,12 @@
 # Trigger reload, embeddings, auth
 import asyncio
+import io
 import math
 import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from email.utils import parsedate_to_datetime
+from typing import Any
 
 import asyncpg
 from fastapi import Depends, FastAPI, HTTPException, Request
@@ -703,6 +705,117 @@ def _build_media_path_sql(field: str, versioned: bool = False) -> str:
     return f"SELECT dataset_id, {expr} AS path FROM {source} WHERE id = $1"
 
 
+async def _readable_here(dataset_id: int, path: str) -> bool:
+    """Whether this server can read a media path itself: a local file under the data root, an s3:// path in a
+    bucket one of the dataset's storage configurations covers, or an external URL (redirected)."""
+    if path.startswith(("http://", "https://")):
+        return True
+    if path.startswith("s3://"):
+        bucket, _key = _parse_s3_path(path)
+        return bool(bucket) and await route_s3_bucket(dataset_id, bucket) is not None
+    try:
+        return os.path.exists(_resolve_local_path(path))
+    except HTTPException:
+        return False  # outside the data root
+
+
+async def _primary_media_source(dataset_id: int, sample_id: int):
+    """The primary and the sample's ids there, when the dataset is a mirror whose primary serves its images."""
+    return await db.fetchrow(
+        """SELECT m.dataset_id, m.origin_dataset_id, ms.origin_id, l.id AS link_id, l.url, l.token_encrypted
+           FROM mirrors m
+           JOIN mirror_samples ms ON ms.dataset_id = m.dataset_id AND ms.sample_id = $2
+           JOIN primary_links l ON l.id = m.link_id
+           WHERE m.dataset_id = $1 AND m.images""",
+        dataset_id,
+        sample_id,
+    )
+
+
+# One client per primary (and event loop), so a grid's thumbnails reuse its connections.
+_primary_clients: dict = {}
+
+
+def _primary_client(source):
+    from . import follower_sync
+
+    key = (source["link_id"], source["token_encrypted"], id(asyncio.get_running_loop()))
+    client = _primary_clients.get(key)
+    if client is None:
+        client = _primary_clients[key] = follower_sync.connect(source)
+    return client
+
+
+async def _media_from_primary(source, path: str, params: dict) -> Response:
+    """The primary's answer for this sample and request, cached here under the media cache. The key holds the
+    sample's path, so a new file there is fetched again."""
+    import glob
+    import hashlib
+    import json
+
+    key = hashlib.md5(json.dumps([path, params], sort_keys=True).encode(), usedforsecurity=False).hexdigest()
+    base = os.path.join(S3_LOCAL_PATH, "primary", str(source["dataset_id"]), str(source["origin_id"]), key)
+    thumbnail = any(name in params for name in ("w", "crop", "overlay"))
+    headers = {"Cache-Control": "private, max-age=31536000, immutable" if thumbnail else _FULL_MEDIA_CACHE_CONTROL}
+    for cached_path in await asyncio.to_thread(glob.glob, glob.escape(base) + ".*"):
+        body = await asyncio.to_thread(read_cache, cached_path)
+        if body is not None:
+            media_type = mimetypes.guess_type(cached_path)[0] or "application/octet-stream"
+            return Response(content=body, media_type=media_type, headers={**headers, "X-Cache": "HIT"})
+    url = f"/follower/datasets/{source['origin_dataset_id']}/samples/{source['origin_id']}/media"
+    try:
+        answer = await _primary_client(source).get(url, params=params)
+    except Exception as error:
+        log.error("Primary %s unreachable for sample %s: %s", source["url"], source["origin_id"], error)
+        raise HTTPException(status_code=502, detail=f"The primary didn't answer for this image: {error}")
+    if answer.status_code != 200:
+        try:
+            detail = answer.json().get("detail")
+        except ValueError:
+            detail = None
+        if answer.status_code in (403, 404):
+            raise HTTPException(
+                status_code=answer.status_code,
+                detail=f"From the primary: {detail or answer.text[:200]}",
+            )
+        raise HTTPException(status_code=502, detail=f"The primary answered {answer.status_code}: {detail or ''}")
+    media_type = answer.headers.get("content-type", "application/octet-stream").split(";")[0]
+    _queue_media_cache(base + (mimetypes.guess_extension(media_type) or ".bin"), answer.content)
+    return Response(content=answer.content, media_type=media_type, headers=headers)
+
+
+_HIGH_BIT_DEPTH_SUFFIXES = (".png", ".tif", ".tiff")
+
+
+async def _is_high_bit_depth(dataset_id: int, path: str) -> bool:
+    """Whether a PNG or TIFF holds one channel wider than 8 bits, from its header. An S3 one is fetched into the
+    media cache, which the full view then serves from."""
+    if not path.lower().endswith(_HIGH_BIT_DEPTH_SUFFIXES):
+        return False
+    if path.startswith("s3://"):
+        body, _ = await _fetch_media_bytes(dataset_id, path)
+        source: Any = io.BytesIO(body)
+    else:
+        source = _resolve_local_path(path)
+        if not os.path.exists(source):
+            return False  # the full view answers 404
+
+    def mode() -> str:
+        from PIL import Image
+
+        with Image.open(source) as image:
+            return image.mode
+
+    from PIL import UnidentifiedImageError
+
+    from .image_modes import is_high_bit_depth
+
+    try:
+        return is_high_bit_depth(await asyncio.to_thread(mode))
+    except (UnidentifiedImageError, OSError):
+        return False  # not an image Pillow reads: served as it is, as before
+
+
 async def _fetch_media_bytes(dataset_id: int, path: str) -> tuple[bytes, str]:
     """Fetch the raw bytes for a resolved media path.
 
@@ -1072,7 +1185,9 @@ async def _serve_crop_resize(
 
         from PIL import Image
 
-        img = Image.open(_io.BytesIO(body)).convert("RGB")
+        from .image_modes import to_rgb
+
+        img = to_rgb(Image.open(_io.BytesIO(body)))
         if bbox is not None:
             img = img.crop(bbox)
         if width is not None and img.width > width:
@@ -1133,6 +1248,38 @@ async def serve_sample_media(
       - /absolute/local/path  → served from disk
       - http(s)://...         → 302 redirect (external URL, frontend follows)
     """
+    return await serve_media(
+        sample_id,
+        request,
+        field=field,
+        overlay=overlay,
+        colormap=colormap,
+        alpha=alpha,
+        range_start=range_start,
+        range_end=range_end,
+        crop=crop,
+        w=w,
+        version_id=version_id,
+    )
+
+
+async def serve_media(
+    sample_id: int,
+    request: Request,
+    *,
+    field: str = "filepath",
+    overlay: str | None = None,
+    colormap: str | None = None,
+    alpha: float = 0.6,
+    range_start: float | None = None,
+    range_end: float | None = None,
+    crop: str | None = None,
+    w: int | None = None,
+    version_id: int | None = None,
+    check_access: bool = True,
+):
+    """serve_sample_media's work. With check_access off, for a follower's request the followers router has
+    authorized, the user's dataset access isn't checked and nothing is fetched from a primary."""
     sql = _build_media_path_sql(field, versioned=version_id is not None)
     media_args = [sample_id] if version_id is None else [sample_id, version_id]
     row = await db.fetchrow(sql, *media_args)
@@ -1147,8 +1294,25 @@ async def serve_sample_media(
             detail=f"Sample {sample_id} has no value for field '{field}'",
         )
 
-    user = await get_optional_user(request)
-    await check_dataset_access(dataset_id, user)
+    if check_access:
+        user = await get_optional_user(request)
+        await check_dataset_access(dataset_id, user)
+        # A mirror's image this instance can't read (on the primary's disk, or in a bucket it has no credentials
+        # for) comes from the primary, when the primary serves that dataset's images (docs/FOLLOWERS.md).
+        if version_id is None and not await _readable_here(dataset_id, path):
+            source = await _primary_media_source(dataset_id, sample_id)
+            if source is not None:
+                params = {
+                    "field": field,
+                    "overlay": overlay,
+                    "colormap": colormap,
+                    "alpha": alpha if overlay is not None else None,
+                    "range_start": range_start,
+                    "range_end": range_end,
+                    "crop": crop,
+                    "w": w,
+                }
+                return await _media_from_primary(source, path, {k: v for k, v in params.items() if v is not None})
 
     if overlay is not None:
         # Overlay branch: composite and return (bypasses the FileResponse
@@ -1174,6 +1338,20 @@ async def serve_sample_media(
     # local/S3 source and are rejected by _serve_crop_resize below.
     if path.startswith(('http://', 'https://')) and crop is None:
         return RedirectResponse(url=path)
+
+    # A sample's own image in 16 bits or float (a multispectral band, a thermal frame): a browser shows a 16-bit
+    # PNG by its top 8 bits, too dark for a 12-bit sensor, and most can't show a TIFF. Its full view is converted
+    # as its thumbnails are (image_modes.to_rgb). Other media fields (masks, heatmaps) keep their raw values.
+    if crop is None and w is None and field == "filepath" and await _is_high_bit_depth(dataset_id, path):
+        return await _serve_crop_resize(
+            sample_id=sample_id,
+            dataset_id=dataset_id,
+            path=path,
+            field=field,
+            crop=None,
+            width=None,
+            version_id=version_id,
+        )
 
     if crop is not None or w is not None:
         # Crop/resize branch: derive a JPEG (per-object crop and/or a thumbnail)

@@ -15,11 +15,15 @@ An admin manages followers under **Settings → Followers** (or the endpoints be
    `follower:<name>`, which has no password and so can't log in. It also creates a **follower token**, shown
    once: give it to the follower with the primary's URL. Only the follower endpoints accept that token (any
    other endpoint answers 403), and they accept no other credential.
-2. **Choose datasets** for it to follow, each with two options. Each is `primary`, where the primary's copy is
-   the only one edited, or `both`, where edits made on the follower are sent to the primary:
+2. **Choose datasets** for it to follow, each with three options. `tags` and `views` are each `primary`, where
+   the primary's copy is the only one edited, or `both`, where edits made on the follower are sent to the primary:
    - **`tags`;**
    - **`views`:** with `primary`, the primary's shared views are copied down and views made on the follower
-     stay there.
+     stay there;
+   - **`images`** (**Serve images**, off by default): this server serves the dataset's images, thumbnails, crops
+     and overlays to the follower when the follower can't read them itself, from this server's disk or from a
+     bucket the follower has no credentials for. Turning it on shares those images with the follower without
+     sharing any credentials.
 
    A mirror (a dataset this instance follows from another) can't be chosen: follows don't chain, so an instance
    that wants it follows its primary.
@@ -118,8 +122,11 @@ its last sync, and any error. The job's successful runs are pruned from the job 
   has re-ranked it. Map placement here leaves the primary's fields alone.
 - **Views that use a concept** stay on the primary, because concepts belong to each instance; the views panel
   lists them.
-- **Images:** the mirror reads the same media paths, so this instance needs a storage configuration with read
-  access to the bucket. Patch vectors never need it.
+- **Images:** the mirror reads the same media paths. When this instance can read them (the same disk path, or a
+  storage configuration with read access to the bucket), it serves them itself. When it can't, and the primary
+  has the dataset's `images` option on, it asks the primary for the image, thumbnail, crop or overlay and keeps
+  the answer in its media cache (`S3_LOCAL_CACHE_PATH`, pruned with it). With the option off, those images don't
+  load. Patch vectors never need them.
 
 ### Edits sent to the primary
 

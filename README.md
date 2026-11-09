@@ -140,7 +140,8 @@ host, and you generate `POSTGRES_PASSWORD`, `FRIDGE_ADMIN_PASSWORD` and `STORAGE
 and set `DOMAIN_NAME` and `ALLOWED_ORIGINS` before the first start. To try the app without a
 domain, use the Quick Start.
 
-- [Deploy to AWS](docs/DEPLOY_TO_AWS.md): one EC2 instance, created with Terraform.
+- [Deploy to AWS](docs/DEPLOY_TO_AWS.md): one EC2 instance, created with Terraform. Arm (Graviton) is the
+  default and recommended; the images run on Arm64 and x86_64 alike.
 - [Docker deployment](docs/DOCKER_DEPLOYMENT.md): any Linux host with Docker.
 - [Upgrading](docs/UPGRADING.md) to a new release, and the [changelog](CHANGELOG.md).
 - [Followers](docs/FOLLOWERS.md): a second instance that keeps read-only mirrors of chosen datasets.

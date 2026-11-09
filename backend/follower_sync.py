@@ -695,12 +695,13 @@ async def configure(pool, link, client, checkpoint: dict) -> StepResult:
             )
             for origin, mirror in live.items():
                 entry = assigned.get(origin)
-                if entry and (entry['tags'], entry['views']) != (mirror['tags'], mirror['views']):
+                # A primary before 2.6.0 has no images option: off.
+                options = (entry['tags'], entry['views'], entry.get('images', False)) if entry else None
+                if options and options != (mirror['tags'], mirror['views'], mirror['images']):
                     await connection.execute(
-                        'UPDATE mirrors SET tags = $2, views = $3 WHERE dataset_id = $1',
+                        'UPDATE mirrors SET tags = $2, views = $3, images = $4 WHERE dataset_id = $1',
                         mirror['dataset_id'],
-                        entry['tags'],
-                        entry['views'],
+                        *options,
                     )
         for origin, plan in plans.items():
             entry = assigned[origin]
@@ -712,14 +713,15 @@ async def configure(pool, link, client, checkpoint: dict) -> StepResult:
             )
             blocks = [row['block'] for row in plan['blocks']]
             await connection.execute(
-                """INSERT INTO mirrors (dataset_id, link_id, origin_dataset_id, tags, views, copy_blocks, copy_total,
-                                        feed_cursor)
-                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8)""",
+                """INSERT INTO mirrors (dataset_id, link_id, origin_dataset_id, tags, views, images, copy_blocks,
+                                        copy_total, feed_cursor)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)""",
                 dataset_id,
                 link['id'],
                 origin,
                 entry['tags'],
                 entry['views'],
+                entry.get('images', False),
                 blocks,
                 len(blocks),
                 entry['start_txid'] - 1,

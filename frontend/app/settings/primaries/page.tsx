@@ -16,6 +16,7 @@ interface Mirror {
     state: 'copying' | 'following' | 'stopped';
     tags: 'primary' | 'both';
     views: 'primary' | 'both';
+    images: boolean;
     copy_total: number;
     copy_left: number;
     samples: number;
@@ -68,6 +69,7 @@ function MirrorRow({ mirror }: { mirror: Mirror }) {
                 <span className="text-zinc-500">
                     Tags {mirror.tags === 'both' ? 'both ways' : 'from the primary'}, views{' '}
                     {mirror.views === 'both' ? 'both ways' : 'from the primary'}
+                    {mirror.images ? ', images the primary serves when this instance can\'t read them' : ''}
                 </span>
                 {mirror.last_synced_at && (
                     <span className="text-zinc-500">synced {new Date(mirror.last_synced_at).toLocaleString()}</span>

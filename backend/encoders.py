@@ -28,6 +28,8 @@ from typing import Dict, List, Optional
 from fastapi import HTTPException
 from PIL import Image
 
+from .image_modes import to_rgb
+
 # JPEG draft decoding reduces pixels before allocation. Other formats must decode
 # the full frame before thumbnailing, so their header limit is deliberately lower.
 _MAX_QUERY_JPEG_PIXELS = 120_000_000
@@ -54,7 +56,7 @@ def _decode_query_image(image_bytes: bytes) -> Image.Image:
                 if is_jpeg:
                     image.draft("RGB", _QUERY_IMAGE_SIZE)
                 image.thumbnail(_QUERY_IMAGE_SIZE, Image.Resampling.LANCZOS)
-                return image.convert("RGB")
+                return to_rgb(image)
     except HTTPException:
         raise
     except (Image.DecompressionBombError, Image.DecompressionBombWarning):

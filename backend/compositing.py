@@ -31,6 +31,7 @@ import numpy as np
 from PIL import Image
 
 from .colormaps import COLORMAPS, DEFAULT_COLORMAP
+from .image_modes import to_rgb
 
 
 def _max_pool_resize(src: np.ndarray, target_w: int, target_h: int) -> np.ndarray:
@@ -97,7 +98,7 @@ def composite_heatmap(
     lut_tuples = COLORMAPS.get(colormap) or COLORMAPS[DEFAULT_COLORMAP]
     lut = np.asarray(lut_tuples, dtype=np.uint8)  # shape (256, 3)
 
-    base_img = Image.open(io.BytesIO(base_png_bytes)).convert("RGB")
+    base_img = to_rgb(Image.open(io.BytesIO(base_png_bytes)))
     heatmap_img = Image.open(io.BytesIO(heatmap_png_bytes))
     base_w, base_h = base_img.size
 
