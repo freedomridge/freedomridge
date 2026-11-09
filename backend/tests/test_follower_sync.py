@@ -2,6 +2,7 @@
 the primary's; the sync copies it into a mirror beside it through the real follower endpoints (an in-process HTTP
 client bound to the app), then applies the primary's feed to it."""
 
+import io
 import os
 from unittest.mock import AsyncMock
 
@@ -515,5 +516,71 @@ def test_the_sync_survives_a_filepath_moved_between_blocks_and_views_that_swap_n
         there = await database.fetch('SELECT id, name FROM views WHERE dataset_id = 1 ORDER BY id')
         assert [(row['origin_view_id'], row['name']) for row in names] == [(row['id'], row['name']) for row in there]
         assert [row['name'] for row in there] == ['b', 'a']
+
+    registry_database(scenario)
+
+
+def test_a_mirror_shows_the_images_its_primary_serves_when_their_option_is_on(monkeypatch, registry_database, tmp_path):
+    from PIL import Image
+
+    from backend import main
+
+    async def scenario(database):
+        _, link_id = await setup(monkeypatch, database)
+        # The primary's image is a file on its disk; the follower (the same process here) is made unable to read it.
+        Image.new('RGB', (40, 30), (200, 40, 40)).save(tmp_path / 'a-0.jpg')
+        monkeypatch.setattr(main, 'db', database)
+        monkeypatch.setattr(main, '_resolve_local_path', lambda path: str(tmp_path / os.path.basename(path)))
+        monkeypatch.setattr(main, 'CROP_CACHE_PATH', str(tmp_path / 'crop'))
+        monkeypatch.setattr(main, 'S3_LOCAL_PATH', str(tmp_path / 'cache'))
+        monkeypatch.setattr(main, 'get_optional_user', AsyncMock(return_value=USER))
+        monkeypatch.setattr(main, 'check_dataset_access', AsyncMock())
+        monkeypatch.setattr(main, '_readable_here', AsyncMock(return_value=False))
+        monkeypatch.setattr(main, '_queue_media_cache', main._write_media_cache)  # written at once
+        requests = []
+        connect = follower_sync.connect
+
+        def counted(link):
+            requests.append(link)
+            return connect(link)
+
+        monkeypatch.setattr(follower_sync, 'connect', counted)
+        main._primary_clients.clear()
+
+        await ingest([{'crop': 'corn'}], dataset_id=1, prefix='/fr-images/a')
+        follower = await database.fetchval('SELECT id FROM followers')
+        await followers.follow_dataset(follower, 1, followers.FollowOptions(), user=USER)
+        await sync(database, link_id)
+        mirror = await mirror_of(database)
+        [sample] = (await copied(database, mirror)).values()
+        assert mirror['images'] is False
+
+        # Images off: nothing is asked of the primary (here the file is still found on this machine's own disk).
+        requests.clear()  # the sync's own connections
+        await main.serve_sample_media(sample['id'], AsyncMock(), w=32)
+        assert requests == []
+        sub = {'id': follower}
+        with pytest.raises(HTTPException) as off:
+            await followers.follower_media(1, sample['origin_id'], AsyncMock(), w=32, follower=sub)
+        assert off.value.status_code == 403 and 'images option is off' in off.value.detail
+
+        # On: the sync takes the option, and the mirror's thumbnail comes from the primary, then from the cache.
+        await followers.follow_dataset(follower, 1, followers.FollowOptions(images=True), user=USER)
+        await sync(database, link_id)
+        assert (await mirror_of(database))['images'] is True
+        requests.clear()
+        first = await main.serve_sample_media(sample['id'], AsyncMock(), w=32)
+        assert first.media_type == 'image/jpeg' and 'X-Cache' not in first.headers and len(requests) == 1
+        red = np.asarray(Image.open(io.BytesIO(first.body)).convert('RGB')).mean(axis=(0, 1))
+        assert red[0] > 150 and red[1] < 90  # the primary's red image
+        again = await main.serve_sample_media(sample['id'], AsyncMock(), w=32)
+        assert again.headers['X-Cache'] == 'HIT' and again.body == first.body and len(requests) == 1
+
+        # The primary serves only the samples of a dataset the follower follows.
+        await ingest([{'crop': 'beet'}], dataset_id=2, prefix='/fr-images/b')
+        other = await database.fetchval('SELECT id FROM samples WHERE dataset_id = 2 LIMIT 1')
+        with pytest.raises(HTTPException) as elsewhere:
+            await followers.follower_media(1, other, AsyncMock(), follower=sub)
+        assert elsewhere.value.status_code == 404
 
     registry_database(scenario)

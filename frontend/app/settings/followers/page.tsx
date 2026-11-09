@@ -16,6 +16,7 @@ interface FollowedDataset {
     name: string;
     tags: Sync;
     views: Sync;
+    images: boolean;
     start_txid: number | null;
     acked_txid: number | null;
     held_rows: number;
@@ -69,8 +70,9 @@ function FollowerCard({ follower, datasets }: { follower: Follower; datasets: { 
     const [confirmRemove, setConfirmRemove] = useState(false);
     const refresh = () => queryClient.invalidateQueries({ queryKey: ['followers'] });
     const follow = useMutation({
-        mutationFn: ({ datasetId, tags, views }: { datasetId: number; tags: Sync; views: Sync }) =>
-            send('PUT', `/followers/${follower.id}/datasets/${datasetId}`, { tags, views }),
+        // The options replace each other's: every change sends all three.
+        mutationFn: ({ datasetId, tags, views, images }: { datasetId: number; tags: Sync; views: Sync; images: boolean }) =>
+            send('PUT', `/followers/${follower.id}/datasets/${datasetId}`, { tags, views, images }),
         onSuccess: refresh,
     });
     const unfollow = useMutation({
@@ -106,13 +108,27 @@ function FollowerCard({ follower, datasets }: { follower: Follower; datasets: { 
                             <SyncSelect
                                 label="Tags"
                                 value={dataset.tags}
-                                onChange={tags => follow.mutate({ datasetId: dataset.dataset_id, tags, views: dataset.views })}
+                                onChange={tags => follow.mutate({ datasetId: dataset.dataset_id, tags, views: dataset.views, images: dataset.images })}
                             />
                             <SyncSelect
                                 label="Views"
                                 value={dataset.views}
-                                onChange={views => follow.mutate({ datasetId: dataset.dataset_id, tags: dataset.tags, views })}
+                                onChange={views => follow.mutate({ datasetId: dataset.dataset_id, tags: dataset.tags, views, images: dataset.images })}
                             />
+                            <label
+                                className="flex items-center gap-2 text-sm text-zinc-300"
+                                title="Serve this dataset's images, thumbnails and overlays to the follower, for one that can't read them itself (files on this server's disk, or a bucket it has no credentials for)"
+                            >
+                                <input
+                                    type="checkbox"
+                                    aria-label="Serve images"
+                                    checked={dataset.images}
+                                    onChange={event => follow.mutate({
+                                        datasetId: dataset.dataset_id, tags: dataset.tags, views: dataset.views, images: event.target.checked,
+                                    })}
+                                />
+                                Serve images
+                            </label>
                             <span className="text-zinc-500" title="Changes kept on this server until the follower applies them">
                                 {dataset.held_rows.toLocaleString()} changes held
                             </span>
@@ -141,7 +157,7 @@ function FollowerCard({ follower, datasets }: { follower: Follower; datasets: { 
                 <button
                     disabled={adding === '' || follow.isPending}
                     onClick={() => {
-                        if (adding !== '') follow.mutate({ datasetId: adding, tags: 'primary', views: 'primary' });
+                        if (adding !== '') follow.mutate({ datasetId: adding, tags: 'primary', views: 'primary', images: false });
                         setAdding('');
                     }}
                     className="px-3 py-1 rounded bg-cyan-600 hover:bg-cyan-500 disabled:opacity-40 text-white text-sm"

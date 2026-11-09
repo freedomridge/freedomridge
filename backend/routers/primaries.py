@@ -56,7 +56,8 @@ async def list_primaries(user: dict = Depends(require_role('admin'))):
         """SELECT id, url, follower_name, created_at, last_synced_at, last_error FROM primary_links ORDER BY id""",
     )
     mirrors = await db.fetch(
-        """SELECT m.link_id, m.dataset_id, d.name, m.origin_dataset_id, m.state, m.tags, m.views, m.copy_total,
+        """SELECT m.link_id, m.dataset_id, d.name, m.origin_dataset_id, m.state, m.tags, m.views, m.images,
+                  m.copy_total,
                   cardinality(m.copy_blocks) AS copy_left, m.concept_views, m.last_synced_at, m.last_error,
                   (SELECT count(*) FROM mirror_samples s WHERE s.dataset_id = m.dataset_id) AS samples
            FROM mirrors m JOIN datasets d ON d.id = m.dataset_id

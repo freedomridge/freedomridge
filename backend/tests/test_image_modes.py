@@ -89,6 +89,7 @@ async def test_grid_thumbnail_of_a_16_bit_png_is_not_white(monkeypatch, tmp_path
     monkeypatch.setattr(main, 'get_optional_user', AsyncMock(return_value={'id': 1}))
     monkeypatch.setattr(main, 'check_dataset_access', AsyncMock())
     monkeypatch.setattr(main, '_fetch_media_bytes', AsyncMock(return_value=(body, 'image/png')))
+    monkeypatch.setattr(main, '_readable_here', AsyncMock(return_value=True))  # not a mirror's
     monkeypatch.setattr(main, 'CROP_CACHE_PATH', str(tmp_path))
     response = await main.serve_sample_media(7, Mock(), w=32)
     assert response.media_type == 'image/jpeg'  # the resize path, not the raw PNG

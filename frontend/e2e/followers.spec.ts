@@ -39,9 +39,19 @@ test('an admin adds a follower, chooses what it follows, and removes it', async 
             const listed = await apiFetch(cookie, '/followers');
             return listed.find((entry: { name: string }) => entry.name === name)?.datasets[0]?.tags;
         }).toBe('both');
+        // Serve images: on, and tags keep the value just set (each change sends every option).
+        // The box shows the saved option: it's ticked once the server has it.
+        const serve = followed.getByLabel('Serve images');
+        await serve.click();
+        await expect(serve).toBeChecked();
+        await expect.poll(async () => {
+            const listed = await apiFetch(cookie, '/followers');
+            const entry = listed.find((item: { name: string }) => item.name === name)?.datasets[0];
+            return entry && [entry.tags, entry.images];
+        }).toEqual(['both', true]);
         const config = await (await asFollower('/follower/config')).json();
-        expect(config.datasets.map((entry: { dataset_id: number; tags: string }) => [entry.dataset_id, entry.tags]))
-            .toEqual([[dataset.id, 'both']]);
+        expect(config.datasets.map((entry: { dataset_id: number; tags: string; images: boolean }) =>
+            [entry.dataset_id, entry.tags, entry.images])).toEqual([[dataset.id, 'both', true]]);
 
         await row.getByRole('button', { name: 'Remove follower…' }).click();
         await row.getByRole('button', { name: 'Remove', exact: true }).click();
