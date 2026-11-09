@@ -21,7 +21,7 @@ SHOWN = (
 class LauncherSettings(BaseModel):
     enabled: bool = False
     region: str = Field('', pattern=r'^([a-z]{2}(-gov)?-[a-z]+-\d)?$')
-    instance_type: str = Field('r7i.2xlarge', pattern=r'^[a-z][a-z0-9-]*\.[a-z0-9]+$')
+    instance_type: str = Field('r7g.2xlarge', pattern=r'^[a-z][a-z0-9-]*\.[a-z0-9]+$')
     subnet_id: Optional[str] = Field(None, pattern=r'^subnet-[0-9a-f]+$')
     security_group_ids: List[str] = Field(default_factory=list, max_length=5)
     server_url: str = Field('', pattern=r'^(https?://[^\s/]+(/\S*)?)?$', max_length=500)

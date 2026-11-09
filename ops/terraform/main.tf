@@ -264,7 +264,7 @@ resource "aws_iam_role_policy" "on_demand_workers" {
       Condition = { StringEquals = { "ec2:CreateAction" = "RunInstances" } } },
       { Effect = "Allow", Action = ["ec2:TerminateInstances"], Resource = "arn:aws:ec2:${var.aws_region}:*:instance/*",
       Condition = { StringLike = { "aws:ResourceTag/fridge:launch" = "*" } } },
-      { Effect = "Allow", Action = ["ec2:DescribeInstances"], Resource = "*" },
+      { Effect = "Allow", Action = ["ec2:DescribeInstances", "ec2:DescribeInstanceTypes"], Resource = "*" },
       { Effect = "Allow", Action = ["ssm:GetParameters"],
       Resource = "arn:aws:ssm:${var.aws_region}::parameter/aws/service/ami-amazon-linux-latest/*" }
     ]

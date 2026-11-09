@@ -25,7 +25,7 @@ test('an admin sets up on-demand workers and sees what AWS says about them', asy
         await card.getByLabel('Machines at once').fill('2');
         await card.getByRole('button', { name: 'Save' }).click();
         await expect.poll(async () => (await apiFetch(cookie, '/compute-launcher')).settings)
-            .toMatchObject({ enabled: true, region: 'us-east-1', max_machines: 2, instance_type: 'r7i.2xlarge' });
+            .toMatchObject({ enabled: true, region: 'us-east-1', max_machines: 2, instance_type: 'r7g.2xlarge' });
         await expect(card.getByTestId('on-demand-hours')).toContainText('of 40 machine-hours used this month');
 
         await card.getByRole('button', { name: 'Check with AWS' }).click();

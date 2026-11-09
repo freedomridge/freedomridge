@@ -2751,7 +2751,7 @@ CREATE TABLE IF NOT EXISTS compute_launcher (
     singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
     enabled BOOLEAN NOT NULL DEFAULT FALSE,
     region TEXT NOT NULL DEFAULT '',
-    instance_type TEXT NOT NULL DEFAULT 'r7i.2xlarge',
+    instance_type TEXT NOT NULL DEFAULT 'r7g.2xlarge',
     subnet_id TEXT,                                      -- NULL: the region's default VPC
     security_group_ids TEXT[] NOT NULL DEFAULT '{}',     -- empty: the VPC's default security group
     server_url TEXT NOT NULL DEFAULT '',                 -- the API address the machines reach this server at
@@ -2806,5 +2806,6 @@ INSERT INTO schema_migrations (filename) VALUES
     ('0007_follower_change_log.sql'),
     ('0008_followers.sql'),
     ('0009_mirrors.sql'),
-    ('0010_compute_launcher.sql')
+    ('0010_compute_launcher.sql'),
+    ('0011_compute_launcher_arm.sql')
 ON CONFLICT (filename) DO NOTHING;

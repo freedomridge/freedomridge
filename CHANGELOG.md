@@ -6,6 +6,14 @@ it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
 
 ## Unreleased
 
+### Upgrade notes
+
+- One database migration, `0011_compute_launcher_arm.sql`, applied with `scripts/apply_migrations.sh` (step 4 of
+  [Upgrading](docs/UPGRADING.md)). It changes the on-demand workers' default instance type, and the saved one if
+  they were never turned on or used.
+- On-demand workers need one more AWS permission, `ec2:DescribeInstanceTypes`, to pick the machine image for the
+  instance type's architecture ([ON_DEMAND_WORKERS.md](docs/ON_DEMAND_WORKERS.md)). The Terraform module adds it.
+
 ### Added
 
 - **Arm images.** The release images on ghcr.io are built for `linux/arm64` as well as `linux/amd64`, under
@@ -15,6 +23,12 @@ it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
   less. The Ubuntu image, and the CloudWatch agent the instance installs, follow the instance type's
   architecture, so an x86_64 `instance_type` works as before. An existing deployment is unchanged: the module
   never replaces or resizes a running instance. Moving one to Arm means a new instance.
+
+### Changed
+
+- **On-demand workers start Arm (Graviton) machines by default**, `r7g.2xlarge`: the same 8 vCPUs and 64 GiB as
+  `r7i.2xlarge`, for less. Any instance type works, Arm or x86_64: the machine's Amazon Linux image follows its
+  architecture, as AWS describes it.
 
 ## 2.4.0 (2026-11-09)
 

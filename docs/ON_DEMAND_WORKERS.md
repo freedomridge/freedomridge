@@ -68,7 +68,7 @@ When a limit holds a job back, the job says which.
      "Condition": {"StringEquals": {"ec2:CreateAction": "RunInstances"}}},
     {"Effect": "Allow", "Action": "ec2:TerminateInstances", "Resource": "arn:aws:ec2:REGION:*:instance/*",
      "Condition": {"StringLike": {"aws:ResourceTag/fridge:launch": "*"}}},
-    {"Effect": "Allow", "Action": "ec2:DescribeInstances", "Resource": "*"},
+    {"Effect": "Allow", "Action": ["ec2:DescribeInstances", "ec2:DescribeInstanceTypes"], "Resource": "*"},
     {"Effect": "Allow", "Action": "ssm:GetParameters",
      "Resource": "arn:aws:ssm:REGION::parameter/aws/service/ami-amazon-linux-latest/*"}
   ]
@@ -78,9 +78,13 @@ When a limit holds a job back, the job says which.
    It may start instances only with the `fridge:launch` tag, and terminate only those. The tag names the server's
    database and the launch, so several servers can share one AWS account. The repository's Terraform
    attaches it to the server's role with `on_demand_workers = true`.
-4. **Settings:** the region, the instance type (x86_64; its memory bounds the biggest fit, which sizes itself to
-   it), and the URL the machines reach this server's API at. **Check with AWS** asks AWS whether it would start a
-   machine with the saved settings, as a dry run: nothing starts. Then turn it on.
+4. **Settings:** the region, the instance type, and the URL the machines reach this server's API at.
+   - The instance type is Arm (Graviton) or x86_64; the machine's image follows it. The default, `r7g.2xlarge`
+     (Graviton, 8 vCPUs, 64 GiB), costs less than the x86_64 `r7i.2xlarge` of the same size.
+   - Its memory bounds the biggest fit, which sizes itself to it.
+
+   **Check with AWS** asks AWS whether it would start a machine with the saved settings, as a dry run: nothing
+   starts. Then turn it on.
 
 The machines started, their type, state, hours and why each ended, are listed on the same page. A worker started on
 demand also shows among the compute workers while it runs, as `on-demand-<n>`.

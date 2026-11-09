@@ -23,7 +23,11 @@ from .version import VERSION
 logger = logging.getLogger(__name__)
 
 SCHEDULE_SECONDS = 60
-AMI = 'resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64'
+# Amazon Linux 2023 for the instance type's architecture; the backend image is built for both.
+AMIS = {
+    'arm64': 'resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64',
+    'x86_64': 'resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64',
+}
 ROOT_VOLUME_GB = 40  # the backend image and a fit's vectors
 BOOT_MINUTES = 15  # a machine whose worker hasn't connected by then is ended
 SILENT_MINUTES = 10  # a connected worker silent for this long: its machine is ended
@@ -89,15 +93,31 @@ docker run --rm --name fridge-worker --stop-timeout 60 \\
 """
 
 
+async def image_for(ec2, instance_type: str) -> str:
+    """The machine image for the instance type's architecture, Arm (Graviton) or x86_64, as AWS describes it."""
+    answer = await asyncio.to_thread(ec2.describe_instance_types, InstanceTypes=[instance_type])
+    supported = answer['InstanceTypes'][0]['ProcessorInfo']['SupportedArchitectures']
+    return AMIS['arm64' if 'arm64' in supported else 'x86_64']
+
+
 def launch_tag(identity: str, launch_id: int) -> str:
     """The fridge:launch tag: this server's database and the launch, so servers sharing an AWS account never take
     each other's machines for their own."""
     return f'{identity}-{launch_id}'
 
 
-def run_request(settings, tag: str, worker_name: str, script: str, *, spot: bool, dry_run: bool = False) -> dict:
+def run_request(
+    settings,
+    tag: str,
+    worker_name: str,
+    script: str,
+    *,
+    image_id: str,
+    spot: bool,
+    dry_run: bool = False,
+) -> dict:
     request = {
-        'ImageId': AMI,
+        'ImageId': image_id,
         'InstanceType': settings['instance_type'],
         'MinCount': 1,
         'MaxCount': 1,
@@ -362,10 +382,18 @@ async def launch(pool, ec2, settings, job_id, identity: str) -> None:
     script = user_data(settings, raw, worker_name)
     market = 'spot'
     try:
+        image_id = await image_for(ec2, settings['instance_type'])
         try:
             answer = await asyncio.to_thread(
                 ec2.run_instances,
-                **run_request(settings, launch_tag(identity, launch_id), worker_name, script, spot=True),
+                **run_request(
+                    settings,
+                    launch_tag(identity, launch_id),
+                    worker_name,
+                    script,
+                    image_id=image_id,
+                    spot=True,
+                ),
             )
         except Exception as error:
             if error_code(error) not in NO_SPOT_CAPACITY:
@@ -373,7 +401,14 @@ async def launch(pool, ec2, settings, job_id, identity: str) -> None:
             market = 'on-demand'
             answer = await asyncio.to_thread(
                 ec2.run_instances,
-                **run_request(settings, launch_tag(identity, launch_id), worker_name, script, spot=False),
+                **run_request(
+                    settings,
+                    launch_tag(identity, launch_id),
+                    worker_name,
+                    script,
+                    image_id=image_id,
+                    spot=False,
+                ),
             )
     except Exception as error:
         await end_launch(pool, launch_id, f'AWS refused the launch: {error}')
@@ -424,10 +459,11 @@ async def check(settings, client_factory=ec2_client) -> str:
     """A dry-run launch with these settings: AWS answers whether it would have been allowed."""
     ec2 = client_factory(settings)
     script = user_data(settings, 'dry-run', 'on-demand-check')
+    image_id = await image_for(ec2, settings['instance_type'])
     try:
         await asyncio.to_thread(
             ec2.run_instances,
-            **run_request(settings, 'check', 'on-demand-check', script, spot=True, dry_run=True),
+            **run_request(settings, 'check', 'on-demand-check', script, image_id=image_id, spot=True, dry_run=True),
         )
     except Exception as error:
         if error_code(error) == 'DryRunOperation':
