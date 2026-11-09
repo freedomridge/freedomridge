@@ -12,6 +12,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel
 
 from .. import public_settings
+from ..api_errors import CodedHTTPException
 from ..auth_cleanup import DEMO_ACCOUNT_LOCK, cleanup_accounts
 from ..auth_policy import validate_new_password
 from ..crypto import hash_token
@@ -194,7 +195,13 @@ async def get_follower_user(request: Request) -> dict:
     auth_header = request.headers.get("Authorization")
     if not (auth_header and auth_header.startswith("Bearer ")):
         raise HTTPException(status_code=401, detail="A follower instance authenticates with its follower token")
-    user, scope = await _token_user(auth_header)
+    try:
+        user, scope = await _token_user(auth_header)
+    except HTTPException as error:
+        if error.status_code != 401:
+            raise
+        # Removing a follower deletes its token: the code tells the follower to stop its mirrors.
+        raise CodedHTTPException(401, str(error.detail), 'follower_token_invalid') from None
     if scope != 'follower':
         raise HTTPException(status_code=403, detail="Use the follower's token (Settings → Followers) here")
     await set_request_user(user)

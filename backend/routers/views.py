@@ -84,8 +84,15 @@ async def create_view(id: int, view: ViewCreate, user: dict = Depends(get_curren
     dataset = await db.fetchrow("SELECT id FROM datasets WHERE id = $1", id)
     if not dataset:
         raise HTTPException(status_code=404, detail="Dataset not found")
-    # A shared view on a mirror whose views sync both ways is made on its primary (docs/FOLLOWERS.md).
-    if view.is_public and await db.fetchval("SELECT 1 FROM mirrors WHERE dataset_id = $1 AND views = 'both'", id):
+    # A shared view on a mirror whose views sync both ways is made on its primary (docs/FOLLOWERS.md), unless it uses
+    # a concept: concepts belong to each instance, so that view stays here, shared on this instance.
+    from .. import follower_sync  # here: it imports the routers
+
+    if (
+        view.is_public
+        and not follower_sync.uses_concept(view.content)
+        and await db.fetchval("SELECT 1 FROM mirrors WHERE dataset_id = $1 AND views = 'both'", id)
+    ):
         from .. import mirror_writes
 
         view.name = clean_name(view.name, "View name")
@@ -278,12 +285,19 @@ async def share_view(id: int, view_id: int, share: ViewShare, user: dict = Depen
         raise HTTPException(status_code=403, detail="Not authorized to share this view")
     await _require_known_users(share.shared_with_user_ids)
     # Made public on a mirror whose views sync both ways: it's made on the primary, and this private one is replaced
-    # by its copy (docs/FOLLOWERS.md).
-    if share.is_public and await db.fetchval(
-        """SELECT 1 FROM mirrors m WHERE m.dataset_id = $1 AND m.views = 'both'
+    # by its copy (docs/FOLLOWERS.md). Not a view that uses a concept: concepts belong to each instance.
+    from .. import follower_sync  # here: it imports the routers
+
+    content = _decode_content(await db.fetchval("SELECT content FROM views WHERE id = $1", view_id))
+    if (
+        share.is_public
+        and not follower_sync.uses_concept(content)
+        and await db.fetchval(
+            """SELECT 1 FROM mirrors m WHERE m.dataset_id = $1 AND m.views = 'both'
            AND NOT EXISTS (SELECT 1 FROM mirror_views v WHERE v.view_id = $2)""",
-        id,
-        view_id,
+            id,
+            view_id,
+        )
     ):
         from .. import mirror_writes
 

@@ -58,8 +58,9 @@ it.
 
 Every call takes the follower token (`Authorization: Bearer <token>`) and records the follower as seen.
 
-1. `GET /api/follower/config` returns its datasets, their options, the primary's `identity`, and whether each
-   dataset is `ready`. A dataset becomes ready once every transaction that might have written to it without
+1. `GET /api/follower/config` returns its datasets, their options, the primary's `database_identity` (its
+   cluster's system identifier and its database's oid; `identity` is the cluster's alone, as followers before
+   2.6.1 read it), and whether each dataset is `ready`. A dataset becomes ready once every transaction that might have written to it without
    being logged has ended. Those are writes already in flight when it became followed.
 2. **Copy a ready dataset:**
    - `GET .../blocks` lists every block and its sample count.
@@ -79,12 +80,16 @@ Every call takes the follower token (`Authorization: Bearer <token>`) and record
 
 Errors:
 
-- **410:** the primary was restored into a new database. Copy again.
+- **410:** the primary was restored: into a new cluster, or into a database dropped and created again (the
+  `identity` sent is the config's `database_identity`; a bare system identifier is compared with the cluster's
+  alone). Copy again. The primary starts its
+  subscriptions again from then, by itself.
 - **409:** a cursor from before the dataset's copy started.
 - **404:** a dataset this follower doesn't follow.
 
-After restoring the primary from an older backup into the same database, which the primary can't detect,
-remove and re-add its followers, so each copies again.
+A restore into the same database without dropping it (`pg_restore --clean`) keeps the identity, so the primary
+can't detect it: remove and re-add its followers then, so each copies again. The documented restore drops and
+creates the database, which followers detect.
 
 ## On the follower
 
@@ -133,12 +138,14 @@ its last sync, and any error. The job's successful runs are pruned from the job 
 With a dataset's **tags** option both ways, tagging its mirror (the tag dialog, or `POST .../samples/bulk-tag` by ids,
 selection or filters) is made on the primary instead, for the same samples there, as the follower's account. A sync
 is queued at once, and the tags show on the mirror when it has run, within a minute. With tags from the primary
-only, tagging a mirror is refused.
+only, tagging a mirror is refused. The option covers `tags` only: the primary's other array fields stay read-only
+on a mirror, and the primary refuses them from a follower.
 
 With the **views** option both ways:
 
 - a view shared with everyone on the mirror (saved public, or shared later) is created on the primary as the
-  follower's account, marked `made_on` with the follower's name, and copied back at once;
+  follower's account, marked `made_on` with the follower's name, and copied back at once. Not one that uses a
+  concept: concepts belong to each instance, so it stays on the mirror, shared there;
 - deleting a copied view deletes it on the primary, which allows it only for views the follower made;
 - private views, and views shared with some users only, stay on the mirror.
 
@@ -148,11 +155,19 @@ both. Every other edit of a mirror (bulk set, rename, clear or delete) is refuse
 
 ### When it stops
 
-- The primary removes this follower, or revokes its token: every mirror of that primary stops.
+- The primary removes this follower, or revokes its token: every mirror of that primary stops. Only the primary's
+  own answer counts (it says which, with a code). Any other refusal, such as a proxy's 403 or a maintenance page,
+  is shown as the primary's last error and retried on the next sync.
 - The primary stops sharing a dataset: its mirror stops.
 - The primary was restored into a new database (410), or a mirror's cursor is too old (409): that mirror stops,
   and a new copy starts if the dataset is still shared.
 - Removing the primary here (Stop following) stops all its mirrors.
+
+A mirror whose sync fails, a vector field clash say, doesn't hold up the other mirrors of its primary: its error
+shows on the Primaries page, and it's tried again after a minute, waiting twice as long after each failure in a
+row, up to an hour. A clash comes from vector indexes being per field
+name over every dataset here: a field of this instance's indexed at another size than the primary's same-named
+field. The error names the field.
 
 A stopped mirror stays as a read-only copy, marked **no longer following**, to keep or delete. A mirror that's still
 following can't be deleted here: stop sharing it on the primary first.

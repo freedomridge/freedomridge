@@ -4,6 +4,36 @@ Freedom Ridge has one version for the server, the web app and the Python SDK (th
 file), following [Semantic Versioning](https://semver.org). A release lists **upgrade notes** when
 it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
 
+## Unreleased
+
+### Upgrade notes
+
+- One database migration, `0013_follower_restarts.sql`, applied with `scripts/apply_migrations.sh` (step 4
+  of [Upgrading](docs/UPGRADING.md)). Existing follower subscriptions keep their place.
+- A primary's identity now names its database too. Primaries and followers can be upgraded in either order, and
+  nothing is copied again: a follower before this release keeps following an upgraded primary (it detects
+  restores once it's upgraded too).
+
+### Fixed
+
+- **Followers: restores are detected, and their subscriptions start again.**
+  - A restore that drops and creates the database (as the AWS guide does) kept the cluster's identity, so
+    followers carried on from cursors into a database that no longer matched. Sample ids reused by the restore
+    could then put a follower's own data on other images. The identity is now the cluster's and the database's,
+    so they get a 410 and copy again.
+  - After a restore into a new cluster, a dataset's subscription waited forever on a start from the old
+    database. It now starts again on the primary's own, as does one whose start was never set.
+- **Followers: one mirror that fails no longer holds up the other mirrors of its primary.** Its error shows on the
+  Primaries page, and it's tried again after a minute, waiting twice as long after each failure in a row, up to an
+  hour. A vector field clash with a same-named field indexed at another
+  size here says which field.
+- **Followers: the `tags` option covers tags only.** A follower could change any array field of the primary's.
+- **Followers: a shared view that uses a concept stays on the instance that made it.** Sent to the primary, it
+  pointed at another concept there, or none, and the next sync then deleted it on the mirror.
+- **Followers: only the primary's own refusal stops the mirrors.** It now says, with a code, when the follower was
+  removed or its token deleted. Before, any 401 or 403, from a proxy say, stopped every mirror, and a new copy of
+  each started once the primary answered again.
+
 ## 2.6.0 (2026-11-09)
 
 2.6.0 lets a primary serve a followed dataset's images to its follower, an option off by default, and shows 16-bit

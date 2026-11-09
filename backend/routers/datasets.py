@@ -6931,9 +6931,16 @@ async def bulk_tag_samples(id: int, request: BulkTagRequest, user: dict = Depend
         if count != len(request.sample_ids):
             raise HTTPException(status_code=400, detail=f"Some samples not found in dataset {id}")
 
-    # A mirror's tags are its primary's: sent there when its tags option is both ways, refused otherwise.
+    # A mirror's tags are its primary's: sent there when its tags option is both ways, refused otherwise. Its other
+    # array fields are the primary's alone: the tags option covers tags only.
     if await db.fetchval('SELECT 1 FROM mirrors WHERE dataset_id = $1', id):
         from .. import mirror_writes
+
+        if request.field_name != 'tags':
+            raise HTTPException(
+                status_code=409,
+                detail=f"{request.field_name} of a mirror is its primary's: only tags go back to the primary",
+            )
 
         return await mirror_writes.forward_tags(db, id, request)
 

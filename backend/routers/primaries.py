@@ -41,7 +41,7 @@ async def add_primary(data: PrimaryCreate, user: dict = Depends(require_role('ad
             url,
             link['token_encrypted'],
             config['name'],
-            config['identity'],
+            follower_sync.primary_identity(config),
             user['id'],
         )
     except asyncpg.UniqueViolationError:
@@ -59,6 +59,7 @@ async def list_primaries(user: dict = Depends(require_role('admin'))):
         """SELECT m.link_id, m.dataset_id, d.name, m.origin_dataset_id, m.state, m.tags, m.views, m.images,
                   m.copy_total,
                   cardinality(m.copy_blocks) AS copy_left, m.concept_views, m.last_synced_at, m.last_error,
+                  m.retry_after,
                   (SELECT count(*) FROM mirror_samples s WHERE s.dataset_id = m.dataset_id) AS samples
            FROM mirrors m JOIN datasets d ON d.id = m.dataset_id
            ORDER BY d.name""",
