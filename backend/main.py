@@ -1,10 +1,12 @@
 # Trigger reload, embeddings, auth
 import asyncio
+import io
 import math
 import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from email.utils import parsedate_to_datetime
+from typing import Any
 
 import asyncpg
 from fastapi import Depends, FastAPI, HTTPException, Request
@@ -703,6 +705,38 @@ def _build_media_path_sql(field: str, versioned: bool = False) -> str:
     return f"SELECT dataset_id, {expr} AS path FROM {source} WHERE id = $1"
 
 
+_HIGH_BIT_DEPTH_SUFFIXES = (".png", ".tif", ".tiff")
+
+
+async def _is_high_bit_depth(dataset_id: int, path: str) -> bool:
+    """Whether a PNG or TIFF holds one channel wider than 8 bits, from its header. An S3 one is fetched into the
+    media cache, which the full view then serves from."""
+    if not path.lower().endswith(_HIGH_BIT_DEPTH_SUFFIXES):
+        return False
+    if path.startswith("s3://"):
+        body, _ = await _fetch_media_bytes(dataset_id, path)
+        source: Any = io.BytesIO(body)
+    else:
+        source = _resolve_local_path(path)
+        if not os.path.exists(source):
+            return False  # the full view answers 404
+
+    def mode() -> str:
+        from PIL import Image
+
+        with Image.open(source) as image:
+            return image.mode
+
+    from PIL import UnidentifiedImageError
+
+    from .image_modes import is_high_bit_depth
+
+    try:
+        return is_high_bit_depth(await asyncio.to_thread(mode))
+    except (UnidentifiedImageError, OSError):
+        return False  # not an image Pillow reads: served as it is, as before
+
+
 async def _fetch_media_bytes(dataset_id: int, path: str) -> tuple[bytes, str]:
     """Fetch the raw bytes for a resolved media path.
 
@@ -1072,7 +1106,9 @@ async def _serve_crop_resize(
 
         from PIL import Image
 
-        img = Image.open(_io.BytesIO(body)).convert("RGB")
+        from .image_modes import to_rgb
+
+        img = to_rgb(Image.open(_io.BytesIO(body)))
         if bbox is not None:
             img = img.crop(bbox)
         if width is not None and img.width > width:
@@ -1174,6 +1210,20 @@ async def serve_sample_media(
     # local/S3 source and are rejected by _serve_crop_resize below.
     if path.startswith(('http://', 'https://')) and crop is None:
         return RedirectResponse(url=path)
+
+    # A sample's own image in 16 bits or float (a multispectral band, a thermal frame): a browser shows a 16-bit
+    # PNG by its top 8 bits, too dark for a 12-bit sensor, and most can't show a TIFF. Its full view is converted
+    # as its thumbnails are (image_modes.to_rgb). Other media fields (masks, heatmaps) keep their raw values.
+    if crop is None and w is None and field == "filepath" and await _is_high_bit_depth(dataset_id, path):
+        return await _serve_crop_resize(
+            sample_id=sample_id,
+            dataset_id=dataset_id,
+            path=path,
+            field=field,
+            crop=None,
+            width=None,
+            version_id=version_id,
+        )
 
     if crop is not None or w is not None:
         # Crop/resize branch: derive a JPEG (per-object crop and/or a thumbnail)

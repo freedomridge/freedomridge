@@ -133,6 +133,8 @@ def test_the_default_loader_reads_any_path_but_s3_as_a_local_file(monkeypatch):
     opened = []
 
     class Opened:
+        mode = 'L'  # an 8-bit image: the loader's to_rgb goes straight to convert('RGB')
+
         def __enter__(self):
             return self
 
