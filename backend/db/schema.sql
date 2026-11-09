@@ -2548,7 +2548,8 @@ CREATE TABLE IF NOT EXISTS followers (
     token_id INTEGER REFERENCES api_tokens(id) ON DELETE SET NULL,
     created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    last_seen_at TIMESTAMPTZ
+    last_seen_at TIMESTAMPTZ,
+    instance TEXT  -- the installation id of the instance its token belongs to: the first that used it (0014)
 );
 
 CREATE TABLE IF NOT EXISTS follower_datasets (
@@ -2581,6 +2582,15 @@ CREATE TRIGGER follower_datasets_followed_insert AFTER INSERT ON follower_datase
     FOR EACH STATEMENT EXECUTE FUNCTION sync_dataset_followed();
 CREATE TRIGGER follower_datasets_followed_delete AFTER DELETE ON follower_datasets REFERENCING OLD TABLE AS changed
     FOR EACH STATEMENT EXECUTE FUNCTION sync_dataset_followed();
+
+-- This installation's id, made once (0014): a follower sends it with each call, and its primary binds the
+-- follower's token to the first that used it. A dump carries it, so a follower restored or moved to another server is
+-- still the same instance, while two installations differ.
+CREATE TABLE IF NOT EXISTS installation (
+    singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
+    id UUID NOT NULL DEFAULT gen_random_uuid()
+);
+INSERT INTO installation DEFAULT VALUES ON CONFLICT DO NOTHING;
 
 -- A follower's side (0009, docs/FOLLOWERS.md): the primaries it follows and its read-only mirrors of their
 -- datasets. Only the sync job, with fridge.mirror_sync set to the mirror's dataset id, changes what came from
@@ -2814,5 +2824,6 @@ INSERT INTO schema_migrations (filename) VALUES
     ('0010_compute_launcher.sql'),
     ('0011_compute_launcher_arm.sql'),
     ('0012_follower_images.sql'),
-    ('0013_follower_restarts.sql')
+    ('0013_follower_restarts.sql'),
+    ('0014_follower_instance.sql')
 ON CONFLICT (filename) DO NOTHING;

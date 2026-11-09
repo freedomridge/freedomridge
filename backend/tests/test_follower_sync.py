@@ -4,7 +4,8 @@ client bound to the app), then applies the primary's feed to it."""
 
 import io
 import os
-from unittest.mock import AsyncMock
+import uuid
+from unittest.mock import AsyncMock, Mock
 
 import asyncpg
 import httpx
@@ -16,6 +17,7 @@ from backend import follower_sync
 from backend.crypto import decrypt_secret, encrypt_secret
 from backend.models import ViewCreate
 from backend.routers import auth, datasets, followers, primaries, schedules, views
+from backend.tests import test_bulk_jobs
 from backend.tests import test_field_registry_postgres as registry_helpers
 
 registry_database = registry_helpers.registry_database
@@ -43,12 +45,11 @@ async def setup(monkeypatch, database):
         encrypt_secret(created['token']),
     )
 
-    def connect(link):
-        return httpx.AsyncClient(
-            transport=httpx.ASGITransport(app=app),
-            base_url=link['url'],
-            headers={'Authorization': f"Bearer {decrypt_secret(link['token_encrypted'])}"},
-        )
+    def connect(link, instance=None):
+        headers = {'Authorization': f"Bearer {decrypt_secret(link['token_encrypted'])}"}
+        if instance:
+            headers['X-Fridge-Instance'] = instance
+        return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=link['url'], headers=headers)
 
     monkeypatch.setattr(follower_sync, 'connect', connect)
     return created, link_id
@@ -540,9 +541,9 @@ def test_a_mirror_shows_the_images_its_primary_serves_when_their_option_is_on(mo
         requests = []
         connect = follower_sync.connect
 
-        def counted(link):
+        def counted(link, instance=None):
             requests.append(link)
-            return connect(link)
+            return connect(link, instance)
 
         monkeypatch.setattr(follower_sync, 'connect', counted)
         main._primary_clients.clear()
@@ -758,7 +759,10 @@ def test_only_a_final_refusal_stops_the_mirrors(monkeypatch, registry_database):
         monkeypatch.setattr(follower_sync, 'call', call)
         await database.execute('DELETE FROM followers')  # removed there
         with pytest.raises(HTTPException) as removed:
-            await followers.current_follower(account={'id': await database.fetchval('SELECT id FROM users LIMIT 1')})
+            await followers.current_follower(
+                Mock(headers={}),
+                account={'id': await database.fetchval('SELECT id FROM users LIMIT 1')},
+            )
         assert removed.value.status_code == 403 and getattr(removed.value, 'code', None) == 'follower_removed'
 
     registry_database(scenario)
@@ -812,8 +816,129 @@ async def test_a_vector_field_clash_says_which_field_and_why(monkeypatch):
         async def copy_to_table(self, *args, **kwargs):
             pass
 
+        async def fetchval(self, sql, *args):
+            return []  # no field of this instance's under that name
+
     monkeypatch.setattr(follower_sync, 'require_free_space', AsyncMock())
     monkeypatch.setattr(follower_sync, 'clear_placement', AsyncMock())
     with pytest.raises(follower_sync.MirrorFieldClash) as clash:
         await follower_sync.write_vectors(Connection(), 5, [(1, 'clip')], {'clip': [(1, [0.5, 0.25])]})
     assert "vector field 'clip' has 2 dimensions" in str(clash.value) and 'expected 768' in str(clash.value)
+
+
+def test_a_primary_field_replaces_all_of_a_same_named_field_the_mirror_had(monkeypatch, registry_database):
+    async def scenario(database):
+        _, link_id = await setup(monkeypatch, database)
+        await ingest([{'crop': 'corn'}, {'crop': 'soy'}], dataset_id=1, prefix='s3://images/a')
+        corn, soy = [r['id'] for r in await database.fetch('SELECT id FROM samples WHERE dataset_id = 1 ORDER BY id')]
+        follower = await database.fetchval('SELECT id FROM followers')
+        await followers.follow_dataset(follower, 1, followers.FollowOptions(), user=USER)
+        await sync(database, link_id)
+        mirror = (await mirror_of(database))['dataset_id']
+        local = {row['origin_id']: row['id'] for row in (await copied(database, {'dataset_id': mirror})).values()}
+        # This instance's own vectors and map, on both samples, under a name the primary doesn't have yet.
+        await database.execute(
+            "INSERT INTO embeddings (sample_id, field_name, vector) "
+            "VALUES ($1, 'dino', '[9,9]'), ($2, 'dino', '[8,8]'), ($2, 'dino_patch_2x2_r0c0', '[7,7]')",
+            local[corn],
+            local[soy],
+        )
+        # A patch map is kept under its scale's name.
+        await database.execute(
+            "INSERT INTO embedding_viz_meta (dataset_id, field_name, total_points) "
+            "VALUES ($1, 'dino', 2), ($1, 'dino_patch_2x2', 1)",
+            mirror,
+        )
+
+        # The primary makes a field of that name, on one sample: all of the mirror's own goes, its map too.
+        await database.execute(
+            "INSERT INTO embeddings (sample_id, field_name, vector) "
+            "VALUES ($1, 'dino', '[1,0]'), ($1, 'dino_patch_2x2_r0c0', '[0,1]')",
+            corn,
+        )
+        await sync(database, link_id)
+        rows = {
+            row['sample_id']: row['vector']
+            for row in await database.fetch(
+                "SELECT sample_id, vector::text FROM embeddings "
+                "WHERE field_name = 'dino' AND sample_id = ANY($1::int[])",
+                [local[corn], local[soy]],
+            )
+        }
+        assert rows == {local[corn]: '[1,0]'}  # soy's own vector didn't stay beside the primary's field
+        assert 'dino' in (await mirror_of(database))['vector_fields']
+        assert not await database.fetchval(
+            "SELECT 1 FROM embedding_viz_meta WHERE dataset_id = $1 AND field_name IN ('dino', 'dino_patch_2x2')",
+            mirror,
+        )
+
+    registry_database(scenario)
+
+
+def test_a_mirror_s_own_vectors_can_be_deleted_and_the_primary_s_cannot(monkeypatch, registry_database):
+    async def scenario(database):
+        _, link_id = await setup(monkeypatch, database)
+        monkeypatch.setattr(datasets, 'db', database)
+        await ingest([{'crop': 'corn'}], dataset_id=1, prefix='s3://images/a')
+        corn = await database.fetchval('SELECT id FROM samples WHERE dataset_id = 1')
+        await database.execute(
+            "INSERT INTO embeddings (sample_id, field_name, vector) VALUES ($1, 'clip', '[1,0]')",
+            corn,
+        )
+        follower = await database.fetchval('SELECT id FROM followers')
+        await followers.follow_dataset(follower, 1, followers.FollowOptions(), user=USER)
+        await sync(database, link_id)
+        mirror = (await mirror_of(database))['dataset_id']
+        local = await database.fetchval('SELECT id FROM samples WHERE dataset_id = $1', mirror)
+        await database.execute(
+            "INSERT INTO embeddings (sample_id, field_name, vector) VALUES ($1, 'patches', '[0,1]')",
+            local,
+        )
+        everything = datasets.BulkTargetRequest(filters={})
+        submitted = await datasets.bulk_delete_embeddings(mirror, 'patches', everything, user=USER)
+        assert submitted.status_code == 202  # this instance's own field
+        assert (await test_bulk_jobs.finish(database))['result'] == {'deleted': 1}
+        fields = 'SELECT array_agg(field_name ORDER BY field_name) FROM embeddings WHERE sample_id = $1'
+        assert await database.fetchval(fields, local) == ['clip']  # the primary's field is untouched
+        with pytest.raises(HTTPException) as theirs:
+            await datasets.bulk_delete_embeddings(mirror, 'clip', everything, user=USER)
+        assert theirs.value.status_code == 409 and 'comes from its primary' in theirs.value.detail
+
+    registry_database(scenario)
+
+
+def test_one_link_per_primary_and_one_instance_per_follower_token(monkeypatch, registry_database):
+    async def scenario(database):
+        created, link_id = await setup(monkeypatch, database)
+        monkeypatch.setattr(primaries, 'db', database)
+        await sync(database, link_id)  # records the primary's identity, as adding it does
+        # The same primary under another address: refused, by its identity.
+        with pytest.raises(HTTPException) as again:
+            await primaries.add_primary(
+                primaries.PrimaryCreate(url='http://primary-by-another-name.example/api', token=created['token']),
+                user=USER,
+            )
+        assert again.value.status_code == 409 and 'already follows that primary' in again.value.detail
+
+        # The primary bound the token to the first instance that used it: this one, by its installation id, which
+        # a dump carries (a restored or moved follower is the same instance).
+        this = await follower_sync.installation_id(database)
+        assert await database.fetchval('SELECT instance FROM followers') == this
+        account = {'id': await database.fetchval('SELECT user_id FROM followers')}
+        await followers.current_follower(Mock(headers={'X-Fridge-Instance': this}), account=account)
+        await followers.current_follower(Mock(headers={}), account=account)  # an older follower: not checked
+        reinstalled = str(uuid.uuid4())
+        with pytest.raises(HTTPException) as other:
+            await followers.current_follower(Mock(headers={'X-Fridge-Instance': reinstalled}), account=account)
+        assert other.value.status_code == 409 and getattr(other.value, 'code', None) == 'follower_instance_mismatch'
+        assert await database.fetchval('SELECT instance FROM followers') == this
+
+        # Reinstalled from scratch: an admin there resets it, and the next installation that calls takes it.
+        monkeypatch.setattr(followers, 'db', database)
+        [listed] = await followers.list_followers(user=USER)
+        assert listed['bound']
+        await followers.reset_follower_instance(listed['id'], user=USER)
+        await followers.current_follower(Mock(headers={'X-Fridge-Instance': reinstalled}), account=account)
+        assert await database.fetchval('SELECT instance FROM followers') == reinstalled
+
+    registry_database(scenario)

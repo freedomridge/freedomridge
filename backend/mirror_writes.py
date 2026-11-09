@@ -80,7 +80,7 @@ async def forward_tags(source, dataset_id: int, request) -> dict:
     )
     origin_ids = [row['origin_id'] for row in rows]
     updated = queued = skipped = 0
-    async with follower_sync.connect(mirror) as client:
+    async with follower_sync.connect(mirror, await follower_sync.installation_id(source)) as client:
         for start in range(0, len(origin_ids), followers.TAG_SAMPLES):
             chunk = origin_ids[start : start + followers.TAG_SAMPLES]
             try:
@@ -134,7 +134,7 @@ async def forward_view(source, dataset_id: int, view, user: dict):
             named,
         )
     }
-    async with follower_sync.connect(mirror) as client:
+    async with follower_sync.connect(mirror, await follower_sync.installation_id(source)) as client:
         created = await send(
             client,
             mirror,
@@ -189,7 +189,7 @@ async def forward_view_deletion(source, view_id: int):
     mirror = await mirror_of(source, mapped['dataset_id'])
     assert mirror is not None
     require_both_ways(mirror, 'views', 'shared views')
-    async with follower_sync.connect(mirror) as client:
+    async with follower_sync.connect(mirror, await follower_sync.installation_id(source)) as client:
         await send(
             client,
             mirror,

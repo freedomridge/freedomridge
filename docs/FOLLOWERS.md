@@ -95,7 +95,12 @@ creates the database, which followers detect.
 
 An admin adds the primary under **Settings → Primaries**, with its API address (`https://primary.example.com/api`)
 and the follower token. The token is checked against the primary before it's saved, and stored encrypted with
-`STORAGE_ENCRYPTION_KEY`.
+`STORAGE_ENCRYPTION_KEY`. An instance follows a primary once: a second address for the same primary (its LAN
+address and a Tailscale name, say) is refused, since both would share one subscription there. The primary, for its
+part, binds a follower's token to the first instance that uses it, by that instance's installation id (made once,
+in its database), and refuses the token from another (409). A follower restored from a dump or moved to another
+server keeps its installation id. One reinstalled from scratch gets a new one: **Reset instance** on the primary's
+Followers page lets the next installation that calls take the token over.
 
 The job runner then syncs once a minute (`FOLLOWER_SYNC_SECONDS`, default 60). Each sync is one background job per
 primary that resumes where it stopped:
@@ -117,8 +122,10 @@ its last sync, and any error. The job's successful runs are pruned from the job 
   change to them with "read-only mirror"; only the sync writes them. A dataset page shows a "Mirror of <host>"
   badge, and tagging is off.
 - **This instance's own:** vector fields only it has (patch vectors imported here, say) and their maps,
-  statistics, indexes (`is_promoted`), concepts, access grants, storage, and views made here. If the primary later sends a vector
-  field of the same name as one only this instance had, the primary's replaces it.
+  statistics, indexes (`is_promoted`), concepts, access grants, storage, and views made here. This instance's own
+  vector fields can be deleted here (`POST /api/datasets/{id}/embeddings/{field}/delete`); the primary's can't. If the
+  primary later sends a vector or hash field of the same name as one only this instance had, the primary's replaces
+  it, all of it at once, with this instance's map of it: none of this instance's values stay beside the primary's.
 - **Sample ids** differ between the two. The sync keeps the mapping, translates an object sample's `parent_id`
   (null until its parent arrives), and translates the sample ids in a shared view's filters (a brushed
   selection). A sample that isn't here matches nothing.

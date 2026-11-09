@@ -11,6 +11,7 @@ import base64
 import copy
 import io
 import logging
+import re
 import struct
 from urllib.parse import urlparse
 
@@ -53,6 +54,7 @@ SAMPLE_COLUMNS = (
 )
 COPIED = ('filepath', 'media_type', 'tags', 'metadata', 'heading', 'created_at', 'last_modified_at')
 CONCEPT_OPERATORS = ('concept_select', 'concept_exclude')
+PATCH_TILE = re.compile(r'(_patch_\d+x\d+)_r\d+c\d+$')  # a patch tile's field name, and its scale's
 
 
 class PrimaryUnavailable(job_queue.QueueBusy):
@@ -70,13 +72,18 @@ class PrimaryRefused(Exception):
 FINAL_REFUSALS = ('follower_removed', 'follower_token_invalid')
 
 
-def connect(link) -> httpx.AsyncClient:
-    """A client for the primary's API; tests bind one to the app instead."""
-    return httpx.AsyncClient(
-        base_url=link['url'].rstrip('/'),
-        headers={'Authorization': f"Bearer {decrypt_secret(link['token_encrypted'])}"},
-        timeout=REQUEST_SECONDS,
-    )
+def connect(link, instance: str | None = None) -> httpx.AsyncClient:
+    """A client for the primary's API, saying which instance this is (the primary binds a follower's token to the
+    first that uses it); tests bind one to the app instead."""
+    headers = {'Authorization': f"Bearer {decrypt_secret(link['token_encrypted'])}"}
+    if instance:
+        headers['X-Fridge-Instance'] = instance
+    return httpx.AsyncClient(base_url=link['url'].rstrip('/'), headers=headers, timeout=REQUEST_SECONDS)
+
+
+async def installation_id(source) -> str:
+    """This installation's id, which a primary binds this instance's follower token to."""
+    return str(await source.fetchval('SELECT id FROM installation'))
 
 
 def _detail(response) -> str:
@@ -401,6 +408,7 @@ async def write_samples(connection, dataset_id: int, blocks: list, data: dict) -
 async def write_hashes(connection, dataset_id: int, present: list, hashes: list) -> None:
     """The primary's hashes of these samples; hash fields only this instance has are left alone."""
     fields = sorted({row['field_name'] for row in hashes})
+    await supersede(connection, dataset_id, 'hash_fields', fields, ('sample_hashes',))
     await connection.execute(
         """UPDATE mirrors SET hash_fields = ARRAY(SELECT DISTINCT unnest(hash_fields || $2::text[]) ORDER BY 1)
            WHERE dataset_id = $1 AND NOT ($2::text[] <@ hash_fields)""",
@@ -437,7 +445,14 @@ async def write_hashes(connection, dataset_id: int, present: list, hashes: list)
 
 async def write_vectors(connection, dataset_id: int, named: list, vectors: dict) -> None:
     """The primary's vectors of the (origin sample, field) pairs named: upsert what came, delete what didn't. A field
-    this instance had on its own becomes the primary's once the primary sends one of that name."""
+    this instance had on its own becomes the primary's once the primary sends one of that name: all of it, at once."""
+    await supersede(
+        connection,
+        dataset_id,
+        'vector_fields',
+        sorted(vectors),
+        ('embeddings', 'map_state_rows'),
+    )
     await connection.execute(
         """UPDATE mirrors SET vector_fields = ARRAY(SELECT DISTINCT unnest(vector_fields || $2::text[]) ORDER BY 1)
            WHERE dataset_id = $1 AND NOT ($2::text[] <@ vector_fields)""",
@@ -492,6 +507,44 @@ async def write_vectors(connection, dataset_id: int, named: list, vectors: dict)
                     "instance: rename this instance's field, or drop its index, and the mirror catches up.",
                 ) from error
     await clear_placement(connection, dataset_id, sorted({sample_id for sample_id, _ in named}))
+
+
+async def supersede(connection, dataset_id: int, column: str, fields: list, what: tuple) -> None:
+    """Fields arriving from the primary that this instance had on its own, under the same name: the primary's
+    replace them (docs/FOLLOWERS.md). Every row of this instance's goes now, not only those of the samples this page
+    names, or the field would hold two sources, the leftovers read-only. The primary's own rows come with the copy
+    and the feed. The mirror's map of such a vector field goes too: it was of the other vectors. Its coordinates and
+    pending placements go with the vectors."""
+    arriving = await connection.fetchval(
+        f'SELECT ARRAY(SELECT unnest($2::text[]) EXCEPT SELECT unnest({column})) FROM mirrors WHERE dataset_id = $1',
+        dataset_id,
+        fields,
+    )
+    if not arriving:
+        return
+    if 'embeddings' in what:
+        await connection.execute(
+            """DELETE FROM embeddings e USING mirror_samples m
+               WHERE m.dataset_id = $1 AND e.sample_id = m.sample_id AND e.field_name = ANY($2::text[])""",
+            dataset_id,
+            arriving,
+        )
+    if 'map_state_rows' in what:
+        # A patch map is kept under its scale's name (clip_patch_4x4), not its tiles' (clip_patch_4x4_r0c0).
+        maps = sorted({*arriving, *(PATCH_TILE.sub(r'\1', field) for field in arriving)})
+        for table in ('embedding_viz_rank', 'embedding_viz_meta', 'embedding_map_state'):
+            await connection.execute(
+                f'DELETE FROM {table} WHERE dataset_id = $1 AND field_name = ANY($2::text[])',
+                dataset_id,
+                maps,
+            )
+    if 'sample_hashes' in what:
+        await connection.execute(
+            """DELETE FROM sample_hashes h USING mirror_samples m
+               WHERE m.dataset_id = $1 AND h.sample_id = m.sample_id AND h.field_name = ANY($2::text[])""",
+            dataset_id,
+            arriving,
+        )
 
 
 async def clear_placement(connection, dataset_id: int, origin_ids: list) -> None:
@@ -1087,7 +1140,7 @@ def handler(pool):
         if link is None:
             return StepResult(finished=True, message='This primary was removed here')
         checkpoint = dict(job['checkpoint'])
-        async with connect(link) as client:
+        async with connect(link, await installation_id(pool)) as client:
             try:
                 if not checkpoint.get('configured'):
                     return await configure(pool, link, client, checkpoint)

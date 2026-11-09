@@ -6790,7 +6790,16 @@ class BulkTargetRequest(BaseModel):
 async def _bulk_response(id, user, operation, payload):
     from .. import bulk_jobs
 
-    if await db.fetchval('SELECT 1 FROM mirrors WHERE dataset_id = $1', id):
+    mirror = await db.fetchrow('SELECT vector_fields FROM mirrors WHERE dataset_id = $1', id)
+    # A mirror's own vector fields (patch vectors imported here, say) are this instance's to delete; the database
+    # refuses the primary's anyway. Everything else of a mirror is the primary's.
+    own_vectors = operation == 'delete_embeddings' and mirror is not None
+    if own_vectors and payload['field_name'] in mirror['vector_fields']:
+        raise HTTPException(
+            status_code=409,
+            detail=f"{payload['field_name']} of this mirror comes from its primary: delete it there",
+        )
+    if mirror is not None and not own_vectors:
         raise HTTPException(
             status_code=409,
             detail='This dataset is a read-only mirror of a dataset on another Freedom Ridge instance: change it there',

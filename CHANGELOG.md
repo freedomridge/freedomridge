@@ -8,8 +8,9 @@ it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
 
 ### Upgrade notes
 
-- One database migration, `0013_follower_restarts.sql`, applied with `scripts/apply_migrations.sh` (step 4
-  of [Upgrading](docs/UPGRADING.md)). Existing follower subscriptions keep their place.
+- Two database migrations, `0013_follower_restarts.sql` and `0014_follower_instance.sql`, applied with
+  `scripts/apply_migrations.sh` (step 4 of [Upgrading](docs/UPGRADING.md)). Existing follower subscriptions keep
+  their place.
 - A primary's identity now names its database too. Primaries and followers can be upgraded in either order, and
   nothing is copied again: a follower before this release keeps following an upgraded primary (it detects
   restores once it's upgraded too).
@@ -30,6 +31,18 @@ it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
 - **Followers: the `tags` option covers tags only.** A follower could change any array field of the primary's.
 - **Followers: a shared view that uses a concept stays on the instance that made it.** Sent to the primary, it
   pointed at another concept there, or none, and the next sync then deleted it on the mirror.
+- **Followers: a primary field that takes the name of one of the mirror's own replaces all of it at once,** its map
+  too, for vector and hash fields. Before, the mirror's own values stayed on the samples the feed hadn't named yet,
+  one field mixing two models, and those were then read-only.
+- **Followers: a mirror's own vector fields can be deleted** (patch vectors imported there, say). Every delete on a
+  mirror was refused.
+- **Followers: one subscription, one follower instance.**
+  - An instance refuses a second link to a primary it follows under another address.
+  - The primary binds a follower's token to the first instance that uses it (by an installation id that a dump
+    carries, so a restored or moved follower is still the same instance), and refuses it from another. **Reset
+    instance** on the Followers page hands the token to a follower reinstalled from scratch.
+  - Two instances on one subscription shared its acknowledgements, so the faster one's pruned changes the other
+    hadn't read.
 - **Followers: only the primary's own refusal stops the mirrors.** It now says, with a code, when the follower was
   removed or its token deleted. Before, any 401 or 403, from a proxy say, stopped every mirror, and a new copy of
   each started once the primary answered again.

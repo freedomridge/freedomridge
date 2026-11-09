@@ -179,7 +179,7 @@ async def list_followers(user: dict = Depends(require_role('admin'))):
     """Every follower with its datasets and options, when it last checked in (stale after STALE_DAYS) and the log
     rows the primary keeps for it."""
     followers = await db.fetch(
-        f"""SELECT id, name, created_at, last_seen_at,
+        f"""SELECT id, name, created_at, last_seen_at, instance IS NOT NULL AS bound,
                    last_seen_at IS NULL OR last_seen_at < now() - interval '{STALE_DAYS} days' AS stale
             FROM followers ORDER BY name""",
     )
@@ -271,6 +271,16 @@ async def unfollow_dataset(follower_id: int, dataset_id: int, user: dict = Depen
     return {'unfollowed': dataset_id}
 
 
+@router.post('/followers/{follower_id}/reset-instance')
+async def reset_follower_instance(follower_id: int, user: dict = Depends(require_role('admin'))):
+    """Let the follower's token be used by another installation: the next one that calls takes it. For a follower
+    reinstalled from scratch (a new installation id) that should carry on, without removing it and copying again."""
+    name = await db.fetchval('UPDATE followers SET instance = NULL WHERE id = $1 RETURNING name', follower_id)
+    if name is None:
+        raise HTTPException(status_code=404, detail='No such follower')
+    return {'reset': name}
+
+
 @router.delete('/followers/{follower_id}')
 async def remove_follower(follower_id: int, user: dict = Depends(require_role('admin'))):
     """Remove a follower: everything the primary keeps for it. Its token stops working, its log rows go, and a
@@ -305,9 +315,23 @@ async def remove_follower(follower_id: int, user: dict = Depends(require_role('a
 # --- The follower's own endpoints ------------------------------------------------------------------------------
 
 
-async def current_follower(account: dict = Depends(get_follower_user)) -> dict:
-    """The follower behind the token, stamped as seen now."""
-    row = await db.fetchrow('UPDATE followers SET last_seen_at = now() WHERE user_id = $1 RETURNING *', account['id'])
+async def current_follower(request: Request, account: dict = Depends(get_follower_user)) -> dict:
+    """The follower behind the token, stamped as seen now. Its token belongs to the first follower instance that used
+    it, by the installation id it sends (X-Fridge-Instance; a follower before 2.6.1 sends none and isn't checked)."""
+    instance = request.headers.get('X-Fridge-Instance') or None
+    row = await db.fetchrow(
+        'UPDATE followers SET last_seen_at = now(), instance = COALESCE(instance, $2) WHERE user_id = $1 RETURNING *',
+        account['id'],
+        instance,
+    )
+    if row is not None and instance and row['instance'] != instance:
+        raise CodedHTTPException(
+            409,
+            "This follower's token is in use by another Freedom Ridge instance: each instance needs a follower of its "
+            'own. If this instance was reinstalled, an admin on the primary can reset the follower on its Followers '
+            'page',
+            'follower_instance_mismatch',
+        )
     if row is None:
         # The code tells the follower this is final: it stops its mirrors (other refusals may pass).
         raise CodedHTTPException(403, 'This follower has been removed on the primary', 'follower_removed')
