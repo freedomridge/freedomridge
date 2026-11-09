@@ -30,7 +30,7 @@
 #
 # The steps follow ci.yml. When ci.yml changes, update them to match and set CI_YML_SHA256 to its
 # `sha256sum`; a run stops while the two disagree.
-CI_YML_SHA256=e9514e068d4628e91d45f4bece2bc396792fabd8a0ccbbcb90c42f6d0bbf9530
+CI_YML_SHA256=c12b9afc933c66a98809e6cb81d3ee50dbd533a1ca0b5db126560b2a0b89d885
 set -u
 
 JOBS=${2:-lint,example-tests,backend-tests,db-recovery,frontend,quality,e2e}
@@ -283,7 +283,7 @@ if want frontend; then
   result "frontend tsc" $?
   (cd frontend && node --test tests/*.test.cjs) > "$L/frontend-unit.log" 2>&1
   result "frontend unit tests" $?
-  (cd launcher && node --test test/ && npm pack --dry-run) > "$L/launcher.log" 2>&1
+  (cd launcher && node --test test/ && mkdir -p "$L/launcher-pack" && npm pack --pack-destination "$L/launcher-pack") > "$L/launcher.log" 2>&1
   result "launcher tests and package" $?
 fi
 if want frontend || want e2e; then
