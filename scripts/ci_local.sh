@@ -16,7 +16,8 @@
 #                    80NN and 30NN (default 93). Give runs at the same time different values.
 #   NODE_BIN         a directory to put first on PATH, for the Node major version that ci.yml sets up.
 #   MAPBOX_ENV_FILE  an .env file with NEXT_PUBLIC_MAPBOX_TOKEN, so the map e2e test runs instead of
-#                    skipping itself. The token goes only into this run's frontend build.
+#                    skipping itself. The token goes only into this run's frontend build. Its URL
+#                    restrictions must allow localhost; an e2e run checks a map tile first.
 #   BACKEND_TESTS    pytest arguments to run instead of the whole backend suite (skips the SDK suites).
 #   E2E_SPECS        Playwright spec files to run instead of the whole e2e suite.
 #
@@ -96,6 +97,17 @@ fi
 if [ -n "${MAPBOX_ENV_FILE:-}" ]; then
   NEXT_PUBLIC_MAPBOX_TOKEN=$(sed -n 's/^NEXT_PUBLIC_MAPBOX_TOKEN=//p' "$MAPBOX_ENV_FILE" | head -1 | tr -d "\"'")
   export NEXT_PUBLIC_MAPBOX_TOKEN
+  # A token's URL restrictions apply to map tiles, not to the style. When every tile is refused, the map
+  # often never asks for its points and the map e2e tests fail now and then (a quarter of the runs).
+  if want e2e; then
+    tile=$(curl -s -o /dev/null -w '%{http_code}' -H "Referer: http://localhost:$FEPORT/" \
+      "https://api.mapbox.com/v4/mapbox.mapbox-streets-v8/0/0/0.vector.pbf?access_token=$NEXT_PUBLIC_MAPBOX_TOKEN")
+    if [ "$tile" != 200 ]; then
+      echo "Mapbox answers $tile for a map tile on http://localhost:$FEPORT with the token in $MAPBOX_ENV_FILE." >&2
+      echo "Use a token whose URL restrictions allow localhost, or leave MAPBOX_ENV_FILE unset." >&2
+      exit 2
+    fi
+  fi
 fi
 
 unset PYTHONPATH
