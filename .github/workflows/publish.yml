@@ -83,6 +83,9 @@ jobs:
           name: sdk
           path: dist/
       - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086  # v1.14.3
+        with:
+          # A run started by hand for a tag PyPI already has (to publish the launcher) passes here.
+          skip-existing: true
 
   publish-npm:
     needs: build
@@ -104,4 +107,5 @@ jobs:
       - name: Publish (trusted publishing needs npm 11.5.1 or newer)
         run: |
           npm --version
-          npm publish dist-npm/freedomridge-*.tgz --access public
+          # ./ makes it a file: npm reads dist-npm/x.tgz as a GitHub repository (owner/repo).
+          npm publish ./dist-npm/freedomridge-*.tgz --access public
