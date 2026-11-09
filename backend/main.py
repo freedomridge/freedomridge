@@ -27,6 +27,7 @@ from .routers import (
     datasets,
     embeddings,
     filter_query,
+    followers,
     hashes,
     index_advisor,
     jobs,
@@ -248,6 +249,7 @@ app.include_router(backup_settings.router, prefix="/api")
 app.include_router(schedules.router, prefix="/api")
 app.include_router(index_advisor.router, prefix="/api")
 app.include_router(workers.router, prefix="/api")
+app.include_router(followers.router, prefix="/api")
 
 
 @app.get("/api/health")

@@ -671,7 +671,8 @@ CREATE TABLE IF NOT EXISTS api_tokens (
     expires_at TIMESTAMP,
     is_active BOOLEAN DEFAULT TRUE,
     -- 'worker': a compute worker's token, which only the worker endpoints accept (routers/workers.py).
-    scope TEXT NOT NULL DEFAULT 'full' CONSTRAINT api_tokens_scope_check CHECK (scope IN ('full', 'worker'))
+    -- 'follower': a follower instance's token, which only the follower endpoints accept (routers/followers.py).
+    scope TEXT NOT NULL DEFAULT 'full' CONSTRAINT api_tokens_scope_check CHECK (scope IN ('full', 'worker', 'follower'))
 );
 
 CREATE INDEX IF NOT EXISTS idx_api_tokens_token ON api_tokens(token);
@@ -2521,6 +2522,46 @@ CREATE TRIGGER views_log_delete AFTER DELETE ON views REFERENCING OLD TABLE AS c
 CREATE TRIGGER datasets_log_settings AFTER UPDATE OR DELETE ON datasets
     FOR EACH ROW EXECUTE FUNCTION log_dataset_settings();
 
+-- Follower instances and what they follow (migration 0008): see routers/followers.py.
+CREATE TABLE IF NOT EXISTS followers (
+    id SERIAL PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE CHECK (name ~ '^[a-z0-9][a-z0-9-]{0,62}$'),
+    user_id INTEGER NOT NULL REFERENCES users(id),
+    token_id INTEGER REFERENCES api_tokens(id) ON DELETE SET NULL,
+    created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_seen_at TIMESTAMPTZ
+);
+
+CREATE TABLE IF NOT EXISTS follower_datasets (
+    follower_id INTEGER NOT NULL REFERENCES followers(id) ON DELETE CASCADE,
+    dataset_id INTEGER NOT NULL REFERENCES datasets(id) ON DELETE CASCADE,
+    tags TEXT NOT NULL DEFAULT 'primary' CHECK (tags IN ('primary', 'both')),
+    views TEXT NOT NULL DEFAULT 'primary' CHECK (views IN ('primary', 'both')),
+    -- Set just after the subscription commits: changes from transactions at or after it are in the log, and the
+    -- follower's full copy starts once every earlier one has ended (a write in flight when the dataset became
+    -- followed may not have seen the flag). NULL until then.
+    start_txid BIGINT,
+    acked_txid BIGINT,
+    subscribed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (follower_id, dataset_id)
+);
+CREATE INDEX IF NOT EXISTS follower_datasets_dataset ON follower_datasets (dataset_id);
+
+CREATE OR REPLACE FUNCTION sync_dataset_followed() RETURNS trigger AS $$
+BEGIN
+    UPDATE datasets d SET followed = EXISTS (SELECT 1 FROM follower_datasets f WHERE f.dataset_id = d.id)
+    WHERE d.id IN (SELECT dataset_id FROM changed)
+      AND d.followed IS DISTINCT FROM EXISTS (SELECT 1 FROM follower_datasets f WHERE f.dataset_id = d.id);
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER follower_datasets_followed_insert AFTER INSERT ON follower_datasets REFERENCING NEW TABLE AS changed
+    FOR EACH STATEMENT EXECUTE FUNCTION sync_dataset_followed();
+CREATE TRIGGER follower_datasets_followed_delete AFTER DELETE ON follower_datasets REFERENCING OLD TABLE AS changed
+    FOR EACH STATEMENT EXECUTE FUNCTION sync_dataset_followed();
+
 -- Ledger of applied migrations: the 1.0.0 baseline, then the files in backend/db/migrations/
 -- (0001_..., 0002_...) that scripts/apply_migrations.sh applies to existing databases. A fresh install
 -- from this file IS current: when you add a migration, make the same change here and ADD ITS
@@ -2537,5 +2578,6 @@ INSERT INTO schema_migrations (filename) VALUES
     ('0004_map_state_without_model.sql'),
     ('0005_map_placement_history.sql'),
     ('0006_map_placement_hold.sql'),
-    ('0007_follower_change_log.sql')
+    ('0007_follower_change_log.sql'),
+    ('0008_followers.sql')
 ON CONFLICT (filename) DO NOTHING;

@@ -1249,3 +1249,12 @@ BEGIN
     RETURN NULL;
 END;
 $$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION sync_dataset_followed() RETURNS trigger AS $$
+BEGIN
+    UPDATE datasets d SET followed = EXISTS (SELECT 1 FROM follower_datasets f WHERE f.dataset_id = d.id)
+    WHERE d.id IN (SELECT dataset_id FROM changed)
+      AND d.followed IS DISTINCT FROM EXISTS (SELECT 1 FROM follower_datasets f WHERE f.dataset_id = d.id);
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;

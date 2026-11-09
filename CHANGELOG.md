@@ -12,6 +12,8 @@ it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
   `sample_block_changes`, `vector_changes` and `dataset_changes` tables and their triggers, and rewrites nothing. Apply it with
   `scripts/apply_migrations.sh` (step 4 of [Upgrading](docs/UPGRADING.md)). It waits at most 2 seconds for its
   locks: if it stops with a lock timeout, run it again.
+- A second migration, `0008_followers.sql`: two small tables for followers, and `api_tokens` accepting the
+  `follower` scope. It's applied the same way.
 
 ### Added
 
@@ -22,8 +24,16 @@ it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
   - its field registry, settings and saved views;
   - its deletion.
 
-  It's what a follower's change feed will read. A dataset nobody follows logs nothing, and no dataset is
-  followed until followers can be added.
+  A dataset nobody follows logs nothing.
+- **Followers, on the primary** ([FOLLOWERS.md](docs/FOLLOWERS.md)).
+  - An admin adds a follower instance (`POST /api/followers`), which gets its own account and a token that
+    only the follower endpoints accept.
+  - The admin chooses the datasets it follows, each with a `tags` and a `views` option (primary only, or both
+    ways).
+  - The follower copies a dataset, then reads what changed in commit order (`/api/follower/...`), and
+    acknowledges what it applied, so the log is pruned.
+  - Removing a follower deletes everything kept for it.
+  - The follower's own sync job comes in a later release.
 
 ## 2.3.0 (2026-11-08)
 
