@@ -53,6 +53,9 @@ def load_patch_model(model_id: str = PATCH_MODEL_ID, revision: Optional[str] = P
     import torch
     from transformers import CLIPModel, CLIPProcessor
 
+    from .hf_weights import download_only_loaded_weights
+
+    download_only_loaded_weights()
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
     # transformers 5's @wraps(Module.to) hides the bound self from mypy.

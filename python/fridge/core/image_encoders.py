@@ -43,7 +43,9 @@ def _huggingface_encoder(model_name):
             'pip install "freedomridge[huggingface-embeddings]"',
         )
     from .clip import image_vectors
+    from .hf_weights import download_only_loaded_weights
 
+    download_only_loaded_weights()
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     processor = AutoProcessor.from_pretrained(model_name, backend='torchvision')  # the fast processor
     model = AutoModel.from_pretrained(model_name).to(device).eval()

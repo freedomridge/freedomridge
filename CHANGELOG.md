@@ -30,6 +30,14 @@ it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
   `r7i.2xlarge`, for less. Any instance type works, Arm or x86_64: the machine's Amazon Linux image follows its
   architecture, as AWS describes it.
 
+### Fixed
+
+- **A model's weights are downloaded once.** When a model revision has only `pytorch_model.bin`, as the pinned
+  patch model and the server's CLIP checkpoint do, transformers loaded it and then downloaded a second,
+  safetensors copy in the background that it never loads: 1.2 GB in the model cache instead of 605 MB for CLIP
+  ViT-B/32. The SDK and the server now turn that download off (transformers' `DISABLE_SAFETENSORS_CONVERSION`,
+  unless it's set already). A cache that already holds the extra copy keeps it; deleting it is safe.
+
 ## 2.4.0 (2026-11-09)
 
 2.4.0 adds follower instances: a second Freedom Ridge keeps read-only mirrors of the datasets a primary shares

@@ -19,6 +19,7 @@ etc.) must be refused by the caller, not encoded anyway.
 
 import asyncio
 import io
+import os
 import threading
 import warnings
 from concurrent.futures import ThreadPoolExecutor
@@ -76,6 +77,17 @@ _MODEL_ALIASES = {
 _cache: Dict[str, tuple] = {}  # hf checkpoint -> (tokenizer, text_model)
 _image_cache: Dict[str, tuple] = {}  # hf checkpoint -> (image_processor, vision_model)
 _lock = threading.Lock()
+
+
+def download_only_loaded_weights() -> None:
+    """Keep transformers from downloading a second copy of the CLIP weights (the SDK's
+    fridge.core.hf_weights twin; the backend doesn't import the SDK). When a checkpoint's revision has only
+    pytorch_model.bin (openai/clip-vit-base-patch32 is one), transformers loads it, then downloads the
+    conversion bot's safetensors copy in a background thread, which it never loads: 600 MB more in the model
+    cache. An explicit setting is kept."""
+    os.environ.setdefault("DISABLE_SAFETENSORS_CONVERSION", "1")
+
+
 # Dedicated single worker: encodes never compete for (or starve) the shared
 # asyncio.to_thread pool that serves media/imaging work, and torch inference on one
 # module stays serialized without holding a lock across the forward pass.
@@ -127,6 +139,7 @@ def _encode_sync(prompt: str, checkpoint: str) -> List[float]:
     with _lock:
         cached = _cache.get(checkpoint)
     if cached is None:
+        download_only_loaded_weights()
         tokenizer = CLIPTokenizer.from_pretrained(checkpoint)  # the fast tokenizer in transformers 5
         # Pass the tower's own config. transformers 4.57 takes each class's config_class from
         # its `config:` annotation in cls.__dict__, which Python 3.14's lazy annotations leave
@@ -166,6 +179,7 @@ def _encode_image_sync(image_bytes: bytes, checkpoint: str) -> List[float]:
     with _lock:
         cached = _image_cache.get(checkpoint)
     if cached is None:
+        download_only_loaded_weights()
         processor = CLIPImageProcessor.from_pretrained(checkpoint)
         # As with text, do not let from_pretrained infer the full CLIPConfig.
         config = CLIPVisionConfig.from_pretrained(checkpoint)
