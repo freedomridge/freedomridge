@@ -31,6 +31,7 @@ from .routers import (
     hashes,
     index_advisor,
     jobs,
+    primaries,
     quality,
     sampling,
     schedules,
@@ -250,6 +251,7 @@ app.include_router(schedules.router, prefix="/api")
 app.include_router(index_advisor.router, prefix="/api")
 app.include_router(workers.router, prefix="/api")
 app.include_router(followers.router, prefix="/api")
+app.include_router(primaries.router, prefix="/api")
 
 
 @app.get("/api/health")

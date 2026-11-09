@@ -15,6 +15,7 @@ from backend import (
     concept_jobs,
     dataset_schedules,
     duplicate_jobs,
+    follower_sync,
     index_jobs,
     job_queue,
     job_runner,
@@ -160,6 +161,7 @@ def test_service_logs_migration_and_outage_transitions_only(monkeypatch, caplog)
         monkeypatch.setattr(map_refit, 'heal_unranked_maps', schedule_statistics)
         monkeypatch.setattr(map_refit, 'expire_unclaimed_fits', schedule_statistics)
         monkeypatch.setattr(map_placement, 'schedule_placements', schedule_statistics)
+        monkeypatch.setattr(follower_sync, 'schedule_sync', schedule_statistics)
         monkeypatch.setattr(auth_cleanup, 'scheduled_cleanup', schedule_statistics)
         monkeypatch.setenv('JOB_STATISTICS_SECONDS', '1000000')
         monkeypatch.setenv('JOB_CONCEPT_SECONDS', '1000000')

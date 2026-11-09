@@ -185,7 +185,11 @@ class DatasetUpdate(BaseModel):
 _DATASET_SELECT = (
     "id, name, description, media_fields, grid_media_field, modal_media_field, "
     "segmentation_config, storage_config_id, owner_id, is_global, created_at, deleting, deletion_job_id, "
-    "default_view_id"
+    "default_view_id, "
+    # A mirror of a dataset on another instance (docs/FOLLOWERS.md): read-only here.
+    "(SELECT jsonb_build_object('state', m.state, 'primary_url', l.url, 'origin_dataset_id', m.origin_dataset_id, "
+    "'tags', m.tags, 'views', m.views, 'concept_views', m.concept_views) "
+    "FROM mirrors m LEFT JOIN primary_links l ON l.id = m.link_id WHERE m.dataset_id = datasets.id) AS mirror"
 )
 
 
@@ -454,6 +458,12 @@ async def update_dataset(id: int, dataset: DatasetUpdate, user: dict = Depends(r
 @router.delete("/datasets/{id}", status_code=202)
 async def delete_dataset(id: int, user: dict = Depends(require_role("admin"))):
     """Seal the dataset and return its durable deletion job."""
+    if await db.fetchval("SELECT 1 FROM mirrors WHERE dataset_id = $1 AND state <> 'stopped'", id):
+        raise HTTPException(
+            status_code=409,
+            detail='This dataset mirrors one on another Freedom Ridge instance. Stop sharing it with this follower '
+            'there (Settings → Followers on the primary), then delete the copy here.',
+        )
     return await dataset_deletion.submit(db.pool, id, user['id'])
 
 
@@ -2492,6 +2502,35 @@ class CreateArrayFieldRequest(BaseModel):
     field_name: str
 
 
+async def add_array_column(pool, dataset_id: int, name: str) -> None:
+    """The physical TEXT[] column and GIN index of an array field, shared by every dataset (a follower's sync adds
+    the primary's this way, from the job runner's pool). ``name`` must already be checked against _SAFE_COLUMN_RE
+    and _RESERVED_COLUMNS."""
+    async with pool.acquire() as conn, _field_index_operation(conn, dataset_id, index_ddl=True):
+        # Bounded: ACCESS EXCLUSIVE queued behind a long reader would stall every samples read and
+        # write queued behind it (ingest included) until the request timed out. Busy: 409, retry.
+        try:
+            async with conn.transaction():
+                await conn.execute("SET LOCAL lock_timeout = '2s'")
+                await conn.execute(f"ALTER TABLE samples ADD COLUMN IF NOT EXISTS {name} TEXT[] DEFAULT '{{}}'")
+        except asyncpg.LockNotAvailableError:
+            raise HTTPException(
+                status_code=409,
+                detail='The samples table is busy (a long read or an index build); retry shortly',
+                headers={'Retry-After': '5'},
+            ) from None
+        await conn.execute(
+            f"CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_samples_{name}_gin ON samples USING gin ({name})",
+        )
+        await conn.execute(
+            "INSERT INTO sample_array_columns (column_name) VALUES ($1) ON CONFLICT DO NOTHING",
+            name,
+        )
+    # Invalidate cache (sample_array_columns changed)
+    global _array_columns_cache
+    _array_columns_cache = None
+
+
 @router.post("/datasets/{id}/array-fields", dependencies=[Depends(require_dataset_access)])
 async def create_array_field(
     id: int,
@@ -2536,29 +2575,7 @@ async def create_array_field(
     # Create the physical column + index only when it doesn't exist yet.
     if not already_exists:
         assert db.pool is not None  # connected at startup (lifespan)
-        async with db.pool.acquire() as conn, _field_index_operation(conn, id, index_ddl=True):
-            # Bounded: ACCESS EXCLUSIVE queued behind a long reader would stall every samples read and
-            # write queued behind it (ingest included) until the request timed out. Busy: 409, retry.
-            try:
-                async with conn.transaction():
-                    await conn.execute("SET LOCAL lock_timeout = '2s'")
-                    await conn.execute(f"ALTER TABLE samples ADD COLUMN IF NOT EXISTS {name} TEXT[] DEFAULT '{{}}'")
-            except asyncpg.LockNotAvailableError:
-                raise HTTPException(
-                    status_code=409,
-                    detail='The samples table is busy (a long read or an index build); retry shortly',
-                    headers={'Retry-After': '5'},
-                ) from None
-            await conn.execute(
-                f"CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_samples_{name}_gin ON samples USING gin ({name})",
-            )
-            await conn.execute(
-                "INSERT INTO sample_array_columns (column_name) VALUES ($1) ON CONFLICT DO NOTHING",
-                name,
-            )
-        # Invalidate cache (sample_array_columns changed)
-        global _array_columns_cache
-        _array_columns_cache = None
+        await add_array_column(db.pool, id, name)
 
     # Register the field for THIS dataset regardless of whether the global column
     # already existed — otherwise a second dataset adopting an existing array column

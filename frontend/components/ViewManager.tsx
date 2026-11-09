@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { View, ViewStage, ComplexFilter, getDatasetViews, createView, deleteView, updateDataset } from '../lib/api';
+import { View, ViewStage, ComplexFilter, DatasetMirror, getDatasetViews, createView, deleteView, updateDataset } from '../lib/api';
+import { primaryHost } from './mirror-badge';
 import { useUser } from '@/contexts/UserContext';
 import { filterHasInSelection } from '@/contexts/FilterContext';
 import { ShareViewModal } from './ShareViewModal';
@@ -13,10 +14,12 @@ interface ViewManagerProps {
     // The dataset's default view, which an administrator sets here (the dataset opens on it).
     defaultViewId?: number | null;
     onDefaultViewChanged?: () => void;
+    // Set on a mirror of a dataset on a primary instance (docs/FOLLOWERS.md).
+    mirror?: DatasetMirror | null;
 }
 
 export default function ViewManager({
-    datasetId, currentFilters, currentViewStages, onLoadView, defaultViewId = null, onDefaultViewChanged,
+    datasetId, currentFilters, currentViewStages, onLoadView, defaultViewId = null, onDefaultViewChanged, mirror = null,
 }: ViewManagerProps) {
     const { user } = useUser();
     const [views, setViews] = useState<View[]>([]);
@@ -155,6 +158,15 @@ export default function ViewManager({
                             <option value="public">Public</option>
                         </select>
                     </div>
+
+                    {mirror && mirror.concept_views.length > 0 && (
+                        <p data-testid="concept-views-note" className="text-xs text-zinc-400 bg-zinc-800/50 rounded border border-zinc-800 p-2">
+                            {mirror.concept_views.length === 1 ? '1 shared view' : `${mirror.concept_views.length} shared views`} on{' '}
+                            {primaryHost(mirror)} ({mirror.concept_views.join(', ')}) use a concept, so{' '}
+                            {mirror.concept_views.length === 1 ? 'it stays' : 'they stay'} there: concepts belong to each
+                            instance, and this one doesn&apos;t have the primary&apos;s.
+                        </p>
+                    )}
 
                     {/* Save New View - Improved Layout */}
                     <div className="p-3 bg-zinc-800/50 rounded border border-zinc-800">

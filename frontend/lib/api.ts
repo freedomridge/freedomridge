@@ -39,6 +39,18 @@ export interface Dataset {
     // (PATCH default_view_id; null removes it). `default_view` is GET /datasets/{id} only.
     default_view_id?: number | null;
     default_view?: DefaultView | null;
+    // Set when the dataset is a read-only mirror of one on a primary instance (docs/FOLLOWERS.md).
+    mirror?: DatasetMirror | null;
+}
+
+export interface DatasetMirror {
+    state: 'copying' | 'following' | 'stopped';
+    primary_url: string | null;
+    origin_dataset_id: number;
+    tags: 'primary' | 'both';
+    views: 'primary' | 'both';
+    // Shared views on the primary that use a concept: concepts belong to each instance, so they stay there.
+    concept_views: string[];
 }
 
 export interface ActiveDatasetJob {

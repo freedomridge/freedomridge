@@ -14,6 +14,8 @@ it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
   locks: if it stops with a lock timeout, run it again.
 - A second migration, `0008_followers.sql`: two small tables for followers, and `api_tokens` accepting the
   `follower` scope. It's applied the same way.
+- A third, `0009_mirrors.sql`: the follower's tables (`primary_links`, `mirrors`, `mirror_samples`,
+  `mirror_views`) and the checks that keep a mirror read-only. Also applied the same way.
 
 ### Added
 
@@ -33,7 +35,16 @@ it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
   - The follower copies a dataset, then reads what changed in commit order (`/api/follower/...`), and
     acknowledges what it applied, so the log is pruned.
   - Removing a follower deletes everything kept for it.
-  - The follower's own sync job comes in a later release.
+- **Followers, on the follower.**
+  - Under Settings → Primaries, an admin follows a primary with its address and follower token.
+  - The job runner syncs every minute: each dataset shared with this follower is copied into a read-only
+    **mirror**, then kept up to date from the primary's feed.
+  - Everything the primary sent is read-only here, enforced by the database. Vector fields only this instance
+    has, maps, statistics and local views stay its own.
+  - Sample ids are translated, in object samples' `parent_id` and in views' filters.
+  - Views that use a concept stay on the primary.
+  - A mirror stops when the primary stops sharing it, removes the follower or is restored into a new database;
+    it then stays as a read-only copy to keep or delete.
 
 ## 2.3.0 (2026-11-08)
 

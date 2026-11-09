@@ -44,6 +44,9 @@ class Dataset(BaseModel):
     default_view_id: Optional[int] = None
     # GET /datasets/{id} only: that view's id, name and content, so the app can apply it without another request.
     default_view: Optional[Dict[str, Any]] = None
+    # Set when this dataset is a read-only mirror of one on a primary (docs/FOLLOWERS.md): its state
+    # (copying, following or stopped), the primary's URL, the dataset there, and the tags and views options.
+    mirror: Optional[Dict[str, Any]] = None
 
 
 class Sample(BaseModel):

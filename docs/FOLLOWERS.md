@@ -4,12 +4,12 @@ A **follower** is a second Freedom Ridge instance that mirrors chosen datasets o
 adds what the primary doesn't hold. For example, a machine with the disk and memory for patch vectors and their
 search indexes. It can also run `python -m fridge.worker` for the primary.
 
-This release has the primary's side: the change log, follower management, and the endpoints a follower reads.
-The follower's own sync job is not built yet.
+Both sides are in this release: the primary's change log, follower management and the endpoints a follower
+reads, and the follower's sync, which keeps a read-only mirror of each dataset shared with it.
 
 ## On the primary
 
-An admin manages followers (endpoints below; a Settings → Followers page is coming):
+An admin manages followers under **Settings → Followers** (or the endpoints below):
 
 1. **Add a follower**, giving it a name such as `tailscale-local`. The primary creates an account for it,
    `follower:<name>`, which has no password and so can't log in. It also creates a **follower token**, shown
@@ -75,5 +75,54 @@ Errors:
 
 After restoring the primary from an older backup into the same database, which the primary can't detect,
 remove and re-add its followers, so each copies again.
+
+## On the follower
+
+An admin adds the primary under **Settings → Primaries**, with its API address (`https://primary.example.com/api`)
+and the follower token. The token is checked against the primary before it's saved, and stored encrypted with
+`STORAGE_ENCRYPTION_KEY`.
+
+The job runner then syncs once a minute (`FOLLOWER_SYNC_SECONDS`, default 60). Each sync is one background job per
+primary that resumes where it stopped:
+
+1. It reads the config. A dataset newly shared and ready gets a local dataset, its **mirror**, with the primary's
+   name, or `<name> (from <primary host>)` when a dataset here already has that name. The mirror is private: admins
+   and the admin who added the primary see it, and access can be granted as for any dataset.
+2. It copies the mirror block by block: samples, hashes and vectors, then the field registry, settings and shared
+   views.
+3. Then it applies the feed, and acknowledges each page applied.
+
+The Primaries page shows each mirror's state (copying, following, or no longer following), the copy's progress,
+its last sync, and any error. The job's successful runs are pruned from the job history like other automatic jobs.
+
+### What a mirror holds
+
+- **The primary's, read-only here:** its samples (metadata, tags, array fields, location), the field registry, the
+  settings, the hashes, every vector field the primary has, and its shared views. The database refuses any other
+  change to them with "read-only mirror"; only the sync writes them. A dataset page shows a "Mirror of <host>"
+  badge, and tagging is off.
+- **This instance's own:** vector fields only it has (patch vectors imported here, say), maps, statistics, indexes
+  (`is_promoted`), concepts, access grants, storage, and views made here. If the primary later sends a vector
+  field of the same name as one only this instance had, the primary's replaces it.
+- **Sample ids** differ between the two. The sync keeps the mapping, translates an object sample's `parent_id`
+  (null until its parent arrives), and translates the sample ids in a shared view's filters (a brushed
+  selection). A sample that isn't here matches nothing.
+- **Views that use a concept** stay on the primary, because concepts belong to each instance; the views panel
+  lists them.
+- **Images:** the mirror reads the same media paths, so this instance needs a storage configuration with read
+  access to the bucket. Patch vectors never need it.
+
+### When it stops
+
+- The primary removes this follower, or revokes its token: every mirror of that primary stops.
+- The primary stops sharing a dataset: its mirror stops.
+- The primary was restored into a new database (410), or a mirror's cursor is too old (409): that mirror stops,
+  and a new copy starts if the dataset is still shared.
+- Removing the primary here (Stop following) stops all its mirrors.
+
+A stopped mirror stays as a read-only copy, marked **no longer following**, to keep or delete. A mirror that's still
+following can't be deleted here: stop sharing it on the primary first.
+
+## Endpoints
 
 The endpoints are listed in [Authentication](AUTHENTICATION.md#endpoints).
