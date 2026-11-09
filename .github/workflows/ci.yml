@@ -179,6 +179,7 @@ jobs:
           # A real pack, as publish.yml makes it: npm pack doesn't create its destination.
           mkdir -p "$RUNNER_TEMP/launcher"
           npm pack --pack-destination "$RUNNER_TEMP/launcher"
+          npm publish --dry-run "$RUNNER_TEMP"/launcher/freedomridge-*.tgz
       - name: Production build
         run: npm run build
 
