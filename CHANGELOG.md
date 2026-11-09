@@ -4,7 +4,11 @@ Freedom Ridge has one version for the server, the web app and the Python SDK (th
 file), following [Semantic Versioning](https://semver.org). A release lists **upgrade notes** when
 it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
 
-## Unreleased
+## 2.5.0 (2026-11-09)
+
+2.5.0 runs on Arm: the release images are built for `linux/arm64` as well, the AWS module defaults to a Graviton
+instance, and on-demand workers start Graviton machines. `npx freedomridge` runs a release on one machine with
+Docker, and upgrades it. Models' weights are downloaded once, and follows don't chain. One migration.
 
 ### Upgrade notes
 
