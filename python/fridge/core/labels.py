@@ -34,6 +34,7 @@ typed wrappers (and ``.area`` etc.) are not reconstructed; access values by key.
 
 from __future__ import annotations
 
+import numbers
 import uuid
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -416,6 +417,48 @@ class Heatmap(_LabelDict):
         super().__init__(d)
 
 
+class ClassProbabilities(_LabelDict):
+    """A segmentation model's class probabilities per pixel, drawn as one class per pixel with a rule.
+
+    The file is one 8-bit grayscale PNG with the classes side by side: ``classes`` planes of w × h, class k in
+    columns ``k*w`` to ``(k+1)*w``, each value ``round(probability * 255)``. Its size may differ from the image's; it
+    is scaled to fit, as masks are. The app turns each pixel into a class with the field's rule
+    (:func:`argmax_rule` unless ``dataset.set_default_rule`` sets another) and draws it in the field's class
+    colours (``dataset.set_field_classes``). Class 0 is never drawn, as in index masks.
+
+    Args:
+        prob_path: path to the PNG (``s3://`` through a storage configuration, or under ``FRIDGE_DATA_ROOT``).
+        classes: the number of classes, N.
+    """
+
+    def __init__(self, prob_path: str, classes: int):
+        # numbers.Integral: an array's shape element (a NumPy integer) counts too.
+        if isinstance(classes, bool) or not isinstance(classes, numbers.Integral) or not 2 <= classes <= 256:
+            raise ValueError("classes must be a number of classes from 2 to 256")
+        super().__init__({"type": "class_probabilities", "probPath": prob_path, "classes": int(classes)})
+
+
+def argmax_rule() -> dict:
+    """The rule that gives each pixel its most probable class: what a field shows without a default rule."""
+    return {"type": "argmax"}
+
+
+def threshold_rule(thresholds: Sequence[Tuple[int, float]], fallback: Optional[int] = None) -> dict:
+    """Per-class thresholds in order of precedence: a pixel takes the first class whose probability is at least its
+    threshold, and ``fallback`` when none passes (None draws nothing).
+
+    ``thresholds`` is ``[(class, min), ...]`` with ``min`` from 0 to 1. For a threshold on a group of classes'
+    summed probability, give the rule as a dict: ``{"classes": [1, 2], "min": 0.5, "class": 1}`` in ``rules``.
+    """
+    return {
+        "type": "rules",
+        "rules": [
+            {"classes": [int(index)], "min": float(minimum), "class": int(index)} for index, minimum in thresholds
+        ],
+        "fallback": fallback,
+    }
+
+
 __all__ = [
     "Cuboid",
     "Cuboids",
@@ -430,4 +473,7 @@ __all__ = [
     "Keypoints",
     "Segmentation",
     "Heatmap",
+    "ClassProbabilities",
+    "argmax_rule",
+    "threshold_rule",
 ]

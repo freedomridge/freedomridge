@@ -188,6 +188,19 @@ async def get_worker_user(request: Request) -> dict:
     return user
 
 
+async def get_follower_user(request: Request) -> dict:
+    """The account behind a follower instance's token. Only the follower endpoints (routers/followers.py) accept these
+    tokens, and they accept nothing else: no session, no full or worker token."""
+    auth_header = request.headers.get("Authorization")
+    if not (auth_header and auth_header.startswith("Bearer ")):
+        raise HTTPException(status_code=401, detail="A follower instance authenticates with its follower token")
+    user, scope = await _token_user(auth_header)
+    if scope != 'follower':
+        raise HTTPException(status_code=403, detail="Use the follower's token (Settings → Followers) here")
+    await set_request_user(user)
+    return user
+
+
 async def get_current_user(request: Request):
     """
     Authenticate via API token (Bearer) OR session cookie.
@@ -205,6 +218,11 @@ async def get_current_user(request: Request):
             raise HTTPException(
                 status_code=403,
                 detail="This is a compute worker token: only the worker endpoints (python -m fridge.worker) accept it",
+            )
+        if scope == 'follower':
+            raise HTTPException(
+                status_code=403,
+                detail="This is a follower token: only the follower endpoints accept it",
             )
         await set_request_user(user_dict)
         _enforce_password_change(user_dict, request)

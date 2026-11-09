@@ -24,6 +24,7 @@ SYSTEM_FIELDS = frozenset(
         'polygons.label',
         'segmentation.labels',
         '__heatmap_fields__',
+        '__probability_fields__',
         '__mask_overlay_fields__',
         '__cuboid_fields__',
         '__keypoint_fields__',

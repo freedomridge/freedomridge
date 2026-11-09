@@ -133,6 +133,8 @@ domain, use the Quick Start.
 - [Deploy to AWS](docs/DEPLOY_TO_AWS.md): one EC2 instance, created with Terraform.
 - [Docker deployment](docs/DOCKER_DEPLOYMENT.md): any Linux host with Docker.
 - [Upgrading](docs/UPGRADING.md) to a new release, and the [changelog](CHANGELOG.md).
+- [Followers](docs/FOLLOWERS.md): a second instance that keeps read-only mirrors of chosen datasets.
+- [On-demand compute workers](docs/ON_DEMAND_WORKERS.md): AWS machines started for heavy jobs, then gone.
 
 ## Architecture
 

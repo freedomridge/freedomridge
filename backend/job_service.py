@@ -11,10 +11,12 @@ from . import (
     auth_cleanup,
     backups,
     bulk_jobs,
+    compute_launcher,
     concept_jobs,
     dataset_deletion,
     dataset_schedules,
     duplicate_jobs,
+    follower_sync,
     index_actions,
     index_advisor,
     index_jobs,
@@ -148,7 +150,7 @@ async def _cleanup_statistics_history(pool, job):
     async with pool.acquire(timeout=1) as connection:
         expired = await connection.fetch(
             """SELECT id FROM jobs
-               WHERE kind IN ('statistics','concept_scoring','duplicate_maintenance','map_place')
+               WHERE kind IN ('statistics','concept_scoring','duplicate_maintenance','map_place','follower_sync')
                  AND dedupe_owner='system' AND state='succeeded'
                  AND NOT barrier @> '{"full":true}' AND finished_at<$1
                ORDER BY finished_at,id LIMIT $2""",
@@ -169,7 +171,7 @@ async def _cleanup_statistics_history(pool, job):
     async def publish(connection):
         await connection.execute(
             """DELETE FROM jobs WHERE id=ANY($1::uuid[])
-               AND kind IN ('statistics','concept_scoring','duplicate_maintenance','map_place')
+               AND kind IN ('statistics','concept_scoring','duplicate_maintenance','map_place','follower_sync')
                  AND dedupe_owner='system' AND state='succeeded'
                AND NOT barrier @> '{"full":true}' AND finished_at<$2""",
             [row['id'] for row in expired],
@@ -211,6 +213,7 @@ async def run_service(dsn=DATABASE_URL):
     interval = positive_seconds('JOB_SELECTION_CLEANUP_SECONDS', 300)
     stats_interval = positive_seconds('JOB_STATISTICS_SECONDS', 5)
     concept_interval = positive_seconds('JOB_CONCEPT_SECONDS', 60)
+    follower_interval = positive_seconds('FOLLOWER_SYNC_SECONDS', 60)
     shutdown_seconds = positive_seconds('JOB_SHUTDOWN_SECONDS', 20)
     placements = runner_placements()
     stopping = asyncio.Event()
@@ -255,6 +258,9 @@ async def run_service(dsn=DATABASE_URL):
     async def handle_patch_import(job):
         return await patch_import.handler(pool)(job)
 
+    async def handle_follower_sync(job):
+        return await follower_sync.handler(pool)(job)
+
     async def handle_index_review(job):
         return await index_advisor.handler(pool)(job)
 
@@ -285,6 +291,7 @@ async def run_service(dsn=DATABASE_URL):
         map_placement.KIND: handle_map_place,
         index_advisor.KIND: handle_index_review,
         patch_import.KIND: handle_patch_import,
+        follower_sync.KIND: handle_follower_sync,
         index_actions.DROP_KIND: handle_index_drop,
         index_actions.RESTORE_KIND: handle_index_restore,
     }
@@ -308,6 +315,7 @@ async def run_service(dsn=DATABASE_URL):
                 map_placement.KIND: map_placement.POLICY,
                 index_advisor.KIND: index_advisor.POLICY,
                 patch_import.KIND: patch_import.POLICY,
+                follower_sync.KIND: follower_sync.POLICY,
                 index_actions.DROP_KIND: index_actions.POLICY,
                 index_actions.RESTORE_KIND: index_actions.POLICY,
             },
@@ -374,6 +382,13 @@ async def run_service(dsn=DATABASE_URL):
                 (lambda: backups.schedule_backups(pool), 60, 'Backups', False),
                 (lambda: duplicate_jobs.schedule_duplicates(pool), 5, 'Duplicates', True),
                 (lambda: map_placement.schedule_placements(pool), 5, 'Map placement', True),
+                (lambda: follower_sync.schedule_sync(pool), follower_interval, 'Follower sync', True),
+                (
+                    lambda: compute_launcher.schedule(pool),
+                    compute_launcher.SCHEDULE_SECONDS,
+                    'On-demand compute workers',
+                    True,
+                ),
                 (lambda: index_jobs.sweep_invalid_indexes(pool), 60, 'Invalid index cleanup', False),
                 (lambda: dataset_schedules.schedule_dataset_jobs(pool), 60, 'Dataset schedules', False),
                 (lambda: map_refit.sweep(pool), 600, 'Map artifact cleanup', False),

@@ -235,6 +235,35 @@ resource "aws_iam_role_policy" "instance" {
     ]
   })
 }
+# On-demand compute workers (docs/ON_DEMAND_WORKERS.md): start EC2 machines tagged fridge:launch, then look at and
+# terminate only those. The machines get no role of their own; Amazon Linux comes from AWS's public SSM parameter.
+resource "aws_iam_role_policy" "on_demand_workers" {
+  count = var.on_demand_workers ? 1 : 0
+  role  = aws_iam_role.instance.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      { Effect   = "Allow", Action = ["ec2:RunInstances"],
+        Resource = ["arn:aws:ec2:${var.aws_region}:*:instance/*", "arn:aws:ec2:${var.aws_region}:*:volume/*"],
+      Condition = { StringLike = { "aws:RequestTag/fridge:launch" = "*" } } },
+      { Effect = "Allow", Action = ["ec2:RunInstances"],
+        Resource = [
+          "arn:aws:ec2:${var.aws_region}::image/*", "arn:aws:ec2:${var.aws_region}:*:subnet/*",
+          "arn:aws:ec2:${var.aws_region}:*:network-interface/*", "arn:aws:ec2:${var.aws_region}:*:security-group/*",
+          "arn:aws:ec2:${var.aws_region}:*:spot-instances-request/*",
+      ] },
+      { Effect   = "Allow", Action = ["ec2:CreateTags"],
+        Resource = ["arn:aws:ec2:${var.aws_region}:*:instance/*", "arn:aws:ec2:${var.aws_region}:*:volume/*"],
+      Condition = { StringEquals = { "ec2:CreateAction" = "RunInstances" } } },
+      { Effect = "Allow", Action = ["ec2:TerminateInstances"], Resource = "arn:aws:ec2:${var.aws_region}:*:instance/*",
+      Condition = { StringLike = { "aws:ResourceTag/fridge:launch" = "*" } } },
+      { Effect = "Allow", Action = ["ec2:DescribeInstances"], Resource = "*" },
+      { Effect = "Allow", Action = ["ssm:GetParameters"],
+      Resource = "arn:aws:ssm:${var.aws_region}::parameter/aws/service/ami-amazon-linux-latest/*" }
+    ]
+  })
+}
+
 resource "aws_iam_instance_profile" "instance" {
   name_prefix = "freedomridge-"
   role        = aws_iam_role.instance.name

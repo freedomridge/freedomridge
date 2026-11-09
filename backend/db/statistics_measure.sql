@@ -12,6 +12,7 @@ WITH definitions AS MATERIALIZED (
     SELECT id, field_name, token, value, CASE
         WHEN jsonb_typeof(value)='object' THEN CASE
             WHEN value->>'type'='heatmap' THEN 'heatmap'
+            WHEN value->>'type'='class_probabilities' THEN 'probability'
             WHEN value->>'_type'='cuboid' THEN NULL
             WHEN value ? 'maskPath' AND field_name<>'segmentation' THEN 'mask_overlay'
             WHEN value ? 'label' AND NOT value ? 'maskPath'

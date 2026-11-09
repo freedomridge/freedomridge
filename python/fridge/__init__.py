@@ -5,6 +5,7 @@ from .core.job import Job, JobCancelled, JobError, JobFailed, JobTimeout
 from .core.labels import (
     Classification,
     Classifications,
+    ClassProbabilities,
     Cuboid,
     Cuboids,
     Detection,
@@ -16,6 +17,8 @@ from .core.labels import (
     Polyline,
     Polylines,
     Segmentation,
+    argmax_rule,
+    threshold_rule,
 )
 from .core.objects import objects_from_cuboids
 from .core.patches import (
@@ -85,4 +88,7 @@ __all__ = [
     'Keypoints',
     'Segmentation',
     'Heatmap',
+    'ClassProbabilities',
+    'argmax_rule',
+    'threshold_rule',
 ]

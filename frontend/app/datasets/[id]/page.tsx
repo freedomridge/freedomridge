@@ -5,7 +5,7 @@ import { toggleOverlayField } from '@/lib/labels';
 import { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import type { Feature, Polygon } from 'geojson';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { ApiError, isRescoringRefusal, getSamples, getDatasetSchema, getDataset, getEmbeddingFields, searchSimilar, searchByImage, searchObjectToPatches, updateDataset, sampleDuplicates, notifySamplesMutated, createSelectionToken, type Dataset, type Filters, type Sample, type SchemaField, type ComplexFilter, type ViewStage } from '@/lib/api';
+import { ApiError, isRescoringRefusal, getSamples, getDatasetSchema, getDataset, getEmbeddingFields, searchSimilar, searchByImage, searchObjectToPatches, updateDataset, setClassRule, sampleDuplicates, notifySamplesMutated, createSelectionToken, type Dataset, type Filters, type Sample, type SchemaField, type ComplexFilter, type ViewStage } from '@/lib/api';
 import { describeFilter, convertSimpleFiltersToComplex } from '@/lib/filter-utils';
 import { usePatchState } from '@/hooks/usePatchState';
 import { useSampleCount } from '@/hooks/useSampleCount';
@@ -48,6 +48,7 @@ import { Header } from '@/components/header';
 import { DatasetJobs } from '@/components/dataset-jobs';
 import { DatasetDeletion } from '@/components/dataset-deletion';
 import { DatasetJobHistoryDialog } from '@/components/job-history';
+import { MirrorBadge } from '@/components/mirror-badge';
 
 // When the machine's network changes (an address coming or going, e.g. a docker container starting), Chromium
 // fails every request still waiting for one of its six connections to the server (net::ERR_NETWORK_CHANGED),
@@ -1022,7 +1023,9 @@ function DatasetPageContent() {
                         } : undefined}
                         hashFields={hashFieldsData || []}
                         onShowDuplicates={handleShowDuplicates}
-                        canTag={user?.role === 'admin' || user?.role === 'power_user'}
+                        // A mirror's tags are the primary's; with tags both ways, a tag edit here is made there.
+                        canTag={(user?.role === 'admin' || user?.role === 'power_user')
+                            && (!dataset?.mirror || (dataset.mirror.tags === 'both' && dataset.mirror.state === 'following'))}
                         gridSamplesRef={getGridSamplesRef(panelId)}
                         gridMoreRef={getGridMoreRef(panelId)}
                         // Patches are a sub-grid of IMAGES only. An object-grain grid never shows
@@ -1262,8 +1265,9 @@ function DatasetPageContent() {
                     </Link>
                     <div className="h-4 w-px bg-zinc-800" />
                     <div className="flex-1 min-w-[10rem]">
-                        <h1 className="text-lg font-bold text-white truncate" title={dataset?.name}>
-                            {dataset?.name || `Dataset ${datasetId}`}
+                        <h1 className="text-lg font-bold text-white truncate flex items-center gap-2" title={dataset?.name}>
+                            <span className="truncate">{dataset?.name || `Dataset ${datasetId}`}</span>
+                            {dataset?.mirror && <MirrorBadge mirror={dataset.mirror} />}
                         </h1>
                         <DatasetDescription description={dataset?.description} />
                         {selectionNotice?.view === stagedViewKey && <p role="status" className="text-xs text-zinc-400">{selectionNotice.message}</p>}
@@ -1362,6 +1366,7 @@ function DatasetPageContent() {
                                 currentFilters={globalFilters} // View content filters (legacy/compiled)
                                 currentViewStages={viewStages} // New: Stages history
                                 defaultViewId={dataset?.default_view_id ?? null}
+                                mirror={dataset?.mirror ?? null}
                                 onDefaultViewChanged={() => queryClient.invalidateQueries({ queryKey: ['dataset', datasetId] })}
                                 onLoadView={(view) => {
                                     if (view.content.viewStages) {
@@ -1479,6 +1484,14 @@ function DatasetPageContent() {
                             activeOverlayFields={activeOverlayFields}
                             overlayConfigs={overlayConfigs}
                             segmentationConfig={dataset?.segmentation_config}
+                            // A mirror's settings, its default rules included, are its primary's: trying one is fine, saving isn't.
+                            onSaveClassRule={datasetId != null && (user?.role === 'admin' || user?.role === 'power_user')
+                                && !dataset?.mirror
+                                ? async (fieldName, rule) => {
+                                    await setClassRule(datasetId, fieldName, rule);
+                                    await queryClient.invalidateQueries({ queryKey: ['dataset', datasetId] });
+                                }
+                                : undefined}
                             onMediaFieldChange={setModalMediaField}
                             highlightBox={highlightBox}
                             highlightCuboidField={highlightCuboidField}

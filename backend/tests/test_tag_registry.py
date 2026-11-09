@@ -41,6 +41,8 @@ class FakeDB:
 
     async def fetchval(self, query, *args, **kw):
         self.calls.append(("fetchval", " ".join(query.split()), args))
+        if 'FROM mirrors' in query:
+            return None  # not a follower's mirror
         return 3  # sample-count check in bulk-tag
 
     async def fetchrow(self, query, *args, **kw):

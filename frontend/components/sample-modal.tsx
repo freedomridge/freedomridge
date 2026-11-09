@@ -7,6 +7,8 @@ import { parseAnnotations, isOverlayActive, toggleOverlayField } from '@/lib/lab
 import * as Dialog from '@radix-ui/react-dialog';
 import { EyeOpenIcon, EyeNoneIcon } from '@radix-ui/react-icons';
 import { AnnotationOverlay } from './annotations/AnnotationOverlay';
+import { ClassRuleEditor } from './annotations/ClassRuleEditor';
+import { defaultRule, type ClassProbabilities, type ClassRule, type ProbabilityView } from '@/lib/class-rules';
 import { PatchGridOverlay } from './annotations/PatchGridOverlay';
 
 interface Props {
@@ -39,11 +41,16 @@ interface Props {
     onCloseOverlay?: () => void;
     /** Emphasize this box over the image — e.g. the object whose parent is shown. */
     highlightCuboidField?: string | null;
+    /** Present when the user may save a class-probability field's shown rule as its default. */
+    onSaveClassRule?: (fieldName: string, rule: ClassRule) => Promise<void>;
     highlightCuboidId?: string | null;
     highlightBox?: [number, number, number, number] | null;
 }
 
-export function SampleModal({ sample, activeMediaField = 'filepath', availableMediaFields = ['filepath'], activeOverlayFields: initialOverlayFields = [], overlayConfigs, segmentationConfig, onMediaFieldChange, onClose, availablePatchScales = [], patchFieldName = 'clip', onPatchSearch, patchScale: externalPatchScale, onPatchScaleChange, onNext, onPrevious, hasNext = false, hasPrevious = false, isSelected = false, onToggleSelection, onFindSimilar, onTag, overlay, onCloseOverlay, highlightBox, highlightCuboidId, highlightCuboidField }: Props) {
+export function SampleModal({ sample, activeMediaField = 'filepath', availableMediaFields = ['filepath'], activeOverlayFields: initialOverlayFields = [], overlayConfigs, segmentationConfig, onMediaFieldChange, onClose, availablePatchScales = [], patchFieldName = 'clip', onPatchSearch, patchScale: externalPatchScale, onPatchScaleChange, onNext, onPrevious, hasNext = false, hasPrevious = false, isSelected = false, onToggleSelection, onFindSimilar, onTag, overlay, onCloseOverlay, highlightBox, highlightCuboidId, highlightCuboidField, onSaveClassRule }: Props) {
+    // How each class-probability field is shown while the modal is open: edited rules redraw at once, write nothing,
+    // and stay while stepping through samples.
+    const [probabilityViews, setProbabilityViews] = useState<Record<string, ProbabilityView>>({});
 
     // Modal owns its own overlay state, seeded from the page's active overlays
     // when the modal opens. Toggling overlays inside the modal no longer
@@ -540,6 +547,7 @@ export function SampleModal({ sample, activeMediaField = 'filepath', availableMe
                                     showLabels={showLabels}
                                     overlayConfigs={overlayConfigs}
                                     segmentationConfig={segmentationConfig}
+                                    probabilityViews={probabilityViews}
                                     hiddenAnnotations={Object.fromEntries(
                                         Object.entries(hiddenAnnotations).map(([key, val]) => [
                                             key.replace(/^metadata\./, ''),
@@ -596,6 +604,9 @@ export function SampleModal({ sample, activeMediaField = 'filepath', availableMe
                                     segmentationConfig={segmentationConfig}
                                     activeOverlayFields={activeOverlayFields}
                                     onToggleOverlay={onToggleOverlay}
+                                    probabilityViews={probabilityViews}
+                                    onProbabilityView={(field, view) => setProbabilityViews(views => ({ ...views, [field]: view }))}
+                                    onSaveClassRule={onSaveClassRule}
                                 />
                             </dl>
                         </div>
@@ -617,6 +628,9 @@ function PropertyViewer({
     segmentationConfig,
     activeOverlayFields = [],
     onToggleOverlay,
+    probabilityViews = {},
+    onProbabilityView,
+    onSaveClassRule,
 }: {
     data: unknown;
     prefix?: string;
@@ -627,6 +641,9 @@ function PropertyViewer({
     segmentationConfig?: SegmentationConfig;
     activeOverlayFields?: string[];
     onToggleOverlay?: (field: string) => void;
+    probabilityViews?: Record<string, ProbabilityView>;
+    onProbabilityView?: (field: string, view: ProbabilityView) => void;
+    onSaveClassRule?: (fieldName: string, rule: ClassRule) => Promise<void>;
 }) {
     if (!data || typeof data !== 'object') return null;
 
@@ -645,9 +662,54 @@ function PropertyViewer({
         v !== null && typeof v === 'object' && !Array.isArray(v) && (v as { type?: string }).type === 'heatmap';
     const isMask = (v: unknown) =>
         v !== null && typeof v === 'object' && !Array.isArray(v) && 'maskPath' in (v as object);
+    const isProbabilities = (v: unknown) =>
+        v !== null && typeof v === 'object' && !Array.isArray(v) && (v as { type?: string }).type === 'class_probabilities';
     const heatmapEntries = entries.filter(([, v]) => isHeatmap(v));
     const maskEntries = entries.filter(([, v]) => isMask(v));
-    const otherEntries = entries.filter(([, v]) => !isHeatmap(v) && !isMask(v));
+    const probabilityEntries = entries.filter(([, v]) => isProbabilities(v));
+    const otherEntries = entries.filter(([, v]) => !isHeatmap(v) && !isMask(v) && !isProbabilities(v));
+
+    // A class-probability field: an eye toggle like a mask's, and while shown, how it's drawn (ClassRuleEditor).
+    const renderProbabilityOverlay = (key: string, value: ClassProbabilities) => {
+        const displayKey = prefix ? `${prefix}.${key}` : key;
+        const field = displayKey.replace(/^metadata\./, '');
+        const active = activeOverlayFields.includes(key);
+        const savedRule = defaultRule(segmentationConfig?.class_rules, field);
+        return (
+            <div key={displayKey} className="py-0.5">
+                <div className="flex items-center justify-between">
+                    <span className="text-sm text-zinc-300 truncate" title={`${key} (class probabilities, ${value.classes} classes)`}>
+                        {key}
+                    </span>
+                    {onToggleOverlay ? (
+                        <button
+                            aria-label={`Toggle ${key} overlay`}
+                            aria-pressed={active}
+                            onClick={() => onToggleOverlay(key)}
+                            className={`p-1 rounded hover:bg-zinc-800 transition-colors ${active ? 'text-cyan-400' : 'text-zinc-500 hover:text-zinc-300'}`}
+                            title={active ? 'Hide from image' : 'Show on image'}
+                        >
+                            {active ? <EyeOpenIcon /> : <EyeNoneIcon />}
+                        </button>
+                    ) : (
+                        <span className="text-xs text-zinc-600">probabilities</span>
+                    )}
+                </div>
+                {active && onProbabilityView && (
+                    <ClassRuleEditor
+                        fieldName={field}
+                        classes={value.classes}
+                        maskTargets={segmentationConfig?.mask_targets?.[field] || segmentationConfig?.default_mask_targets}
+                        colorConfig={segmentationConfig?.color_scheme?.fields?.[field]}
+                        view={probabilityViews[field] ?? { rule: savedRule, show: 'map' }}
+                        savedRule={savedRule}
+                        onChange={view => onProbabilityView(field, view)}
+                        onSave={onSaveClassRule ? rule => onSaveClassRule(field, rule) : undefined}
+                    />
+                )}
+            </div>
+        );
+    };
 
     const renderHeatmapRow = (key: string) => {
         const displayKey = prefix ? `${prefix}.${key}` : key;
@@ -742,7 +804,7 @@ function PropertyViewer({
 
     return (
         <>
-            {(heatmapEntries.length > 0 || maskEntries.length > 0) && (
+            {(heatmapEntries.length > 0 || maskEntries.length > 0 || probabilityEntries.length > 0) && (
                 <div className="pb-3 mb-3 border-b border-zinc-800">
                     <h4 className="text-xs font-semibold text-zinc-500 uppercase tracking-wider mb-2">
                         Overlays
@@ -750,6 +812,7 @@ function PropertyViewer({
                     <div className="space-y-0.5">
                         {heatmapEntries.map(([key]) => renderHeatmapRow(key))}
                         {maskEntries.map(([key]) => renderMaskOverlay(key))}
+                        {probabilityEntries.map(([key, value]) => renderProbabilityOverlay(key, value as ClassProbabilities))}
                     </div>
                 </div>
             )}
@@ -872,6 +935,9 @@ function PropertyViewer({
                                     segmentationConfig={segmentationConfig}
                                     activeOverlayFields={activeOverlayFields}
                                     onToggleOverlay={onToggleOverlay}
+                                    probabilityViews={probabilityViews}
+                                    onProbabilityView={onProbabilityView}
+                                    onSaveClassRule={onSaveClassRule}
                                 />
                             </div>
                         </div>

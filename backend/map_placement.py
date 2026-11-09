@@ -317,6 +317,9 @@ async def schedule_placements(pool, limit: int = 10):
                LEFT JOIN embedding_map_state m ON m.dataset_id = v.dataset_id AND m.field_name = v.field_name
                WHERE v.total_points > 0
                  AND (v.placement_held_until IS NULL OR v.placement_held_until <= clock_timestamp())
+                 -- A mirror's copy of a primary map is placed there, and its coordinates come with the sync.
+                 AND NOT EXISTS(SELECT 1 FROM mirrors r
+                                WHERE r.dataset_id = v.dataset_id AND v.field_name = ANY(r.vector_fields))
                  AND NOT EXISTS(SELECT 1 FROM jobs a WHERE a.id = m.active_job_id AND a.state IN ('queued','running'))
                  AND EXISTS(SELECT 1 FROM embedding_projection_pending p
                             WHERE p.dataset_id = v.dataset_id AND p.field_name = v.field_name)

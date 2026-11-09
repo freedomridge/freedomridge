@@ -1,3 +1,4 @@
+import type { ClassRule } from './class-rules';
 import type { DefaultView } from './default-view';
 
 // Segmentation visualization configuration
@@ -16,6 +17,7 @@ export interface SegmentationConfig {
         opacity?: number;
         fields?: Record<string, FieldColorConfig>;
     };
+    class_rules?: Record<string, ClassRule>;  // class-probability field -> its default rule
 }
 
 export interface Dataset {
@@ -39,6 +41,18 @@ export interface Dataset {
     // (PATCH default_view_id; null removes it). `default_view` is GET /datasets/{id} only.
     default_view_id?: number | null;
     default_view?: DefaultView | null;
+    // Set when the dataset is a read-only mirror of one on a primary instance (docs/FOLLOWERS.md).
+    mirror?: DatasetMirror | null;
+}
+
+export interface DatasetMirror {
+    state: 'copying' | 'following' | 'stopped';
+    primary_url: string | null;
+    origin_dataset_id: number;
+    tags: 'primary' | 'both';
+    views: 'primary' | 'both';
+    // Shared views on the primary that use a concept: concepts belong to each instance, so they stay there.
+    concept_views: string[];
 }
 
 export interface ActiveDatasetJob {
@@ -447,10 +461,12 @@ export interface View {
         viewStages?: ViewStage[]; // The history of how we got here
         sort?: string;
         order?: 'asc' | 'desc';
+        made_on?: string; // The follower instance the view was made on (docs/FOLLOWERS.md)
     };
     is_public: boolean;
     shared_with_user_ids: number[];
     created_at: string;
+    from_primary?: boolean; // On a mirror: this view is the copy of one on its primary
 }
 
 export interface ComplexFilter {
@@ -485,7 +501,7 @@ export interface SchemaField {
     stats_pending?: boolean;
     name: string;
     // 'derived': an embedding / hash / location (derivedFieldNames), presence-only in the stage editor.
-    type: 'unknown' | 'list' | 'object' | 'string' | 'number' | 'boolean' | 'enum' | 'array' | 'datetime' | 'filepath' | 'heatmap' | 'segmentation' | 'keypoints' | 'cuboids' | 'classification' | 'detections' | 'polygons' | 'derived';
+    type: 'unknown' | 'list' | 'object' | 'string' | 'number' | 'boolean' | 'enum' | 'array' | 'datetime' | 'filepath' | 'heatmap' | 'class_probabilities' | 'segmentation' | 'keypoints' | 'cuboids' | 'classification' | 'detections' | 'polygons' | 'derived';
     min?: number | string;
     max?: number | string;
     values?: string[];
@@ -1579,6 +1595,17 @@ export async function getHashStats(datasetId: number, filters?: ComplexFilter): 
     const res = await fetch(`${API_BASE}/datasets/${datasetId}/hashes/stats`);
     await ensureOk(res, 'Hash stats failed');
     return res.json();
+}
+
+// A class-probability field's default rule (lib/class-rules.ts); null removes it.
+export async function setClassRule(datasetId: number, fieldName: string, rule: ClassRule | null): Promise<void> {
+    const res = await fetch(`${API_BASE}/datasets/${datasetId}/class-rules/${encodeURIComponent(fieldName)}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({ rule }),
+    });
+    await ensureOk(res, 'Saving the rule failed');
 }
 
 export async function setFieldType(datasetId: number, fieldName: string, fieldType: DeclaredFieldType): Promise<void> {

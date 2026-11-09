@@ -113,3 +113,9 @@ variable "cache_volume_gib" {
     error_message = "Allow at least 20 GiB for cache and model weights."
   }
 }
+
+variable "on_demand_workers" {
+  description = "Let the server start compute workers on demand (docs/ON_DEMAND_WORKERS.md): its role may launch EC2 instances, and look at and terminate only the ones it tagged. The feature also needs turning on in Settings → Compute Workers."
+  type        = bool
+  default     = false
+}

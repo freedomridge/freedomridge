@@ -17,6 +17,9 @@ CLAIM_WAIT_SECONDS on the server, and keeps the worker online). The one kind so 
 All the while a thread renews the job's lease. A lost lease (the server gave the job to someone else, or it
 ended) or a cancel stops the fit at once; Ctrl-C or SIGTERM gives the job back. Work files live in
 ``FRIDGE_WORKER_DIR`` (default ``~/.fridge/worker``), one folder per job, removed when it is done.
+
+``--exit-when-idle SECONDS`` makes the worker exit once it has had no job for that long, unreachable server
+included: a machine started for some jobs then powers off when they're done.
 """
 
 import argparse
@@ -278,13 +281,18 @@ def do_job(client, worker_id, job) -> bool:
     return True
 
 
-def run(client, name, kinds, sleep=time.sleep, work=do_job):
+def run(client, name, kinds, sleep=time.sleep, work=do_job, idle_seconds=None, clock=time.monotonic):
     """Register, then claim and work until stopped. A server that is down, restarting, busy or not answering
     (5xx, 429, a timeout) is retried; a server that no longer knows the worker (404: a day without a claim) gets a
     new registration; any other refusal (a revoked token, one that isn't a worker token, a kind the server
-    doesn't have) stops the worker with the server's reason, as only a person can fix it."""
+    doesn't have) stops the worker with the server's reason, as only a person can fix it. With `idle_seconds`, it
+    returns once no job has been worked on for that long."""
     worker = None
+    idle_since = clock()
     while True:
+        if idle_seconds is not None and clock() - idle_since >= idle_seconds:
+            print(f"No work for {idle_seconds:g} seconds; stopping", flush=True)
+            return
         try:
             if worker is None:
                 worker = client.register_worker(name, kinds, capabilities(), socket.gethostname(), sdk_version())
@@ -293,8 +301,11 @@ def run(client, name, kinds, sleep=time.sleep, work=do_job):
                     flush=True,
                 )
             job = client.claim_worker_job(worker["worker_id"], wait_seconds=CLAIM_WAIT_SECONDS)
-            if job is not None and work(client, worker["worker_id"], job) is False:
-                sleep(RETRY_SECONDS)  # a job it gave back unworked: don't claim it again at once
+            if job is not None:
+                if work(client, worker["worker_id"], job) is False:
+                    sleep(RETRY_SECONDS)  # a job it gave back unworked: don't claim it again at once
+                else:
+                    idle_since = clock()  # idle from the end of the work
             continue  # a claim waits on the server, so there's nothing to wait for here
         except requests.HTTPError as error:
             status = error.response.status_code if error.response is not None else None
@@ -316,11 +327,19 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description="Run this machine as a compute worker for a Freedom Ridge server")
     parser.add_argument("--name", default=socket.gethostname(), help="how the server lists this worker")
     parser.add_argument("--kinds", default=",".join(KINDS), help="the job kinds to take, comma separated")
+    parser.add_argument(
+        "--exit-when-idle",
+        type=float,
+        metavar="SECONDS",
+        help="exit once there has been no job for this long (a machine started for some jobs)",
+    )
     args = parser.parse_args(argv)
+    if args.exit_when_idle is not None and args.exit_when_idle <= 0:
+        parser.error("--exit-when-idle takes a number of seconds above 0")
     kinds = [kind.strip() for kind in args.kinds.split(",") if kind.strip()]
     signal.signal(signal.SIGTERM, _stop_on_sigterm)  # a service manager's stop gives the job back, like Ctrl-C
     try:
-        run(get_client(), args.name, kinds)
+        run(get_client(), args.name, kinds, idle_seconds=args.exit_when_idle)
     except KeyboardInterrupt:
         pass
     except requests.HTTPError as error:

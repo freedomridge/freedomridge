@@ -387,11 +387,13 @@ BEGIN
             IF OLD.tags IS DISTINCT FROM NEW.tags THEN affected := affected || ARRAY['tags']; END IF;
             IF OLD.media_type IS DISTINCT FROM NEW.media_type THEN affected := affected || ARRAY['media_type']; END IF;
         END IF;
+        PERFORM sample_block_changed(NEW.dataset_id, NEW.id::bigint / 4096);
         PERFORM record_stats_work(NEW.dataset_id, NEW.id::bigint / 4096, affected);
     END IF;
     IF TG_OP = 'DELETE' OR (TG_OP = 'UPDATE' AND
         (OLD.dataset_id, OLD.id::bigint / 4096) IS DISTINCT FROM (NEW.dataset_id, NEW.id::bigint / 4096)) THEN
         IF EXISTS (SELECT 1 FROM datasets WHERE id = OLD.dataset_id) THEN
+            PERFORM sample_block_changed(OLD.dataset_id, OLD.id::bigint / 4096);
             PERFORM record_stats_work(OLD.dataset_id, OLD.id::bigint / 4096, NULL);
         END IF;
     END IF;
@@ -1190,3 +1192,167 @@ BEGIN
                                          'model_id', current_model)::text;
 END;
 $$ LANGUAGE plpgsql STABLE PARALLEL SAFE;
+
+CREATE OR REPLACE FUNCTION sample_block_changed(target_dataset INTEGER, target_block BIGINT) RETURNS VOID AS $$
+BEGIN
+    IF current_setting('fridge.deletion_dataset', TRUE) = target_dataset::text THEN
+        RETURN;
+    END IF;
+    -- A mirror's samples change only through its sync (0009).
+    PERFORM require_mirror_sync(target_dataset);
+    INSERT INTO sample_block_changes (dataset_id, block_id)
+    SELECT target_dataset, target_block FROM datasets WHERE id = target_dataset AND followed
+    ON CONFLICT DO NOTHING;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION log_vector_changes() RETURNS trigger AS $$
+BEGIN
+    IF NULLIF(current_setting('fridge.deletion_dataset', TRUE), '') IS NOT NULL THEN
+        RETURN NULL;
+    END IF;
+    -- The primary's fields on a mirror change only through its sync; fields only this instance has stay writable.
+    IF EXISTS (SELECT 1 FROM mirrors) AND EXISTS (
+        SELECT 1 FROM changed c JOIN samples s ON s.id = c.sample_id JOIN mirrors m ON m.dataset_id = s.dataset_id
+        WHERE c.field_name = ANY (CASE TG_ARGV[0] WHEN 'vector' THEN m.vector_fields ELSE m.hash_fields END)
+          AND s.dataset_id::text IS DISTINCT FROM current_setting('fridge.mirror_sync', TRUE)
+    ) THEN
+        RAISE EXCEPTION 'This field came from another Freedom Ridge instance, which this dataset mirrors: change it there'
+            USING ERRCODE = '55000';
+    END IF;
+    -- Most installations follow nothing: skip reading the changed rows at all.
+    IF NOT EXISTS (SELECT 1 FROM datasets WHERE followed) THEN
+        RETURN NULL;
+    END IF;
+    INSERT INTO vector_changes (dataset_id, sample_id, kind, field_name)
+    SELECT DISTINCT s.dataset_id, c.sample_id, TG_ARGV[0], c.field_name
+    FROM changed c JOIN samples s ON s.id = c.sample_id JOIN datasets d ON d.id = s.dataset_id
+    WHERE d.followed;
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION log_dataset_change() RETURNS trigger AS $$
+BEGIN
+    -- Most installations follow nothing: skip reading the changed rows at all.
+    IF NULLIF(current_setting('fridge.deletion_dataset', TRUE), '') IS NOT NULL
+       OR NOT EXISTS (SELECT 1 FROM datasets WHERE followed) THEN
+        RETURN NULL;
+    END IF;
+    INSERT INTO dataset_changes (dataset_id, kind)
+    SELECT DISTINCT c.dataset_id, TG_ARGV[0] FROM changed c JOIN datasets d ON d.id = c.dataset_id WHERE d.followed;
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION log_dataset_settings() RETURNS trigger AS $$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        -- Its subscriptions go with it (ON DELETE CASCADE), so nobody could read or acknowledge its log rows: they go too.
+        DELETE FROM sample_block_changes WHERE dataset_id = OLD.id;
+        DELETE FROM vector_changes WHERE dataset_id = OLD.id;
+        DELETE FROM dataset_changes WHERE dataset_id = OLD.id;
+        DELETE FROM map_block_changes WHERE dataset_id = OLD.id;
+        RETURN NULL;
+    END IF;
+    IF (OLD.name, OLD.description, OLD.media_fields, OLD.grid_media_field, OLD.modal_media_field,
+        OLD.segmentation_config, OLD.default_view_id)
+        IS DISTINCT FROM (NEW.name, NEW.description, NEW.media_fields, NEW.grid_media_field, NEW.modal_media_field,
+                          NEW.segmentation_config, NEW.default_view_id) THEN
+        PERFORM require_mirror_sync(NEW.id);
+        IF NEW.followed THEN
+            INSERT INTO dataset_changes (dataset_id, kind) VALUES (NEW.id, 'settings');
+        END IF;
+    END IF;
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION sync_dataset_followed() RETURNS trigger AS $$
+BEGIN
+    UPDATE datasets d SET followed = EXISTS (SELECT 1 FROM follower_datasets f WHERE f.dataset_id = d.id)
+    WHERE d.id IN (SELECT dataset_id FROM changed)
+      AND d.followed IS DISTINCT FROM EXISTS (SELECT 1 FROM follower_datasets f WHERE f.dataset_id = d.id);
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION require_mirror_sync(target_dataset INTEGER) RETURNS VOID AS $$
+BEGIN
+    IF current_setting('fridge.mirror_sync', TRUE) IS DISTINCT FROM target_dataset::text
+       AND EXISTS (SELECT 1 FROM mirrors WHERE dataset_id = target_dataset) THEN
+        RAISE EXCEPTION 'This dataset is a read-only mirror of a dataset on another Freedom Ridge instance: change it there'
+            USING ERRCODE = '55000';
+    END IF;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION guard_mirror_fields() RETURNS trigger AS $$
+BEGIN
+    IF TG_OP = 'UPDATE' AND (OLD.dataset_id, OLD.field_name, OLD.field_type, OLD.origin, OLD.display_type,
+                             OLD.overlay_config)
+        IS NOT DISTINCT FROM (NEW.dataset_id, NEW.field_name, NEW.field_type, NEW.origin, NEW.display_type,
+                              NEW.overlay_config) THEN
+        RETURN NULL;
+    END IF;
+    IF TG_OP <> 'INSERT' AND current_setting('fridge.deletion_dataset', TRUE) = OLD.dataset_id::text THEN
+        RETURN NULL;
+    END IF;
+    IF TG_OP <> 'INSERT' THEN
+        PERFORM require_mirror_sync(OLD.dataset_id);
+    END IF;
+    IF TG_OP <> 'DELETE' THEN
+        PERFORM require_mirror_sync(NEW.dataset_id);
+    END IF;
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION guard_mirror_views() RETURNS trigger AS $$
+BEGIN
+    IF current_setting('fridge.deletion_dataset', TRUE) IS DISTINCT FROM OLD.dataset_id::text
+       AND EXISTS (SELECT 1 FROM mirror_views WHERE view_id = OLD.id) THEN
+        PERFORM require_mirror_sync(OLD.dataset_id);
+    END IF;
+    IF TG_OP = 'DELETE' THEN
+        RETURN OLD;
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION log_map_changes() RETURNS trigger AS $$
+BEGIN
+    IF NULLIF(current_setting('fridge.deletion_dataset', TRUE), '') IS NOT NULL THEN
+        RETURN NULL;
+    END IF;
+    IF EXISTS (SELECT 1 FROM mirrors) AND EXISTS (
+        SELECT 1 FROM changed c JOIN samples s ON s.id = c.sample_id JOIN mirrors m ON m.dataset_id = s.dataset_id
+        WHERE c.field_name = ANY (m.vector_fields)
+          AND s.dataset_id::text IS DISTINCT FROM current_setting('fridge.mirror_sync', TRUE)
+    ) THEN
+        RAISE EXCEPTION 'This map came from another Freedom Ridge instance, which this dataset mirrors: change it there'
+            USING ERRCODE = '55000';
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM datasets WHERE followed) THEN
+        RETURN NULL;
+    END IF;
+    INSERT INTO map_block_changes (dataset_id, field_name, block_id)
+    SELECT DISTINCT s.dataset_id, c.field_name, c.sample_id::bigint / 4096
+    FROM changed c JOIN samples s ON s.id = c.sample_id JOIN datasets d ON d.id = s.dataset_id
+    WHERE d.followed
+    ON CONFLICT DO NOTHING;
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION log_map_ranked() RETURNS trigger AS $$
+BEGIN
+    IF current_setting('fridge.deletion_dataset', TRUE) IS DISTINCT FROM NEW.dataset_id::text
+       AND NOT NEW.rank_stale AND (TG_OP = 'INSERT' OR OLD.rank_stale)
+       AND EXISTS (SELECT 1 FROM datasets WHERE id = NEW.dataset_id AND followed) THEN
+        INSERT INTO dataset_changes (dataset_id, kind) VALUES (NEW.dataset_id, 'maps');
+    END IF;
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;

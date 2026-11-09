@@ -105,6 +105,9 @@ Details:
   worker, a machine that runs jobs for the server (`python -m fridge.worker`). Only the worker endpoints
   accept it; everywhere else it gets a 403, so the token kept on a worker machine can do only what a
   worker does. A full token or a session doesn't work on the worker endpoints either.
+- A **follower token** is created with a follower on the primary (`POST /api/followers`, admins only), for
+  a [follower instance](FOLLOWERS.md). It belongs to the follower's own account, `follower:<name>`, and
+  only the follower endpoints accept it. Removing the follower revokes it.
 
 The SDK's `client.login(username, password)` also works, but it keeps the password in your script
 and uses a cookie session that expires when idle. Prefer a token.
@@ -205,6 +208,18 @@ the variable.
 | `/api/workers/{id}/jobs/{job_id}/heartbeat`, `.../complete`, `.../fail`, `.../release` | POST | its owner's worker token, with the job's lease | Renew, finish, fail or give back a claimed job |
 | `/api/workers/{id}/jobs/{job_id}/files/{name}` | GET, PUT | its owner's worker token, with the job's lease (`X-Fridge-Lease`) | Download a job's inputs, upload its outputs |
 | `/api/workers` | GET | power_user (own workers), admin (all) | List compute workers and job runners |
+| `/api/followers` | POST, GET | admin | Add a follower (its token is returned once); list followers and what they follow |
+| `/api/followers/{id}` | DELETE | admin | Remove a follower and everything kept for it |
+| `/api/followers/{id}/datasets/{dataset_id}` | PUT, DELETE | admin | Follow a dataset (`tags`, `views`: `primary` or `both`), or stop |
+| `/api/follower/config` | GET | follower token | What this follower follows, and the primary's identity |
+| `/api/follower/datasets/{id}/blocks`, `.../blocks/samples`, `.../vectors`, `.../state` | GET, POST | follower token | Copy a followed dataset |
+| `/api/follower/datasets/{id}/changes`, `.../ack` | GET, POST | follower token | Read what changed since a cursor; acknowledge it |
+| `/api/follower/datasets/{id}/coordinates` | POST | follower token | Copy a followed dataset's map coordinates |
+| `/api/follower/datasets/{id}/tags`, `.../views`, `.../views/{view_id}` | POST, DELETE | follower token | Edits sent up, when the dataset's tags or views option is both ways |
+| `/api/primaries` | POST, GET | admin | On a follower: follow a primary (its follower token is checked first); list primaries and their mirrors |
+| `/api/primaries/{id}` | DELETE | admin | Stop following a primary; its mirrors stay as read-only copies |
+| `/api/compute-launcher` | GET, PUT | admin | On-demand compute workers: their settings (never the secret), and the machines started |
+| `/api/compute-launcher/check` | POST | admin | Ask AWS whether it would start a machine with the saved settings (a dry run) |
 
 ## Troubleshooting
 

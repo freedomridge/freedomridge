@@ -115,6 +115,18 @@ job's lease meanwhile; if the lease is lost, or someone cancels the job, the fit
 SIGTERM) gives the job back. Work files live in `FRIDGE_WORKER_DIR` (default `~/.fridge/worker`), one folder
 per job, removed when it ends.
 
+`--exit-when-idle SECONDS` makes the worker exit once it has had no job for that long, an unreachable server
+included, so a machine started for some jobs can power off when they're done.
+
+With Docker, the server's own `backend` image has the worker and everything a fit needs. Use the server's
+version, so the two match:
+
+```bash
+docker run --rm -e FRIDGE_API_URL=https://YOUR_DOMAIN/api -e FRIDGE_API_TOKEN=<worker token> \
+  -e FRIDGE_WORKER_DIR=/tmp/fridge-worker ghcr.io/freedomridge/backend:<server version> \
+  python -m fridge.worker --exit-when-idle 600
+```
+
 ## Core Classes
 
 ### Dataset
@@ -1009,6 +1021,60 @@ A prediction field is a value in each predicted sample's metadata. Predicting th
 images you will review (a view of thousands) is cheap; writing a field for every
 model version across millions of samples rewrites all those rows and grows the
 metadata indexes each time.
+
+### Class probabilities
+
+A segmentation model's class probabilities per pixel can be shown instead of, or beside, its index mask. The app
+turns each pixel into one class with a **rule** you can change while looking at a sample, and draws the classes in
+the field's colours.
+
+- **The file:** one 8-bit grayscale PNG per image with the N classes side by side: N planes of w × h, class k in
+  columns `k*w` to `(k+1)*w`, each value `round(probability * 255)`. It may be smaller than the image (scaled to
+  fit, without blending classes) and follows the same path rules as masks. Keep N × w at most 16,384 pixels, a
+  browser's canvas limit.
+- **The field:** `ClassProbabilities(path, classes=N)`, stored as
+  `{"type": "class_probabilities", "probPath": path, "classes": N}`. It's its own toggle under **Overlays**.
+- **Class names and colours:** `dataset.set_field_classes(field, names, colors=None)`, the same
+  `mask_targets` and `idColors` entries masks use. Class 0 is never drawn, as in index masks.
+- **The rule:** argmax (the most probable class) unless the field has a default. `threshold_rule` gives
+  per-class thresholds in order of precedence: a pixel takes the first class whose probability is at least its
+  threshold, and `fallback` when none passes (None draws nothing). A threshold on a group of classes' summed
+  probability is a dict entry with several `classes`.
+- **The default rule** is a dataset setting, `segmentation_config.class_rules[field]`, set with
+  `dataset.set_default_rule` or **Save as default** in the sample view (anyone who may edit the dataset). The
+  grid draws it; the sample view opens with it, and changing the rule there redraws at once and saves nothing.
+  The sample view can also show one class's probability as a heatmap.
+
+```python
+from pathlib import Path
+
+import numpy as np
+from PIL import Image
+from fridge import ClassProbabilities, threshold_rule
+
+def write_probabilities(probabilities: np.ndarray, path: str) -> None:
+    """probabilities: (N, h, w) floats from 0 to 1, a softmax's output."""
+    planes = (np.clip(probabilities, 0, 1) * 255).round().astype(np.uint8)
+    Image.fromarray(np.hstack(list(planes))).save(path)   # N*w x h, mode L
+
+folder = "s3://my-predictions/weeds/9f8e7d6"   # this model version's probabilities
+field = "probabilities_weeds_v2_0_0_9f8e7d6"
+dataset.set_values_per_sample_multi({
+    s.id: {field: ClassProbabilities(f"{folder}/{Path(s.filepath).stem}.png", classes=3)}
+    for s in view.iter_samples()
+})
+dataset.set_field_classes(field, ["soil", "crop", "weed"], colors={1: "#22c55e", 2: "#ef4444"})
+dataset.set_default_rule(field, threshold_rule([(2, 0.3), (1, 0.6)], fallback=None))
+# A group threshold, as a dict: crop or weed together above 0.8 is crop.
+dataset.set_default_rule(field, {"type": "rules", "fallback": None, "rules": [
+    {"classes": [2], "min": 0.3, "class": 2},
+    {"classes": [1, 2], "min": 0.8, "class": 1},
+]})
+```
+
+The argmax of the 8-bit values can differ from a float argmax on a few pixels where two classes are within 1/255
+of each other. Like class names and colours, the default rule follows `rename_field` and `clone_field`, and
+`clear_field` leaves it.
 
 ### Per-object filtering
 

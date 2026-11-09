@@ -211,6 +211,10 @@ export function TagManagementModal({
                 queryClient.invalidateQueries({ queryKey: ['dataset-active-jobs', datasetId] });
                 queryClient.invalidateQueries({ queryKey: ['dataset-job-history', datasetId] });
                 addToast('Bulk edit queued. Follow progress in Jobs; cancelling keeps completed chunks.', 'info', 6000);
+            } else {
+                // On a mirror (docs/FOLLOWERS.md) the edit was sent to its primary: say so, and when it shows here.
+                const result = await res.json().catch(() => ({}));
+                if (result.forwarded_to) addToast(result.message, 'info', 8000);
             }
             // Success - notify parent and close
             onUpdate();

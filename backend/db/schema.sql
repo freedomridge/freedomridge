@@ -42,7 +42,8 @@ CREATE TABLE IF NOT EXISTS datasets (
     owner_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
     is_global BOOLEAN DEFAULT FALSE,  -- private: admins, the owner and granted users
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    default_view_id INTEGER  -- the saved view the app opens on; FK to views(id) added below, after views
+    default_view_id INTEGER,  -- the saved view the app opens on; FK to views(id) added below, after views
+    followed BOOLEAN NOT NULL DEFAULT FALSE  -- a follower instance follows it: it logs its changes
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_datasets_active_name ON datasets(name) WHERE NOT deleting;
@@ -670,7 +671,8 @@ CREATE TABLE IF NOT EXISTS api_tokens (
     expires_at TIMESTAMP,
     is_active BOOLEAN DEFAULT TRUE,
     -- 'worker': a compute worker's token, which only the worker endpoints accept (routers/workers.py).
-    scope TEXT NOT NULL DEFAULT 'full' CONSTRAINT api_tokens_scope_check CHECK (scope IN ('full', 'worker'))
+    -- 'follower': a follower instance's token, which only the follower endpoints accept (routers/followers.py).
+    scope TEXT NOT NULL DEFAULT 'full' CONSTRAINT api_tokens_scope_check CHECK (scope IN ('full', 'worker', 'follower'))
 );
 
 CREATE INDEX IF NOT EXISTS idx_api_tokens_token ON api_tokens(token);
@@ -743,11 +745,13 @@ BEGIN
             IF OLD.tags IS DISTINCT FROM NEW.tags THEN affected := affected || ARRAY['tags']; END IF;
             IF OLD.media_type IS DISTINCT FROM NEW.media_type THEN affected := affected || ARRAY['media_type']; END IF;
         END IF;
+        PERFORM sample_block_changed(NEW.dataset_id, NEW.id::bigint / 4096);
         PERFORM record_stats_work(NEW.dataset_id, NEW.id::bigint / 4096, affected);
     END IF;
     IF TG_OP = 'DELETE' OR (TG_OP = 'UPDATE' AND
         (OLD.dataset_id, OLD.id::bigint / 4096) IS DISTINCT FROM (NEW.dataset_id, NEW.id::bigint / 4096)) THEN
         IF EXISTS (SELECT 1 FROM datasets WHERE id = OLD.dataset_id) THEN
+            PERFORM sample_block_changed(OLD.dataset_id, OLD.id::bigint / 4096);
             PERFORM record_stats_work(OLD.dataset_id, OLD.id::bigint / 4096, NULL);
         END IF;
     END IF;
@@ -2402,6 +2406,387 @@ CREATE TABLE IF NOT EXISTS system_job_schedules (
 );
 INSERT INTO system_job_schedules (job_type) VALUES ('index_review') ON CONFLICT (job_type) DO NOTHING;
 
+-- The follower change log (migration 0007): what changed in a followed dataset, stamped with the writing
+-- transaction for a feed in commit order. Samples are logged by block from the samples statistics trigger
+-- (mark_dataset_stats_stale, above), through sample_block_changed below.
+CREATE TABLE IF NOT EXISTS sample_block_changes (
+    dataset_id INTEGER NOT NULL,
+    transaction_id BIGINT NOT NULL DEFAULT txid_current(),
+    block_id BIGINT NOT NULL,
+    PRIMARY KEY (dataset_id, transaction_id, block_id)
+);
+
+CREATE TABLE IF NOT EXISTS vector_changes (
+    id BIGSERIAL PRIMARY KEY,
+    dataset_id INTEGER NOT NULL,
+    sample_id INTEGER NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('vector', 'hash')),
+    field_name TEXT NOT NULL,
+    transaction_id BIGINT NOT NULL DEFAULT txid_current()
+);
+CREATE INDEX IF NOT EXISTS vector_changes_feed ON vector_changes (dataset_id, transaction_id, id);
+
+CREATE TABLE IF NOT EXISTS dataset_changes (
+    id BIGSERIAL PRIMARY KEY,
+    dataset_id INTEGER NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('fields', 'settings', 'views', 'deleted', 'maps')),
+    transaction_id BIGINT NOT NULL DEFAULT txid_current()
+);
+CREATE INDEX IF NOT EXISTS dataset_changes_feed ON dataset_changes (dataset_id, transaction_id, id);
+
+-- A followed dataset's changed sample block, for its followers' feed. The samples statistics trigger calls it once per
+-- changed block and transaction, where it records statistics work for the write (record_stats_work is also called
+-- for statistics bookkeeping alone, which changes no sample).
+CREATE OR REPLACE FUNCTION sample_block_changed(target_dataset INTEGER, target_block BIGINT) RETURNS VOID AS $$
+BEGIN
+    IF current_setting('fridge.deletion_dataset', TRUE) = target_dataset::text THEN
+        RETURN;
+    END IF;
+    -- A mirror's samples change only through its sync (0009).
+    PERFORM require_mirror_sync(target_dataset);
+    INSERT INTO sample_block_changes (dataset_id, block_id)
+    SELECT target_dataset, target_block FROM datasets WHERE id = target_dataset AND followed
+    ON CONFLICT DO NOTHING;
+END;
+$$ LANGUAGE plpgsql;
+
+-- A vector or hash row of a sample that still exists; rows deleted with their sample are covered by its block.
+CREATE OR REPLACE FUNCTION log_vector_changes() RETURNS trigger AS $$
+BEGIN
+    IF NULLIF(current_setting('fridge.deletion_dataset', TRUE), '') IS NOT NULL THEN
+        RETURN NULL;
+    END IF;
+    -- The primary's fields on a mirror change only through its sync; fields only this instance has stay writable.
+    IF EXISTS (SELECT 1 FROM mirrors) AND EXISTS (
+        SELECT 1 FROM changed c JOIN samples s ON s.id = c.sample_id JOIN mirrors m ON m.dataset_id = s.dataset_id
+        WHERE c.field_name = ANY (CASE TG_ARGV[0] WHEN 'vector' THEN m.vector_fields ELSE m.hash_fields END)
+          AND s.dataset_id::text IS DISTINCT FROM current_setting('fridge.mirror_sync', TRUE)
+    ) THEN
+        RAISE EXCEPTION 'This field came from another Freedom Ridge instance, which this dataset mirrors: change it there'
+            USING ERRCODE = '55000';
+    END IF;
+    -- Most installations follow nothing: skip reading the changed rows at all.
+    IF NOT EXISTS (SELECT 1 FROM datasets WHERE followed) THEN
+        RETURN NULL;
+    END IF;
+    INSERT INTO vector_changes (dataset_id, sample_id, kind, field_name)
+    SELECT DISTINCT s.dataset_id, c.sample_id, TG_ARGV[0], c.field_name
+    FROM changed c JOIN samples s ON s.id = c.sample_id JOIN datasets d ON d.id = s.dataset_id
+    WHERE d.followed;
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION log_dataset_change() RETURNS trigger AS $$
+BEGIN
+    -- Most installations follow nothing: skip reading the changed rows at all.
+    IF NULLIF(current_setting('fridge.deletion_dataset', TRUE), '') IS NOT NULL
+       OR NOT EXISTS (SELECT 1 FROM datasets WHERE followed) THEN
+        RETURN NULL;
+    END IF;
+    INSERT INTO dataset_changes (dataset_id, kind)
+    SELECT DISTINCT c.dataset_id, TG_ARGV[0] FROM changed c JOIN datasets d ON d.id = c.dataset_id WHERE d.followed;
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION log_dataset_settings() RETURNS trigger AS $$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        -- Its subscriptions go with it (ON DELETE CASCADE), so nobody could read or acknowledge its log rows: they go too.
+        DELETE FROM sample_block_changes WHERE dataset_id = OLD.id;
+        DELETE FROM vector_changes WHERE dataset_id = OLD.id;
+        DELETE FROM dataset_changes WHERE dataset_id = OLD.id;
+        DELETE FROM map_block_changes WHERE dataset_id = OLD.id;
+        RETURN NULL;
+    END IF;
+    IF (OLD.name, OLD.description, OLD.media_fields, OLD.grid_media_field, OLD.modal_media_field,
+        OLD.segmentation_config, OLD.default_view_id)
+        IS DISTINCT FROM (NEW.name, NEW.description, NEW.media_fields, NEW.grid_media_field, NEW.modal_media_field,
+                          NEW.segmentation_config, NEW.default_view_id) THEN
+        PERFORM require_mirror_sync(NEW.id);
+        IF NEW.followed THEN
+            INSERT INTO dataset_changes (dataset_id, kind) VALUES (NEW.id, 'settings');
+        END IF;
+    END IF;
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER embeddings_log_insert AFTER INSERT ON embeddings REFERENCING NEW TABLE AS changed
+    FOR EACH STATEMENT EXECUTE FUNCTION log_vector_changes('vector');
+CREATE TRIGGER embeddings_log_update AFTER UPDATE ON embeddings REFERENCING NEW TABLE AS changed
+    FOR EACH STATEMENT EXECUTE FUNCTION log_vector_changes('vector');
+CREATE TRIGGER embeddings_log_delete AFTER DELETE ON embeddings REFERENCING OLD TABLE AS changed
+    FOR EACH STATEMENT EXECUTE FUNCTION log_vector_changes('vector');
+CREATE TRIGGER hashes_log_insert AFTER INSERT ON sample_hashes REFERENCING NEW TABLE AS changed
+    FOR EACH STATEMENT EXECUTE FUNCTION log_vector_changes('hash');
+CREATE TRIGGER hashes_log_update AFTER UPDATE ON sample_hashes REFERENCING NEW TABLE AS changed
+    FOR EACH STATEMENT EXECUTE FUNCTION log_vector_changes('hash');
+CREATE TRIGGER hashes_log_delete AFTER DELETE ON sample_hashes REFERENCING OLD TABLE AS changed
+    FOR EACH STATEMENT EXECUTE FUNCTION log_vector_changes('hash');
+CREATE TRIGGER dataset_fields_log_insert AFTER INSERT ON dataset_fields REFERENCING NEW TABLE AS changed
+    FOR EACH STATEMENT EXECUTE FUNCTION log_dataset_change('fields');
+CREATE TRIGGER dataset_fields_log_update AFTER UPDATE ON dataset_fields REFERENCING NEW TABLE AS changed
+    FOR EACH STATEMENT EXECUTE FUNCTION log_dataset_change('fields');
+CREATE TRIGGER dataset_fields_log_delete AFTER DELETE ON dataset_fields REFERENCING OLD TABLE AS changed
+    FOR EACH STATEMENT EXECUTE FUNCTION log_dataset_change('fields');
+CREATE TRIGGER views_log_insert AFTER INSERT ON views REFERENCING NEW TABLE AS changed
+    FOR EACH STATEMENT EXECUTE FUNCTION log_dataset_change('views');
+CREATE TRIGGER views_log_update AFTER UPDATE ON views REFERENCING NEW TABLE AS changed
+    FOR EACH STATEMENT EXECUTE FUNCTION log_dataset_change('views');
+CREATE TRIGGER views_log_delete AFTER DELETE ON views REFERENCING OLD TABLE AS changed
+    FOR EACH STATEMENT EXECUTE FUNCTION log_dataset_change('views');
+CREATE TRIGGER datasets_log_settings AFTER UPDATE OR DELETE ON datasets
+    FOR EACH ROW EXECUTE FUNCTION log_dataset_settings();
+
+-- Follower instances and what they follow (migration 0008): see routers/followers.py.
+CREATE TABLE IF NOT EXISTS followers (
+    id SERIAL PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE CHECK (name ~ '^[a-z0-9][a-z0-9-]{0,62}$'),
+    user_id INTEGER NOT NULL REFERENCES users(id),
+    token_id INTEGER REFERENCES api_tokens(id) ON DELETE SET NULL,
+    created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_seen_at TIMESTAMPTZ
+);
+
+CREATE TABLE IF NOT EXISTS follower_datasets (
+    follower_id INTEGER NOT NULL REFERENCES followers(id) ON DELETE CASCADE,
+    dataset_id INTEGER NOT NULL REFERENCES datasets(id) ON DELETE CASCADE,
+    tags TEXT NOT NULL DEFAULT 'primary' CHECK (tags IN ('primary', 'both')),
+    views TEXT NOT NULL DEFAULT 'primary' CHECK (views IN ('primary', 'both')),
+    -- Set just after the subscription commits: changes from transactions at or after it are in the log, and the
+    -- follower's full copy starts once every earlier one has ended (a write in flight when the dataset became
+    -- followed may not have seen the flag). NULL until then.
+    start_txid BIGINT,
+    acked_txid BIGINT,
+    subscribed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (follower_id, dataset_id)
+);
+CREATE INDEX IF NOT EXISTS follower_datasets_dataset ON follower_datasets (dataset_id);
+
+CREATE OR REPLACE FUNCTION sync_dataset_followed() RETURNS trigger AS $$
+BEGIN
+    UPDATE datasets d SET followed = EXISTS (SELECT 1 FROM follower_datasets f WHERE f.dataset_id = d.id)
+    WHERE d.id IN (SELECT dataset_id FROM changed)
+      AND d.followed IS DISTINCT FROM EXISTS (SELECT 1 FROM follower_datasets f WHERE f.dataset_id = d.id);
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER follower_datasets_followed_insert AFTER INSERT ON follower_datasets REFERENCING NEW TABLE AS changed
+    FOR EACH STATEMENT EXECUTE FUNCTION sync_dataset_followed();
+CREATE TRIGGER follower_datasets_followed_delete AFTER DELETE ON follower_datasets REFERENCING OLD TABLE AS changed
+    FOR EACH STATEMENT EXECUTE FUNCTION sync_dataset_followed();
+
+-- A follower's side (0009, docs/FOLLOWERS.md): the primaries it follows and its read-only mirrors of their
+-- datasets. Only the sync job, with fridge.mirror_sync set to the mirror's dataset id, changes what came from
+-- the primary; sample_block_changed, log_vector_changes and log_dataset_settings above call require_mirror_sync.
+CREATE TABLE IF NOT EXISTS primary_links (
+    id SERIAL PRIMARY KEY,
+    url TEXT NOT NULL UNIQUE,         -- the primary's API, e.g. https://primary.example.com/api
+    token_encrypted TEXT NOT NULL,    -- the follower token, encrypted with STORAGE_ENCRYPTION_KEY
+    follower_name TEXT,               -- this instance's name on the primary, from its config
+    identity TEXT,                    -- the primary database's identity, from its config
+    created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_synced_at TIMESTAMPTZ,
+    last_error TEXT
+);
+
+CREATE TABLE IF NOT EXISTS mirrors (
+    dataset_id INTEGER PRIMARY KEY REFERENCES datasets(id) ON DELETE CASCADE,
+    -- NULL once the link is removed here; the mirror is then a stopped, static copy.
+    link_id INTEGER REFERENCES primary_links(id) ON DELETE SET NULL,
+    origin_dataset_id INTEGER NOT NULL,
+    state TEXT NOT NULL DEFAULT 'copying' CHECK (state IN ('copying', 'following', 'stopped')),
+    tags TEXT NOT NULL DEFAULT 'primary' CHECK (tags IN ('primary', 'both')),
+    views TEXT NOT NULL DEFAULT 'primary' CHECK (views IN ('primary', 'both')),
+    -- Copying: the blocks left to copy, from the primary's plan. Changes during the copy come through the feed.
+    copy_blocks BIGINT[] NOT NULL DEFAULT '{}',
+    copy_total INTEGER NOT NULL DEFAULT 0,
+    -- The feed's next `after`: start_txid - 1 until the copy is done.
+    feed_cursor BIGINT NOT NULL,
+    -- The primary's vector and hash fields seen so far: read-only here, and the primary's copy wins on a name clash.
+    vector_fields TEXT[] NOT NULL DEFAULT '{}',
+    hash_fields TEXT[] NOT NULL DEFAULT '{}',
+    -- Shared views on the primary that use a concept: concepts are per instance, so those views stay there.
+    concept_views TEXT[] NOT NULL DEFAULT '{}',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_synced_at TIMESTAMPTZ,
+    last_error TEXT
+);
+-- One live mirror per primary dataset; a stopped one stays beside a new copy.
+CREATE UNIQUE INDEX IF NOT EXISTS mirrors_live_origin ON mirrors (link_id, origin_dataset_id) WHERE state <> 'stopped';
+
+CREATE TABLE IF NOT EXISTS mirror_samples (
+    dataset_id INTEGER NOT NULL REFERENCES mirrors(dataset_id) ON DELETE CASCADE,
+    origin_id INTEGER NOT NULL,
+    sample_id INTEGER NOT NULL REFERENCES samples(id) ON DELETE CASCADE,
+    -- An object sample's metadata.parent_id on the primary; stored here translated, or null until its parent arrives.
+    origin_parent_id INTEGER,
+    PRIMARY KEY (dataset_id, origin_id),
+    UNIQUE (sample_id)
+);
+CREATE INDEX IF NOT EXISTS mirror_samples_parent ON mirror_samples (dataset_id, origin_parent_id) WHERE origin_parent_id IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS mirror_views (
+    dataset_id INTEGER NOT NULL REFERENCES mirrors(dataset_id) ON DELETE CASCADE,
+    origin_view_id INTEGER NOT NULL,
+    view_id INTEGER NOT NULL UNIQUE REFERENCES views(id) ON DELETE CASCADE,
+    PRIMARY KEY (dataset_id, origin_view_id)
+);
+
+CREATE OR REPLACE FUNCTION require_mirror_sync(target_dataset INTEGER) RETURNS VOID AS $$
+BEGIN
+    IF current_setting('fridge.mirror_sync', TRUE) IS DISTINCT FROM target_dataset::text
+       AND EXISTS (SELECT 1 FROM mirrors WHERE dataset_id = target_dataset) THEN
+        RAISE EXCEPTION 'This dataset is a read-only mirror of a dataset on another Freedom Ridge instance: change it there'
+            USING ERRCODE = '55000';
+    END IF;
+END;
+$$ LANGUAGE plpgsql;
+
+-- The field registry of a mirror is the primary's. is_promoted stays local: it stands for an index here.
+CREATE OR REPLACE FUNCTION guard_mirror_fields() RETURNS trigger AS $$
+BEGIN
+    IF TG_OP = 'UPDATE' AND (OLD.dataset_id, OLD.field_name, OLD.field_type, OLD.origin, OLD.display_type,
+                             OLD.overlay_config)
+        IS NOT DISTINCT FROM (NEW.dataset_id, NEW.field_name, NEW.field_type, NEW.origin, NEW.display_type,
+                              NEW.overlay_config) THEN
+        RETURN NULL;
+    END IF;
+    IF TG_OP <> 'INSERT' AND current_setting('fridge.deletion_dataset', TRUE) = OLD.dataset_id::text THEN
+        RETURN NULL;
+    END IF;
+    IF TG_OP <> 'INSERT' THEN
+        PERFORM require_mirror_sync(OLD.dataset_id);
+    END IF;
+    IF TG_OP <> 'DELETE' THEN
+        PERFORM require_mirror_sync(NEW.dataset_id);
+    END IF;
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+-- A view copied from the primary changes only through the sync. BEFORE, so the mapping row is still there on DELETE.
+CREATE OR REPLACE FUNCTION guard_mirror_views() RETURNS trigger AS $$
+BEGIN
+    IF current_setting('fridge.deletion_dataset', TRUE) IS DISTINCT FROM OLD.dataset_id::text
+       AND EXISTS (SELECT 1 FROM mirror_views WHERE view_id = OLD.id) THEN
+        PERFORM require_mirror_sync(OLD.dataset_id);
+    END IF;
+    IF TG_OP = 'DELETE' THEN
+        RETURN OLD;
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER dataset_fields_mirror_guard AFTER INSERT OR UPDATE OR DELETE ON dataset_fields
+    FOR EACH ROW EXECUTE FUNCTION guard_mirror_fields();
+CREATE TRIGGER views_mirror_guard BEFORE UPDATE OR DELETE ON views
+    FOR EACH ROW EXECUTE FUNCTION guard_mirror_views();
+
+-- The primary's maps, for its followers: coordinates are logged like samples, by field and block, so a full re-fit
+-- of a 3.6M-sample map logs about 880 rows. A full re-rank (the only thing that clears rank_stale) logs a 'maps'
+-- dataset change, so a follower re-ranks its copy when the primary did. On a mirror, the coordinates of the
+-- primary's fields change only through the sync.
+CREATE TABLE IF NOT EXISTS map_block_changes (
+    dataset_id INTEGER NOT NULL,
+    transaction_id BIGINT NOT NULL DEFAULT txid_current(),
+    field_name TEXT NOT NULL,
+    block_id BIGINT NOT NULL,
+    PRIMARY KEY (dataset_id, transaction_id, field_name, block_id)
+);
+
+CREATE OR REPLACE FUNCTION log_map_changes() RETURNS trigger AS $$
+BEGIN
+    IF NULLIF(current_setting('fridge.deletion_dataset', TRUE), '') IS NOT NULL THEN
+        RETURN NULL;
+    END IF;
+    IF EXISTS (SELECT 1 FROM mirrors) AND EXISTS (
+        SELECT 1 FROM changed c JOIN samples s ON s.id = c.sample_id JOIN mirrors m ON m.dataset_id = s.dataset_id
+        WHERE c.field_name = ANY (m.vector_fields)
+          AND s.dataset_id::text IS DISTINCT FROM current_setting('fridge.mirror_sync', TRUE)
+    ) THEN
+        RAISE EXCEPTION 'This map came from another Freedom Ridge instance, which this dataset mirrors: change it there'
+            USING ERRCODE = '55000';
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM datasets WHERE followed) THEN
+        RETURN NULL;
+    END IF;
+    INSERT INTO map_block_changes (dataset_id, field_name, block_id)
+    SELECT DISTINCT s.dataset_id, c.field_name, c.sample_id::bigint / 4096
+    FROM changed c JOIN samples s ON s.id = c.sample_id JOIN datasets d ON d.id = s.dataset_id
+    WHERE d.followed
+    ON CONFLICT DO NOTHING;
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION log_map_ranked() RETURNS trigger AS $$
+BEGIN
+    IF current_setting('fridge.deletion_dataset', TRUE) IS DISTINCT FROM NEW.dataset_id::text
+       AND NOT NEW.rank_stale AND (TG_OP = 'INSERT' OR OLD.rank_stale)
+       AND EXISTS (SELECT 1 FROM datasets WHERE id = NEW.dataset_id AND followed) THEN
+        INSERT INTO dataset_changes (dataset_id, kind) VALUES (NEW.dataset_id, 'maps');
+    END IF;
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER coordinates_log_insert AFTER INSERT ON embedding_coordinates REFERENCING NEW TABLE AS changed
+    FOR EACH STATEMENT EXECUTE FUNCTION log_map_changes();
+CREATE TRIGGER coordinates_log_update AFTER UPDATE ON embedding_coordinates REFERENCING NEW TABLE AS changed
+    FOR EACH STATEMENT EXECUTE FUNCTION log_map_changes();
+CREATE TRIGGER coordinates_log_delete AFTER DELETE ON embedding_coordinates REFERENCING OLD TABLE AS changed
+    FOR EACH STATEMENT EXECUTE FUNCTION log_map_changes();
+CREATE TRIGGER viz_meta_log_ranked AFTER INSERT OR UPDATE ON embedding_viz_meta
+    FOR EACH ROW EXECUTE FUNCTION log_map_ranked();
+
+-- On-demand compute workers (0010, docs/ON_DEMAND_WORKERS.md): the launcher's settings and the machines it started.
+CREATE TABLE IF NOT EXISTS compute_launcher (
+    singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
+    enabled BOOLEAN NOT NULL DEFAULT FALSE,
+    region TEXT NOT NULL DEFAULT '',
+    instance_type TEXT NOT NULL DEFAULT 'r7i.2xlarge',
+    subnet_id TEXT,                                      -- NULL: the region's default VPC
+    security_group_ids TEXT[] NOT NULL DEFAULT '{}',     -- empty: the VPC's default security group
+    server_url TEXT NOT NULL DEFAULT '',                 -- the API address the machines reach this server at
+    image TEXT,                                          -- NULL: this version's ghcr.io/freedomridge/backend
+    access_key_id TEXT,                                  -- NULL: the server's own AWS credentials (its role)
+    secret_access_key_encrypted TEXT,                    -- with STORAGE_ENCRYPTION_KEY
+    wait_minutes INTEGER NOT NULL DEFAULT 5 CHECK (wait_minutes >= 1),
+    idle_minutes INTEGER NOT NULL DEFAULT 10 CHECK (idle_minutes >= 1),
+    max_machines INTEGER NOT NULL DEFAULT 1 CHECK (max_machines >= 1),
+    max_hours_per_machine DOUBLE PRECISION NOT NULL DEFAULT 6 CHECK (max_hours_per_machine > 0),
+    monthly_hours DOUBLE PRECISION NOT NULL DEFAULT 40 CHECK (monthly_hours > 0),
+    last_error TEXT,
+    last_error_at TIMESTAMPTZ,
+    updated_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+INSERT INTO compute_launcher DEFAULT VALUES ON CONFLICT DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS compute_launches (
+    id SERIAL PRIMARY KEY,
+    job_id UUID REFERENCES jobs(id) ON DELETE SET NULL,  -- the job it was started for
+    instance_id TEXT UNIQUE,                             -- NULL until AWS answers
+    region TEXT NOT NULL,
+    instance_type TEXT NOT NULL,
+    market TEXT NOT NULL CHECK (market IN ('spot', 'on-demand')),
+    worker_name TEXT NOT NULL,                           -- the name its worker registers with
+    token_id INTEGER REFERENCES api_tokens(id) ON DELETE SET NULL,
+    state TEXT NOT NULL DEFAULT 'starting' CHECK (state IN ('starting', 'running', 'ended')),
+    launched_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    connected_at TIMESTAMPTZ,
+    ended_at TIMESTAMPTZ,
+    end_reason TEXT
+);
+CREATE INDEX IF NOT EXISTS compute_launches_live ON compute_launches (launched_at) WHERE state <> 'ended';
+
 -- Ledger of applied migrations: the 1.0.0 baseline, then the files in backend/db/migrations/
 -- (0001_..., 0002_...) that scripts/apply_migrations.sh applies to existing databases. A fresh install
 -- from this file IS current: when you add a migration, make the same change here and ADD ITS
@@ -2417,5 +2802,9 @@ INSERT INTO schema_migrations (filename) VALUES
     ('0003_compute_worker_tokens.sql'),
     ('0004_map_state_without_model.sql'),
     ('0005_map_placement_history.sql'),
-    ('0006_map_placement_hold.sql')
+    ('0006_map_placement_hold.sql'),
+    ('0007_follower_change_log.sql'),
+    ('0008_followers.sql'),
+    ('0009_mirrors.sql'),
+    ('0010_compute_launcher.sql')
 ON CONFLICT (filename) DO NOTHING;

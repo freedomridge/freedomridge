@@ -5,7 +5,7 @@ import { Header } from '@/components/header';
 import { ProtectedRoute } from '@/components/ProtectedRoute';
 import { useUser } from '@/contexts/UserContext';
 import Link from 'next/link';
-import { Key, Users, Shield, Cloud, Activity, Cpu } from 'lucide-react';
+import { Key, Users, Shield, Cloud, Activity, Cpu, Share2, Download } from 'lucide-react';
 import { ChangePasswordModal } from '@/components/ChangePasswordModal';
 
 export default function SettingsPage() {
@@ -59,6 +59,48 @@ export default function SettingsPage() {
                                 </div>
                                 <p className="text-zinc-400 text-sm">
                                     Connect machines that run heavy jobs, such as map re-fits, for this server.
+                                </p>
+                            </Link>
+                        )}
+
+                        {/* Followers Card (Admin Only) */}
+                        {(user?.role === 'admin') && (
+                            <Link
+                                href="/settings/followers"
+                                data-testid="settings-followers-card"
+                                className="group block p-6 bg-zinc-900/50 border border-zinc-800 rounded-xl hover:border-cyan-500/50 hover:ring-1 hover:ring-cyan-500/50 transition-all shadow-lg hover:shadow-cyan-900/10"
+                            >
+                                <div className="flex items-center gap-4 mb-4">
+                                    <div className="p-3 bg-cyan-500/10 rounded-lg text-cyan-400 group-hover:bg-cyan-500/20 transition-colors">
+                                        <Share2 size={24} />
+                                    </div>
+                                    <h3 className="text-xl font-semibold text-white group-hover:text-cyan-400 transition-colors">
+                                        Followers
+                                    </h3>
+                                </div>
+                                <p className="text-zinc-400 text-sm">
+                                    Instances that mirror datasets of this server and add what it doesn&apos;t hold, such as patch vectors.
+                                </p>
+                            </Link>
+                        )}
+
+                        {/* Primaries Card (Admin Only): this instance as a follower */}
+                        {(user?.role === 'admin') && (
+                            <Link
+                                href="/settings/primaries"
+                                data-testid="settings-primaries-card"
+                                className="group block p-6 bg-zinc-900/50 border border-zinc-800 rounded-xl hover:border-cyan-500/50 hover:ring-1 hover:ring-cyan-500/50 transition-all shadow-lg hover:shadow-cyan-900/10"
+                            >
+                                <div className="flex items-center gap-4 mb-4">
+                                    <div className="p-3 bg-cyan-500/10 rounded-lg text-cyan-400 group-hover:bg-cyan-500/20 transition-colors">
+                                        <Download size={24} />
+                                    </div>
+                                    <h3 className="text-xl font-semibold text-white group-hover:text-cyan-400 transition-colors">
+                                        Primaries
+                                    </h3>
+                                </div>
+                                <p className="text-zinc-400 text-sm">
+                                    Follow another instance: the datasets it shares with this one arrive here as read-only mirrors.
                                 </p>
                             </Link>
                         )}

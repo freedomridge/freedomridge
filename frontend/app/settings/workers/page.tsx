@@ -6,6 +6,7 @@ import { ArrowLeft } from 'lucide-react';
 import { Header } from '@/components/header';
 import { PermissionGate } from '@/components/PermissionGate';
 import { ProtectedRoute } from '@/components/ProtectedRoute';
+import { OnDemandWorkers } from '@/components/on-demand-workers';
 
 // A compute worker (python -m fridge.worker on a machine with a worker token), or one of the server's job runners.
 interface Worker {
@@ -73,6 +74,9 @@ export default function WorkersPage() {
                                 The worker shows here within a minute. It keeps going while the server restarts, and stops when its token is revoked.
                             </p>
                         </div>
+                        <PermissionGate role="admin" fallback={null}>
+                            <OnDemandWorkers />
+                        </PermissionGate>
                         {isLoading ? (
                             <p className="text-zinc-500">Loading workers…</p>
                         ) : isError ? (

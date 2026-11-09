@@ -25,7 +25,7 @@ USER = {'id': 1, 'role': 'admin'}
 
 @pytest.fixture
 def registry_database(monkeypatch):
-    def run(scenario):
+    def run(scenario, pool_size=5):
         async def execute():
             dsn = os.environ['FRIDGE_TEST_POSTGRES_DSN']
             admin = await asyncpg.connect(dsn)
@@ -37,7 +37,7 @@ def registry_database(monkeypatch):
                 database.pool = await asyncpg.create_pool(
                     dsn,
                     min_size=1,
-                    max_size=5,
+                    max_size=pool_size,
                     init=init_connection,
                     server_settings={'search_path': f'{namespace},public', 'statement_timeout': '10000'},
                 )

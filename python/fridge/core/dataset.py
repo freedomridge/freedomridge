@@ -930,6 +930,32 @@ class Dataset:
         self._dirty = True
         return result
 
+    def set_field_classes(self, field_name: str, names, colors=None) -> dict:
+        """Name a mask or class-probability field's classes, and optionally colour them.
+
+        ``names`` is a list (class index i is ``names[i]``) or a ``{index: name}`` dict; ``colors`` is a list or dict
+        of ``"#rrggbb"`` by index. Other fields' entries and this field's other settings are kept (admin)."""
+
+        def by_index(values):
+            items = enumerate(values) if isinstance(values, (list, tuple)) else values.items()
+            return {str(int(index)): value for index, value in items}
+
+        config = self.client.get_dataset_by_id(self._id).get("segmentation_config") or {}
+        config.setdefault("mask_targets", {})[field_name] = by_index(names)
+        if colors is not None:
+            fields = config.setdefault("color_scheme", {}).setdefault("fields", {})
+            fields[field_name] = {
+                **fields.get(field_name, {}),
+                "colorByAttribute": "label",
+                "idColors": by_index(colors),
+            }
+        return self.client.update_dataset(self._id, segmentation_config=config)
+
+    def set_default_rule(self, field_name: str, rule: Optional[dict]) -> dict:
+        """A class-probability field's default rule (:func:`fridge.argmax_rule`, :func:`fridge.threshold_rule`, or the
+        dict form), which the app opens it with and the grid draws. None removes it (argmax)."""
+        return self.client.set_class_rule(self._id, field_name, rule)
+
     def promote_field(self, field_name: str, *, wait=True, timeout=3600):
         """Promote a field for indexed filtering (the index builds in a server job;
         ``wait=False`` returns its Job)."""

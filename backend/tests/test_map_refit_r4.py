@@ -230,7 +230,9 @@ def test_writers_during_the_rank_step(registry_database, tmp_path, monkeypatch, 
             await database.fetchval('SELECT count(*) FROM embedding_coordinates WHERE field_name=$1', FIELD),
         )
 
-    registry_database(scenario)
+    # Each writer above holds a connection while it waits (the refused ones for 2 to 5 s), next to the rank
+    # step's. With fewer than one each, a writer's time would include waiting for a free connection.
+    registry_database(scenario, pool_size=8)
 
 
 # --- the rank step cannot be cancelled; a failed one is healed; the counter stays right ---------

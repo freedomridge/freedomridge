@@ -7,6 +7,7 @@ import os
 import asyncpg
 import pytest
 
+from backend.label_fields import DISCOVERY_TYPES
 from backend.routers import datasets
 from backend.tests.statistics_helpers import run_refresh
 from backend.tests.test_field_registry_postgres import USER, ingest, registry_database  # noqa: F401
@@ -148,7 +149,7 @@ def test_writes_keep_discovery_caches_without_scanning(registry_database, monkey
         before = await database.fetch(
             "SELECT field_name, xmin::text AS token FROM dataset_field_stats WHERE field_name LIKE '\\_\\_%'",
         )
-        assert len(before) == 7
+        assert len(before) == len(DISCOVERY_TYPES)
         scans = _watch_scans(monkeypatch, database)
         if write == 'ingest':
             await ingest([{'detections': BOX}], prefix='later')
@@ -448,7 +449,7 @@ def test_background_bulk_preserves_discovery(registry_database, operation):
                 "SELECT field_name,unique_values FROM dataset_field_stats WHERE field_name LIKE '\\_\\_%'",
             )
         }
-        assert len(caches) == 7
+        assert len(caches) == len(DISCOVERY_TYPES)
         assert caches['__detection_fields__'] == (['vehicles'] if operation == 'delete' else ['traffic', 'vehicles'])
 
     registry_database(scenario)
@@ -546,7 +547,7 @@ def test_classification_list_append_does_not_scan_or_invalidate(registry_databas
         after = await database.fetch(
             "SELECT field_name,xmin::text FROM dataset_field_stats WHERE field_name LIKE '\\_\\_%' ORDER BY 1",
         )
-        assert len(before) == len(after) == 7
+        assert len(before) == len(after) == len(DISCOVERY_TYPES)
         assert [a['field_name'] for a, b in zip(after, before) if a != b] == ['__classification_fields__']
         assert scans == []
 
@@ -568,12 +569,9 @@ def test_statistics_publishes_caches_before_bikes_and_lanes(registry_database):
                 'bikes0.label': ['car'],
                 'lanes.label': ['lane'],
             }
-            assert (
-                await database.fetchval(
-                    "SELECT count(*) FROM dataset_field_stats WHERE field_name LIKE '\\_\\_%'",
-                )
-                == 7
-            )
+            assert await database.fetchval(
+                "SELECT count(*) FROM dataset_field_stats WHERE field_name LIKE '\\_\\_%'",
+            ) == len(DISCOVERY_TYPES)
 
     registry_database(scenario)
 
@@ -605,8 +603,8 @@ def test_concurrent_sidebar_discovery_is_single_flight(registry_database, monkey
         for response in responses:
             assert {f['name']: f['type'] for f in response}['vehicles'] == 'detections'
         discovery = [query for query in scans if 'jsonb_each(' in query]
-        assert len(discovery) == 7
-        assert len(set(discovery)) == 7
+        assert len(discovery) == len(DISCOVERY_TYPES)
+        assert len(set(discovery)) == len(DISCOVERY_TYPES)
 
     registry_database(scenario)
 
@@ -628,7 +626,7 @@ def test_sidebar_timeout_releases_discovery_lock(registry_database, monkeypatch)
         monkeypatch.setattr(label_fields, 'DISCOVERY_TIMEOUT_MS', 100, raising=False)
         monkeypatch.setattr(asyncpg.Connection, 'fetch', slow_scan)
         await datasets._get_dataset_field_stats_impl(1, None)
-        assert seen_timeouts == ['100ms'] * 7
+        assert seen_timeouts == ['100ms'] * len(DISCOVERY_TYPES)
         assert not await database.fetchval(
             "SELECT EXISTS(SELECT 1 FROM dataset_field_stats WHERE field_name LIKE '\\_\\_%')",
         )

@@ -45,7 +45,7 @@ from backend.label_fields import (
 )
 from backend.sample_ingest import insert_samples
 
-from .. import dataset_deletion, field_usage, job_queue, job_wait, statistics
+from .. import class_rules, dataset_deletion, field_usage, job_queue, job_wait, statistics
 from ..access import check_dataset_access, filter_datasets_for_user, require_dataset_access
 from ..database import db
 from ..diskspace import INGEST_ROW_BYTES, require_free_space
@@ -185,7 +185,11 @@ class DatasetUpdate(BaseModel):
 _DATASET_SELECT = (
     "id, name, description, media_fields, grid_media_field, modal_media_field, "
     "segmentation_config, storage_config_id, owner_id, is_global, created_at, deleting, deletion_job_id, "
-    "default_view_id"
+    "default_view_id, "
+    # A mirror of a dataset on another instance (docs/FOLLOWERS.md): read-only here.
+    "(SELECT jsonb_build_object('state', m.state, 'primary_url', l.url, 'origin_dataset_id', m.origin_dataset_id, "
+    "'tags', m.tags, 'views', m.views, 'concept_views', m.concept_views) "
+    "FROM mirrors m LEFT JOIN primary_links l ON l.id = m.link_id WHERE m.dataset_id = datasets.id) AS mirror"
 )
 
 
@@ -388,10 +392,14 @@ async def update_dataset(id: int, dataset: DatasetUpdate, user: dict = Depends(r
         idx += 1
 
     if dataset.segmentation_config is not None:
+        try:
+            config = class_rules.validate_config(dataset.segmentation_config)
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from None
         fields.append(f"segmentation_config = ${idx}")
         # Bind the dict directly — the asyncpg jsonb codec serializes it once.
         # (json.dumps here double-encoded it into a jsonb *string*, corrupting it.)
-        values.append(dataset.segmentation_config)
+        values.append(config)
         idx += 1
 
     # storage_config_id is nullable (NULL means "use the default / env-var
@@ -451,9 +459,56 @@ async def update_dataset(id: int, dataset: DatasetUpdate, user: dict = Depends(r
         raise HTTPException(status_code=400, detail="Invalid storage_config_id")
 
 
+class ClassRuleUpdate(BaseModel):
+    # The rule (class_rules.py); null removes the field's default, which is then argmax.
+    rule: Optional[Dict[str, Any]] = None
+
+
+@router.put("/datasets/{id}/class-rules/{field_name}", dependencies=[Depends(require_dataset_access)])
+async def set_class_rule(
+    id: int,
+    field_name: str,
+    update: ClassRuleUpdate = Body(...),
+    user: dict = Depends(require_role("power_user")),
+):
+    """A class-probability field's default rule, which the app opens the field with and the grid draws. Anyone who
+    may edit the dataset may set it; it changes only how the field is shown."""
+    if not 0 < len(field_name) <= 255:
+        raise HTTPException(status_code=400, detail='A field name is 1 to 255 characters')
+    rule = None
+    if update.rule is not None:
+        try:
+            rule = class_rules.validate_rule(update.rule)
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from None
+    async with db.pool.acquire() as connection, connection.transaction():
+        # NO KEY UPDATE serializes with PATCH /datasets/{id} and the rename/clone carry, as they do.
+        config = await connection.fetchval(
+            'SELECT segmentation_config FROM datasets WHERE id = $1 FOR NO KEY UPDATE',
+            id,
+        )
+        if isinstance(config, str):
+            config = json.loads(config)
+        config = dict(config or {})
+        rules = dict(config.get('class_rules') or {})
+        if rule is None:
+            rules.pop(field_name, None)
+        else:
+            rules[field_name] = rule
+        config['class_rules'] = rules
+        await connection.execute('UPDATE datasets SET segmentation_config = $2 WHERE id = $1', id, config)
+    return {'field_name': field_name, 'rule': rule}
+
+
 @router.delete("/datasets/{id}", status_code=202)
 async def delete_dataset(id: int, user: dict = Depends(require_role("admin"))):
     """Seal the dataset and return its durable deletion job."""
+    if await db.fetchval("SELECT 1 FROM mirrors WHERE dataset_id = $1 AND state <> 'stopped'", id):
+        raise HTTPException(
+            status_code=409,
+            detail='This dataset mirrors one on another Freedom Ridge instance. Stop sharing it with this follower '
+            'there (Settings → Followers on the primary), then delete the copy here.',
+        )
     return await dataset_deletion.submit(db.pool, id, user['id'])
 
 
@@ -1838,6 +1893,7 @@ async def _get_dataset_field_stats_impl(
     cuboid_fields = by_type['cuboids']
     keypoint_fields = by_type['keypoints']
     heatmap_fields = by_type['heatmap']
+    probability_fields = by_type['class_probabilities']
     mask_overlay_fields = by_type['segmentation']
     classification_fields = [name for name in by_type['classification'] if name not in cuboid_fields]
     classification_lists = {
@@ -1862,6 +1918,7 @@ async def _get_dataset_field_stats_impl(
     segmentation_labels = cached_labels[-1]
     registered_names = {stat['field_name'] for stat in stats if stat.get('origin') != 'system'}
     heatmap_fields = [name for name in heatmap_fields if name in registered_names]
+    probability_fields = [name for name in probability_fields if name in registered_names]
     mask_overlay_fields = [name for name in mask_overlay_fields if name in registered_names]
     cuboid_fields = [name for name in cuboid_fields if name in registered_names]
     keypoint_fields = [name for name in keypoint_fields if name in registered_names]
@@ -1953,6 +2010,17 @@ async def _get_dataset_field_stats_impl(
                 "name": heatmap_field,
                 "type": "heatmap",
                 "config": _overlay_cfgs.get(heatmap_field),
+            },
+        )
+
+    # Class-probability overlays ({"type": "class_probabilities", "probPath": ..., "classes": N}): drawn by the app
+    # with a rule, the field's default in segmentation_config.class_rules (class_rules.py).
+    for probability_field in probability_fields:
+        schema.append(
+            {
+                "name": probability_field,
+                "type": "class_probabilities",
+                "config": _overlay_cfgs.get(probability_field),
             },
         )
 
@@ -2172,6 +2240,7 @@ async def _get_dataset_field_stats_impl(
             continue
         if stat['field_name'] in (
             '__heatmap_fields__',
+            '__probability_fields__',
             '__mask_overlay_fields__',
             '__cuboid_fields__',
             '__keypoint_fields__',
@@ -2180,8 +2249,8 @@ async def _get_dataset_field_stats_impl(
             '__classification_fields__',
         ):
             continue  # Internal cache rows; never surfaced to the frontend
-        if stat['field_name'] in heatmap_field_set:
-            continue  # Already emitted above as a heatmap; would otherwise appear as "string"
+        if stat['field_name'] in heatmap_field_set or stat['field_name'] in probability_fields:
+            continue  # Already emitted above as an overlay; would otherwise appear as "string"
         if stat['field_name'] in mask_overlay_field_set:
             continue  # Already emitted above as a segmentation overlay; would otherwise appear as "dict"
         if stat['field_name'] in classification_field_set and not stat['is_promoted']:
@@ -2492,6 +2561,35 @@ class CreateArrayFieldRequest(BaseModel):
     field_name: str
 
 
+async def add_array_column(pool, dataset_id: int, name: str) -> None:
+    """The physical TEXT[] column and GIN index of an array field, shared by every dataset (a follower's sync adds
+    the primary's this way, from the job runner's pool). ``name`` must already be checked against _SAFE_COLUMN_RE
+    and _RESERVED_COLUMNS."""
+    async with pool.acquire() as conn, _field_index_operation(conn, dataset_id, index_ddl=True):
+        # Bounded: ACCESS EXCLUSIVE queued behind a long reader would stall every samples read and
+        # write queued behind it (ingest included) until the request timed out. Busy: 409, retry.
+        try:
+            async with conn.transaction():
+                await conn.execute("SET LOCAL lock_timeout = '2s'")
+                await conn.execute(f"ALTER TABLE samples ADD COLUMN IF NOT EXISTS {name} TEXT[] DEFAULT '{{}}'")
+        except asyncpg.LockNotAvailableError:
+            raise HTTPException(
+                status_code=409,
+                detail='The samples table is busy (a long read or an index build); retry shortly',
+                headers={'Retry-After': '5'},
+            ) from None
+        await conn.execute(
+            f"CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_samples_{name}_gin ON samples USING gin ({name})",
+        )
+        await conn.execute(
+            "INSERT INTO sample_array_columns (column_name) VALUES ($1) ON CONFLICT DO NOTHING",
+            name,
+        )
+    # Invalidate cache (sample_array_columns changed)
+    global _array_columns_cache
+    _array_columns_cache = None
+
+
 @router.post("/datasets/{id}/array-fields", dependencies=[Depends(require_dataset_access)])
 async def create_array_field(
     id: int,
@@ -2536,29 +2634,7 @@ async def create_array_field(
     # Create the physical column + index only when it doesn't exist yet.
     if not already_exists:
         assert db.pool is not None  # connected at startup (lifespan)
-        async with db.pool.acquire() as conn, _field_index_operation(conn, id, index_ddl=True):
-            # Bounded: ACCESS EXCLUSIVE queued behind a long reader would stall every samples read and
-            # write queued behind it (ingest included) until the request timed out. Busy: 409, retry.
-            try:
-                async with conn.transaction():
-                    await conn.execute("SET LOCAL lock_timeout = '2s'")
-                    await conn.execute(f"ALTER TABLE samples ADD COLUMN IF NOT EXISTS {name} TEXT[] DEFAULT '{{}}'")
-            except asyncpg.LockNotAvailableError:
-                raise HTTPException(
-                    status_code=409,
-                    detail='The samples table is busy (a long read or an index build); retry shortly',
-                    headers={'Retry-After': '5'},
-                ) from None
-            await conn.execute(
-                f"CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_samples_{name}_gin ON samples USING gin ({name})",
-            )
-            await conn.execute(
-                "INSERT INTO sample_array_columns (column_name) VALUES ($1) ON CONFLICT DO NOTHING",
-                name,
-            )
-        # Invalidate cache (sample_array_columns changed)
-        global _array_columns_cache
-        _array_columns_cache = None
+        await add_array_column(db.pool, id, name)
 
     # Register the field for THIS dataset regardless of whether the global column
     # already existed — otherwise a second dataset adopting an existing array column
@@ -6714,6 +6790,12 @@ class BulkTargetRequest(BaseModel):
 async def _bulk_response(id, user, operation, payload):
     from .. import bulk_jobs
 
+    if await db.fetchval('SELECT 1 FROM mirrors WHERE dataset_id = $1', id):
+        raise HTTPException(
+            status_code=409,
+            detail='This dataset is a read-only mirror of a dataset on another Freedom Ridge instance: change it there',
+        )
+
     result = await bulk_jobs.submit(db.pool, id, user['id'], operation, payload)
     return JSONResponse(status_code=202, content=result)
 
@@ -6848,6 +6930,12 @@ async def bulk_tag_samples(id: int, request: BulkTagRequest, user: dict = Depend
         )
         if count != len(request.sample_ids):
             raise HTTPException(status_code=400, detail=f"Some samples not found in dataset {id}")
+
+    # A mirror's tags are its primary's: sent there when its tags option is both ways, refused otherwise.
+    if await db.fetchval('SELECT 1 FROM mirrors WHERE dataset_id = $1', id):
+        from .. import mirror_writes
+
+        return await mirror_writes.forward_tags(db, id, request)
 
     if (
         request.background
@@ -7082,8 +7170,8 @@ async def _carry_segmentation_entries(
     *,
     keep_source: bool,
 ) -> None:
-    """Give new_name the field's class names and colours: its segmentation_config entries
-    (mask_targets and color_scheme.fields, nested fields included), which are keyed by field name.
+    """Give new_name the field's class names, colours and default class rule: its segmentation_config entries
+    (mask_targets, color_scheme.fields and class_rules, nested fields included), which are keyed by field name.
     new_name None only drops them; keep_source leaves the field's own entries in place."""
     # NO KEY UPDATE serializes with PATCH /datasets/{id} but not with writers' KEY SHARE dataset lock.
     config = await connection.fetchval(
@@ -7093,7 +7181,11 @@ async def _carry_segmentation_entries(
     if isinstance(config, str):
         config = json.loads(config)
     changed = False
-    for section in ((config or {}).get('mask_targets'), ((config or {}).get('color_scheme') or {}).get('fields')):
+    for section in (
+        (config or {}).get('mask_targets'),
+        ((config or {}).get('color_scheme') or {}).get('fields'),
+        (config or {}).get('class_rules'),
+    ):
         if not isinstance(section, dict):
             continue
         keys = [key for key in section if key == field or key.startswith(f'{field}.')]

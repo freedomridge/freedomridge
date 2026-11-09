@@ -4,6 +4,85 @@ Freedom Ridge has one version for the server, the web app and the Python SDK (th
 file), following [Semantic Versioning](https://semver.org). A release lists **upgrade notes** when
 it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
 
+## 2.4.0 (2026-11-09)
+
+2.4.0 adds follower instances: a second Freedom Ridge keeps read-only mirrors of the datasets a primary shares
+with it, kept up to date from the primary's change log, and can send tags and views back. It also adds on-demand
+compute workers, AWS spot machines started for a waiting map re-fit, and class-probability overlays. A deployment
+that uses none of it needs only the four migrations, none of which rewrites a table.
+
+### Upgrade notes
+
+- Four database migrations, applied with `scripts/apply_migrations.sh` (step 4 of [Upgrading](docs/UPGRADING.md)).
+  None rewrites a table; each waits at most 2 seconds for its locks, so if one stops with a lock timeout, run it
+  again.
+  - `0007_follower_change_log.sql`: the `datasets.followed` column, and the change log's tables and triggers.
+  - `0008_followers.sql`: the followers' tables, and `api_tokens` accepting the `follower` scope.
+  - `0009_mirrors.sql`: the follower side's tables, the checks that keep a mirror read-only, and the map
+    coordinates' change log.
+  - `0010_compute_launcher.sql`: the on-demand workers' settings (off) and the machines they start.
+- Nothing else changes for a deployment that uses none of this. On-demand workers also need
+  `JOB_RUNNER_PLACEMENTS=server` and AWS permissions ([ON_DEMAND_WORKERS.md](docs/ON_DEMAND_WORKERS.md)).
+
+### Added
+
+- **A change log for follower instances.** Every change to a followed dataset is logged with the transaction
+  that made it, by triggers, whatever path made it:
+  - samples inserted, changed or deleted, by block of 4096 ids, from the statistics trigger already on samples;
+  - vectors and hashes, per sample and field;
+  - map coordinates, by field and block, and a map's full re-rank;
+  - its field registry, settings and saved views.
+
+  A dataset nobody follows logs nothing, and a deleted dataset's log rows go with it.
+- **Followers, on the primary** ([FOLLOWERS.md](docs/FOLLOWERS.md)).
+  - Under Settings → Followers, an admin adds a follower instance (`POST /api/followers`), which gets its own
+    account and a token that only the follower endpoints accept. The page shows each follower's last check-in,
+    highlighted after a week of silence, and the changes held for it.
+  - The admin chooses the datasets it follows, each with a `tags` and a `views` option (primary only, or both
+    ways).
+  - The follower copies a dataset, then reads what changed in commit order (`/api/follower/...`), and
+    acknowledges what it applied, so the log is pruned.
+  - Removing a follower deletes everything kept for it.
+- **Followers, on the follower.**
+  - Under Settings → Primaries, an admin follows a primary with its address and follower token.
+  - The job runner syncs every minute: each dataset shared with this follower is copied into a read-only
+    **mirror**, then kept up to date from the primary's feed.
+  - Everything the primary sent is read-only here, enforced by the database. Vector fields only this instance
+    has and their maps, statistics and local views stay its own.
+  - The primary's maps are copied, logged by field and block, so a map view selects the same samples on both;
+    the mirror re-ranks a map when the primary did.
+  - With tags both ways, tagging a mirror is made on the primary as the follower's account. With views both
+    ways, views shared with everyone on a mirror are made on the primary, marked with the follower's name.
+  - Sample ids are translated, in object samples' `parent_id` and in views' filters.
+  - Views that use a concept stay on the primary.
+  - A mirror stops when the primary stops sharing it, removes the follower or is restored into a new database;
+    it then stays as a read-only copy to keep or delete.
+- **`python -m fridge.worker --exit-when-idle SECONDS`:** a compute worker exits once it has had no job for that
+  long, an unreachable server included, so a machine started for some jobs can power off afterwards. The SDK
+  docs show running a worker from the server's `backend` image with Docker.
+- **On-demand compute workers** ([ON_DEMAND_WORKERS.md](docs/ON_DEMAND_WORKERS.md)), off until an admin turns
+  them on under Settings → Compute Workers.
+  - When a compute job (a map re-fit) has waited with no worker free, the job runner starts an AWS spot machine,
+    or on-demand when AWS has no spot capacity. The machine runs the worker from this version's backend image
+    and powers off, and so terminates, once the worker is idle.
+  - Limits are times: machines at once, hours per machine, machine-hours a month. A job held back by one says
+    which.
+  - Each machine has its own worker token, revoked when it ends. Machines that AWS ended, that are over their
+    time, or whose worker never came or went quiet are ended once a minute.
+  - **Check with AWS** dry-runs a launch with the settings. The Terraform module attaches the AWS permissions
+    with `on_demand_workers = true`.
+- **Class-probability overlays** (docs/SDK.md, "Class probabilities"). A field holding a segmentation model's
+  class probabilities per pixel (`fridge.ClassProbabilities`, one 8-bit grayscale PNG with the classes side by
+  side) is drawn as one class per pixel with a rule: argmax, or thresholds in order of precedence with a
+  fallback, including thresholds on a group of classes' summed probability.
+  - The sample view changes the rule live, or shows one class's probability as a heatmap. **Save as default**
+    stores the rule for everyone (anyone who may edit the dataset; `PUT /api/datasets/{id}/class-rules/{field}`).
+  - The grid draws the default rule.
+  - The SDK sets classes and colours with `dataset.set_field_classes` and the default rule with
+    `dataset.set_default_rule` (`fridge.argmax_rule`, `fridge.threshold_rule`).
+  - The rule is kept in `segmentation_config.class_rules` and follows `rename_field` and `clone_field` like class
+    names and colours.
+
 ## 2.3.0 (2026-11-08)
 
 2.3.0 adds what a follower instance needs first: one image's patch vectors computed without a server, and a
