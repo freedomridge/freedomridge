@@ -4,7 +4,12 @@ Freedom Ridge has one version for the server, the web app and the Python SDK (th
 file), following [Semantic Versioning](https://semver.org). A release lists **upgrade notes** when
 it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
 
-## Unreleased
+## 2.4.0 (2026-11-09)
+
+2.4.0 adds follower instances: a second Freedom Ridge keeps read-only mirrors of the datasets a primary shares
+with it, kept up to date from the primary's change log, and can send tags and views back. It also adds on-demand
+compute workers, AWS spot machines started for a waiting map re-fit, and class-probability overlays. A deployment
+that uses none of it needs only the four migrations, none of which rewrites a table.
 
 ### Upgrade notes
 
