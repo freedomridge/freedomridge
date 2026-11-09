@@ -1318,3 +1318,39 @@ BEGIN
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION log_map_changes() RETURNS trigger AS $$
+BEGIN
+    IF NULLIF(current_setting('fridge.deletion_dataset', TRUE), '') IS NOT NULL THEN
+        RETURN NULL;
+    END IF;
+    IF EXISTS (SELECT 1 FROM mirrors) AND EXISTS (
+        SELECT 1 FROM changed c JOIN samples s ON s.id = c.sample_id JOIN mirrors m ON m.dataset_id = s.dataset_id
+        WHERE c.field_name = ANY (m.vector_fields)
+          AND s.dataset_id::text IS DISTINCT FROM current_setting('fridge.mirror_sync', TRUE)
+    ) THEN
+        RAISE EXCEPTION 'This map came from another Freedom Ridge instance, which this dataset mirrors: change it there'
+            USING ERRCODE = '55000';
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM datasets WHERE followed) THEN
+        RETURN NULL;
+    END IF;
+    INSERT INTO map_block_changes (dataset_id, field_name, block_id)
+    SELECT DISTINCT s.dataset_id, c.field_name, c.sample_id::bigint / 4096
+    FROM changed c JOIN samples s ON s.id = c.sample_id JOIN datasets d ON d.id = s.dataset_id
+    WHERE d.followed
+    ON CONFLICT DO NOTHING;
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION log_map_ranked() RETURNS trigger AS $$
+BEGIN
+    IF current_setting('fridge.deletion_dataset', TRUE) IS DISTINCT FROM NEW.dataset_id::text
+       AND NOT NEW.rank_stale AND (TG_OP = 'INSERT' OR OLD.rank_stale)
+       AND EXISTS (SELECT 1 FROM datasets WHERE id = NEW.dataset_id AND followed) THEN
+        INSERT INTO dataset_changes (dataset_id, kind) VALUES (NEW.dataset_id, 'maps');
+    END IF;
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;

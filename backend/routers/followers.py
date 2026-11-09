@@ -36,6 +36,8 @@ STALE_DAYS = 7
 FEED_TRANSACTIONS = 1000  # whole transactions per feed page
 SAMPLE_BLOCKS = 16  # blocks per samples request
 VECTOR_SAMPLES = 2000  # samples per vectors request
+# The change log's tables, each with dataset_id and transaction_id.
+LOG_TABLES = ('sample_block_changes', 'vector_changes', 'dataset_changes', 'map_block_changes')
 
 
 class FollowerCreate(BaseModel):
@@ -76,7 +78,7 @@ async def prune(source, dataset_id: int) -> None:
     )
     if floor['followers'] and (floor['starting'] or floor['floor'] is None):
         return
-    for table in ('sample_block_changes', 'vector_changes', 'dataset_changes'):
+    for table in LOG_TABLES:
         if floor['followers']:
             await source.execute(
                 f'DELETE FROM {table} WHERE dataset_id = $1 AND transaction_id <= $2',
@@ -130,19 +132,15 @@ async def list_followers(user: dict = Depends(require_role('admin'))):
                    last_seen_at IS NULL OR last_seen_at < now() - interval '{STALE_DAYS} days' AS stale
             FROM followers ORDER BY name""",
     )
+    held = ' + '.join(
+        f'(SELECT count(*) FROM {table} c WHERE c.dataset_id = f.dataset_id '
+        'AND c.transaction_id > COALESCE(f.acked_txid, f.start_txid - 1, 0))'
+        for table in LOG_TABLES
+    )
     datasets = await db.fetch(
-        """SELECT f.follower_id, f.dataset_id, d.name, f.tags, f.views, f.start_txid, f.acked_txid, f.subscribed_at,
-                  (SELECT count(*) FROM sample_block_changes c
-                    WHERE c.dataset_id = f.dataset_id
-                      AND c.transaction_id > COALESCE(f.acked_txid, f.start_txid - 1, 0))
-                + (SELECT count(*) FROM vector_changes c
-                    WHERE c.dataset_id = f.dataset_id
-                      AND c.transaction_id > COALESCE(f.acked_txid, f.start_txid - 1, 0))
-                + (SELECT count(*) FROM dataset_changes c
-                    WHERE c.dataset_id = f.dataset_id
-                      AND c.transaction_id > COALESCE(f.acked_txid, f.start_txid - 1, 0))
-                  AS held_rows
-           FROM follower_datasets f JOIN datasets d ON d.id = f.dataset_id ORDER BY d.name""",
+        f"""SELECT f.follower_id, f.dataset_id, d.name, f.tags, f.views, f.start_txid, f.acked_txid, f.subscribed_at,
+                   {held} AS held_rows
+            FROM follower_datasets f JOIN datasets d ON d.id = f.dataset_id ORDER BY d.name""",
     )
     result = []
     for follower in followers:
@@ -305,15 +303,12 @@ async def follower_changes(
                 detail='Copy the dataset first, then read the feed from start_txid - 1',
             )
         xmin = await connection.fetchval('SELECT txid_snapshot_xmin(txid_current_snapshot())')
+        logged = ' UNION '.join(
+            f'SELECT transaction_id FROM {table} WHERE dataset_id = $1 AND transaction_id > $2 AND transaction_id < $3'
+            for table in LOG_TABLES
+        )
         found = await connection.fetch(
-            """SELECT transaction_id FROM (
-                   SELECT transaction_id FROM sample_block_changes
-                   WHERE dataset_id = $1 AND transaction_id > $2 AND transaction_id < $3
-                   UNION SELECT transaction_id FROM vector_changes
-                   WHERE dataset_id = $1 AND transaction_id > $2 AND transaction_id < $3
-                   UNION SELECT transaction_id FROM dataset_changes
-                   WHERE dataset_id = $1 AND transaction_id > $2 AND transaction_id < $3
-               ) t ORDER BY 1 LIMIT $4""",
+            f'SELECT transaction_id FROM ({logged}) t ORDER BY 1 LIMIT $4',
             dataset_id,
             after,
             xmin,
@@ -335,6 +330,13 @@ async def follower_changes(
             after,
             upto,
         )
+        maps = await connection.fetch(
+            'SELECT DISTINCT field_name, block_id FROM map_block_changes '
+            'WHERE dataset_id = $1 AND transaction_id > $2 AND transaction_id <= $3 ORDER BY 1, 2',
+            dataset_id,
+            after,
+            upto,
+        )
         state = await connection.fetch(
             'SELECT DISTINCT kind FROM dataset_changes '
             'WHERE dataset_id = $1 AND transaction_id > $2 AND transaction_id <= $3 ORDER BY 1',
@@ -347,6 +349,7 @@ async def follower_changes(
         'more': more,
         'blocks': [row['block_id'] for row in blocks],
         'vectors': [dict(row) for row in vectors],
+        'maps': [{'field_name': row['field_name'], 'block': row['block_id']} for row in maps],
         'dataset': [row['kind'] for row in state],
     }
 
@@ -413,6 +416,23 @@ async def follower_vectors(dataset_id: int, request: VectorRequest, follower: di
     }
 
 
+@router.post('/follower/datasets/{dataset_id}/coordinates')
+async def follower_coordinates(dataset_id: int, request: BlockRequest, follower: dict = Depends(current_follower)):
+    """The map coordinates of those blocks' samples, every field. A (sample, field) a mirror holds in one of these
+    blocks but that isn't here has no coordinates any more."""
+    await subscription(db, follower, dataset_id)
+    rows = await db.fetch(
+        f"""SELECT c.sample_id, c.field_name, c.x, c.y
+            FROM unnest($2::bigint[]) b
+            JOIN samples s ON s.id >= b * {BLOCK} AND s.id < (b + 1) * {BLOCK} AND s.dataset_id = $1
+            JOIN embedding_coordinates c ON c.sample_id = s.id
+            ORDER BY 1, 2""",
+        dataset_id,
+        request.blocks,
+    )
+    return {'blocks': request.blocks, 'coordinates': [dict(row) for row in rows]}
+
+
 @router.get('/follower/datasets/{dataset_id}/state')
 async def follower_state(dataset_id: int, follower: dict = Depends(current_follower)):
     """The dataset's settings, field registry and shared views, for a mirror."""
@@ -431,7 +451,17 @@ async def follower_state(dataset_id: int, follower: dict = Depends(current_follo
         'SELECT id, name, slug, content FROM views WHERE dataset_id = $1 AND is_public ORDER BY id',
         dataset_id,
     )
-    return {'dataset': dict(dataset), 'fields': [dict(row) for row in fields], 'views': [dict(row) for row in views]}
+    # The ranked maps: rank_stale is cleared only by a full re-rank, which logs a 'maps' change.
+    maps = await db.fetch(
+        'SELECT field_name, rank_stale FROM embedding_viz_meta WHERE dataset_id = $1 ORDER BY field_name',
+        dataset_id,
+    )
+    return {
+        'dataset': dict(dataset),
+        'fields': [dict(row) for row in fields],
+        'views': [dict(row) for row in views],
+        'maps': [dict(row) for row in maps],
+    }
 
 
 @router.post('/follower/datasets/{dataset_id}/ack')

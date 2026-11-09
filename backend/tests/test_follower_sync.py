@@ -5,6 +5,7 @@ client bound to the app), then applies the primary's feed to it."""
 import os
 from unittest.mock import AsyncMock
 
+import asyncpg
 import httpx
 import numpy as np
 import pytest
@@ -250,5 +251,99 @@ def test_admins_add_a_primary_see_its_mirrors_and_remove_it(monkeypatch, registr
         unlinked = (await primaries.list_primaries(user=USER))['unlinked_mirrors']
         assert [(entry['dataset_id'], entry['state']) for entry in unlinked] == [(mirror['dataset_id'], 'stopped')]
         assert unlinked[0]['last_error'] == 'No longer following: the primary was removed on this instance'
+
+    registry_database(scenario)
+
+
+async def coordinates_of(database, dataset_id):
+    rows = await database.fetch(
+        """SELECT m.origin_id, c.x, c.y FROM embedding_coordinates c
+           JOIN mirror_samples m ON m.sample_id = c.sample_id
+           WHERE m.dataset_id = $1 AND c.field_name = 'clip' ORDER BY m.origin_id""",
+        dataset_id,
+    )
+    return {row['origin_id']: (row['x'], row['y']) for row in rows}
+
+
+async def rank_stale(database, dataset_id):
+    return await database.fetchval(
+        "SELECT rank_stale FROM embedding_viz_meta WHERE dataset_id = $1 AND field_name = 'clip'",
+        dataset_id,
+    )
+
+
+def test_a_mirror_copies_the_primary_maps_and_re_ranks_when_the_primary_does(monkeypatch, registry_database):
+    async def scenario(database):
+        _, link_id = await setup(monkeypatch, database)
+        await ingest([{'crop': 'corn'}, {'crop': 'soy'}, {'crop': 'oat'}], dataset_id=1, prefix='s3://images/a')
+        ids = [row['id'] for row in await database.fetch('SELECT id FROM samples WHERE dataset_id = 1 ORDER BY id')]
+        for index, sample_id in enumerate(ids):
+            await database.execute(
+                "INSERT INTO embeddings (sample_id, field_name, vector) VALUES ($1, 'clip', $2::vector)",
+                sample_id,
+                f'[{index},1]',
+            )
+            await database.execute(
+                "INSERT INTO embedding_coordinates (sample_id, field_name, x, y) VALUES ($1, 'clip', $2, $3)",
+                sample_id,
+                float(index),
+                float(-index),
+            )
+        await database.execute("SELECT recompute_viz_rank(1, 'clip', TRUE)")
+        follower = await database.fetchval('SELECT id FROM followers')
+        await followers.follow_dataset(follower, 1, followers.FollowOptions(), user=USER)
+
+        await sync(database, link_id)
+        mirror = (await mirror_of(database))['dataset_id']
+        assert await coordinates_of(database, mirror) == {sample_id: (i, -i) for i, sample_id in enumerate(ids)}
+        # Ranked here as the primary is, and nothing waits for placement on the mirror: the primary places.
+        assert await rank_stale(database, mirror) is False
+        assert await database.fetchval('SELECT count(*) FROM embedding_viz_rank WHERE dataset_id = $1', mirror) == 3
+        assert (
+            await database.fetchval('SELECT count(*) FROM embedding_projection_pending WHERE dataset_id = $1', mirror)
+            == 0
+        )
+
+        # A coordinate moved there comes through on its own; the ranking goes stale on both, and isn't redone here
+        # until the primary re-ranks.
+        await database.execute(
+            "UPDATE embedding_coordinates SET x = 9 WHERE sample_id = $1 AND field_name = 'clip'",
+            ids[0],
+        )
+        await sync(database, link_id)
+        assert (await coordinates_of(database, mirror))[ids[0]] == (9.0, 0.0)
+        assert await rank_stale(database, 1) is True and await rank_stale(database, mirror) is True
+        await database.execute("SELECT recompute_viz_rank(1, 'clip', TRUE)")
+        await sync(database, link_id)
+        assert await rank_stale(database, mirror) is False
+
+        # A new sample's vector arrives before the primary places it; then its coordinates follow.
+        await ingest([{'crop': 'rye'}], dataset_id=1, prefix='s3://images/b')
+        rye = await database.fetchval("SELECT id FROM samples WHERE metadata->>'crop' = 'rye'")
+        await database.execute(
+            "INSERT INTO embeddings (sample_id, field_name, vector) VALUES ($1, 'clip', '[5,1]')",
+            rye,
+        )
+        await sync(database, link_id)
+        assert rye not in await coordinates_of(database, mirror)
+        assert (
+            await database.fetchval('SELECT count(*) FROM embedding_projection_pending WHERE dataset_id = $1', mirror)
+            == 0
+        )
+        await database.execute(
+            "INSERT INTO embedding_coordinates (sample_id, field_name, x, y) VALUES ($1, 'clip', 5, 5)",
+            rye,
+        )
+        await sync(database, link_id)
+        assert (await coordinates_of(database, mirror))[rye] == (5.0, 5.0)
+
+        # The mirror's copy of the map is read-only outside the sync.
+        local_rye = await database.fetchval('SELECT sample_id FROM mirror_samples WHERE origin_id = $1', rye)
+        with pytest.raises(asyncpg.ObjectNotInPrerequisiteStateError) as refused:
+            await database.execute(
+                "UPDATE embedding_coordinates SET x = 0 WHERE sample_id = $1 AND field_name = 'clip'",
+                local_rye,
+            )
+        assert 'This map came from another Freedom Ridge instance' in str(refused.value)
 
     registry_database(scenario)

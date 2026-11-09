@@ -29,7 +29,9 @@ from .routers import followers
 logger = logging.getLogger(__name__)
 
 KIND = 'follower_sync'
-POLICY = job_queue.JobPolicy(max_unit_seconds=600, max_failures=5, retry_seconds=30, max_retry_seconds=900)
+# A step can re-rank a whole map, as the primary's own re-rank does (up to 1800 s there).
+POLICY = job_queue.JobPolicy(max_unit_seconds=1800, max_failures=5, retry_seconds=30, max_retry_seconds=900)
+RANK_SECONDS = 1800
 BLOCK = followers.BLOCK
 COPY_BLOCKS = 2  # blocks per step: up to 8192 samples and their vectors
 REQUEST_SECONDS = 120
@@ -210,6 +212,19 @@ async def fetch_blocks(client, origin: int, blocks: list) -> dict:
         merged['hashes'] += part['hashes']
         merged['array_fields'] = sorted(set(merged['array_fields']) | set(part['array_fields']))
     return merged
+
+
+async def fetch_coordinates(client, origin: int, blocks: list) -> list:
+    found: list = []
+    for start in range(0, len(blocks), followers.SAMPLE_BLOCKS):
+        part = await call(
+            client,
+            'POST',
+            f'/follower/datasets/{origin}/coordinates',
+            body={'blocks': blocks[start : start + followers.SAMPLE_BLOCKS]},
+        )
+        found += part['coordinates']
+    return found
 
 
 async def fetch_vectors(client, origin: int, sample_ids: list, fields=None) -> list:
@@ -435,6 +450,58 @@ async def write_vectors(connection, dataset_id: int, named: list, vectors: dict)
                 dataset_id,
                 field,
             )
+    await clear_placement(connection, dataset_id, sorted({sample_id for sample_id, _ in named}))
+
+
+async def clear_placement(connection, dataset_id: int, origin_ids: list) -> None:
+    """A new or changed vector queues its sample for map placement. On a mirror, the primary places the samples of
+    its fields and the coordinates come with the feed, so the queue rows go."""
+    await connection.execute(
+        """DELETE FROM embedding_projection_pending p USING mirror_samples m, mirrors r
+           WHERE m.dataset_id = $1 AND r.dataset_id = $1 AND p.sample_id = m.sample_id
+             AND m.origin_id = ANY($2::int[]) AND p.field_name = ANY(r.vector_fields)""",
+        dataset_id,
+        origin_ids,
+    )
+
+
+async def write_coordinates(connection, dataset_id: int, blocks: list, coordinates: list) -> None:
+    """The primary's map coordinates of these blocks' samples; maps of fields only this instance has stay its own."""
+    await connection.execute(
+        f"""DELETE FROM embedding_coordinates c USING mirror_samples m, mirrors r, unnest($2::bigint[]) b
+            WHERE m.dataset_id = $1 AND r.dataset_id = $1 AND c.sample_id = m.sample_id
+              AND m.origin_id >= b * {BLOCK} AND m.origin_id < (b + 1) * {BLOCK}
+              AND c.field_name = ANY(r.vector_fields)
+              AND NOT EXISTS (SELECT 1 FROM unnest($3::int[], $4::text[]) AS k(origin_id, field_name)
+                              WHERE k.origin_id = m.origin_id AND k.field_name = c.field_name)""",
+        dataset_id,
+        blocks,
+        [row['sample_id'] for row in coordinates],
+        [row['field_name'] for row in coordinates],
+    )
+    if coordinates:
+        await connection.execute(
+            """INSERT INTO embedding_coordinates AS c (sample_id, field_name, x, y)
+               SELECT m.sample_id, n.field_name, n.x, n.y
+               FROM unnest($2::int[], $3::text[], $4::float8[], $5::float8[]) AS n(origin_id, field_name, x, y)
+               JOIN mirror_samples m ON m.dataset_id = $1 AND m.origin_id = n.origin_id
+               JOIN embeddings e ON e.sample_id = m.sample_id AND e.field_name = n.field_name
+               ON CONFLICT (sample_id, field_name) DO UPDATE SET x = EXCLUDED.x, y = EXCLUDED.y
+               WHERE (c.x, c.y) IS DISTINCT FROM (EXCLUDED.x, EXCLUDED.y)""",
+            dataset_id,
+            [row['sample_id'] for row in coordinates],
+            [row['field_name'] for row in coordinates],
+            [row['x'] for row in coordinates],
+            [row['y'] for row in coordinates],
+        )
+    # Clearing a coordinate queues its sample for placement again.
+    origin_ids = await connection.fetch(
+        f"""SELECT m.origin_id FROM mirror_samples m, unnest($2::bigint[]) b
+            WHERE m.dataset_id = $1 AND m.origin_id >= b * {BLOCK} AND m.origin_id < (b + 1) * {BLOCK}""",
+        dataset_id,
+        blocks,
+    )
+    await clear_placement(connection, dataset_id, [row['origin_id'] for row in origin_ids])
 
 
 async def write_fields(connection, dataset_id: int, fields: list) -> None:
@@ -656,6 +723,10 @@ async def apply_state(pool, link, client, mirror, checkpoint: dict, *, views: bo
         [field['field_name'] for field in state['fields'] if field['origin'] == 'native_array'],
     )
 
+    if views:
+        # Once the samples are all here, and with each later state: the maps to re-rank where the primary did.
+        checkpoint.setdefault('ranks', {})[str(dataset_id)] = state['maps']
+
     async def publish(connection):
         await begin_mirror_write(connection, dataset_id)
         await write_fields(connection, dataset_id, state['fields'])
@@ -679,6 +750,7 @@ async def apply_blocks(pool, client, mirror, blocks: list, after_write=None) -> 
     await ensure_array_columns(pool, dataset_id, data['array_fields'])
     origin_ids = [sample['id'] for sample in data['samples']]
     vectors = decode_vectors(await fetch_vectors(client, origin, origin_ids)) if origin_ids else {}
+    coordinates = await fetch_coordinates(client, origin, blocks) if origin_ids else []
 
     async def publish(connection):
         await begin_mirror_write(connection, dataset_id)
@@ -686,6 +758,7 @@ async def apply_blocks(pool, client, mirror, blocks: list, after_write=None) -> 
         await write_hashes(connection, dataset_id, present, data['hashes'])
         # Every primary field of every sample present: what didn't come was deleted there.
         await write_vectors(connection, dataset_id, [(sample_id, None) for sample_id in present], vectors)
+        await write_coordinates(connection, dataset_id, blocks, coordinates)
         if after_write is not None:
             await after_write(connection)
 
@@ -731,6 +804,44 @@ async def copy_step(pool, link, client, mirror, checkpoint: dict) -> StepResult:
     )
 
 
+async def rank_step(pool, mirror, checkpoint: dict):
+    """Rank the mirror's copy of a primary map that has no ranking here yet, or that the primary has re-ranked since
+    its coordinates moved (its rank_stale is clear and ours isn't). The rest of the time the coordinate triggers
+    keep the ranking as the primary's own placements keep its: exact positions, approximate order."""
+    dataset_id = mirror['dataset_id']
+    pending = checkpoint.get('ranks', {}).get(str(dataset_id)) or []
+    while pending:
+        entry = pending.pop(0)
+        field = entry['field_name']
+        local = await pool.fetchrow(
+            'SELECT rank_stale FROM embedding_viz_meta WHERE dataset_id = $1 AND field_name = $2',
+            dataset_id,
+            field,
+        )
+        if local is not None and not (local['rank_stale'] and not entry['rank_stale']):
+            continue
+        placed = await pool.fetchval(
+            """SELECT EXISTS (SELECT 1 FROM embedding_coordinates c JOIN samples s ON s.id = c.sample_id
+                              WHERE s.dataset_id = $1 AND c.field_name = $2)""",
+            dataset_id,
+            field,
+        )
+        if not placed:
+            continue
+
+        async def publish(connection, field=field):
+            await connection.execute(f"SET LOCAL lock_timeout = '0'; SET LOCAL statement_timeout = '{RANK_SECONDS}s'")
+            await connection.fetchval(
+                'SELECT recompute_viz_rank($1, $2, TRUE)',
+                dataset_id,
+                field,
+                timeout=RANK_SECONDS,
+            )
+
+        return StepResult(checkpoint=checkpoint, message=f'Ranked the map of {field}', publish=publish)
+    return None
+
+
 async def advance_cursor(connection, dataset_id: int, cursor: int) -> None:
     await connection.execute(
         'UPDATE mirrors SET feed_cursor = $2, last_synced_at = now(), last_error = NULL WHERE dataset_id = $1',
@@ -743,6 +854,9 @@ async def feed_step(pool, link, client, mirror, checkpoint: dict) -> StepResult:
     dataset_id, origin = mirror['dataset_id'], mirror['origin_dataset_id']
     page = checkpoint.get('page')
     if page is None or page['dataset_id'] != dataset_id:
+        ranked = await rank_step(pool, mirror, checkpoint)
+        if ranked is not None:
+            return ranked
         acked = checkpoint.setdefault('acked', {})
         if acked.get(str(dataset_id)) != mirror['feed_cursor']:
             await call(client, 'POST', f'/follower/datasets/{origin}/ack', body={'cursor': mirror['feed_cursor']})
@@ -781,9 +895,11 @@ async def feed_step(pool, link, client, mirror, checkpoint: dict) -> StepResult:
             'more': changes['more'],
             'blocks': blocks,
             'vectors': loose,
-            'state': bool(set(changes['dataset']) & {'fields', 'settings', 'views'}),
+            # Coordinates alone (a placement or a re-fit there): no samples or vectors to re-read.
+            'maps': sorted({entry['block'] for entry in changes['maps']} - reread),
+            'state': bool(set(changes['dataset']) & {'fields', 'settings', 'views', 'maps'}),
         }
-        if not (blocks or loose or page['state']):
+        if not (blocks or loose or page['maps'] or page['state']):
             checkpoint['page'] = None
             if not changes['more']:
                 checkpoint.setdefault('caught_up', []).append(dataset_id)
@@ -813,6 +929,19 @@ async def feed_step(pool, link, client, mirror, checkpoint: dict) -> StepResult:
             await write_vectors(connection, dataset_id, [tuple(pair) for pair in part], vectors)
 
         return StepResult(checkpoint=checkpoint, message=f'Applied {len(part):,} changed vectors', publish=publish)
+    if page['maps']:
+        blocks, page['maps'] = page['maps'][:COPY_BLOCKS], page['maps'][COPY_BLOCKS:]
+        coordinates = await fetch_coordinates(client, origin, blocks)
+
+        async def publish(connection):
+            await begin_mirror_write(connection, dataset_id)
+            await write_coordinates(connection, dataset_id, blocks, coordinates)
+
+        return StepResult(
+            checkpoint=checkpoint,
+            message=f'Applied {len(coordinates):,} changed map coordinates',
+            publish=publish,
+        )
     if page['state']:
         page['state'] = False
         return await apply_state(pool, link, client, mirror, checkpoint, views=True)

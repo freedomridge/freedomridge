@@ -40,7 +40,9 @@ it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
   - The job runner syncs every minute: each dataset shared with this follower is copied into a read-only
     **mirror**, then kept up to date from the primary's feed.
   - Everything the primary sent is read-only here, enforced by the database. Vector fields only this instance
-    has, maps, statistics and local views stay its own.
+    has and their maps, statistics and local views stay its own.
+  - The primary's maps are copied, logged by field and block, so a map view selects the same samples on both;
+    the mirror re-ranks a map when the primary did.
   - Sample ids are translated, in object samples' `parent_id` and in views' filters.
   - Views that use a concept stay on the primary.
   - A mirror stops when the primary stops sharing it, removes the follower or is restored into a new database;

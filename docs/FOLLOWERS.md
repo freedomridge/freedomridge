@@ -39,6 +39,8 @@ transaction that made the change, whatever made it:
   once per transaction, so sample writes gain no work of their own. A follower re-reads a changed block and
   compares it with its copy, which also finds the samples deleted from it.
 - **Vectors and hashes** per sample and field.
+- **Map coordinates** by field and block, so a full re-fit of a map logs one row per block, not per sample. A full
+  re-rank of a map logs a dataset change, so followers re-rank their copy when the primary did.
 - **Dataset state:** the field registry, settings and shared views, and the dataset's deletion.
 
 A dataset nobody follows logs nothing. The log is pruned once every follower of the dataset has acknowledged
@@ -88,8 +90,8 @@ primary that resumes where it stopped:
 1. It reads the config. A dataset newly shared and ready gets a local dataset, its **mirror**, with the primary's
    name, or `<name> (from <primary host>)` when a dataset here already has that name. The mirror is private: admins
    and the admin who added the primary see it, and access can be granted as for any dataset.
-2. It copies the mirror block by block: samples, hashes and vectors, then the field registry, settings and shared
-   views.
+2. It copies the mirror block by block: samples, hashes, vectors and map coordinates, then the field registry,
+   settings and shared views, and ranks each map the primary has.
 3. Then it applies the feed, and acknowledges each page applied.
 
 The Primaries page shows each mirror's state (copying, following, or no longer following), the copy's progress,
@@ -98,15 +100,18 @@ its last sync, and any error. The job's successful runs are pruned from the job 
 ### What a mirror holds
 
 - **The primary's, read-only here:** its samples (metadata, tags, array fields, location), the field registry, the
-  settings, the hashes, every vector field the primary has, and its shared views. The database refuses any other
+  settings, the hashes, every vector field the primary has and their maps, and its shared views. The database refuses any other
   change to them with "read-only mirror"; only the sync writes them. A dataset page shows a "Mirror of <host>"
   badge, and tagging is off.
-- **This instance's own:** vector fields only it has (patch vectors imported here, say), maps, statistics, indexes
-  (`is_promoted`), concepts, access grants, storage, and views made here. If the primary later sends a vector
+- **This instance's own:** vector fields only it has (patch vectors imported here, say) and their maps,
+  statistics, indexes (`is_promoted`), concepts, access grants, storage, and views made here. If the primary later sends a vector
   field of the same name as one only this instance had, the primary's replaces it.
 - **Sample ids** differ between the two. The sync keeps the mapping, translates an object sample's `parent_id`
   (null until its parent arrives), and translates the sample ids in a shared view's filters (a brushed
   selection). A sample that isn't here matches nothing.
+- **Maps:** the primary places new samples on its maps and re-fits them; the mirror takes its coordinates, so a
+  view with a polygon drawn on a map selects the same samples on both. The mirror ranks a map when the primary
+  has re-ranked it. Map placement here leaves the primary's fields alone.
 - **Views that use a concept** stay on the primary, because concepts belong to each instance; the views panel
   lists them.
 - **Images:** the mirror reads the same media paths, so this instance needs a storage configuration with read

@@ -2429,7 +2429,7 @@ CREATE INDEX IF NOT EXISTS vector_changes_feed ON vector_changes (dataset_id, tr
 CREATE TABLE IF NOT EXISTS dataset_changes (
     id BIGSERIAL PRIMARY KEY,
     dataset_id INTEGER NOT NULL,
-    kind TEXT NOT NULL CHECK (kind IN ('fields', 'settings', 'views', 'deleted')),
+    kind TEXT NOT NULL CHECK (kind IN ('fields', 'settings', 'views', 'deleted', 'maps')),
     transaction_id BIGINT NOT NULL DEFAULT txid_current()
 );
 CREATE INDEX IF NOT EXISTS dataset_changes_feed ON dataset_changes (dataset_id, transaction_id, id);
@@ -2686,6 +2686,63 @@ CREATE TRIGGER dataset_fields_mirror_guard AFTER INSERT OR UPDATE OR DELETE ON d
     FOR EACH ROW EXECUTE FUNCTION guard_mirror_fields();
 CREATE TRIGGER views_mirror_guard BEFORE UPDATE OR DELETE ON views
     FOR EACH ROW EXECUTE FUNCTION guard_mirror_views();
+
+-- The primary's maps, for its followers: coordinates are logged like samples, by field and block, so a full re-fit
+-- of a 3.6M-sample map logs about 880 rows. A full re-rank (the only thing that clears rank_stale) logs a 'maps'
+-- dataset change, so a follower re-ranks its copy when the primary did. On a mirror, the coordinates of the
+-- primary's fields change only through the sync.
+CREATE TABLE IF NOT EXISTS map_block_changes (
+    dataset_id INTEGER NOT NULL,
+    transaction_id BIGINT NOT NULL DEFAULT txid_current(),
+    field_name TEXT NOT NULL,
+    block_id BIGINT NOT NULL,
+    PRIMARY KEY (dataset_id, transaction_id, field_name, block_id)
+);
+
+CREATE OR REPLACE FUNCTION log_map_changes() RETURNS trigger AS $$
+BEGIN
+    IF NULLIF(current_setting('fridge.deletion_dataset', TRUE), '') IS NOT NULL THEN
+        RETURN NULL;
+    END IF;
+    IF EXISTS (SELECT 1 FROM mirrors) AND EXISTS (
+        SELECT 1 FROM changed c JOIN samples s ON s.id = c.sample_id JOIN mirrors m ON m.dataset_id = s.dataset_id
+        WHERE c.field_name = ANY (m.vector_fields)
+          AND s.dataset_id::text IS DISTINCT FROM current_setting('fridge.mirror_sync', TRUE)
+    ) THEN
+        RAISE EXCEPTION 'This map came from another Freedom Ridge instance, which this dataset mirrors: change it there'
+            USING ERRCODE = '55000';
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM datasets WHERE followed) THEN
+        RETURN NULL;
+    END IF;
+    INSERT INTO map_block_changes (dataset_id, field_name, block_id)
+    SELECT DISTINCT s.dataset_id, c.field_name, c.sample_id::bigint / 4096
+    FROM changed c JOIN samples s ON s.id = c.sample_id JOIN datasets d ON d.id = s.dataset_id
+    WHERE d.followed
+    ON CONFLICT DO NOTHING;
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION log_map_ranked() RETURNS trigger AS $$
+BEGIN
+    IF current_setting('fridge.deletion_dataset', TRUE) IS DISTINCT FROM NEW.dataset_id::text
+       AND NOT NEW.rank_stale AND (TG_OP = 'INSERT' OR OLD.rank_stale)
+       AND EXISTS (SELECT 1 FROM datasets WHERE id = NEW.dataset_id AND followed) THEN
+        INSERT INTO dataset_changes (dataset_id, kind) VALUES (NEW.dataset_id, 'maps');
+    END IF;
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER coordinates_log_insert AFTER INSERT ON embedding_coordinates REFERENCING NEW TABLE AS changed
+    FOR EACH STATEMENT EXECUTE FUNCTION log_map_changes();
+CREATE TRIGGER coordinates_log_update AFTER UPDATE ON embedding_coordinates REFERENCING NEW TABLE AS changed
+    FOR EACH STATEMENT EXECUTE FUNCTION log_map_changes();
+CREATE TRIGGER coordinates_log_delete AFTER DELETE ON embedding_coordinates REFERENCING OLD TABLE AS changed
+    FOR EACH STATEMENT EXECUTE FUNCTION log_map_changes();
+CREATE TRIGGER viz_meta_log_ranked AFTER INSERT OR UPDATE ON embedding_viz_meta
+    FOR EACH ROW EXECUTE FUNCTION log_map_ranked();
 
 -- Ledger of applied migrations: the 1.0.0 baseline, then the files in backend/db/migrations/
 -- (0001_..., 0002_...) that scripts/apply_migrations.sh applies to existing databases. A fresh install
