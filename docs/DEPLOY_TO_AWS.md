@@ -66,16 +66,17 @@ inviting visitors.
   with the media in S3, 50–100 GiB (section 13). **EBS volumes can grow but cannot
   shrink**, so choose `data_volume_gib` before the first apply.
 - A budget. In us-east-1 at on-demand prices, the default instance and disks cost
-  about **$94/month**: t3.large is 730 h × $0.0832 = $60.74, 370 GiB of gp3 is
+  about **$82/month**: t4g.large (Graviton) is 730 h × $0.0672 = $49.06, 370 GiB of gp3 is
   370 × $0.08 = $29.60, and one public IPv4 address is 730 h × $0.005 = $3.65.
   S3 dumps, CloudWatch metrics and alarms, Internet egress, temporary import
-  instances and t3 CPU-credit charges come on top, so the total sits close to the
-  **$100/month** budget alert set below. A t3.xlarge instance alone costs about
-  $121/month. Check your region's prices in the [AWS calculator](https://calculator.aws/).
+  instances and CPU-credit charges come on top, under the **$100/month** budget alert
+  set below. The x86_64 t3.large costs $60.74/month instead, and a t4g.xlarge (16 GiB)
+  about $98/month for the instance alone. Check your region's prices in the
+  [AWS calculator](https://calculator.aws/).
 
 Full CPU imports and patch generation are substantial jobs. Run them in `tmux`
 or a persistent SSH session. The full selection is about **1.24 million CLIP
-encodings** and is not a safe overnight job on a t3.large. Either import COCO and
+encodings** and is not a safe overnight job on a t4g.large. Either import COCO and
 KITTI first (the smaller first launch in section 8), or use a temporary
 compute-optimized instance for the import window.
 
@@ -142,7 +143,7 @@ repository_ref     = "YOUR_REVIEWED_COMMIT_SHA"
 public_origin      = "https://YOUR_DOMAIN"
 budget_email       = "you@example.com"
 monthly_budget_usd = 100
-instance_type      = "t3.large"
+instance_type      = "t4g.large"
 data_volume_gib    = 300
 cache_volume_gib   = 30
 # Private repo only: this is a path ON THE INSTANCE, not a token.
@@ -160,9 +161,10 @@ terraform output
 and backed up (the state bucket above does both); do not commit state, plans or tfvars.
 The module creates an Elastic IP (stable across stop/start), encrypted gp3 disks,
 private versioned backup and media buckets, an instance role, CPU/disk alarms, and an
-account-wide monthly budget. It resolves Canonical's current Ubuntu 26.04 LTS x86_64
-AMI from Canonical's public SSM parameter (it needs a Haswell-class or newer instance
-family, such as t3 or c7i) and a default subnet in an AZ offering `instance_type`;
+account-wide monthly budget. It resolves Canonical's current Ubuntu 26.04 LTS AMI for the
+instance type's architecture, Arm (Graviton, such as t4g or c7g) or x86_64 (a Haswell-class
+or newer family, such as t3 or c7i), from Canonical's public SSM parameters; the release
+images are built for both. It also picks a default subnet in an AZ offering `instance_type`;
 `availability_zone` can select a specific supported AZ. After first deploy, pin that AZ from the
 `availability_zone` output in tfvars. The instance ignores later `ami`, `user_data`,
 `subnet_id` and `instance_type` drift; EBS AZs are also held stable. An instance
@@ -394,14 +396,16 @@ Plan the full workload as 150,433 images, 369,188 object crops and **719,360
 COCO/Open Images 4×4 patches** (section 9): about **1.24 million CLIP encodings**.
 On CPU, expect roughly 20–28 encodings/s with 2–4 threads, before JPEG decoding,
 API writes and index builds. At that rate, encoding alone takes about **12–17 hours**;
-allow **1–2 days or more on t3.large**, plus downloads and map building. These are
+allow **1–2 days or more on t4g.large**, plus downloads and map building. These are
 estimates, not a measured EC2 run.
 
-For a full import, temporarily use **c7i.8xlarge (32 vCPU, 64 GiB)**. A provisional
+For a full import, temporarily use **c7g.8xlarge (32 vCPU, 64 GiB, Graviton)**, or
+c7i.8xlarge on an x86_64 instance: an instance can only change type within its
+architecture, since its disk holds that architecture's Ubuntu. A provisional
 80–160 encodings/s budget gives about 2–4.5 hours of encoding; reserve **4–10 hours**
 including decode, writes, indexing and reductions, plus download time. This is an
 unmeasured scaling estimate; benchmark the first few thousand inputs and revise it.
-For cost planning, budget about **$1.50/hour**, or **$6–15** for that window,
+For cost planning, budget about **$1.20/hour** (c7i.8xlarge: $1.50), or **$5–12** for that window,
 excluding disks/egress. Confirm the selected region's Linux On-Demand rate in the
 [AWS calculator](https://calculator.aws/) before resizing. CPU scaling is not linear;
 try 16 versus 32 OMP threads if throughput drops. Run one importer at a time.
@@ -415,16 +419,16 @@ export INSTANCE_ID=YOUR_INSTANCE_ID
 aws ec2 stop-instances --instance-ids "$INSTANCE_ID"
 aws ec2 wait instance-stopped --instance-ids "$INSTANCE_ID"
 aws ec2 modify-instance-attribute --instance-id "$INSTANCE_ID" \
-  --instance-type '{"Value":"c7i.8xlarge"}'
+  --instance-type '{"Value":"c7g.8xlarge"}'
 aws ec2 start-instances --instance-ids "$INSTANCE_ID"
 aws ec2 wait instance-running --instance-ids "$INSTANCE_ID"
 ```
 
 The EIP and EBS disks remain. Wait for SSH/Docker, check `findmnt /data` and
 `findmnt /cache`, then import. Never resize during an import. After patches and
-indexes finish (section 9), repeat stop/wait/modify/start/wait with `t3.large`.
+indexes finish (section 9), repeat stop/wait/modify/start/wait with `t4g.large`.
 Terraform deliberately ignores instance-type drift; it does not perform these
-resizes. Keep the pinned AZ unchanged. Sustained imports on t3 can incur Unlimited
+resizes. Keep the pinned AZ unchanged. Sustained imports on t4g or t3 can incur Unlimited
 CPU-credit charges.
 
 ### Prepare the import environment
@@ -601,10 +605,10 @@ may still take time to load weights into each worker's RAM. Warm text and revers
 image search before inviting guests: repeat about eight mixed searches so all four
 workers have a chance to load both towers; inspect memory and latency. One request
 warms only one worker. The backend uses about **1.6 GiB** idle and about **3.4 GiB**
-with search warm, before PostgreSQL, Next.js, jobs and page cache. **t3.large
+with search warm, before PostgreSQL, Next.js, jobs and page cache. **t4g.large
 (8 GiB) is the default and fits the budget**, but memory is tight: watch `free -h`
-and `docker stats` while warming search. t3.xlarge (16 GiB) gives headroom at about
-$121/month for the instance alone. No GPU is required.
+and `docker stats` while warming search. t4g.xlarge (16 GiB) gives headroom at about
+$98/month for the instance alone. No GPU is required.
 
 See [examples/README.md](../examples/README.md) for resume, verification and
 per-dataset source details. Dataset downloads and model fetches require outbound
@@ -960,7 +964,7 @@ DATASET=kitti
 aws s3 cp --only-show-errors --recursive "s3://$MEDIA_BUCKET/archives/$DATASET/" "$FRIDGE_DATA_ROOT/$DATASET/"
 ```
 
-Section 1 gives the monthly estimate: about **$94** for t3.large, 370 GiB of gp3 and
+Section 1 gives the monthly estimate: about **$82** for t4g.large, 370 GiB of gp3 and
 one public IPv4 address in us-east-1, before S3 dumps and requests, CloudWatch
 metrics and alarms, Internet egress, temporary larger-instance hours and CPU
 credits. With the media in S3 and a 100 GiB data disk, the disks cost $13.60 instead

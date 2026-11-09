@@ -52,9 +52,14 @@ def test_compose_files_pull_this_release_s_published_images():
         named += found
     assert {f"{image}:{tag}" for image, tag in named if tag != VERSION} == set()
     workflow = (ROOT / ".github/workflows/images.yml").read_text()
-    built = re.search(r"^\s+image: \[([a-z, -]+)\]$", workflow, re.M)
-    assert built, "images.yml has no image matrix"
-    published = {name.strip() for name in built.group(1).split(",")}
+    # The build matrix and the manifest matrix, which tags what was built: the same images.
+    matrices = [
+        {name.strip() for name in names.split(",")}
+        for names in re.findall(r"^\s+image: \[([a-z, -]+)\]$", workflow, re.M)
+    ]
+    assert len(matrices) == 2, "images.yml should have an image matrix in its image and manifest jobs"
+    assert matrices[0] == matrices[1], matrices
+    published = matrices[0]
     assert {image for image, _ in named} <= published
     for image in published:
         assert (ROOT / f"Dockerfile.{image}").is_file(), f"images.yml builds {image} from a missing Dockerfile.{image}"

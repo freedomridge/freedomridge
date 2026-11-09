@@ -168,8 +168,9 @@ curl -fsSL "$cw_base/assets/amazon-cloudwatch-agent.gpg" -o "$cw_dir/key.gpg"
 cw_fingerprint=$(gpg --homedir "$cw_dir/gnupg" --show-keys --with-colons "$cw_dir/key.gpg" | awk -F: '$1 == "fpr" {print $10; exit}')
 [ "$cw_fingerprint" = 937616F3450B7D806CBD9725D58167303B789C72 ] || { echo 'CloudWatch signing key mismatch' >&2; exit 1; }
 gpg --homedir "$cw_dir/gnupg" --batch --import "$cw_dir/key.gpg"
-curl -fsSL "$cw_base/ubuntu/amd64/latest/amazon-cloudwatch-agent.deb" -o "$cw_dir/agent.deb"
-curl -fsSL "$cw_base/ubuntu/amd64/latest/amazon-cloudwatch-agent.deb.sig" -o "$cw_dir/agent.deb.sig"
+cw_arch=$(dpkg --print-architecture)  # amd64 or arm64, as the instance type
+curl -fsSL "$cw_base/ubuntu/$cw_arch/latest/amazon-cloudwatch-agent.deb" -o "$cw_dir/agent.deb"
+curl -fsSL "$cw_base/ubuntu/$cw_arch/latest/amazon-cloudwatch-agent.deb.sig" -o "$cw_dir/agent.deb.sig"
 gpg --homedir "$cw_dir/gnupg" --batch --verify "$cw_dir/agent.deb.sig" "$cw_dir/agent.deb"
 dpkg -i "$cw_dir/agent.deb"
 cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json <<'JSON'

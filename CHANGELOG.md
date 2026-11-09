@@ -4,6 +4,18 @@ Freedom Ridge has one version for the server, the web app and the Python SDK (th
 file), following [Semantic Versioning](https://semver.org). A release lists **upgrade notes** when
 it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
 
+## Unreleased
+
+### Added
+
+- **Arm images.** The release images on ghcr.io are built for `linux/arm64` as well as `linux/amd64`, under
+  the same tags, so Freedom Ridge runs natively on Arm servers (AWS Graviton) and Apple-silicon Macs. The
+  release workflow builds each on a runner of that architecture and starts the try-it stack on both.
+- **The AWS module defaults to a Graviton instance**, `t4g.large`: the same 8 GiB as `t3.large` for about 19%
+  less. The Ubuntu image, and the CloudWatch agent the instance installs, follow the instance type's
+  architecture, so an x86_64 `instance_type` works as before. An existing deployment is unchanged: the module
+  never replaces or resizes a running instance. Moving one to Arm means a new instance.
+
 ## 2.4.0 (2026-11-09)
 
 2.4.0 adds follower instances: a second Freedom Ridge keeps read-only mirrors of the datasets a primary shares
