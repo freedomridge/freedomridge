@@ -21,6 +21,10 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+# The architectures AWS describes for these types; any other type is unknown to it.
+ARCHITECTURES = {'r7g.2xlarge': ['arm64'], 'r7i.2xlarge': ['i386', 'x86_64']}
+
+
 class FakeEC2:
     def __init__(self, spot_capacity=True, refuse=None):
         self.spot_capacity, self.refuse = spot_capacity, refuse
@@ -38,6 +42,15 @@ class FakeEC2:
         tags = {tag['Key']: tag['Value'] for spec in request['TagSpecifications'] for tag in spec['Tags']}
         self.instances[instance_id] = {'InstanceId': instance_id, 'State': {'Name': 'running'}, 'Tags': tags}
         return {'Instances': [{'InstanceId': instance_id}]}
+
+    def describe_instance_types(self, InstanceTypes):
+        [instance_type] = InstanceTypes
+        if instance_type not in ARCHITECTURES:
+            raise ClientError({'Error': {'Code': 'InvalidInstanceType', 'Message': 'unknown'}}, 'DescribeInstanceTypes')
+        supported = ARCHITECTURES[instance_type]
+        return {
+            'InstanceTypes': [{'InstanceType': instance_type, 'ProcessorInfo': {'SupportedArchitectures': supported}}],
+        }
 
     def describe_instances(self, InstanceIds=None, Filters=None):
         if InstanceIds is not None:
@@ -115,8 +128,10 @@ def test_a_waiting_fit_gets_one_spot_machine_that_runs_the_worker(registry_datab
         [launch] = await launches(database)
         assert (launch['state'], launch['market'], launch['instance_id']) == ('starting', 'spot', 'i-0001')
         request = ec2.requests[0]
-        assert request['InstanceType'] == 'r7i.2xlarge' and request['InstanceInitiatedShutdownBehavior'] == 'terminate'
-        assert request['MetadataOptions']['HttpTokens'] == 'required' and request['ImageId'].startswith('resolve:ssm:')
+        # The default type is Arm (Graviton), and the image follows it.
+        assert request['InstanceType'] == 'r7g.2xlarge' and request['InstanceInitiatedShutdownBehavior'] == 'terminate'
+        assert request['ImageId'] == compute_launcher.AMIS['arm64'] and request['ImageId'].endswith('-arm64')
+        assert request['MetadataOptions']['HttpTokens'] == 'required'
         assert request['InstanceMarketOptions']['MarketType'] == 'spot'
         script = request['UserData']
         assert 'https://fr.example.com/api' in script and f'ghcr.io/freedomridge/backend:{VERSION}' in script
@@ -125,7 +140,7 @@ def test_a_waiting_fit_gets_one_spot_machine_that_runs_the_worker(registry_datab
         assert token['scope'] == 'worker' and token['is_active'] and token['expires_at'] is not None
         assert token['token'] not in script  # the hash stays here; the machine gets the token itself
         message = await database.fetchval("SELECT message FROM jobs WHERE state = 'queued' ORDER BY created_at LIMIT 1")
-        assert message == 'Starting a compute worker (r7i.2xlarge, spot)'
+        assert message == 'Starting a compute worker (r7g.2xlarge, spot)'
 
         # A machine starting covers the job: no second one. Its worker connects, and it's running.
         await run(database, ec2)
@@ -140,11 +155,22 @@ def test_a_waiting_fit_gets_one_spot_machine_that_runs_the_worker(registry_datab
 
 def test_on_demand_when_aws_has_no_spot_capacity_and_a_refusal_is_recorded(registry_database):
     async def scenario(database):
-        await configure(database)
+        await configure(database, instance_type='r7i.2xlarge')
         await waiting_fit(database)
-        await run(database, FakeEC2(spot_capacity=False))
+        ec2 = FakeEC2(spot_capacity=False)
+        await run(database, ec2)
         [launch] = await launches(database)
         assert (launch['market'], launch['state']) == ('on-demand', 'starting')
+        # An x86_64 type gets the x86_64 image, spot and on-demand alike.
+        assert [request['ImageId'] for request in ec2.requests] == [compute_launcher.AMIS['x86_64']] * 2
+
+        # A type AWS doesn't know is refused before any launch.
+        await database.execute("UPDATE compute_launches SET state = 'ended'")
+        await configure(database, instance_type='r9z.huge')
+        unknown = FakeEC2()
+        await run(database, unknown)
+        assert unknown.requests == [] and 'InvalidInstanceType' in (await launches(database))[-1]['end_reason']
+        await configure(database, instance_type='r7g.2xlarge')
 
         await database.execute("UPDATE compute_launches SET state = 'ended'")
         await run(database, FakeEC2(refuse='UnauthorizedOperation'))

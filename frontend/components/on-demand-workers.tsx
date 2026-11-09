@@ -136,7 +136,7 @@ export function OnDemandWorkers() {
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                 <Field label="AWS region"><input aria-label="AWS region" className={input} value={form.region}
                     placeholder="us-east-1" onChange={e => set({ region: e.target.value.trim() })} /></Field>
-                <Field label="Instance type" hint="x86_64; its memory bounds the biggest fit">
+                <Field label="Instance type" hint="Arm (Graviton) or x86_64; its memory bounds the biggest fit">
                     <input aria-label="Instance type" className={input} value={form.instance_type}
                         onChange={e => set({ instance_type: e.target.value.trim() })} /></Field>
                 <Field label="Server URL" hint="The API address the machines reach this server at">

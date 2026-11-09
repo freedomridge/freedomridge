@@ -20,6 +20,9 @@ An admin manages followers under **Settings → Followers** (or the endpoints be
    - **`tags`;**
    - **`views`:** with `primary`, the primary's shared views are copied down and views made on the follower
      stay there.
+
+   A mirror (a dataset this instance follows from another) can't be chosen: follows don't chain, so an instance
+   that wants it follows its primary.
 3. **Watch** when each follower last checked in, and how many log rows the primary keeps for it until it
    catches up. Nothing is removed automatically.
 4. **Remove a follower** to delete everything the primary keeps for it:

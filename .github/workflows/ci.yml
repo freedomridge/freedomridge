@@ -172,6 +172,11 @@ jobs:
         run: npx tsc --noEmit
       - name: Frontend unit tests
         run: node --test tests/*.test.cjs
+      - name: Launcher (npx freedomridge) tests and package
+        working-directory: launcher
+        run: |
+          node --test test/
+          npm pack --dry-run
       - name: Production build
         run: npm run build
 

@@ -39,6 +39,9 @@ def _clip_image_embeddings(filepaths: List[str], batch_size: int = 32) -> List[l
     import torch
     from transformers import CLIPModel, CLIPProcessor
 
+    from ..core.hf_weights import download_only_loaded_weights
+
+    download_only_loaded_weights()
     model_id = "openai/clip-vit-base-patch32"
     device = "cuda" if torch.cuda.is_available() else "cpu"
     # transformers 5's @wraps(Module.to) hides the bound self from mypy.

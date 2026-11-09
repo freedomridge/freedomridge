@@ -4,6 +4,53 @@ Freedom Ridge has one version for the server, the web app and the Python SDK (th
 file), following [Semantic Versioning](https://semver.org). A release lists **upgrade notes** when
 it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
 
+## 2.5.0 (2026-11-09)
+
+2.5.0 runs on Arm: the release images are built for `linux/arm64` as well, the AWS module defaults to a Graviton
+instance, and on-demand workers start Graviton machines. `npx freedomridge` runs a release on one machine with
+Docker, and upgrades it. Models' weights are downloaded once, and follows don't chain. One migration.
+
+### Upgrade notes
+
+- One database migration, `0011_compute_launcher_arm.sql`, applied with `scripts/apply_migrations.sh` (step 4 of
+  [Upgrading](docs/UPGRADING.md)). It changes the on-demand workers' default instance type, and the saved one if
+  they were never turned on or used.
+- On-demand workers need one more AWS permission, `ec2:DescribeInstanceTypes`, to pick the machine image for the
+  instance type's architecture ([ON_DEMAND_WORKERS.md](docs/ON_DEMAND_WORKERS.md)). The Terraform module adds it.
+
+### Added
+
+- **Arm images.** The release images on ghcr.io are built for `linux/arm64` as well as `linux/amd64`, under
+  the same tags, so Freedom Ridge runs natively on Arm servers (AWS Graviton) and Apple-silicon Macs. The
+  release workflow builds each on a runner of that architecture and starts the try-it stack on both.
+- **The AWS module defaults to a Graviton instance**, `t4g.large`: the same 8 GiB as `t3.large` for about 19%
+  less. The Ubuntu image, and the CloudWatch agent the instance installs, follow the instance type's
+  architecture, so an x86_64 `instance_type` works as before. An existing deployment is unchanged: the module
+  never replaces or resizes a running instance. Moving one to Arm means a new instance.
+
+- **`npx freedomridge`** ([launcher/README.md](launcher/README.md)): runs this release on one machine with Docker
+  and Node.js. It puts the release's try-it Compose file in `~/freedomridge`, pulls the images, brings the
+  folder's database up to the release with the release's own migrations, starts it and opens the app. Run with
+  a newer version, it upgrades; it refuses a folder a newer release runs. `stop`, `status` and `logs`, and
+  `--port`/`--api-port`, kept in the folder's `.env`. `docker-compose.try.yml` takes `FRIDGE_PORT` and
+  `FRIDGE_API_PORT` for the same. The launcher is published to npm by the release tag, after approval, like the SDK.
+
+### Changed
+
+- **On-demand workers start Arm (Graviton) machines by default**, `r7g.2xlarge`: the same 8 vCPUs and 64 GiB as
+  `r7i.2xlarge`, for less. Any instance type works, Arm or x86_64: the machine's Amazon Linux image follows its
+  architecture, as AWS describes it.
+
+### Fixed
+
+- **Follows don't chain.** A mirror can no longer be shared with a follower of its own (`409`), and the Followers
+  page no longer lists mirrors: an instance that wants the dataset follows its primary.
+- **A model's weights are downloaded once.** When a model revision has only `pytorch_model.bin`, as the pinned
+  patch model and the server's CLIP checkpoint do, transformers loaded it and then downloaded a second,
+  safetensors copy in the background that it never loads: 1.2 GB in the model cache instead of 605 MB for CLIP
+  ViT-B/32. The SDK and the server now turn that download off (transformers' `DISABLE_SAFETENSORS_CONVERSION`,
+  unless it's set already). A cache that already holds the extra copy keeps it; deleting it is safe.
+
 ## 2.4.0 (2026-11-09)
 
 2.4.0 adds follower instances: a second Freedom Ridge keeps read-only mirrors of the datasets a primary shares

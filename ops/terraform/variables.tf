@@ -5,9 +5,9 @@ variable "aws_region" {
 }
 
 variable "instance_type" {
-  description = "t3.large default (8 GiB; fits a $100/month budget). Use c7i.8xlarge only temporarily for imports; see the AWS guide."
+  description = "t4g.large default (Graviton, 8 GiB; fits a $100/month budget). Arm or x86_64; the AMI follows. Use c7g.8xlarge (or c7i.8xlarge on x86_64) only temporarily for imports; see the AWS guide."
   type        = string
-  default     = "t3.large"
+  default     = "t4g.large"
 }
 
 variable "key_name" {
@@ -16,7 +16,7 @@ variable "key_name" {
 }
 
 variable "ami_id" {
-  description = "Optional Ubuntu 26.04 x86_64 AMI override; otherwise resolve Canonical's current regional image."
+  description = "Optional Ubuntu 26.04 AMI override, of the instance type's architecture; otherwise resolve Canonical's current regional image."
   type        = string
   default     = null
 }

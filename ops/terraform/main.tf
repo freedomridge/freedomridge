@@ -46,11 +46,18 @@ data "aws_subnets" "default" {
 data "aws_subnet" "selected" {
   id = sort(data.aws_subnets.default.ids)[0]
 }
-# Canonical publishes its current Ubuntu 26.04 LTS server image (x86_64, gp3) under this
-# public parameter in every region. Its x86_64 images need Haswell-class CPUs or newer
-# (t3 and c7i qualify; M4/C4/R4 and older families do not).
+# Canonical publishes its current Ubuntu 26.04 LTS server image (gp3) for each architecture under
+# these public parameters in every region; the instance type's architecture picks one (the release
+# images are built for both). The x86_64 images need Haswell-class CPUs or newer (t3 and c7i
+# qualify; M4/C4/R4 and older families do not).
+data "aws_ec2_instance_type" "app" {
+  instance_type = var.instance_type
+}
+locals {
+  ubuntu_arch = contains(data.aws_ec2_instance_type.app.supported_architectures, "arm64") ? "arm64" : "amd64"
+}
 data "aws_ssm_parameter" "ubuntu_ami" {
-  name = "/aws/service/canonical/ubuntu/server/resolute/stable/current/amd64/hvm/ebs-gp3/ami-id"
+  name = "/aws/service/canonical/ubuntu/server/resolute/stable/current/${local.ubuntu_arch}/hvm/ebs-gp3/ami-id"
 }
 
 resource "aws_security_group" "freedomridge_sg" {
@@ -257,7 +264,7 @@ resource "aws_iam_role_policy" "on_demand_workers" {
       Condition = { StringEquals = { "ec2:CreateAction" = "RunInstances" } } },
       { Effect = "Allow", Action = ["ec2:TerminateInstances"], Resource = "arn:aws:ec2:${var.aws_region}:*:instance/*",
       Condition = { StringLike = { "aws:ResourceTag/fridge:launch" = "*" } } },
-      { Effect = "Allow", Action = ["ec2:DescribeInstances"], Resource = "*" },
+      { Effect = "Allow", Action = ["ec2:DescribeInstances", "ec2:DescribeInstanceTypes"], Resource = "*" },
       { Effect = "Allow", Action = ["ssm:GetParameters"],
       Resource = "arn:aws:ssm:${var.aws_region}::parameter/aws/service/ami-amazon-linux-latest/*" }
     ]

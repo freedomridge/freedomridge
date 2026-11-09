@@ -201,6 +201,15 @@ def test_a_mirror_stops_when_the_primary_removes_the_follower(monkeypatch, regis
         follower = await database.fetchval('SELECT id FROM followers')
         await followers.follow_dataset(follower, 1, followers.FollowOptions(), user=USER)
         await sync(database, link_id)
+        # No chains: the mirror can't be followed in turn.
+        with pytest.raises(HTTPException) as chained:
+            await followers.follow_dataset(
+                follower,
+                (await mirror_of(database))['dataset_id'],
+                followers.FollowOptions(),
+                user=USER,
+            )
+        assert chained.value.status_code == 409 and "A mirror can't be followed" in chained.value.detail
         await followers.remove_follower(follower, user=USER)
         result = await sync(database, link_id)
         mirror = await mirror_of(database)

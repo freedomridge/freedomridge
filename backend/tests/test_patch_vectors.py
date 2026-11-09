@@ -3,6 +3,7 @@ them (python/fridge/core/patches.py), so vectors computed next to the images and
 computed through a server."""
 
 import json
+import os
 from unittest.mock import Mock
 
 import numpy as np
@@ -84,3 +85,19 @@ def test_matches_what_compute_patch_embeddings_stores(monkeypatch, tiny_clip):
     assert [(row['patch_row'], row['patch_col']) for row in stored] == [(i // 4, i % 4) for i in range(16)]
     assert {(row['sample_id'], row['field_name'], row['patch_scale']) for row in stored} == {(7, 'clip', '4x4')}
     np.testing.assert_allclose([row['vector'] for row in stored], vectors, rtol=0, atol=1e-6)
+
+
+def test_loading_the_patch_model_downloads_only_the_weights_it_loads(monkeypatch, tmp_path, tiny_clip):
+    # The patch model's revision has only pytorch_model.bin; transformers would also download the conversion bot's
+    # safetensors copy, which it never loads, unless its switch is on when the model loads.
+    model, processor, _ = tiny_clip
+    model.save_pretrained(tmp_path / 'clip')
+    processor.save_pretrained(tmp_path / 'clip')
+    monkeypatch.delenv('DISABLE_SAFETENSORS_CONVERSION', raising=False)
+    loaded, _, device = patches.load_patch_model(str(tmp_path / 'clip'), revision=None, device='cpu')
+    assert os.environ['DISABLE_SAFETENSORS_CONVERSION'] == '1' and device == 'cpu'
+    assert loaded.config.projection_dim == 4
+    # Someone who set it keeps their setting.
+    monkeypatch.setenv('DISABLE_SAFETENSORS_CONVERSION', '0')
+    patches.load_patch_model(str(tmp_path / 'clip'), revision=None, device='cpu')
+    assert os.environ['DISABLE_SAFETENSORS_CONVERSION'] == '0'
