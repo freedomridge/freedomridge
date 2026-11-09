@@ -32,6 +32,8 @@ it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
 
 ### Fixed
 
+- **Follows don't chain.** A mirror can no longer be shared with a follower of its own (`409`), and the Followers
+  page no longer lists mirrors: an instance that wants the dataset follows its primary.
 - **A model's weights are downloaded once.** When a model revision has only `pytorch_model.bin`, as the pinned
   patch model and the server's CLIP checkpoint do, transformers loaded it and then downloaded a second,
   safetensors copy in the background that it never loads: 1.2 GB in the model cache instead of 605 MB for CLIP

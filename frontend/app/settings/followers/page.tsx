@@ -257,7 +257,8 @@ export default function FollowersPage() {
                                     <FollowerCard
                                         key={follower.id}
                                         follower={follower}
-                                        datasets={(datasets ?? []).map(dataset => ({ id: dataset.id, name: dataset.name }))}
+                                        // A mirror isn't followed in turn: no chains.
+                                        datasets={(datasets ?? []).filter(dataset => !dataset.mirror).map(dataset => ({ id: dataset.id, name: dataset.name }))}
                                     />
                                 ))}
                             </div>

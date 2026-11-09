@@ -190,6 +190,12 @@ async def follow_dataset(
                 dataset_id,
             ):
                 raise HTTPException(status_code=404, detail='No such dataset')
+            # No chains: a mirror is its primary's copy, and an instance that wants it follows the primary.
+            if await connection.fetchval('SELECT 1 FROM mirrors WHERE dataset_id = $1', dataset_id):
+                raise HTTPException(
+                    status_code=409,
+                    detail="A mirror can't be followed: follow the dataset on its primary instead",
+                )
             await connection.execute(
                 """INSERT INTO follower_datasets (follower_id, dataset_id, tags, views) VALUES ($1, $2, $3, $4)
                    ON CONFLICT (follower_id, dataset_id) DO UPDATE SET tags = EXCLUDED.tags, views = EXCLUDED.views""",
