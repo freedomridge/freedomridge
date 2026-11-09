@@ -605,7 +605,7 @@ def test_a_restore_is_noticed_and_its_subscriptions_start_again_in_the_restored_
         assert oid == str(await database.fetchval('SELECT oid FROM pg_database WHERE datname = current_database()'))
         cursor = (await mirror_of(database))['feed_cursor']
         with pytest.raises(HTTPException) as restored:
-            await followers.follower_changes(1, after=cursor, identity_=f'{system_id}:1', follower=sub)
+            await followers.follower_changes(1, cursor, f'{system_id}:1', 1000, follower=sub)
         assert restored.value.status_code == 410
 
         # Restored from another cluster: the subscription's txids are another database's. It starts again here.
@@ -940,5 +940,84 @@ def test_one_link_per_primary_and_one_instance_per_follower_token(monkeypatch, r
         await followers.reset_follower_instance(listed['id'], user=USER)
         await followers.current_follower(Mock(headers={'X-Fridge-Instance': reinstalled}), account=account)
         assert await database.fetchval('SELECT instance FROM followers') == reinstalled
+
+    registry_database(scenario)
+
+
+def test_the_feed_fetches_vectors_only_for_new_samples_and_keeps_the_id_sequence(monkeypatch, registry_database):
+    async def scenario(database):
+        _, link_id = await setup(monkeypatch, database)
+        await ingest([{'crop': 'corn'}], dataset_id=1, prefix='s3://images/a')
+        corn = await database.fetchval('SELECT id FROM samples WHERE dataset_id = 1')
+        await database.execute(
+            "INSERT INTO embeddings (sample_id, field_name, vector) VALUES ($1, 'clip', '[1,0]')",
+            corn,
+        )
+        follower = await database.fetchval('SELECT id FROM followers')
+        await followers.follow_dataset(follower, 1, followers.FollowOptions(), user=USER)
+        await sync(database, link_id)
+        asked = []
+        fetch_vectors = follower_sync.fetch_vectors
+
+        async def recorded(client, origin, origin_ids, fields=None):
+            asked.append(sorted(origin_ids))
+            return await fetch_vectors(client, origin, origin_ids, fields)
+
+        monkeypatch.setattr(follower_sync, 'fetch_vectors', recorded)
+        # A tag changes corn's block, and a new sample arrives in it with a vector: only the new one's are fetched.
+        await database.execute("UPDATE samples SET tags = '{reviewed}' WHERE id = $1", corn)
+        await ingest([{'crop': 'soy'}], dataset_id=1, prefix='s3://images/b')
+        soy = await database.fetchval("SELECT id FROM samples WHERE metadata->>'crop' = 'soy'")
+        await database.execute(
+            "INSERT INTO embeddings (sample_id, field_name, vector) VALUES ($1, 'clip', '[0,1]')",
+            soy,
+        )
+        await sync(database, link_id)
+        assert corn not in [origin_id for request in asked for origin_id in request]
+        mirror = await mirror_of(database)
+        local = {row['origin_id']: row['id'] for row in (await copied(database, mirror)).values()}
+        vectors = dict(
+            await database.fetch(
+                "SELECT sample_id, vector::text FROM embeddings "
+                "WHERE field_name = 'clip' AND sample_id = ANY($1::int[])",
+                [local[corn], local[soy]],
+            ),
+        )
+        assert vectors == {local[corn]: '[1,0]', local[soy]: '[0,1]'}  # corn's kept, soy's came
+
+        # A changed vector updates the mirror's row without taking a sequence value.
+        before = await database.fetchval('SELECT last_value FROM embeddings_id_seq')
+        await database.execute("UPDATE embeddings SET vector = '[0.5,0.5]' WHERE sample_id = $1", corn)
+        await sync(database, link_id)
+        assert await database.fetchval('SELECT vector::text FROM embeddings WHERE sample_id = $1', local[corn]) == (
+            '[0.5,0.5]'
+        )
+        assert await database.fetchval('SELECT last_value FROM embeddings_id_seq') == before
+
+    registry_database(scenario)
+
+
+def test_a_follower_can_ask_for_feed_pages_bounded_by_vector_changes(monkeypatch, registry_database):
+    async def scenario(database):
+        _, link_id = await setup(monkeypatch, database)
+        await ingest([{'crop': 'a'}, {'crop': 'b'}, {'crop': 'c'}], dataset_id=1, prefix='s3://images/a')
+        ids = [row['id'] for row in await database.fetch('SELECT id FROM samples WHERE dataset_id = 1 ORDER BY id')]
+        follower = await database.fetchval('SELECT id FROM followers')
+        await followers.follow_dataset(follower, 1, followers.FollowOptions(), user=USER)
+        await sync(database, link_id)
+        cursor = (await mirror_of(database))['feed_cursor']
+        for sample_id in ids:  # three transactions, one vector change each
+            await database.execute(
+                "INSERT INTO embeddings (sample_id, field_name, vector) VALUES ($1, 'clip', '[1,1]')",
+                sample_id,
+            )
+        sub = dict(await database.fetchrow('SELECT * FROM followers WHERE id = $1', follower))
+        ident = await followers.identity(database)
+        page = await followers.follower_changes(1, cursor, ident, 1000, vector_limit=1, follower=sub)
+        assert page['more'] and [v['sample_id'] for v in page['vectors']] == ids[:1]
+        rest = await followers.follower_changes(1, page['cursor'], ident, 1000, vector_limit=2, follower=sub)
+        assert not rest['more'] and [v['sample_id'] for v in rest['vectors']] == ids[1:]
+        whole = await followers.follower_changes(1, cursor, ident, 1000, follower=sub)  # an older follower
+        assert not whole['more'] and len(whole['vectors']) == 3
 
     registry_database(scenario)

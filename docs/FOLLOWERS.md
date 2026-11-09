@@ -76,6 +76,11 @@ Every call takes the follower token (`Authorization: Bearer <token>`) and record
    - The feed serves only transactions that have ended, so nothing can appear behind a cursor it gave out. A
      long transaction on the primary holds the feed back until it commits.
    - `more: true` means another page follows straight away.
+   - `vector_limit=<n>` bounds a page by its vector changes: whole transactions, up to the first that would go
+     over `n`, and at least one transaction. This instance's sync asks for 20,000, since it keeps the page in its
+     job's checkpoint. Without it, a page is up to 1,000 transactions, whatever their size.
+   - A re-read block's samples bring their own vectors only when they're new on the follower: changes to the
+     others' vectors are in the feed's vector changes.
 4. `POST .../ack {"cursor": ...}` after applying a page, so the primary can prune.
 
 Errors:

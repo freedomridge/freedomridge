@@ -488,12 +488,22 @@ async def write_vectors(connection, dataset_id: int, named: list, vectors: dict)
             payload = io.BytesIO(vector_payload(group))
             await connection.copy_to_table('mirror_vector_stage', source=payload, format='binary')
             try:
+                # Changed rows updated, missing ones inserted: an upsert would take an embeddings.id sequence value
+                # for every row, those that conflict included.
+                await connection.execute(
+                    """UPDATE embeddings e SET vector = st.vector FROM mirror_vector_stage st
+                       JOIN mirror_samples m ON m.dataset_id = $1 AND m.origin_id = st.sample_id
+                       WHERE e.sample_id = m.sample_id AND e.field_name = $2 AND e.vector IS DISTINCT FROM st.vector""",
+                    dataset_id,
+                    field,
+                )
                 await connection.execute(
                     """INSERT INTO embeddings (sample_id, field_name, vector)
                        SELECT m.sample_id, $2, st.vector FROM mirror_vector_stage st
                        JOIN mirror_samples m ON m.dataset_id = $1 AND m.origin_id = st.sample_id
-                       ON CONFLICT (sample_id, field_name) DO UPDATE SET vector = EXCLUDED.vector
-                       WHERE embeddings.vector IS DISTINCT FROM EXCLUDED.vector""",
+                       WHERE NOT EXISTS (SELECT 1 FROM embeddings e
+                                         WHERE e.sample_id = m.sample_id AND e.field_name = $2)
+                       ON CONFLICT (sample_id, field_name) DO NOTHING""",
                     dataset_id,
                     field,
                 )
@@ -856,21 +866,36 @@ async def apply_state(pool, link, client, mirror, checkpoint: dict, *, views: bo
     )
 
 
-async def apply_blocks(pool, client, mirror, blocks: list, after_write=None) -> tuple:
-    """Fetch these blocks' samples, hashes and vectors from the primary, and a publish that writes them."""
+async def apply_blocks(pool, client, mirror, blocks: list, after_write=None, *, new_only: bool = False) -> tuple:
+    """Fetch these blocks' samples, hashes and vectors from the primary, and a publish that writes them. From the
+    feed (new_only), only the vectors of samples new here: the feed's vector log carries every change to the others,
+    and re-reading a block whose samples were tagged mustn't download all their vectors again."""
     dataset_id, origin = mirror['dataset_id'], mirror['origin_dataset_id']
     data = await fetch_blocks(client, origin, blocks)
     await ensure_array_columns(pool, dataset_id, data['array_fields'])
     origin_ids = [sample['id'] for sample in data['samples']]
-    vectors = decode_vectors(await fetch_vectors(client, origin, origin_ids)) if origin_ids else {}
+    wanted = origin_ids
+    if new_only and origin_ids:
+        known = {
+            row['origin_id']
+            for row in await pool.fetch(
+                'SELECT origin_id FROM mirror_samples WHERE dataset_id = $1 AND origin_id = ANY($2::int[])',
+                dataset_id,
+                origin_ids,
+            )
+        }
+        wanted = [origin_id for origin_id in origin_ids if origin_id not in known]
+    vectors = decode_vectors(await fetch_vectors(client, origin, wanted)) if wanted else {}
     coordinates = await fetch_coordinates(client, origin, blocks) if origin_ids else []
 
     async def publish(connection):
         await begin_mirror_write(connection, dataset_id)
         present = await write_samples(connection, dataset_id, blocks, data)
         await write_hashes(connection, dataset_id, present, data['hashes'])
-        # Every primary field of every sample present: what didn't come was deleted there.
-        await write_vectors(connection, dataset_id, [(sample_id, None) for sample_id in present], vectors)
+        # Every primary field of every sample asked for: what didn't come was deleted there.
+        wanted_ids = set(wanted)
+        asked = present if not new_only else [sample_id for sample_id in present if sample_id in wanted_ids]
+        await write_vectors(connection, dataset_id, [(sample_id, None) for sample_id in asked], vectors)
         await write_coordinates(connection, dataset_id, blocks, coordinates)
         if after_write is not None:
             await after_write(connection)
@@ -981,7 +1006,12 @@ async def feed_step(pool, link, client, mirror, checkpoint: dict) -> StepResult:
                 client,
                 'GET',
                 f'/follower/datasets/{origin}/changes',
-                params={'after': mirror['feed_cursor'], 'identity': checkpoint['identity']},
+                params={
+                    'after': mirror['feed_cursor'],
+                    'identity': checkpoint['identity'],
+                    # Bounded pages: the page is kept in the job's checkpoint. An older primary ignores it.
+                    'vector_limit': followers.FEED_VECTOR_ROWS,
+                },
             )
         except PrimaryRefused as error:
             if error.status not in (404, 409, 410):
@@ -998,11 +1028,9 @@ async def feed_step(pool, link, client, mirror, checkpoint: dict) -> StepResult:
         hashed = {vector['sample_id'] // BLOCK for vector in changes['vectors'] if vector['kind'] == 'hash'}
         reread = set(changes['blocks']) | hashed
         blocks = sorted(reread)
-        # A vector change in a block being re-read comes with the block; the rest are fetched on their own.
+        # Every vector change is fetched on its own: a re-read block brings only the vectors of samples new here.
         loose = [
-            (vector['sample_id'], vector['field_name'])
-            for vector in changes['vectors']
-            if vector['kind'] == 'vector' and vector['sample_id'] // BLOCK not in reread
+            (vector['sample_id'], vector['field_name']) for vector in changes['vectors'] if vector['kind'] == 'vector'
         ]
         page = {
             'dataset_id': dataset_id,
@@ -1031,7 +1059,7 @@ async def feed_step(pool, link, client, mirror, checkpoint: dict) -> StepResult:
 
     if page['blocks']:
         blocks, page['blocks'] = page['blocks'][:COPY_BLOCKS], page['blocks'][COPY_BLOCKS:]
-        count, publish = await apply_blocks(pool, client, mirror, blocks)
+        count, publish = await apply_blocks(pool, client, mirror, blocks, new_only=True)
         return StepResult(checkpoint=checkpoint, message=f'Applied {count:,} changed samples', publish=publish)
     if page['vectors']:
         part, page['vectors'] = page['vectors'][: followers.VECTOR_SAMPLES], page['vectors'][followers.VECTOR_SAMPLES :]

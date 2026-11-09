@@ -43,6 +43,13 @@ it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
     instance** on the Followers page hands the token to a follower reinstalled from scratch.
   - Two instances on one subscription shared its acknowledgements, so the faster one's pruned changes the other
     hadn't read.
+- **Followers: tagging samples on the primary no longer re-downloads their vectors.** A changed block (a bulk tag,
+  say) made the follower fetch every vector of every field of its samples again: tens of GB for a large dataset.
+  Now a re-read block brings only the vectors of samples new to the mirror; the feed's vector changes carry the
+  rest. Writing a vector also no longer uses up an `embeddings.id` value for a row that already exists.
+- **Followers: feed pages are bounded by their vector changes.** A large embedding job on the primary made pages
+  of up to about a million changes, which the follower rewrote in its checkpoint on every step. A follower now
+  asks for pages of at most 20,000 (`vector_limit`, in whole transactions); an older primary ignores it.
 - **Followers: only the primary's own refusal stops the mirrors.** It now says, with a code, when the follower was
   removed or its token deleted. Before, any 401 or 403, from a proxy say, stopped every mirror, and a new copy of
   each started once the primary answered again.

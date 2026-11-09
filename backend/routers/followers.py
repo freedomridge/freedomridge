@@ -19,7 +19,7 @@ copy it reads the feed from start_txid - 1.
 
 import base64
 import secrets
-from typing import List, Literal, Optional
+from typing import Annotated, List, Literal, Optional
 
 import numpy as np
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -39,6 +39,7 @@ router = APIRouter()
 BLOCK = 4096
 STALE_DAYS = 7
 FEED_TRANSACTIONS = 1000  # whole transactions per feed page
+FEED_VECTOR_ROWS = 20000  # vector changes per page a follower asks for (vector_limit), in whole transactions
 SAMPLE_BLOCKS = 16  # blocks per samples request
 VECTOR_SAMPLES = 2000  # samples per vectors request
 TAG_SAMPLES = 50000  # samples per tags request from a follower
@@ -390,6 +391,7 @@ async def follower_changes(
     after: int,
     identity_: str = Query(alias='identity'),
     transactions: int = Query(FEED_TRANSACTIONS, ge=1, le=FEED_TRANSACTIONS),
+    vector_limit: Annotated[Optional[int], Query(ge=1)] = None,
     follower: dict = Depends(current_follower),
 ):
     """What changed in transactions after `after` and below the snapshot's xmin, whole transactions only, at most
@@ -418,6 +420,24 @@ async def follower_changes(
         )
         more = len(found) > transactions
         upto = found[transactions - 1]['transaction_id'] if more else max(after, xmin - 1)
+        if vector_limit is not None and found:
+            # A follower that keeps the page in its checkpoint asks for a bounded one: whole transactions, up to the
+            # first whose vector changes go over the limit, and always at least one transaction.
+            counts = await connection.fetch(
+                'SELECT transaction_id, count(*) AS rows FROM vector_changes '
+                'WHERE dataset_id = $1 AND transaction_id > $2 AND transaction_id <= $3 GROUP BY 1 ORDER BY 1',
+                dataset_id,
+                after,
+                upto,
+            )
+            total = 0
+            for row in counts:
+                total += row['rows']
+                if total > vector_limit and row['transaction_id'] > found[0]['transaction_id']:
+                    # This transaction goes to the next page: the page ends at the logged one before it.
+                    upto = max(t['transaction_id'] for t in found if t['transaction_id'] < row['transaction_id'])
+                    more = True
+                    break
         blocks = await connection.fetch(
             'SELECT DISTINCT block_id FROM sample_block_changes '
             'WHERE dataset_id = $1 AND transaction_id > $2 AND transaction_id <= $3 ORDER BY 1',
