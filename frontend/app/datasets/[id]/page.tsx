@@ -1023,8 +1023,9 @@ function DatasetPageContent() {
                         } : undefined}
                         hashFields={hashFieldsData || []}
                         onShowDuplicates={handleShowDuplicates}
-                        // A mirror's tags are the primary's (docs/FOLLOWERS.md).
-                        canTag={(user?.role === 'admin' || user?.role === 'power_user') && !dataset?.mirror}
+                        // A mirror's tags are the primary's; with tags both ways, a tag edit here is made there.
+                        canTag={(user?.role === 'admin' || user?.role === 'power_user')
+                            && (!dataset?.mirror || (dataset.mirror.tags === 'both' && dataset.mirror.state === 'following'))}
                         gridSamplesRef={getGridSamplesRef(panelId)}
                         gridMoreRef={getGridMoreRef(panelId)}
                         // Patches are a sub-grid of IMAGES only. An object-grain grid never shows

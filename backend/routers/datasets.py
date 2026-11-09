@@ -6731,6 +6731,12 @@ class BulkTargetRequest(BaseModel):
 async def _bulk_response(id, user, operation, payload):
     from .. import bulk_jobs
 
+    if await db.fetchval('SELECT 1 FROM mirrors WHERE dataset_id = $1', id):
+        raise HTTPException(
+            status_code=409,
+            detail='This dataset is a read-only mirror of a dataset on another Freedom Ridge instance: change it there',
+        )
+
     result = await bulk_jobs.submit(db.pool, id, user['id'], operation, payload)
     return JSONResponse(status_code=202, content=result)
 
@@ -6865,6 +6871,12 @@ async def bulk_tag_samples(id: int, request: BulkTagRequest, user: dict = Depend
         )
         if count != len(request.sample_ids):
             raise HTTPException(status_code=400, detail=f"Some samples not found in dataset {id}")
+
+    # A mirror's tags are its primary's: sent there when its tags option is both ways, refused otherwise.
+    if await db.fetchval('SELECT 1 FROM mirrors WHERE dataset_id = $1', id):
+        from .. import mirror_writes
+
+        return await mirror_writes.forward_tags(db, id, request)
 
     if (
         request.background

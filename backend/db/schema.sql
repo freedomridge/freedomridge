@@ -2493,9 +2493,11 @@ $$ LANGUAGE plpgsql;
 CREATE OR REPLACE FUNCTION log_dataset_settings() RETURNS trigger AS $$
 BEGIN
     IF TG_OP = 'DELETE' THEN
-        IF OLD.followed THEN
-            INSERT INTO dataset_changes (dataset_id, kind) VALUES (OLD.id, 'deleted');
-        END IF;
+        -- Its subscriptions go with it (ON DELETE CASCADE), so nobody could read or acknowledge its log rows: they go too.
+        DELETE FROM sample_block_changes WHERE dataset_id = OLD.id;
+        DELETE FROM vector_changes WHERE dataset_id = OLD.id;
+        DELETE FROM dataset_changes WHERE dataset_id = OLD.id;
+        DELETE FROM map_block_changes WHERE dataset_id = OLD.id;
         RETURN NULL;
     END IF;
     IF (OLD.name, OLD.description, OLD.media_fields, OLD.grid_media_field, OLD.modal_media_field,

@@ -107,8 +107,9 @@ export default function ViewManager({
         try {
             await deleteView(id);
             await loadViews();
-        } catch {
-            alert('Failed to delete view');
+        } catch (e) {
+            // A mirror's primary can refuse it (it deletes only the views this follower made): show why.
+            alert(e instanceof Error ? e.message : 'Failed to delete view');
         }
     }
 
@@ -222,6 +223,9 @@ export default function ViewManager({
                             // Note: shared_with_user_ids might be null/empty
                             const isSharedExplicitly = !isPublic && ((view.shared_with_user_ids?.length || 0) > 0 || (!isMine));
                             const isPrivate = isMine && !isPublic && !isSharedExplicitly;
+                            // A copy of a view on the primary changes there; with views both ways, it can be deleted from here.
+                            const sendsUp = mirror?.views === 'both' && mirror.state === 'following';
+                            const editable = !view.from_primary || sendsUp;
 
                             return (
                                 <div key={view.id} className="flex items-center justify-between p-2.5 hover:bg-zinc-800 rounded-md group transition-all border border-transparent hover:border-zinc-700/50">
@@ -260,7 +264,18 @@ export default function ViewManager({
                                                 </span>
                                             )}
 
-                                            {!isMine && (
+                                            {view.from_primary && mirror && (
+                                                <span data-testid="view-from-primary" className="text-[10px] text-sky-300 truncate">
+                                                    from {primaryHost(mirror)}
+                                                </span>
+                                            )}
+                                            {view.content.made_on && (
+                                                <span data-testid="view-made-on" className="text-[10px] text-zinc-400 truncate"
+                                                    title={`Made on the follower instance ${view.content.made_on}. Saved searches keep their results, so it shows the same samples here.`}>
+                                                    made on {view.content.made_on}
+                                                </span>
+                                            )}
+                                            {!isMine && !view.from_primary && (
                                                 <span className="text-[10px] text-zinc-600 truncate ml-auto">
                                                     by {view.user_id}
                                                 </span>
@@ -269,7 +284,7 @@ export default function ViewManager({
                                     </button>
 
                                     <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
-                                        {user?.role === 'admin' && (
+                                        {user?.role === 'admin' && !mirror && (
                                             <button
                                                 data-testid="view-default-toggle"
                                                 onClick={(e) => {
@@ -299,7 +314,7 @@ export default function ViewManager({
                                                 <Share1Icon className="w-3.5 h-3.5" />
                                             </button>
                                         )}
-                                        {(isMine || user?.role === 'admin') && (
+                                        {(isMine || user?.role === 'admin') && editable && (
                                             <button
                                                 onClick={(e) => {
                                                     e.stopPropagation();

@@ -43,6 +43,8 @@ it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
     has and their maps, statistics and local views stay its own.
   - The primary's maps are copied, logged by field and block, so a map view selects the same samples on both;
     the mirror re-ranks a map when the primary did.
+  - With tags both ways, tagging a mirror is made on the primary as the follower's account. With views both
+    ways, views shared with everyone on a mirror are made on the primary, marked with the follower's name.
   - Sample ids are translated, in object samples' `parent_id` and in views' filters.
   - Views that use a concept stay on the primary.
   - A mirror stops when the primary stops sharing it, removes the follower or is restored into a new database;

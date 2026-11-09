@@ -84,6 +84,12 @@ async def create_view(id: int, view: ViewCreate, user: dict = Depends(get_curren
     dataset = await db.fetchrow("SELECT id FROM datasets WHERE id = $1", id)
     if not dataset:
         raise HTTPException(status_code=404, detail="Dataset not found")
+    # A shared view on a mirror whose views sync both ways is made on its primary (docs/FOLLOWERS.md).
+    if view.is_public and await db.fetchval("SELECT 1 FROM mirrors WHERE dataset_id = $1 AND views = 'both'", id):
+        from .. import mirror_writes
+
+        view.name = clean_name(view.name, "View name")
+        return await mirror_writes.forward_view(db, id, view, user)
 
     # Blank names were accepted, and "rv_a " / "RV_A" sat next to "rv_a" as indistinguishable
     # entries: trim, and compare names case-insensitively.
@@ -149,7 +155,8 @@ async def create_view(id: int, view: ViewCreate, user: dict = Depends(get_curren
 @router.get("/datasets/{id}/views", response_model=list[View], dependencies=[Depends(require_dataset_access)])
 async def list_dataset_views(id: int, user: dict = Depends(get_current_user)):
     query = """
-        SELECT id, dataset_id, user_id, name, description, slug, content, is_public, shared_with_user_ids, created_at
+        SELECT id, dataset_id, user_id, name, description, slug, content, is_public, shared_with_user_ids, created_at,
+               EXISTS (SELECT 1 FROM mirror_views m WHERE m.view_id = views.id) AS from_primary
         FROM views
         WHERE dataset_id = $1 AND (
             user_id = $2 OR
@@ -222,6 +229,8 @@ async def get_view(slug: str, request: Request):
 
 @router.delete("/views/{id}")
 async def delete_view(id: int, user: dict = Depends(get_current_user)):
+    from .. import mirror_writes
+
     # Check ownership or admin
     view = await db.fetchrow("SELECT user_id FROM views WHERE id = $1", id)
     if not view:
@@ -229,6 +238,10 @@ async def delete_view(id: int, user: dict = Depends(get_current_user)):
 
     if view['user_id'] != user['id'] and user['role'] != 'admin':
         raise HTTPException(status_code=403, detail="Not authorized to delete this view")
+    # A view a mirror copied from its primary is deleted there, when the mirror's views sync both ways.
+    forwarded = await mirror_writes.forward_view_deletion(db, id)
+    if forwarded is not None:
+        return forwarded
 
     query = "DELETE FROM views WHERE id = $1 RETURNING id"
     row = await db.fetchrow(query, id)
@@ -264,6 +277,25 @@ async def share_view(id: int, view_id: int, share: ViewShare, user: dict = Depen
     if view['user_id'] != user['id'] and user['role'] != 'admin':
         raise HTTPException(status_code=403, detail="Not authorized to share this view")
     await _require_known_users(share.shared_with_user_ids)
+    # Made public on a mirror whose views sync both ways: it's made on the primary, and this private one is replaced
+    # by its copy (docs/FOLLOWERS.md).
+    if share.is_public and await db.fetchval(
+        """SELECT 1 FROM mirrors m WHERE m.dataset_id = $1 AND m.views = 'both'
+           AND NOT EXISTS (SELECT 1 FROM mirror_views v WHERE v.view_id = $2)""",
+        id,
+        view_id,
+    ):
+        from .. import mirror_writes
+
+        local = await db.fetchrow("SELECT name, content FROM views WHERE id = $1", view_id)
+        copy = await mirror_writes.forward_view(
+            db,
+            id,
+            ViewCreate(name=local['name'], content=_decode_content(local['content']), is_public=True),
+            user,
+        )
+        await db.execute("DELETE FROM views WHERE id = $1", view_id)
+        return copy
 
     async with db.pool.acquire() as connection, connection.transaction():
         # FOR UPDATE first: a default-view change holds the view FOR SHARE until it commits, and then the

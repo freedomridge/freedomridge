@@ -158,6 +158,8 @@ class View(BaseModel):
     is_public: bool = False
     shared_with_user_ids: List[int] = []
     created_at: datetime
+    # The dataset is a mirror and this view is its copy of one on the primary (docs/FOLLOWERS.md).
+    from_primary: bool = False
 
 
 class ViewCreate(BaseModel):

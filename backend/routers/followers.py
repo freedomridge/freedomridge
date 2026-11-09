@@ -23,10 +23,14 @@ from typing import List, Literal
 
 import numpy as np
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from ..crypto import hash_token
 from ..database import db
+from ..models import ViewCreate
+from . import datasets as datasets_router
+from . import views as views_router
 from .auth import get_follower_user, require_role
 
 router = APIRouter()
@@ -36,6 +40,7 @@ STALE_DAYS = 7
 FEED_TRANSACTIONS = 1000  # whole transactions per feed page
 SAMPLE_BLOCKS = 16  # blocks per samples request
 VECTOR_SAMPLES = 2000  # samples per vectors request
+TAG_SAMPLES = 50000  # samples per tags request from a follower
 # The change log's tables, each with dataset_id and transaction_id.
 LOG_TABLES = ('sample_block_changes', 'vector_changes', 'dataset_changes', 'map_block_changes')
 
@@ -60,6 +65,18 @@ class VectorRequest(BaseModel):
 
 class Ack(BaseModel):
     cursor: int
+
+
+class TagRequest(BaseModel):
+    sample_ids: List[int] = Field(min_length=1, max_length=TAG_SAMPLES)
+    field_name: str = 'tags'
+    add_tags: List[str] = Field(default_factory=list)
+    remove_tags: List[str] = Field(default_factory=list)
+
+
+class ViewRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+    content: dict
 
 
 async def identity(source=None) -> str:
@@ -167,7 +184,11 @@ async def follow_dataset(
         async with connection.transaction():
             if not await connection.fetchval('SELECT 1 FROM followers WHERE id = $1', follower_id):
                 raise HTTPException(status_code=404, detail='No such follower')
-            if not await connection.fetchval('SELECT 1 FROM datasets WHERE id = $1 AND NOT deleting', dataset_id):
+            # Serializes with unfollowing and removal, which recompute datasets.followed from the subscriptions.
+            if not await connection.fetchval(
+                'SELECT 1 FROM datasets WHERE id = $1 AND NOT deleting FOR NO KEY UPDATE',
+                dataset_id,
+            ):
                 raise HTTPException(status_code=404, detail='No such dataset')
             await connection.execute(
                 """INSERT INTO follower_datasets (follower_id, dataset_id, tags, views) VALUES ($1, $2, $3, $4)
@@ -192,6 +213,7 @@ async def follow_dataset(
 @router.delete('/followers/{follower_id}/datasets/{dataset_id}')
 async def unfollow_dataset(follower_id: int, dataset_id: int, user: dict = Depends(require_role('admin'))):
     async with db.pool.acquire() as connection, connection.transaction():
+        await connection.execute('SELECT 1 FROM datasets WHERE id = $1 FOR NO KEY UPDATE', dataset_id)
         deleted = await connection.fetchval(
             'DELETE FROM follower_datasets WHERE follower_id = $1 AND dataset_id = $2 RETURNING 1',
             follower_id,
@@ -218,6 +240,10 @@ async def remove_follower(follower_id: int, user: dict = Depends(require_role('a
                 follower_id,
             )
         ]
+        await connection.execute(
+            'SELECT 1 FROM datasets WHERE id = ANY($1::int[]) ORDER BY id FOR NO KEY UPDATE',
+            datasets,
+        )
         await connection.execute('DELETE FROM followers WHERE id = $1', follower_id)
         await connection.execute('UPDATE api_tokens SET is_active = FALSE WHERE user_id = $1', follower['user_id'])
         await connection.execute(
@@ -481,3 +507,74 @@ async def follower_ack(dataset_id: int, ack: Ack, follower: dict = Depends(curre
         )
         await prune(connection, dataset_id)
     return {'acked': ack.cursor}
+
+
+# --- Edits a follower sends up (its tags and views options both ways) ---------------------------------------------
+
+
+async def both_ways(follower: dict, dataset_id: int, option: str) -> dict:
+    """The follower's account, as which its edits are made here, once the dataset's option allows them."""
+    sub = await subscription(db, follower, dataset_id)
+    if sub[option] != 'both':
+        raise HTTPException(
+            status_code=403,
+            detail=f'The {option} of this dataset come from the primary only: this follower cannot change them',
+        )
+    return dict(await db.fetchrow('SELECT id, username, role FROM users WHERE id = $1', follower['user_id']))
+
+
+@router.post('/follower/datasets/{dataset_id}/tags')
+async def follower_tags(dataset_id: int, request: TagRequest, follower: dict = Depends(current_follower)):
+    """Tags edited on the follower: made here as its account, and back to it through the feed. Samples deleted here
+    since the follower copied them are skipped. A large edit is queued as a bulk job here (202)."""
+    account = await both_ways(follower, dataset_id, 'tags')
+    present = [
+        row['id']
+        for row in await db.fetch(
+            'SELECT id FROM samples WHERE dataset_id = $1 AND id = ANY($2::int[])',
+            dataset_id,
+            request.sample_ids,
+        )
+    ]
+    skipped = len(set(request.sample_ids)) - len(present)
+    if not present:
+        return {'updated_count': 0, 'skipped': skipped}
+    result = await datasets_router.bulk_tag_samples(
+        dataset_id,
+        datasets_router.BulkTagRequest(
+            sample_ids=present,
+            field_name=request.field_name,
+            add_tags=request.add_tags,
+            remove_tags=request.remove_tags,
+        ),
+        user=account,
+    )
+    if isinstance(result, JSONResponse):
+        return result
+    return {**result, 'skipped': skipped}
+
+
+@router.post('/follower/datasets/{dataset_id}/views', status_code=201)
+async def follower_create_view(dataset_id: int, request: ViewRequest, follower: dict = Depends(current_follower)):
+    """A shared view made on the follower, created here as its account and marked with where it was made."""
+    account = await both_ways(follower, dataset_id, 'views')
+    content = {**request.content, 'made_on': follower['name']}
+    return await views_router.create_view(
+        dataset_id,
+        ViewCreate(name=request.name, content=content, is_public=True),
+        user=account,
+    )
+
+
+@router.delete('/follower/datasets/{dataset_id}/views/{view_id}')
+async def follower_delete_view(dataset_id: int, view_id: int, follower: dict = Depends(current_follower)):
+    """A shared view deleted on the follower. As anywhere, its account deletes only the views it made."""
+    account = await both_ways(follower, dataset_id, 'views')
+    shared = await db.fetchval(
+        'SELECT 1 FROM views WHERE id = $1 AND dataset_id = $2 AND is_public',
+        view_id,
+        dataset_id,
+    )
+    if not shared:
+        raise HTTPException(status_code=404, detail='No such shared view in this dataset')
+    return await views_router.delete_view(view_id, user=account)

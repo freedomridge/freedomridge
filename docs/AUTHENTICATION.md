@@ -214,6 +214,8 @@ the variable.
 | `/api/follower/config` | GET | follower token | What this follower follows, and the primary's identity |
 | `/api/follower/datasets/{id}/blocks`, `.../blocks/samples`, `.../vectors`, `.../state` | GET, POST | follower token | Copy a followed dataset |
 | `/api/follower/datasets/{id}/changes`, `.../ack` | GET, POST | follower token | Read what changed since a cursor; acknowledge it |
+| `/api/follower/datasets/{id}/coordinates` | POST | follower token | Copy a followed dataset's map coordinates |
+| `/api/follower/datasets/{id}/tags`, `.../views`, `.../views/{view_id}` | POST, DELETE | follower token | Edits sent up, when the dataset's tags or views option is both ways |
 | `/api/primaries` | POST, GET | admin | On a follower: follow a primary (its follower token is checked first); list primaries and their mirrors |
 | `/api/primaries/{id}` | DELETE | admin | Stop following a primary; its mirrors stay as read-only copies |
 

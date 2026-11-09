@@ -91,23 +91,29 @@ async def call(client, method: str, path: str, *, params=None, body=None):
     return response.json()
 
 
-async def schedule_sync(pool) -> None:
-    """Queue a sync for each primary link that has none waiting or running."""
-    links = await pool.fetch(
-        """SELECT l.id FROM primary_links l WHERE NOT EXISTS (
-               SELECT 1 FROM jobs j WHERE j.kind = $1 AND j.state IN ('queued', 'running')
-                 AND j.args->>'link_id' = l.id::text)
-           ORDER BY l.id""",
+async def queue_sync(pool, link_id: int) -> None:
+    """Queue a sync of this link unless one is waiting or running: one job at a time writes a link's mirrors, and a
+    running one that has caught up picks later changes up on its next run."""
+    busy = await pool.fetchval(
+        """SELECT EXISTS (SELECT 1 FROM jobs WHERE kind = $1 AND state IN ('queued', 'running')
+                          AND args->>'link_id' = $2)""",
         KIND,
+        str(link_id),
     )
-    for link in links:
+    if not busy:
         await job_queue.enqueue_job(
             pool,
             KIND,
             lane='maintenance',
-            args={'link_id': link['id']},
-            dedupe_key=f"link:{link['id']}",
+            args={'link_id': link_id},
+            dedupe_key=f'link:{link_id}',
         )
+
+
+async def schedule_sync(pool) -> None:
+    """Queue a sync for each primary link."""
+    for link in await pool.fetch('SELECT id FROM primary_links ORDER BY id'):
+        await queue_sync(pool, link['id'])
 
 
 # --- What a mirror holds -------------------------------------------------------------------------------------------
@@ -291,6 +297,15 @@ async def write_samples(connection, dataset_id: int, blocks: list, data: dict) -
     )
     if not samples:
         return present
+    # A filepath the primary moved here from another sample (a version restore recreating a deleted sample, say):
+    # that sample's own block, which changed too, brings it back. Until then it would break UNIQUE (dataset, filepath).
+    await connection.execute(
+        """DELETE FROM samples s USING mirror_samples m, unnest($2::int[], $3::text[]) AS r(origin_id, filepath)
+           WHERE m.dataset_id = $1 AND s.id = m.sample_id AND s.filepath = r.filepath AND m.origin_id <> r.origin_id""",
+        dataset_id,
+        present,
+        [sample['filepath'] for sample in samples],
+    )
     source = f"""
         incoming AS (
             SELECT r.*, CASE WHEN r.metadata->>'parent_id' ~ '^-?[0-9]+$'
@@ -548,13 +563,24 @@ async def write_views(connection, dataset_id: int, views: list) -> list:
         dataset_id,
         [view['id'] for view in copied],
     )
+    copies = {
+        row['origin_view_id']: row['view_id']
+        for row in await connection.fetch(
+            'SELECT origin_view_id, view_id FROM mirror_views WHERE dataset_id = $1',
+            dataset_id,
+        )
+    }
+    # Renames first through names of their own, so views that swapped names there don't collide here.
+    renamed = [copies[view['id']] for view in copied if view['id'] in copies]
+    await connection.execute(
+        """UPDATE views v SET name = 'renaming ' || v.id
+           FROM unnest($1::int[], $2::text[]) AS n(id, name) WHERE v.id = n.id AND v.name <> n.name""",
+        renamed,
+        [view['name'] for view in copied if view['id'] in copies],
+    )
     for view in copied:
         content = translate_ids(view['content'], mapping)
-        local = await connection.fetchval(
-            'SELECT view_id FROM mirror_views WHERE dataset_id = $1 AND origin_view_id = $2',
-            dataset_id,
-            view['id'],
-        )
+        local = copies.get(view['id'])
         if local is not None:
             await connection.execute(
                 """UPDATE views SET name = $2, content = $3::jsonb

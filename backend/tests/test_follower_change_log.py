@@ -1,7 +1,7 @@
 """The follower change log (migration 0007): what changes in a followed dataset is logged with the writing
 transaction, whatever wrote it. Samples are logged by block (id / 4096) from the samples statistics trigger,
 vectors and hashes per sample and field, and dataset state per kind. An unfollowed dataset,
-an unchanged row and a dataset being deleted log nothing, except the deleted dataset's final 'deleted'."""
+an unchanged row and a dataset being deleted log nothing, and a deleted dataset's log rows go with it."""
 
 import os
 
@@ -137,7 +137,9 @@ def test_dataset_state_and_deletion_are_logged(registry_database):
         )
         assert await taken(database, 'dataset_changes') == [(1, 'settings'), (1, 'fields'), (1, 'views')]
 
-        # A dataset deletion's per-row work (fridge.deletion_dataset) logs nothing; removing the dataset logs 'deleted'.
+        # A dataset deletion's per-row work (fridge.deletion_dataset) logs nothing, and removing the dataset deletes
+        # its log rows: its subscriptions go with it, so nobody could read or acknowledge them.
+        await database.execute("UPDATE datasets SET description = 'unread' WHERE id = 1")
         async with database.pool.acquire() as connection, connection.transaction():
             await connection.execute("SET LOCAL fridge.deletion_dataset = '1'")
             await connection.execute('DELETE FROM views WHERE dataset_id = 1')
@@ -147,6 +149,6 @@ def test_dataset_state_and_deletion_are_logged(registry_database):
             await connection.execute('DELETE FROM datasets WHERE id = 1')
         assert await taken(database, 'sample_block_changes') == []
         assert await taken(database, 'vector_changes') == []
-        assert await taken(database, 'dataset_changes') == [(1, 'deleted')]
+        assert await taken(database, 'dataset_changes') == []
 
     registry_database(scenario)

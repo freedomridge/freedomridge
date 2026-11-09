@@ -41,7 +41,8 @@ transaction that made the change, whatever made it:
 - **Vectors and hashes** per sample and field.
 - **Map coordinates** by field and block, so a full re-fit of a map logs one row per block, not per sample. A full
   re-rank of a map logs a dataset change, so followers re-rank their copy when the primary did.
-- **Dataset state:** the field registry, settings and shared views, and the dataset's deletion.
+- **Dataset state:** the field registry, settings and shared views. Deleting a followed dataset deletes its log
+  rows with its subscriptions; its followers find it gone (404) and stop their mirrors.
 
 A dataset nobody follows logs nothing. The log is pruned once every follower of the dataset has acknowledged
 it.
@@ -116,6 +117,24 @@ its last sync, and any error. The job's successful runs are pruned from the job 
   lists them.
 - **Images:** the mirror reads the same media paths, so this instance needs a storage configuration with read
   access to the bucket. Patch vectors never need it.
+
+### Edits sent to the primary
+
+With a dataset's **tags** option both ways, tagging its mirror (the tag dialog, or `POST .../samples/bulk-tag` by ids,
+selection or filters) is made on the primary instead, for the same samples there, as the follower's account. A sync
+is queued at once, and the tags show on the mirror when it has run, within a minute. With tags from the primary
+only, tagging a mirror is refused.
+
+With the **views** option both ways:
+
+- a view shared with everyone on the mirror (saved public, or shared later) is created on the primary as the
+  follower's account, marked `made_on` with the follower's name, and copied back at once;
+- deleting a copied view deletes it on the primary, which allows it only for views the follower made;
+- private views, and views shared with some users only, stay on the mirror.
+
+With views from the primary only, views made on the mirror stay there. Either way, a copied view's sample ids
+are translated, so a saved search (patch search included, which saves its results) shows the same samples on
+both. Every other edit of a mirror (bulk set, rename, clear or delete) is refused before it's queued.
 
 ### When it stops
 

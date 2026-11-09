@@ -21,7 +21,7 @@ test('an instance follows a primary and mirrors the dataset it shares', async ({
     try {
         await apiFetch(cookie, `/followers/${follower.id}/datasets/${source.id}`, {
             method: 'PUT',
-            body: JSON.stringify({ tags: 'primary', views: 'primary' }),
+            body: JSON.stringify({ tags: 'both', views: 'primary' }),
         });
 
         await page.goto('/settings');
@@ -52,6 +52,15 @@ test('an instance follows a primary and mirrors the dataset it shares', async ({
         });
         expect(refused.status).toBe(409);
         expect((await refused.json()).detail).toContain('read-only mirror');
+        // Tags sync both ways: a tag edit here is made on the primary.
+        const [local] = (await apiFetch(cookie, `/datasets/${mirrorId}/samples?limit=1`)).items;
+        const tagged = await apiFetch(cookie, `/datasets/${mirrorId}/samples/bulk-tag`, {
+            method: 'POST',
+            body: JSON.stringify({ sample_ids: [local.id], add_tags: ['from-the-follower'] }),
+        });
+        expect(tagged.forwarded_to).toBe(new URL(API).hostname);
+        const [there] = (await apiFetch(cookie, `/datasets/${source.id}/samples?limit=1`)).items;
+        expect(there.tags).toContain('from-the-follower');
 
         await page.goto('/settings/primaries');
         await row.getByRole('button', { name: 'Stop following…' }).click();

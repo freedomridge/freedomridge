@@ -13,7 +13,8 @@ from fastapi import HTTPException
 
 from backend import follower_sync
 from backend.crypto import decrypt_secret, encrypt_secret
-from backend.routers import auth, datasets, followers, primaries
+from backend.models import ViewCreate
+from backend.routers import auth, datasets, followers, primaries, schedules, views
 from backend.tests import test_field_registry_postgres as registry_helpers
 
 registry_database = registry_helpers.registry_database
@@ -345,5 +346,165 @@ def test_a_mirror_copies_the_primary_maps_and_re_ranks_when_the_primary_does(mon
                 local_rye,
             )
         assert 'This map came from another Freedom Ridge instance' in str(refused.value)
+        # And it isn't re-fitted here: a re-fit schedule for it is refused when it's made.
+        monkeypatch.setattr(schedules, 'db', database)
+        with pytest.raises(HTTPException) as scheduled:
+            await schedules.create_schedule(mirror, schedules.ScheduleCreate(target='clip'), user=USER)
+        assert scheduled.value.status_code == 409 and "comes from this mirror's primary" in scheduled.value.detail
+
+    registry_database(scenario)
+
+
+def test_tags_and_shared_views_made_on_a_mirror_go_to_the_primary_when_they_sync_both_ways(
+    monkeypatch,
+    registry_database,
+):
+    async def scenario(database):
+        _, link_id = await setup(monkeypatch, database)
+        monkeypatch.setattr(views, 'db', database)
+        await ingest([{'crop': 'corn'}, {'crop': 'soy'}], dataset_id=1, prefix='s3://images/a')
+        corn, soy = [
+            row['id'] for row in await database.fetch('SELECT id FROM samples WHERE dataset_id = 1 ORDER BY id')
+        ]
+        await database.execute(
+            "INSERT INTO views (dataset_id, user_id, name, slug, content, is_public) "
+            "VALUES (1, 1, 'Made there', 'made-there', '{}', TRUE)",
+        )
+        follower = await database.fetchval('SELECT id FROM followers')
+        await followers.follow_dataset(follower, 1, followers.FollowOptions(tags='both', views='both'), user=USER)
+        await sync(database, link_id)
+        mirror = (await mirror_of(database))['dataset_id']
+        local = {row['origin_id']: row['id'] for row in (await copied(database, {'dataset_id': mirror})).values()}
+
+        # Tags: sent there as the follower's account, and back through the feed.
+        result = await datasets.bulk_tag_samples(
+            mirror,
+            datasets.BulkTagRequest(sample_ids=[local[corn]], add_tags=['weedy']),
+            user=USER,
+        )
+        assert (result['updated_count'], result['forwarded_to']) == (1, 'primary')
+        assert await database.fetchval('SELECT tags FROM samples WHERE id = $1', corn) == ['weedy']
+        # Made there as the follower's own account.
+        account = await database.fetchval('SELECT user_id FROM followers')
+        assert await database.fetchval('SELECT modified_by_user_id FROM samples WHERE id = $1', corn) == account
+        assert await database.fetchval("SELECT count(*) FROM jobs WHERE kind = 'follower_sync'") == 1  # queued at once
+        await sync(database, link_id)
+        assert await database.fetchval('SELECT tags FROM samples WHERE id = $1', local[corn]) == ['weedy']
+
+        # A shared view: made there with its sample ids, marked as made here, and copied here at once.
+        content = {'filters': {'field': 'id', 'operator': 'in', 'value': [local[soy]]}}
+        view = await views.create_view(mirror, ViewCreate(name='Soy', content=content, is_public=True), user=USER)
+        assert view['from_primary'] is True and view['content']['filters']['value'] == [local[soy]]
+        there = await database.fetchrow("SELECT * FROM views WHERE dataset_id = 1 AND name = 'Soy'")
+        assert there['content']['filters']['value'] == [soy] and there['content']['made_on'] == 'lab'
+        assert there['is_public'] and there['user_id'] == await database.fetchval('SELECT user_id FROM followers')
+        await sync(database, link_id)
+        names = sorted(
+            row['name'] for row in await database.fetch('SELECT name FROM views WHERE dataset_id = $1', mirror)
+        )
+        assert names == ['Made there', 'Soy']  # the sync found the copy already there
+        # A private view stays here, until it's shared with everyone: then it's made there, and its copy replaces it.
+        mine = await views.create_view(mirror, ViewCreate(name='Mine', content={}), user=USER)
+        assert not await database.fetchval("SELECT 1 FROM views WHERE dataset_id = 1 AND name = 'Mine'")
+        shared = await views.share_view(
+            mirror,
+            mine['id'],
+            views.ViewShare(is_public=True, shared_with_user_ids=[]),
+            user=USER,
+        )
+        assert shared['from_primary'] is True and shared['id'] != mine['id']
+        assert (
+            await database.fetchval("SELECT content->>'made_on' FROM views WHERE dataset_id = 1 AND name = 'Mine'")
+            == 'lab'
+        )
+        assert not await database.fetchval('SELECT 1 FROM views WHERE id = $1', mine['id'])
+
+        # Deleting: the follower deletes there only the views it made, and here only their owner or an admin may.
+        made_there = await database.fetchval(
+            "SELECT id FROM views WHERE dataset_id = $1 AND name = 'Made there'",
+            mirror,
+        )
+        other = await database.fetchval(
+            "INSERT INTO users (username, role, password_hash) VALUES ('viewer', 'power_user', 'x') RETURNING id",
+        )
+        with pytest.raises(HTTPException) as not_theirs:
+            await views.delete_view(view['id'], user={'id': other, 'role': 'power_user'})
+        assert not_theirs.value.status_code == 403
+        assert await database.fetchval("SELECT 1 FROM views WHERE dataset_id = 1 AND name = 'Soy'")  # still there
+        with pytest.raises(HTTPException) as refused:
+            await views.delete_view(made_there, user=USER)
+        assert refused.value.status_code == 403 and 'Not authorized' in refused.value.detail
+        await views.delete_view(view['id'], user=USER)
+        assert not await database.fetchval("SELECT 1 FROM views WHERE name = 'Soy'")
+
+        # Other bulk edits of a mirror are refused before they're queued.
+        with pytest.raises(HTTPException) as bulk:
+            await datasets._bulk_response(mirror, USER, 'set', {})
+        assert bulk.value.status_code == 409 and 'read-only mirror' in bulk.value.detail
+
+    registry_database(scenario)
+
+
+def test_a_mirror_refuses_tags_and_shared_views_that_come_from_the_primary_only(monkeypatch, registry_database):
+    async def scenario(database):
+        _, link_id = await setup(monkeypatch, database)
+        monkeypatch.setattr(views, 'db', database)
+        await ingest([{'crop': 'corn'}], dataset_id=1, prefix='s3://images/a')
+        follower = await database.fetchval('SELECT id FROM followers')
+        await followers.follow_dataset(follower, 1, followers.FollowOptions(), user=USER)
+        await sync(database, link_id)
+        mirror = (await mirror_of(database))['dataset_id']
+        sample = await database.fetchval('SELECT sample_id FROM mirror_samples')
+        with pytest.raises(HTTPException) as tags:
+            await datasets.bulk_tag_samples(
+                mirror,
+                datasets.BulkTagRequest(sample_ids=[sample], add_tags=['x']),
+                user=USER,
+            )
+        assert tags.value.status_code == 409 and "tags come from primary" in tags.value.detail
+        # With views from the primary only, a shared view made here stays here.
+        await views.create_view(mirror, ViewCreate(name='Local', content={}, is_public=True), user=USER)
+        assert await database.fetchval("SELECT dataset_id FROM views WHERE name = 'Local'") == mirror
+
+    registry_database(scenario)
+
+
+def test_the_sync_survives_a_filepath_moved_between_blocks_and_views_that_swap_names(monkeypatch, registry_database):
+    async def scenario(database):
+        _, link_id = await setup(monkeypatch, database)
+        monkeypatch.setattr(follower_sync, 'COPY_BLOCKS', 1)  # each block in a step of its own
+        await database.execute(
+            "INSERT INTO samples (id, dataset_id, filepath, media_type) VALUES (9000, 1, 's3://i/x.jpg', 'image')",
+        )
+        for name in ('a', 'b'):
+            await database.execute(
+                "INSERT INTO views (dataset_id, name, slug, content, is_public) VALUES (1, $1, $1, '{}', TRUE)",
+                name,
+            )
+        follower = await database.fetchval('SELECT id FROM followers')
+        await followers.follow_dataset(follower, 1, followers.FollowOptions(), user=USER)
+        await sync(database, link_id)
+        mirror = (await mirror_of(database))['dataset_id']
+
+        # There, a restore brings the path back as a lower id, in an earlier block; and the views swap names.
+        async with database.pool.acquire() as connection, connection.transaction():
+            await connection.execute('DELETE FROM samples WHERE id = 9000')
+            await connection.execute(
+                "INSERT INTO samples (id, dataset_id, filepath, media_type) VALUES (100, 1, 's3://i/x.jpg', 'image')",
+            )
+            await connection.execute("UPDATE views SET name = 'swap' WHERE dataset_id = 1 AND name = 'a'")
+            await connection.execute("UPDATE views SET name = 'a' WHERE dataset_id = 1 AND name = 'b'")
+            await connection.execute("UPDATE views SET name = 'b' WHERE dataset_id = 1 AND name = 'swap'")
+        await sync(database, link_id)
+        samples = await copied(database, {'dataset_id': mirror})
+        assert [(origin, row['filepath']) for origin, row in samples.items()] == [(100, 's3://i/x.jpg')]
+        names = await database.fetch(
+            """SELECT m.origin_view_id, v.name FROM mirror_views m JOIN views v ON v.id = m.view_id
+               WHERE m.dataset_id = $1 ORDER BY 1""",
+            mirror,
+        )
+        there = await database.fetch('SELECT id, name FROM views WHERE dataset_id = 1 ORDER BY id')
+        assert [(row['origin_view_id'], row['name']) for row in names] == [(row['id'], row['name']) for row in there]
+        assert [row['name'] for row in there] == ['b', 'a']
 
     registry_database(scenario)

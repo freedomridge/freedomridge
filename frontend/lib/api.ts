@@ -459,10 +459,12 @@ export interface View {
         viewStages?: ViewStage[]; // The history of how we got here
         sort?: string;
         order?: 'asc' | 'desc';
+        made_on?: string; // The follower instance the view was made on (docs/FOLLOWERS.md)
     };
     is_public: boolean;
     shared_with_user_ids: number[];
     created_at: string;
+    from_primary?: boolean; // On a mirror: this view is the copy of one on its primary
 }
 
 export interface ComplexFilter {

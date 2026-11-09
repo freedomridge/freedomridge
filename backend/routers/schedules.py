@@ -184,6 +184,17 @@ async def create_schedule(id: int, body: ScheduleCreate, user: dict = Depends(re
         await connection.execute('SELECT require_writable_dataset($1)', id)
         if not review and not await _target_exists(connection, id, target):
             raise HTTPException(status_code=422, detail=f'No map or embeddings for field {target!r}')
+        # A mirror's copy of a primary map (docs/FOLLOWERS.md) is re-fitted there; its coordinates come with the sync.
+        if not review and await connection.fetchval(
+            'SELECT 1 FROM mirrors WHERE dataset_id = $1 AND $2 = ANY(vector_fields)',
+            id,
+            target,
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail=f"The map of {target!r} comes from this mirror's primary, which re-fits it: its coordinates "
+                'arrive with the sync',
+            )
         now = await connection.fetchval('SELECT clock_timestamp()')
         rule = {**body.model_dump(), 'time_of_day': _time(body.time)}
         row = await connection.fetchrow(
