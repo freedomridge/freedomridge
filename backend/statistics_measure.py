@@ -15,6 +15,7 @@ VALUE_LIMIT = 100
 MEASURE_SECONDS = 10.0
 INDEX_TYPES = {
     '__heatmap_fields__': 'heatmap_index',
+    '__probability_fields__': 'probability_index',
     '__mask_overlay_fields__': 'mask_overlay_index',
     '__cuboid_fields__': 'cuboid_index',
     '__keypoint_fields__': 'keypoint_index',

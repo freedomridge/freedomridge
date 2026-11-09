@@ -22,6 +22,42 @@ function rgbToHex(r: number, g: number, b: number): string {
     return '#' + [r, g, b].map(c => c.toString(16).padStart(2, '0')).join('');
 }
 
+/** An index mask's class colour, as a class-probability overlay draws its classes too: the field's colour for the
+ * class ID, then for its name, then a built-in palette. */
+export function classColor(
+    id: number,
+    colorConfig?: FieldColorConfig,
+    maskTargets?: Record<string, string>,
+): [number, number, number] {
+    const idStr = String(id);
+    const label = maskTargets?.[idStr] || idStr;
+
+    // 1. Check ID-based colors first (stable when labels change)
+    let hex = colorConfig?.idColors?.[idStr];
+
+    // 2. Fallback to label-based colors (legacy)
+    if (!hex) {
+        hex = colorConfig?.valueColors?.[label];
+    }
+
+    // 3. Fallback to ID-based default color palette
+    if (!hex) {
+        const palette = [
+            '#e6194B', '#3cb44b', '#ffe119', '#4363d8', '#f58231',
+            '#911eb4', '#42d4f4', '#f032e6', '#bfef45', '#fabed4',
+            '#469990', '#dcbeff', '#9A6324', '#fffac8', '#800000',
+            '#aaffc3', '#808000', '#ffd8b1', '#000075', '#a9a9a9'
+        ];
+        hex = palette[id % palette.length] || '#888888';
+    }
+
+    // Hex to RGB
+    const r = parseInt(hex.slice(1, 3), 16);
+    const g = parseInt(hex.slice(3, 5), 16);
+    const b = parseInt(hex.slice(5, 7), 16);
+    return [r, g, b];
+}
+
 interface Props {
     /** Freedom Ridge sample ID; used to build the media-proxy URL for the mask PNG. */
     sampleId: number;
@@ -120,36 +156,7 @@ export function MaskRenderer({
         const overlayData = ctx.createImageData(canvas.width, canvas.height);
         const output = overlayData.data;
 
-        // Helper to get color for an ID
-        const getColor = (id: number): [number, number, number] => {
-            const idStr = String(id);
-            const label = maskTargets?.[idStr] || idStr;
-
-            // 1. Check ID-based colors first (stable when labels change)
-            let hex = colorConfig?.idColors?.[idStr];
-
-            // 2. Fallback to label-based colors (legacy)
-            if (!hex) {
-                hex = colorConfig?.valueColors?.[label];
-            }
-
-            // 3. Fallback to ID-based default color palette
-            if (!hex) {
-                const palette = [
-                    '#e6194B', '#3cb44b', '#ffe119', '#4363d8', '#f58231',
-                    '#911eb4', '#42d4f4', '#f032e6', '#bfef45', '#fabed4',
-                    '#469990', '#dcbeff', '#9A6324', '#fffac8', '#800000',
-                    '#aaffc3', '#808000', '#ffd8b1', '#000075', '#a9a9a9'
-                ];
-                hex = palette[id % palette.length] || '#888888';
-            }
-
-            // Hex to RGB
-            const r = parseInt(hex.slice(1, 3), 16);
-            const g = parseInt(hex.slice(3, 5), 16);
-            const b = parseInt(hex.slice(5, 7), 16);
-            return [r, g, b];
-        };
+        const getColor = (id: number) => classColor(id, colorConfig, maskTargets);
 
         // Process pixels
         // We need to scale from mask coordinates to canvas coordinates

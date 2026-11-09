@@ -17,6 +17,7 @@ DISCOVERY_TYPES = {
     **VECTOR_CACHES,
     '__cuboid_fields__': 'cuboids',
     '__heatmap_fields__': 'heatmap',
+    '__probability_fields__': 'class_probabilities',
     '__mask_overlay_fields__': 'segmentation',
     '__classification_fields__': 'classification',
 }
@@ -39,6 +40,8 @@ def overlay_type(value):
     if isinstance(value, dict):
         if value.get('type') == 'heatmap':
             return 'heatmap'
+        if value.get('type') == 'class_probabilities':
+            return 'class_probabilities'
         if value.get('_type') == 'cuboid':
             return None
         if 'maskPath' in value:
@@ -113,6 +116,7 @@ DISCOVERY_SQL.update(
         '__cuboid_fields__': "jsonb_typeof(value)='array' AND jsonb_typeof(value->0)='object' "
         "AND value->0->>'_type'='cuboid'",
         '__heatmap_fields__': "jsonb_typeof(value)='object' AND value->>'type'='heatmap'",
+        '__probability_fields__': "jsonb_typeof(value)='object' AND value->>'type'='class_probabilities'",
         '__mask_overlay_fields__': "jsonb_typeof(value)='object' AND value ? 'maskPath' AND key<>'segmentation' "
         "AND value->>'type' IS DISTINCT FROM 'heatmap'",
         '__classification_fields__': """key NOT IN ('detections','polygons') AND (

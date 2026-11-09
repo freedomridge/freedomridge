@@ -148,7 +148,8 @@ function MaskFieldRow({ datasetId, field, readOnly, onSaved }: {
 function MaskOverlayConfig({ datasetId, schema, readOnly, onSaved }: {
     datasetId: number; schema: SchemaField[]; readOnly?: boolean; onSaved: () => void;
 }) {
-    const masks = schema.filter(f => f.type === 'segmentation');
+    // Class-probability fields take an opacity too (ClassProbabilityRenderer).
+    const masks = schema.filter(f => f.type === 'segmentation' || f.type === 'class_probabilities');
     if (masks.length === 0) return null;
     return (
         <div className="space-y-3">

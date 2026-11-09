@@ -92,7 +92,7 @@ const OPERATORS: Record<string, string[]> = {
 // of falling back to a blank `=`.
 const VALUELESS_OPS = ['exists', 'not_exists', 'is_null', 'is_not_null'];
 // Overlays, and the derived fields (embeddings / hashes / location), have presence only.
-const PRESENCE_ONLY_TYPES = ['heatmap', 'segmentation', 'keypoints', 'cuboids', 'derived'];
+const PRESENCE_ONLY_TYPES = ['heatmap', 'class_probabilities', 'segmentation', 'keypoints', 'cuboids', 'derived'];
 function opsForType(t: string): string[] {
     return PRESENCE_ONLY_TYPES.includes(t)
         ? ['exists', 'not_exists']

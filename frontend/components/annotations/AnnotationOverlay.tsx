@@ -7,6 +7,8 @@ import type { AnnotationField, Heatmap, Calibration } from '@/lib/labels';
 import { AnnotationRenderer } from './AnnotationRenderer';
 import { AnnotationTooltip } from './AnnotationTooltip';
 import { HeatmapRenderer } from './HeatmapRenderer';
+import { ClassProbabilityRenderer } from './ClassProbabilityRenderer';
+import { defaultRule, type ClassProbabilities, type ProbabilityView } from '@/lib/class-rules';
 import type { SegmentationConfig, FieldColorConfig } from '@/lib/api';
 
 interface Props {
@@ -29,6 +31,8 @@ interface Props {
     compactOverlays?: boolean;
     overlayConfigs?: Record<string, { colormap?: string; range?: [number, number]; opacity?: number } | null>;
     segmentationConfig?: SegmentationConfig;
+    /** Class-probability fields shown otherwise than their default rule's class map (the modal's live rules). */
+    probabilityViews?: Record<string, ProbabilityView>;
     hiddenAnnotations?: Record<string, Set<number>>;
     // Optional hover callback - when provided, tooltip is handled by parent
     onHover?: (label: string | null, clientX: number, clientY: number) => void;
@@ -59,6 +63,7 @@ export function AnnotationOverlay({
     compactOverlays = false,
     overlayConfigs,
     segmentationConfig,
+    probabilityViews,
     hiddenAnnotations = {},
     onHover: parentHoverCallback,
     onSelect,
@@ -346,6 +351,33 @@ export function AnnotationOverlay({
                         />
                     </div>
                 ))}
+
+            {/* Class probabilities: the class map from the field's rule (its default, or the modal's live one). */}
+            {hasAnnotations && imageSize.width > 0 && sampleId !== undefined && annotations
+                .filter(ann => ann.type === 'class_probabilities')
+                .filter(ann => !activeOverlayFields || activeOverlayFields.includes(ann.fieldName))
+                .map((ann, idx) => {
+                    const probabilities = ann.data as ClassProbabilities;
+                    const view = probabilityViews?.[ann.fieldName]
+                        ?? { rule: defaultRule(segmentationConfig?.class_rules, ann.fieldName), show: 'map' as const };
+                    return (
+                        <div key={`${ann.fieldName}-${idx}`} className="absolute inset-0 pointer-events-auto">
+                            <ClassProbabilityRenderer
+                                sampleId={sampleId}
+                                versionId={versionId}
+                                fieldName={ann.fieldName}
+                                probPath={probabilities.probPath}
+                                classes={probabilities.classes}
+                                imageSize={imageSize}
+                                view={view}
+                                colorConfig={getFieldColorConfig(ann.fieldName)}
+                                maskTargets={getFieldMaskTargets(ann.fieldName)}
+                                opacity={overlayConfigs?.[ann.fieldName]?.opacity}
+                                onHover={handleAnnotationHover}
+                            />
+                        </div>
+                    );
+                })}
 
             {/* Canvas overlay for heatmap predictions (probability maps, terrain, etc.).
                 Explicit field-name toggle — heatmaps don't have a .label sub-field to

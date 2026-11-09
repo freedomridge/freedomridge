@@ -8,16 +8,16 @@ it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
 
 ### Upgrade notes
 
-- One database migration, `0007_follower_change_log.sql`. It adds the `datasets.followed` column, the
-  `sample_block_changes`, `vector_changes` and `dataset_changes` tables and their triggers, and rewrites nothing. Apply it with
-  `scripts/apply_migrations.sh` (step 4 of [Upgrading](docs/UPGRADING.md)). It waits at most 2 seconds for its
-  locks: if it stops with a lock timeout, run it again.
-- A second migration, `0008_followers.sql`: two small tables for followers, and `api_tokens` accepting the
-  `follower` scope. It's applied the same way.
-- A third, `0009_mirrors.sql`: the follower's tables (`primary_links`, `mirrors`, `mirror_samples`,
-  `mirror_views`) and the checks that keep a mirror read-only. Also applied the same way.
-- A fourth, `0010_compute_launcher.sql`: the on-demand workers' settings (off) and the machines they start. Also
-  applied the same way.
+- Four database migrations, applied with `scripts/apply_migrations.sh` (step 4 of [Upgrading](docs/UPGRADING.md)).
+  None rewrites a table; each waits at most 2 seconds for its locks, so if one stops with a lock timeout, run it
+  again.
+  - `0007_follower_change_log.sql`: the `datasets.followed` column, and the change log's tables and triggers.
+  - `0008_followers.sql`: the followers' tables, and `api_tokens` accepting the `follower` scope.
+  - `0009_mirrors.sql`: the follower side's tables, the checks that keep a mirror read-only, and the map
+    coordinates' change log.
+  - `0010_compute_launcher.sql`: the on-demand workers' settings (off) and the machines they start.
+- Nothing else changes for a deployment that uses none of this. On-demand workers also need
+  `JOB_RUNNER_PLACEMENTS=server` and AWS permissions ([ON_DEMAND_WORKERS.md](docs/ON_DEMAND_WORKERS.md)).
 
 ### Added
 
@@ -25,13 +25,14 @@ it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
   that made it, by triggers, whatever path made it:
   - samples inserted, changed or deleted, by block of 4096 ids, from the statistics trigger already on samples;
   - vectors and hashes, per sample and field;
-  - its field registry, settings and saved views;
-  - its deletion.
+  - map coordinates, by field and block, and a map's full re-rank;
+  - its field registry, settings and saved views.
 
-  A dataset nobody follows logs nothing.
+  A dataset nobody follows logs nothing, and a deleted dataset's log rows go with it.
 - **Followers, on the primary** ([FOLLOWERS.md](docs/FOLLOWERS.md)).
-  - An admin adds a follower instance (`POST /api/followers`), which gets its own account and a token that
-    only the follower endpoints accept.
+  - Under Settings → Followers, an admin adds a follower instance (`POST /api/followers`), which gets its own
+    account and a token that only the follower endpoints accept. The page shows each follower's last check-in,
+    highlighted after a week of silence, and the changes held for it.
   - The admin chooses the datasets it follows, each with a `tags` and a `views` option (primary only, or both
     ways).
   - The follower copies a dataset, then reads what changed in commit order (`/api/follower/...`), and
@@ -65,6 +66,17 @@ it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
     time, or whose worker never came or went quiet are ended once a minute.
   - **Check with AWS** dry-runs a launch with the settings. The Terraform module attaches the AWS permissions
     with `on_demand_workers = true`.
+- **Class-probability overlays** (docs/SDK.md, "Class probabilities"). A field holding a segmentation model's
+  class probabilities per pixel (`fridge.ClassProbabilities`, one 8-bit grayscale PNG with the classes side by
+  side) is drawn as one class per pixel with a rule: argmax, or thresholds in order of precedence with a
+  fallback, including thresholds on a group of classes' summed probability.
+  - The sample view changes the rule live, or shows one class's probability as a heatmap. **Save as default**
+    stores the rule for everyone (anyone who may edit the dataset; `PUT /api/datasets/{id}/class-rules/{field}`).
+  - The grid draws the default rule.
+  - The SDK sets classes and colours with `dataset.set_field_classes` and the default rule with
+    `dataset.set_default_rule` (`fridge.argmax_rule`, `fridge.threshold_rule`).
+  - The rule is kept in `segmentation_config.class_rules` and follows `rename_field` and `clone_field` like class
+    names and colours.
 
 ## 2.3.0 (2026-11-08)
 

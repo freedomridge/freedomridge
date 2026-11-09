@@ -8,7 +8,7 @@ import warnings
 from importlib import metadata
 from pathlib import Path
 from typing import Any, Dict, Optional
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 import numpy as np
 import requests
@@ -1658,6 +1658,15 @@ class Client:
 
             params["filters"] = json.dumps(filters)
         resp = self.session.get(f"{self.base_url}/datasets/{dataset_id}/schema", params=params)
+        _raise_for_status(resp)
+        return resp.json()
+
+    def set_class_rule(self, dataset_id, field_name, rule) -> dict:
+        """A class-probability field's default rule (None removes it: argmax)."""
+        resp = self.session.put(
+            f"{self.base_url}/datasets/{dataset_id}/class-rules/{quote(field_name, safe='')}",
+            json={"rule": rule},
+        )
         _raise_for_status(resp)
         return resp.json()
 

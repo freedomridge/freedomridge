@@ -100,7 +100,8 @@ function isStatsPending(field: SchemaField): boolean {
 // Whether a field's section has inputs to expand (the field loop skips internal fields, and heatmaps
 // are listed under Overlays).
 function hasSectionBody(field: SchemaField): boolean {
-    return field.name !== 'location' && field.name !== 'metadata' && field.type !== 'heatmap' && !isStatsPending(field);
+    return field.name !== 'location' && field.name !== 'metadata' && field.type !== 'heatmap'
+        && field.type !== 'class_probabilities' && !isStatsPending(field);
 }
 
 // A promoted (indexed) number or datetime: its filtered MIN/MAX is computed for any filter.
@@ -652,7 +653,7 @@ export function FilterSidebar({
                             rendered overlay). The section is hidden when this dataset has
                             no overlay fields. */}
                         {(() => {
-                            const overlayFields = schema.filter(f => f.type === 'detections' || f.type === 'polygons' || f.type === 'heatmap' || f.type === 'segmentation' || f.type === 'keypoints' || f.type === 'cuboids' || f.type === 'classification');
+                            const overlayFields = schema.filter(f => f.type === 'detections' || f.type === 'polygons' || f.type === 'heatmap' || f.type === 'class_probabilities' || f.type === 'segmentation' || f.type === 'keypoints' || f.type === 'cuboids' || f.type === 'classification');
                             if (overlayFields.length === 0) return null;
                             return (
                                 <div className="space-y-2 pb-4 border-b border-zinc-800">
@@ -676,8 +677,8 @@ export function FilterSidebar({
                             if (field.name === 'location' || field.name === 'metadata') {
                                 return null;
                             }
-                            // Heatmap fields are rendered above in the dedicated Overlays section.
-                            if (field.type === 'heatmap') {
+                            // Heatmap and class-probability fields are rendered above in the dedicated Overlays section.
+                            if (field.type === 'heatmap' || field.type === 'class_probabilities') {
                                 return null;
                             }
 

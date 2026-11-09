@@ -45,7 +45,7 @@ from backend.label_fields import (
 )
 from backend.sample_ingest import insert_samples
 
-from .. import dataset_deletion, field_usage, job_queue, job_wait, statistics
+from .. import class_rules, dataset_deletion, field_usage, job_queue, job_wait, statistics
 from ..access import check_dataset_access, filter_datasets_for_user, require_dataset_access
 from ..database import db
 from ..diskspace import INGEST_ROW_BYTES, require_free_space
@@ -392,10 +392,14 @@ async def update_dataset(id: int, dataset: DatasetUpdate, user: dict = Depends(r
         idx += 1
 
     if dataset.segmentation_config is not None:
+        try:
+            config = class_rules.validate_config(dataset.segmentation_config)
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from None
         fields.append(f"segmentation_config = ${idx}")
         # Bind the dict directly — the asyncpg jsonb codec serializes it once.
         # (json.dumps here double-encoded it into a jsonb *string*, corrupting it.)
-        values.append(dataset.segmentation_config)
+        values.append(config)
         idx += 1
 
     # storage_config_id is nullable (NULL means "use the default / env-var
@@ -453,6 +457,47 @@ async def update_dataset(id: int, dataset: DatasetUpdate, user: dict = Depends(r
         raise HTTPException(status_code=400, detail="Dataset with this name already exists")
     except asyncpg.ForeignKeyViolationError:
         raise HTTPException(status_code=400, detail="Invalid storage_config_id")
+
+
+class ClassRuleUpdate(BaseModel):
+    # The rule (class_rules.py); null removes the field's default, which is then argmax.
+    rule: Optional[Dict[str, Any]] = None
+
+
+@router.put("/datasets/{id}/class-rules/{field_name}", dependencies=[Depends(require_dataset_access)])
+async def set_class_rule(
+    id: int,
+    field_name: str,
+    update: ClassRuleUpdate = Body(...),
+    user: dict = Depends(require_role("power_user")),
+):
+    """A class-probability field's default rule, which the app opens the field with and the grid draws. Anyone who
+    may edit the dataset may set it; it changes only how the field is shown."""
+    if not 0 < len(field_name) <= 255:
+        raise HTTPException(status_code=400, detail='A field name is 1 to 255 characters')
+    rule = None
+    if update.rule is not None:
+        try:
+            rule = class_rules.validate_rule(update.rule)
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from None
+    async with db.pool.acquire() as connection, connection.transaction():
+        # NO KEY UPDATE serializes with PATCH /datasets/{id} and the rename/clone carry, as they do.
+        config = await connection.fetchval(
+            'SELECT segmentation_config FROM datasets WHERE id = $1 FOR NO KEY UPDATE',
+            id,
+        )
+        if isinstance(config, str):
+            config = json.loads(config)
+        config = dict(config or {})
+        rules = dict(config.get('class_rules') or {})
+        if rule is None:
+            rules.pop(field_name, None)
+        else:
+            rules[field_name] = rule
+        config['class_rules'] = rules
+        await connection.execute('UPDATE datasets SET segmentation_config = $2 WHERE id = $1', id, config)
+    return {'field_name': field_name, 'rule': rule}
 
 
 @router.delete("/datasets/{id}", status_code=202)
@@ -1848,6 +1893,7 @@ async def _get_dataset_field_stats_impl(
     cuboid_fields = by_type['cuboids']
     keypoint_fields = by_type['keypoints']
     heatmap_fields = by_type['heatmap']
+    probability_fields = by_type['class_probabilities']
     mask_overlay_fields = by_type['segmentation']
     classification_fields = [name for name in by_type['classification'] if name not in cuboid_fields]
     classification_lists = {
@@ -1872,6 +1918,7 @@ async def _get_dataset_field_stats_impl(
     segmentation_labels = cached_labels[-1]
     registered_names = {stat['field_name'] for stat in stats if stat.get('origin') != 'system'}
     heatmap_fields = [name for name in heatmap_fields if name in registered_names]
+    probability_fields = [name for name in probability_fields if name in registered_names]
     mask_overlay_fields = [name for name in mask_overlay_fields if name in registered_names]
     cuboid_fields = [name for name in cuboid_fields if name in registered_names]
     keypoint_fields = [name for name in keypoint_fields if name in registered_names]
@@ -1963,6 +2010,17 @@ async def _get_dataset_field_stats_impl(
                 "name": heatmap_field,
                 "type": "heatmap",
                 "config": _overlay_cfgs.get(heatmap_field),
+            },
+        )
+
+    # Class-probability overlays ({"type": "class_probabilities", "probPath": ..., "classes": N}): drawn by the app
+    # with a rule, the field's default in segmentation_config.class_rules (class_rules.py).
+    for probability_field in probability_fields:
+        schema.append(
+            {
+                "name": probability_field,
+                "type": "class_probabilities",
+                "config": _overlay_cfgs.get(probability_field),
             },
         )
 
@@ -2182,6 +2240,7 @@ async def _get_dataset_field_stats_impl(
             continue
         if stat['field_name'] in (
             '__heatmap_fields__',
+            '__probability_fields__',
             '__mask_overlay_fields__',
             '__cuboid_fields__',
             '__keypoint_fields__',
@@ -2190,8 +2249,8 @@ async def _get_dataset_field_stats_impl(
             '__classification_fields__',
         ):
             continue  # Internal cache rows; never surfaced to the frontend
-        if stat['field_name'] in heatmap_field_set:
-            continue  # Already emitted above as a heatmap; would otherwise appear as "string"
+        if stat['field_name'] in heatmap_field_set or stat['field_name'] in probability_fields:
+            continue  # Already emitted above as an overlay; would otherwise appear as "string"
         if stat['field_name'] in mask_overlay_field_set:
             continue  # Already emitted above as a segmentation overlay; would otherwise appear as "dict"
         if stat['field_name'] in classification_field_set and not stat['is_promoted']:
@@ -7111,8 +7170,8 @@ async def _carry_segmentation_entries(
     *,
     keep_source: bool,
 ) -> None:
-    """Give new_name the field's class names and colours: its segmentation_config entries
-    (mask_targets and color_scheme.fields, nested fields included), which are keyed by field name.
+    """Give new_name the field's class names, colours and default class rule: its segmentation_config entries
+    (mask_targets, color_scheme.fields and class_rules, nested fields included), which are keyed by field name.
     new_name None only drops them; keep_source leaves the field's own entries in place."""
     # NO KEY UPDATE serializes with PATCH /datasets/{id} but not with writers' KEY SHARE dataset lock.
     config = await connection.fetchval(
@@ -7122,7 +7181,11 @@ async def _carry_segmentation_entries(
     if isinstance(config, str):
         config = json.loads(config)
     changed = False
-    for section in ((config or {}).get('mask_targets'), ((config or {}).get('color_scheme') or {}).get('fields')):
+    for section in (
+        (config or {}).get('mask_targets'),
+        ((config or {}).get('color_scheme') or {}).get('fields'),
+        (config or {}).get('class_rules'),
+    ):
         if not isinstance(section, dict):
             continue
         keys = [key for key in section if key == field or key.startswith(f'{field}.')]

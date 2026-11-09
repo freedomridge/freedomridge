@@ -336,12 +336,13 @@ def test_legacy_json_only_filter_parameters_remain_resumable(registry_database):
 
 @pytest.mark.parametrize('operation', ['rename', 'clone'])
 @pytest.mark.parametrize('background', [False, True])
-def test_rename_and_clone_carry_class_names_and_colours(registry_database, operation, background):
+def test_rename_and_clone_carry_class_names_colours_and_rules(registry_database, operation, background):
     async def scenario(database):
         await ingest([{'mask': {'maskPath': 's3://bucket/1.png'}}])
         names = {'mask': {'1': 'corn'}, 'mask.inner': {'2': 'weed'}, 'masked': {'3': 'soil'}}
         colours = {'mask': {'idColors': {'1': '#00ff00'}}}
-        config = {'mask_targets': names, 'color_scheme': {'opacity': 0.5, 'fields': colours}}
+        rules = {'mask': {'type': 'rules', 'rules': [{'classes': [1], 'min': 0.4, 'class': 1}], 'fallback': None}}
+        config = {'mask_targets': names, 'color_scheme': {'opacity': 0.5, 'fields': colours}, 'class_rules': rules}
         await database.execute('UPDATE datasets SET segmentation_config=$1::jsonb WHERE id=1', json.dumps(config))
         request = datasets.FieldRenameRequest(new_name='prediction', background=background)
         response = await getattr(datasets, f'{operation}_field')(1, 'mask', request, USER)
@@ -354,5 +355,6 @@ def test_rename_and_clone_carry_class_names_and_colours(registry_database, opera
         assert config['mask_targets'] == {**kept_names, **carried_names}
         kept_colours = colours if operation == 'clone' else {}
         assert config['color_scheme'] == {'opacity': 0.5, 'fields': {**kept_colours, 'prediction': colours['mask']}}
+        assert config['class_rules'] == {**(rules if operation == 'clone' else {}), 'prediction': rules['mask']}
 
     registry_database(scenario)

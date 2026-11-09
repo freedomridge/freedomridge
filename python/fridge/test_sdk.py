@@ -10,7 +10,7 @@ Usage (requires FRIDGE_TEST_URL pointing to a disposable backend):
 import sys
 import traceback
 
-from fridge import Dataset, DatasetView, Sample, connect, geo_within
+from fridge import ClassProbabilities, Dataset, DatasetView, Sample, connect, geo_within, threshold_rule
 from fridge._test_safety import require_test_url
 from fridge.core.client import get_client
 
@@ -154,6 +154,33 @@ def run_tests():
         assert hm.get('map_path') == 's3://test/img_3_heatmap.png'
         assert hm.get('range') == [0.0, 100.0]
         assert hm.get('colormap') == 'viridis'
+
+    _()
+
+    @test("class probabilities: the label, its classes and colours, and its default rule")
+    def _():
+        s = ds['s3://test/img_5.jpg']
+        s.metadata['weeds'] = ClassProbabilities('s3://test/img_5_probs.png', classes=3)
+        s.save()
+        assert ds['s3://test/img_5.jpg'].metadata['weeds'] == {
+            'type': 'class_probabilities',
+            'probPath': 's3://test/img_5_probs.png',
+            'classes': 3,
+        }
+        ds.set_field_classes('weeds', ['soil', 'crop', 'weed'], colors={1: '#00ff00', 2: '#ff0000'})
+        rule = threshold_rule([(2, 0.3), (1, 0.6)], fallback=None)
+        ds.set_default_rule('weeds', rule)
+        config = ds.client.get_dataset_by_id(ds._id)['segmentation_config']
+        assert config['mask_targets']['weeds'] == {'0': 'soil', '1': 'crop', '2': 'weed'}, config
+        assert config['color_scheme']['fields']['weeds']['idColors'] == {'1': '#00ff00', '2': '#ff0000'}, config
+        assert config['class_rules']['weeds'] == rule, config
+        try:
+            ds.set_default_rule('weeds', {'type': 'rules', 'rules': []})
+            assert False, "A rule with no thresholds should be refused"
+        except Exception as error:
+            assert '1 to 64' in str(error), error
+        ds.set_default_rule('weeds', None)
+        assert 'weeds' not in ds.client.get_dataset_by_id(ds._id)['segmentation_config']['class_rules']
 
     _()
 

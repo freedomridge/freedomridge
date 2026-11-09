@@ -90,6 +90,7 @@ export type LabelType =
     | 'keypoints'
     | 'cuboids'
     | 'heatmap'
+    | 'class_probabilities'
     | null;
 
 export interface AnnotationField {
@@ -108,6 +109,11 @@ export function detectLabelType(value: unknown): LabelType {
     // shape (dict with map_path) would otherwise be ambiguous with new label types.
     if (value && typeof value === 'object' && !Array.isArray(value) && (value as Record<string, unknown>).type === 'heatmap') {
         return 'heatmap';
+    }
+    // Class probabilities (lib/class-rules.ts): an explicit marker too, so probPath is never read as a mask.
+    if (value && typeof value === 'object' && !Array.isArray(value)
+        && (value as Record<string, unknown>).type === 'class_probabilities') {
+        return 'class_probabilities';
     }
 
     // First element of an array-of-objects label list (null for non-arrays/empties).

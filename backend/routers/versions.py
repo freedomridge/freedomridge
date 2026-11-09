@@ -200,7 +200,8 @@ async def _restore_field_registry(conn, dataset_id: int, version):
                WHERE snapshot.version_id = $2
                  AND key NOT IN ('tags', 'media_type', 'detections.label', 'ground_truth.label',
                      'predictions.label', 'polygons.label', 'segmentation.labels', '__heatmap_fields__',
-                     '__mask_overlay_fields__', '__keypoint_fields__', '__cuboid_fields__', '__classification_fields__',
+                     '__probability_fields__', '__mask_overlay_fields__', '__keypoint_fields__', '__cuboid_fields__',
+                     '__classification_fields__',
                      '__detection_fields__', '__polyline_fields__')
                GROUP BY key ORDER BY key ON CONFLICT (dataset_id, field_name) DO NOTHING""",
             dataset_id,

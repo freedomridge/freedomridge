@@ -5,7 +5,7 @@ import { toggleOverlayField } from '@/lib/labels';
 import { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import type { Feature, Polygon } from 'geojson';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { ApiError, isRescoringRefusal, getSamples, getDatasetSchema, getDataset, getEmbeddingFields, searchSimilar, searchByImage, searchObjectToPatches, updateDataset, sampleDuplicates, notifySamplesMutated, createSelectionToken, type Dataset, type Filters, type Sample, type SchemaField, type ComplexFilter, type ViewStage } from '@/lib/api';
+import { ApiError, isRescoringRefusal, getSamples, getDatasetSchema, getDataset, getEmbeddingFields, searchSimilar, searchByImage, searchObjectToPatches, updateDataset, setClassRule, sampleDuplicates, notifySamplesMutated, createSelectionToken, type Dataset, type Filters, type Sample, type SchemaField, type ComplexFilter, type ViewStage } from '@/lib/api';
 import { describeFilter, convertSimpleFiltersToComplex } from '@/lib/filter-utils';
 import { usePatchState } from '@/hooks/usePatchState';
 import { useSampleCount } from '@/hooks/useSampleCount';
@@ -1484,6 +1484,14 @@ function DatasetPageContent() {
                             activeOverlayFields={activeOverlayFields}
                             overlayConfigs={overlayConfigs}
                             segmentationConfig={dataset?.segmentation_config}
+                            // A mirror's settings, its default rules included, are its primary's: trying one is fine, saving isn't.
+                            onSaveClassRule={datasetId != null && (user?.role === 'admin' || user?.role === 'power_user')
+                                && !dataset?.mirror
+                                ? async (fieldName, rule) => {
+                                    await setClassRule(datasetId, fieldName, rule);
+                                    await queryClient.invalidateQueries({ queryKey: ['dataset', datasetId] });
+                                }
+                                : undefined}
                             onMediaFieldChange={setModalMediaField}
                             highlightBox={highlightBox}
                             highlightCuboidField={highlightCuboidField}
