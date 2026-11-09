@@ -2548,7 +2548,8 @@ CREATE TABLE IF NOT EXISTS followers (
     token_id INTEGER REFERENCES api_tokens(id) ON DELETE SET NULL,
     created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    last_seen_at TIMESTAMPTZ
+    last_seen_at TIMESTAMPTZ,
+    instance TEXT  -- the installation id of the instance its token belongs to: the first that used it (0014)
 );
 
 CREATE TABLE IF NOT EXISTS follower_datasets (
@@ -2563,6 +2564,7 @@ CREATE TABLE IF NOT EXISTS follower_datasets (
     acked_txid BIGINT,
     subscribed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     images BOOLEAN NOT NULL DEFAULT FALSE,  -- serve the dataset's images to the follower (0012)
+    start_identity TEXT,  -- the primary identity start_txid belongs to; another one restarts the subscription (0013)
     PRIMARY KEY (follower_id, dataset_id)
 );
 CREATE INDEX IF NOT EXISTS follower_datasets_dataset ON follower_datasets (dataset_id);
@@ -2580,6 +2582,15 @@ CREATE TRIGGER follower_datasets_followed_insert AFTER INSERT ON follower_datase
     FOR EACH STATEMENT EXECUTE FUNCTION sync_dataset_followed();
 CREATE TRIGGER follower_datasets_followed_delete AFTER DELETE ON follower_datasets REFERENCING OLD TABLE AS changed
     FOR EACH STATEMENT EXECUTE FUNCTION sync_dataset_followed();
+
+-- This installation's id, made once (0014): a follower sends it with each call, and its primary binds the
+-- follower's token to the first that used it. A dump carries it, so a follower restored or moved to another server is
+-- still the same instance, while two installations differ.
+CREATE TABLE IF NOT EXISTS installation (
+    singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
+    id UUID NOT NULL DEFAULT gen_random_uuid()
+);
+INSERT INTO installation DEFAULT VALUES ON CONFLICT DO NOTHING;
 
 -- A follower's side (0009, docs/FOLLOWERS.md): the primaries it follows and its read-only mirrors of their
 -- datasets. Only the sync job, with fridge.mirror_sync set to the mirror's dataset id, changes what came from
@@ -2617,7 +2628,9 @@ CREATE TABLE IF NOT EXISTS mirrors (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     last_synced_at TIMESTAMPTZ,
     last_error TEXT,
-    images BOOLEAN NOT NULL DEFAULT FALSE  -- the primary serves its images to this instance (0012)
+    images BOOLEAN NOT NULL DEFAULT FALSE,  -- the primary serves its images to this instance (0012)
+    failures INTEGER NOT NULL DEFAULT 0,  -- failed runs in a row (0013)
+    retry_after TIMESTAMP WITH TIME ZONE  -- after a failure, not tried again before this (0013)
 );
 -- One live mirror per primary dataset; a stopped one stays beside a new copy.
 CREATE UNIQUE INDEX IF NOT EXISTS mirrors_live_origin ON mirrors (link_id, origin_dataset_id) WHERE state <> 'stopped';
@@ -2810,5 +2823,7 @@ INSERT INTO schema_migrations (filename) VALUES
     ('0009_mirrors.sql'),
     ('0010_compute_launcher.sql'),
     ('0011_compute_launcher_arm.sql'),
-    ('0012_follower_images.sql')
+    ('0012_follower_images.sql'),
+    ('0013_follower_restarts.sql'),
+    ('0014_follower_instance.sql')
 ON CONFLICT (filename) DO NOTHING;

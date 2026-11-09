@@ -23,6 +23,7 @@ interface Mirror {
     concept_views: string[];
     last_synced_at: string | null;
     last_error: string | null;
+    retry_after: string | null;
 }
 interface Primary {
     id: number;
@@ -80,7 +81,13 @@ function MirrorRow({ mirror }: { mirror: Mirror }) {
                     Not copied, because they use a concept and concepts belong to each instance: {mirror.concept_views.join(', ')}
                 </p>
             )}
-            {mirror.last_error && <p className="text-xs text-red-300">{mirror.last_error}</p>}
+            {mirror.last_error && (
+                <p data-testid="mirror-error" className="text-xs text-red-300">
+                    {mirror.last_error}
+                    {mirror.retry_after && new Date(mirror.retry_after) > new Date() &&
+                        ` (next try at ${new Date(mirror.retry_after).toLocaleTimeString()})`}
+                </p>
+            )}
         </div>
     );
 }

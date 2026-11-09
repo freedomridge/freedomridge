@@ -161,6 +161,16 @@ npm run build
 cd ..
 ```
 
+The `npx freedomridge` launcher's tests, in the same CI job. `launcher/release/` isn't in git: `npm pack` copies the
+release files into it (`scripts/bundle.js`), and so do the tests. To run `launcher/bin/freedomridge.js` straight
+from a checkout, run `node launcher/scripts/bundle.js` first.
+
+```bash
+cd launcher
+node --test test/
+cd ..
+```
+
 ### 7. Browser tests (CI `e2e`)
 
 Run these for any UI change. The backend runs in demo mode on a fresh database, and Playwright

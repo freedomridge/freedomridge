@@ -27,6 +27,7 @@ interface Follower {
     created_at: string;
     last_seen_at: string | null;
     stale: boolean;
+    bound: boolean;  // its token belongs to the installation that first used it
     datasets: FollowedDataset[];
 }
 
@@ -80,7 +81,8 @@ function FollowerCard({ follower, datasets }: { follower: Follower; datasets: { 
         onSuccess: refresh,
     });
     const remove = useMutation({ mutationFn: () => send('DELETE', `/followers/${follower.id}`), onSuccess: refresh });
-    const error = follow.error || unfollow.error || remove.error;
+    const reset = useMutation({ mutationFn: () => send('POST', `/followers/${follower.id}/reset-instance`), onSuccess: refresh });
+    const error = follow.error || unfollow.error || remove.error || reset.error;
     const followed = new Set(follower.datasets.map(dataset => dataset.dataset_id));
 
     return (
@@ -165,6 +167,16 @@ function FollowerCard({ follower, datasets }: { follower: Follower; datasets: { 
                     Follow
                 </button>
                 <div className="flex-1" />
+                {follower.bound && (
+                    <button
+                        data-testid="follower-reset-instance"
+                        onClick={() => reset.mutate()}
+                        title="Its token works only for the installation that first used it. Reset it when that follower was reinstalled, so the new installation takes it over."
+                        className="text-sm text-zinc-400 hover:text-white"
+                    >
+                        Reset instance
+                    </button>
+                )}
                 {confirmRemove ? (
                     <span className="flex items-center gap-2 text-sm">
                         <span className="text-zinc-300">Remove {follower.name} and everything kept for it?</span>

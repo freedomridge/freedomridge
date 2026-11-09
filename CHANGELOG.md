@@ -4,6 +4,65 @@ Freedom Ridge has one version for the server, the web app and the Python SDK (th
 file), following [Semantic Versioning](https://semver.org). A release lists **upgrade notes** when
 it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
 
+## 2.6.1 (2026-11-09)
+
+2.6.1 fixes followers, from a review of the feature: a restored primary is detected and its followers copy again,
+one failing mirror no longer holds up the others and backs off, a follower can change only tags on the primary, a
+token is bound to one follower installation, and re-read blocks and big embedding jobs no longer make the follower
+re-download vectors. Primaries and followers can be upgraded in either order. Two migrations.
+
+### Upgrade notes
+
+- Two database migrations, `0013_follower_restarts.sql` and `0014_follower_instance.sql`, applied with
+  `scripts/apply_migrations.sh` (step 4 of [Upgrading](docs/UPGRADING.md)). Existing follower subscriptions keep
+  their place.
+- A primary's identity now names its database too. Primaries and followers can be upgraded in either order, and
+  nothing is copied again: a follower before this release keeps following an upgraded primary (it detects
+  restores once it's upgraded too).
+
+### Fixed
+
+- **Followers: restores are detected, and their subscriptions start again.**
+  - A restore that drops and creates the database (as the AWS guide does) kept the cluster's identity, so
+    followers carried on from cursors into a database that no longer matched. Sample ids reused by the restore
+    could then put a follower's own data on other images. The identity is now the cluster's and the database's,
+    so they get a 410 and copy again.
+  - After a restore into a new cluster, a dataset's subscription waited forever on a start from the old
+    database. It now starts again on the primary's own, as does one whose start was never set.
+- **Followers: one mirror that fails no longer holds up the other mirrors of its primary.** Its error shows on the
+  Primaries page, and it's tried again after a minute, waiting twice as long after each failure in a row, up to an
+  hour. A vector field clash with a same-named field indexed at another
+  size here says which field.
+- **Followers: the `tags` option covers tags only.** A follower could change any array field of the primary's.
+- **Followers: a shared view that uses a concept stays on the instance that made it.** Sent to the primary, it
+  pointed at another concept there, or none, and the next sync then deleted it on the mirror.
+- **Followers: a primary field that takes the name of one of the mirror's own replaces all of it at once,** its map
+  too, for vector and hash fields. Before, the mirror's own values stayed on the samples the feed hadn't named yet,
+  one field mixing two models, and those were then read-only.
+- **Followers: a mirror's own vector fields can be deleted** (patch vectors imported there, say). Every delete on a
+  mirror was refused.
+- **Followers: one subscription, one follower instance.**
+  - An instance refuses a second link to a primary it follows under another address.
+  - The primary binds a follower's token to the first instance that uses it (by an installation id that a dump
+    carries, so a restored or moved follower is still the same instance), and refuses it from another. **Reset
+    instance** on the Followers page hands the token to a follower reinstalled from scratch.
+  - Two instances on one subscription shared its acknowledgements, so the faster one's pruned changes the other
+    hadn't read.
+- **Followers: tagging samples on the primary no longer re-downloads their vectors.** A changed block (a bulk tag,
+  say) made the follower fetch every vector of every field of its samples again: tens of GB for a large dataset.
+  Now a re-read block brings only the vectors of samples new to the mirror; the feed's vector changes carry the
+  rest. Writing a vector also no longer uses up an `embeddings.id` value for a row that already exists.
+- **Followers: feed pages are bounded by their vector changes.** A large embedding job on the primary made pages
+  of up to about a million changes, which the follower rewrote in its checkpoint on every step. A follower now
+  asks for pages of at most 20,000 (`vector_limit`, in whole transactions); an older primary ignores it.
+- **The embeddings panel no longer warns of a crash that didn't happen.** Searching (Find similar, say) before
+  the scatter had finished loading remounted the panel, which took its own load marker for a crash: it dropped to
+  a small sample and said the previous load may have run out of memory. Only a marker from another page load
+  counts now, since a real crash always means a new page load.
+- **Followers: only the primary's own refusal stops the mirrors.** It now says, with a code, when the follower was
+  removed or its token deleted. Before, any 401 or 403, from a proxy say, stopped every mirror, and a new copy of
+  each started once the primary answered again.
+
 ## 2.6.0 (2026-11-09)
 
 2.6.0 lets a primary serve a followed dataset's images to its follower, an option off by default, and shows 16-bit

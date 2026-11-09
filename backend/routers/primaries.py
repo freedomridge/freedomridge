@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field
 from .. import follower_sync
 from ..crypto import encrypt_secret
 from ..database import db
+from . import followers
 from .auth import require_role
 
 router = APIRouter()
@@ -27,13 +28,21 @@ async def add_primary(data: PrimaryCreate, user: dict = Depends(require_role('ad
     """Follow a primary: its datasets shared with this follower start copying within a minute."""
     url = data.url.rstrip('/')
     link = {'url': url, 'token_encrypted': encrypt_secret(data.token)}
-    async with follower_sync.connect(link) as client:
+    async with follower_sync.connect(link, await follower_sync.installation_id(db)) as client:
         try:
             config = await follower_sync.call(client, 'GET', '/follower/config')
         except follower_sync.PrimaryRefused as error:
             raise HTTPException(status_code=400, detail=f'The primary refused that token: {error.detail}') from None
         except follower_sync.PrimaryUnavailable as error:
             raise HTTPException(status_code=502, detail=str(error)) from None
+    # One link per primary, by its identity, not its address: two (a LAN address and a Tailscale name, say) would
+    # share one subscription there, and one's acknowledgements would prune what the other hasn't read.
+    for other in await db.fetch('SELECT url, identity FROM primary_links'):
+        if followers.same_identity(other['identity'], follower_sync.primary_identity(config)):
+            raise HTTPException(
+                status_code=409,
+                detail=f"This instance already follows that primary, at {other['url']}",
+            )
     try:
         row = await db.fetchrow(
             """INSERT INTO primary_links (url, token_encrypted, follower_name, identity, created_by)
@@ -41,7 +50,7 @@ async def add_primary(data: PrimaryCreate, user: dict = Depends(require_role('ad
             url,
             link['token_encrypted'],
             config['name'],
-            config['identity'],
+            follower_sync.primary_identity(config),
             user['id'],
         )
     except asyncpg.UniqueViolationError:
@@ -59,6 +68,7 @@ async def list_primaries(user: dict = Depends(require_role('admin'))):
         """SELECT m.link_id, m.dataset_id, d.name, m.origin_dataset_id, m.state, m.tags, m.views, m.images,
                   m.copy_total,
                   cardinality(m.copy_blocks) AS copy_left, m.concept_views, m.last_synced_at, m.last_error,
+                  m.retry_after,
                   (SELECT count(*) FROM mirror_samples s WHERE s.dataset_id = m.dataset_id) AS samples
            FROM mirrors m JOIN datasets d ON d.id = m.dataset_id
            ORDER BY d.name""",

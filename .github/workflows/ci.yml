@@ -179,7 +179,12 @@ jobs:
           # A real pack, as publish.yml makes it: npm pack doesn't create its destination.
           mkdir -p "$RUNNER_TEMP/launcher"
           npm pack --pack-destination "$RUNNER_TEMP/launcher"
-          npm publish --dry-run "$RUNNER_TEMP"/launcher/freedomridge-*.tgz
+          # npm reads it as a file (the publish job's way). A released version can't be published again, which
+          # npm says only after reading the file, so that answer passes too.
+          if ! out=$(npm publish --dry-run "$RUNNER_TEMP"/launcher/freedomridge-*.tgz 2>&1); then
+            echo "$out"
+            echo "$out" | grep -q 'cannot publish over the previously published versions'
+          fi
       - name: Production build
         run: npm run build
 

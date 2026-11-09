@@ -19,13 +19,14 @@ copy it reads the feed from start_txid - 1.
 
 import base64
 import secrets
-from typing import List, Literal, Optional
+from typing import Annotated, List, Literal, Optional
 
 import numpy as np
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
+from ..api_errors import CodedHTTPException
 from ..crypto import hash_token
 from ..database import db
 from ..models import ViewCreate
@@ -38,6 +39,7 @@ router = APIRouter()
 BLOCK = 4096
 STALE_DAYS = 7
 FEED_TRANSACTIONS = 1000  # whole transactions per feed page
+FEED_VECTOR_ROWS = 20000  # vector changes per page a follower asks for (vector_limit), in whole transactions
 SAMPLE_BLOCKS = 16  # blocks per samples request
 VECTOR_SAMPLES = 2000  # samples per vectors request
 TAG_SAMPLES = 50000  # samples per tags request from a follower
@@ -72,7 +74,8 @@ class Ack(BaseModel):
 
 class TagRequest(BaseModel):
     sample_ids: List[int] = Field(min_length=1, max_length=TAG_SAMPLES)
-    field_name: str = 'tags'
+    # The tags option covers tags only: no other array field of the primary's.
+    field_name: Literal['tags'] = 'tags'
     add_tags: List[str] = Field(default_factory=list)
     remove_tags: List[str] = Field(default_factory=list)
 
@@ -83,8 +86,37 @@ class ViewRequest(BaseModel):
 
 
 async def identity(source=None) -> str:
-    """The primary's identity in a cursor: its cluster's system identifier, new after a restore into a new database."""
-    return str(await (source or db).fetchval('SELECT system_identifier FROM pg_control_system()'))
+    """The primary's identity in a cursor: its cluster's system identifier and its database's oid. A restore into a
+    new cluster changes the first, and one with dropdb and createdb (docs/DEPLOY_TO_AWS.md) the second. (A value
+    stored in a table wouldn't do: a dump carries it.)"""
+    return await (source or db).fetchval(
+        """SELECT (SELECT system_identifier::text FROM pg_control_system()) || ':'
+                  || (SELECT oid::text FROM pg_database WHERE datname = current_database())""",
+    )
+
+
+def same_identity(recorded: str | None, current: str) -> bool:
+    """Whether an identity recorded earlier names this primary database. One without the database oid, from a
+    primary or follower before 2.6.1 or a cursor from before the primary's upgrade, matches by the cluster alone."""
+    if recorded is None:
+        return False
+    if ':' in recorded and ':' in current:
+        return recorded == current
+    return recorded.split(':')[0] == current.split(':')[0]
+
+
+async def stamp_starts(source, follower_id: int, current: str) -> None:
+    """Give a start to this follower's subscriptions that need one: none yet (its second statement failed), or one
+    from another database (this one was restored), whose txids mean nothing here. The follower then copies again,
+    which a restore makes it do anyway (410). As in follow_dataset, the start is the xmax of a snapshot taken after
+    the subscription is visible."""
+    await source.execute(
+        """UPDATE follower_datasets
+           SET start_txid = txid_snapshot_xmax(txid_current_snapshot()), acked_txid = NULL, start_identity = $2
+           WHERE follower_id = $1 AND (start_txid IS NULL OR start_identity IS DISTINCT FROM $2)""",
+        follower_id,
+        current,
+    )
 
 
 async def prune(source, dataset_id: int) -> None:
@@ -148,7 +180,7 @@ async def list_followers(user: dict = Depends(require_role('admin'))):
     """Every follower with its datasets and options, when it last checked in (stale after STALE_DAYS) and the log
     rows the primary keeps for it."""
     followers = await db.fetch(
-        f"""SELECT id, name, created_at, last_seen_at,
+        f"""SELECT id, name, created_at, last_seen_at, instance IS NOT NULL AS bound,
                    last_seen_at IS NULL OR last_seen_at < now() - interval '{STALE_DAYS} days' AS stale
             FROM followers ORDER BY name""",
     )
@@ -215,10 +247,12 @@ async def follow_dataset(
         # id below this snapshot's xmax.
         row = await connection.fetchrow(
             """UPDATE follower_datasets
-               SET start_txid = COALESCE(start_txid, txid_snapshot_xmax(txid_current_snapshot()))
+               SET start_txid = COALESCE(start_txid, txid_snapshot_xmax(txid_current_snapshot())),
+                   start_identity = COALESCE(start_identity, $3)
                WHERE follower_id = $1 AND dataset_id = $2 RETURNING *""",
             follower_id,
             dataset_id,
+            await identity(connection),
         )
     return dict(row)
 
@@ -236,6 +270,16 @@ async def unfollow_dataset(follower_id: int, dataset_id: int, user: dict = Depen
             raise HTTPException(status_code=404, detail='The follower does not follow that dataset')
         await prune(connection, dataset_id)
     return {'unfollowed': dataset_id}
+
+
+@router.post('/followers/{follower_id}/reset-instance')
+async def reset_follower_instance(follower_id: int, user: dict = Depends(require_role('admin'))):
+    """Let the follower's token be used by another installation: the next one that calls takes it. For a follower
+    reinstalled from scratch (a new installation id) that should carry on, without removing it and copying again."""
+    name = await db.fetchval('UPDATE followers SET instance = NULL WHERE id = $1 RETURNING name', follower_id)
+    if name is None:
+        raise HTTPException(status_code=404, detail='No such follower')
+    return {'reset': name}
 
 
 @router.delete('/followers/{follower_id}')
@@ -272,11 +316,26 @@ async def remove_follower(follower_id: int, user: dict = Depends(require_role('a
 # --- The follower's own endpoints ------------------------------------------------------------------------------
 
 
-async def current_follower(account: dict = Depends(get_follower_user)) -> dict:
-    """The follower behind the token, stamped as seen now."""
-    row = await db.fetchrow('UPDATE followers SET last_seen_at = now() WHERE user_id = $1 RETURNING *', account['id'])
+async def current_follower(request: Request, account: dict = Depends(get_follower_user)) -> dict:
+    """The follower behind the token, stamped as seen now. Its token belongs to the first follower instance that used
+    it, by the installation id it sends (X-Fridge-Instance; a follower before 2.6.1 sends none and isn't checked)."""
+    instance = request.headers.get('X-Fridge-Instance') or None
+    row = await db.fetchrow(
+        'UPDATE followers SET last_seen_at = now(), instance = COALESCE(instance, $2) WHERE user_id = $1 RETURNING *',
+        account['id'],
+        instance,
+    )
+    if row is not None and instance and row['instance'] != instance:
+        raise CodedHTTPException(
+            409,
+            "This follower's token is in use by another Freedom Ridge instance: each instance needs a follower of its "
+            'own. If this instance was reinstalled, an admin on the primary can reset the follower on its Followers '
+            'page',
+            'follower_instance_mismatch',
+        )
     if row is None:
-        raise HTTPException(status_code=403, detail='This follower has been removed on the primary')
+        # The code tells the follower this is final: it stops its mirrors (other refusals may pass).
+        raise CodedHTTPException(403, 'This follower has been removed on the primary', 'follower_removed')
     return dict(row)
 
 
@@ -295,6 +354,8 @@ async def subscription(source, follower: dict, dataset_id: int) -> dict:
 async def follower_config(follower: dict = Depends(current_follower)):
     """What this follower follows and with which options. A dataset is `ready` to copy once every transaction that
     might have written to it without logging has ended."""
+    current = await identity()
+    await stamp_starts(db, follower['id'], current)
     xmin = await db.fetchval('SELECT txid_snapshot_xmin(txid_current_snapshot())')
     rows = await db.fetch(
         """SELECT f.dataset_id, d.name, f.tags, f.views, f.images, f.start_txid, f.acked_txid
@@ -303,7 +364,10 @@ async def follower_config(follower: dict = Depends(current_follower)):
     )
     return {
         'name': follower['name'],
-        'identity': await identity(),
+        # A follower before 2.6.1 compares `identity` exactly and copies everything again when it changes: it
+        # keeps the cluster's identifier alone. Newer followers read the database's.
+        'identity': current.split(':')[0],
+        'database_identity': current,
         'datasets': [
             {**dict(row), 'ready': row['start_txid'] is not None and xmin >= row['start_txid']} for row in rows
         ],
@@ -327,13 +391,14 @@ async def follower_changes(
     after: int,
     identity_: str = Query(alias='identity'),
     transactions: int = Query(FEED_TRANSACTIONS, ge=1, le=FEED_TRANSACTIONS),
+    vector_limit: Annotated[Optional[int], Query(ge=1)] = None,
     follower: dict = Depends(current_follower),
 ):
     """What changed in transactions after `after` and below the snapshot's xmin, whole transactions only, at most
     `transactions` of them. The cursor returned is the next `after`. 410 when the primary is no longer the one the
     cursor came from (restored into a new database): copy again."""
     async with db.pool.acquire() as connection, connection.transaction(isolation='repeatable_read'):
-        if identity_ != await identity(connection):
+        if not same_identity(identity_, await identity(connection)):
             raise HTTPException(status_code=410, detail='The primary was restored or replaced: copy the dataset again')
         sub = await subscription(connection, follower, dataset_id)
         if sub['start_txid'] is None or after < sub['start_txid'] - 1:
@@ -355,6 +420,24 @@ async def follower_changes(
         )
         more = len(found) > transactions
         upto = found[transactions - 1]['transaction_id'] if more else max(after, xmin - 1)
+        if vector_limit is not None and found:
+            # A follower that keeps the page in its checkpoint asks for a bounded one: whole transactions, up to the
+            # first whose vector changes go over the limit, and always at least one transaction.
+            counts = await connection.fetch(
+                'SELECT transaction_id, count(*) AS rows FROM vector_changes '
+                'WHERE dataset_id = $1 AND transaction_id > $2 AND transaction_id <= $3 GROUP BY 1 ORDER BY 1',
+                dataset_id,
+                after,
+                upto,
+            )
+            total = 0
+            for row in counts:
+                total += row['rows']
+                if total > vector_limit and row['transaction_id'] > found[0]['transaction_id']:
+                    # This transaction goes to the next page: the page ends at the logged one before it.
+                    upto = max(t['transaction_id'] for t in found if t['transaction_id'] < row['transaction_id'])
+                    more = True
+                    break
         blocks = await connection.fetch(
             'SELECT DISTINCT block_id FROM sample_block_changes '
             'WHERE dataset_id = $1 AND transaction_id > $2 AND transaction_id <= $3 ORDER BY 1',
@@ -617,6 +700,13 @@ async def follower_tags(dataset_id: int, request: TagRequest, follower: dict = D
 async def follower_create_view(dataset_id: int, request: ViewRequest, follower: dict = Depends(current_follower)):
     """A shared view made on the follower, created here as its account and marked with where it was made."""
     account = await both_ways(follower, dataset_id, 'views')
+    from ..follower_sync import uses_concept  # the follower side's check: the same on both
+
+    if uses_concept(request.content):
+        raise HTTPException(
+            status_code=400,
+            detail='A view that uses a concept stays on the instance that made it: concepts belong to each instance',
+        )
     content = {**request.content, 'made_on': follower['name']}
     return await views_router.create_view(
         dataset_id,

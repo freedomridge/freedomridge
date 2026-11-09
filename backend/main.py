@@ -736,13 +736,13 @@ async def _primary_media_source(dataset_id: int, sample_id: int):
 _primary_clients: dict = {}
 
 
-def _primary_client(source):
+async def _primary_client(source):
     from . import follower_sync
 
     key = (source["link_id"], source["token_encrypted"], id(asyncio.get_running_loop()))
     client = _primary_clients.get(key)
     if client is None:
-        client = _primary_clients[key] = follower_sync.connect(source)
+        client = _primary_clients[key] = follower_sync.connect(source, await follower_sync.installation_id(db))
     return client
 
 
@@ -764,7 +764,7 @@ async def _media_from_primary(source, path: str, params: dict) -> Response:
             return Response(content=body, media_type=media_type, headers={**headers, "X-Cache": "HIT"})
     url = f"/follower/datasets/{source['origin_dataset_id']}/samples/{source['origin_id']}/media"
     try:
-        answer = await _primary_client(source).get(url, params=params)
+        answer = await (await _primary_client(source)).get(url, params=params)
     except Exception as error:
         log.error("Primary %s unreachable for sample %s: %s", source["url"], source["origin_id"], error)
         raise HTTPException(status_code=502, detail=f"The primary didn't answer for this image: {error}")

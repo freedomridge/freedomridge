@@ -8,8 +8,10 @@ dataset id (migration 0009); everything the primary didn't send stays the follow
 """
 
 import base64
+import copy
 import io
 import logging
+import re
 import struct
 from urllib.parse import urlparse
 
@@ -36,6 +38,8 @@ BLOCK = followers.BLOCK
 COPY_BLOCKS = 2  # blocks per step: up to 8192 samples and their vectors
 REQUEST_SECONDS = 120
 LOCK_SECONDS = 5
+RETRY_SECONDS = 60  # a failed mirror's wait before its next try, doubling after each failure in a row
+RETRY_MAX_SECONDS = 3600
 SAMPLE_COLUMNS = (
     ('id', 'integer'),
     ('filepath', 'text'),
@@ -50,6 +54,7 @@ SAMPLE_COLUMNS = (
 )
 COPIED = ('filepath', 'media_type', 'tags', 'metadata', 'heading', 'created_at', 'last_modified_at')
 CONCEPT_OPERATORS = ('concept_select', 'concept_exclude')
+PATCH_TILE = re.compile(r'(_patch_\d+x\d+)_r\d+c\d+$')  # a patch tile's field name, and its scale's
 
 
 class PrimaryUnavailable(job_queue.QueueBusy):
@@ -57,18 +62,28 @@ class PrimaryUnavailable(job_queue.QueueBusy):
 
 
 class PrimaryRefused(Exception):
-    def __init__(self, status: int, detail: str):
+    def __init__(self, status: int, detail: str, code: str | None = None):
         super().__init__(f'The primary answered {status}: {detail}')
-        self.status, self.detail = status, detail
+        self.status, self.detail, self.code = status, detail, code
 
 
-def connect(link) -> httpx.AsyncClient:
-    """A client for the primary's API; tests bind one to the app instead."""
-    return httpx.AsyncClient(
-        base_url=link['url'].rstrip('/'),
-        headers={'Authorization': f"Bearer {decrypt_secret(link['token_encrypted'])}"},
-        timeout=REQUEST_SECONDS,
-    )
+# The primary's refusals that are final: the follower was removed or its token deleted. Its mirrors stop. Any other
+# refusal (a proxy's 403, an inactive account for a moment, an older primary without codes) is retried.
+FINAL_REFUSALS = ('follower_removed', 'follower_token_invalid')
+
+
+def connect(link, instance: str | None = None) -> httpx.AsyncClient:
+    """A client for the primary's API, saying which instance this is (the primary binds a follower's token to the
+    first that uses it); tests bind one to the app instead."""
+    headers = {'Authorization': f"Bearer {decrypt_secret(link['token_encrypted'])}"}
+    if instance:
+        headers['X-Fridge-Instance'] = instance
+    return httpx.AsyncClient(base_url=link['url'].rstrip('/'), headers=headers, timeout=REQUEST_SECONDS)
+
+
+async def installation_id(source) -> str:
+    """This installation's id, which a primary binds this instance's follower token to."""
+    return str(await source.fetchval('SELECT id FROM installation'))
 
 
 def _detail(response) -> str:
@@ -79,6 +94,14 @@ def _detail(response) -> str:
     return detail if isinstance(detail, str) else response.text[:300]
 
 
+def _code(response) -> str | None:
+    try:
+        code = response.json().get('code')
+    except (ValueError, AttributeError):
+        return None
+    return code if isinstance(code, str) else None
+
+
 async def call(client, method: str, path: str, *, params=None, body=None):
     try:
         response = await client.request(method, path, params=params, json=body)
@@ -87,7 +110,7 @@ async def call(client, method: str, path: str, *, params=None, body=None):
     if response.status_code >= 500 or response.status_code == 429:
         raise PrimaryUnavailable(f'The primary answered {response.status_code}: {_detail(response)}')
     if response.status_code >= 400:
-        raise PrimaryRefused(response.status_code, _detail(response))
+        raise PrimaryRefused(response.status_code, _detail(response), _code(response))
     return response.json()
 
 
@@ -385,6 +408,7 @@ async def write_samples(connection, dataset_id: int, blocks: list, data: dict) -
 async def write_hashes(connection, dataset_id: int, present: list, hashes: list) -> None:
     """The primary's hashes of these samples; hash fields only this instance has are left alone."""
     fields = sorted({row['field_name'] for row in hashes})
+    await supersede(connection, dataset_id, 'hash_fields', fields, ('sample_hashes',))
     await connection.execute(
         """UPDATE mirrors SET hash_fields = ARRAY(SELECT DISTINCT unnest(hash_fields || $2::text[]) ORDER BY 1)
            WHERE dataset_id = $1 AND NOT ($2::text[] <@ hash_fields)""",
@@ -421,7 +445,14 @@ async def write_hashes(connection, dataset_id: int, present: list, hashes: list)
 
 async def write_vectors(connection, dataset_id: int, named: list, vectors: dict) -> None:
     """The primary's vectors of the (origin sample, field) pairs named: upsert what came, delete what didn't. A field
-    this instance had on its own becomes the primary's once the primary sends one of that name."""
+    this instance had on its own becomes the primary's once the primary sends one of that name: all of it, at once."""
+    await supersede(
+        connection,
+        dataset_id,
+        'vector_fields',
+        sorted(vectors),
+        ('embeddings', 'map_state_rows'),
+    )
     await connection.execute(
         """UPDATE mirrors SET vector_fields = ARRAY(SELECT DISTINCT unnest(vector_fields || $2::text[]) ORDER BY 1)
            WHERE dataset_id = $1 AND NOT ($2::text[] <@ vector_fields)""",
@@ -456,16 +487,74 @@ async def write_vectors(connection, dataset_id: int, named: list, vectors: dict)
             await connection.execute('TRUNCATE mirror_vector_stage')
             payload = io.BytesIO(vector_payload(group))
             await connection.copy_to_table('mirror_vector_stage', source=payload, format='binary')
-            await connection.execute(
-                """INSERT INTO embeddings (sample_id, field_name, vector)
-                   SELECT m.sample_id, $2, st.vector FROM mirror_vector_stage st
-                   JOIN mirror_samples m ON m.dataset_id = $1 AND m.origin_id = st.sample_id
-                   ON CONFLICT (sample_id, field_name) DO UPDATE SET vector = EXCLUDED.vector
-                   WHERE embeddings.vector IS DISTINCT FROM EXCLUDED.vector""",
-                dataset_id,
-                field,
-            )
+            try:
+                # Changed rows updated, missing ones inserted: an upsert would take an embeddings.id sequence value
+                # for every row, those that conflict included.
+                await connection.execute(
+                    """UPDATE embeddings e SET vector = st.vector FROM mirror_vector_stage st
+                       JOIN mirror_samples m ON m.dataset_id = $1 AND m.origin_id = st.sample_id
+                       WHERE e.sample_id = m.sample_id AND e.field_name = $2 AND e.vector IS DISTINCT FROM st.vector""",
+                    dataset_id,
+                    field,
+                )
+                await connection.execute(
+                    """INSERT INTO embeddings (sample_id, field_name, vector)
+                       SELECT m.sample_id, $2, st.vector FROM mirror_vector_stage st
+                       JOIN mirror_samples m ON m.dataset_id = $1 AND m.origin_id = st.sample_id
+                       WHERE NOT EXISTS (SELECT 1 FROM embeddings e
+                                         WHERE e.sample_id = m.sample_id AND e.field_name = $2)
+                       ON CONFLICT (sample_id, field_name) DO NOTHING""",
+                    dataset_id,
+                    field,
+                )
+            except asyncpg.PostgresError as error:
+                if 'dimensions' not in str(error):
+                    raise
+                # A vector index is per field name, over every dataset here (index_jobs.py).
+                raise MirrorFieldClash(
+                    f"The primary's vector field {field!r} has {len(group[0][1])} dimensions, but a field of that name "
+                    f'here is indexed at another size ({error}). Field names are shared by every dataset on this '
+                    "instance: rename this instance's field, or drop its index, and the mirror catches up.",
+                ) from error
     await clear_placement(connection, dataset_id, sorted({sample_id for sample_id, _ in named}))
+
+
+async def supersede(connection, dataset_id: int, column: str, fields: list, what: tuple) -> None:
+    """Fields arriving from the primary that this instance had on its own, under the same name: the primary's
+    replace them (docs/FOLLOWERS.md). Every row of this instance's goes now, not only those of the samples this page
+    names, or the field would hold two sources, the leftovers read-only. The primary's own rows come with the copy
+    and the feed. The mirror's map of such a vector field goes too: it was of the other vectors. Its coordinates and
+    pending placements go with the vectors."""
+    arriving = await connection.fetchval(
+        f'SELECT ARRAY(SELECT unnest($2::text[]) EXCEPT SELECT unnest({column})) FROM mirrors WHERE dataset_id = $1',
+        dataset_id,
+        fields,
+    )
+    if not arriving:
+        return
+    if 'embeddings' in what:
+        await connection.execute(
+            """DELETE FROM embeddings e USING mirror_samples m
+               WHERE m.dataset_id = $1 AND e.sample_id = m.sample_id AND e.field_name = ANY($2::text[])""",
+            dataset_id,
+            arriving,
+        )
+    if 'map_state_rows' in what:
+        # A patch map is kept under its scale's name (clip_patch_4x4), not its tiles' (clip_patch_4x4_r0c0).
+        maps = sorted({*arriving, *(PATCH_TILE.sub(r'\1', field) for field in arriving)})
+        for table in ('embedding_viz_rank', 'embedding_viz_meta', 'embedding_map_state'):
+            await connection.execute(
+                f'DELETE FROM {table} WHERE dataset_id = $1 AND field_name = ANY($2::text[])',
+                dataset_id,
+                maps,
+            )
+    if 'sample_hashes' in what:
+        await connection.execute(
+            """DELETE FROM sample_hashes h USING mirror_samples m
+               WHERE m.dataset_id = $1 AND h.sample_id = m.sample_id AND h.field_name = ANY($2::text[])""",
+            dataset_id,
+            arriving,
+        )
 
 
 async def clear_placement(connection, dataset_id: int, origin_ids: list) -> None:
@@ -650,13 +739,18 @@ async def stop_mirrors(connection, where: str, args: tuple, reason: str) -> None
     )
 
 
+def primary_identity(config: dict) -> str:
+    """The primary database's identity from its config. A primary before 2.6.1 sends its cluster's alone."""
+    return config.get('database_identity') or config['identity']
+
+
 async def configure(pool, link, client, checkpoint: dict) -> StepResult:
     """Read what the primary assigns this follower: start a copy of each newly ready dataset, update the options,
     and stop the mirrors of datasets it no longer shares."""
     try:
         config = await call(client, 'GET', '/follower/config')
     except PrimaryRefused as error:
-        if error.status not in (401, 403):
+        if error.status not in (401, 403) or error.code not in FINAL_REFUSALS:
             raise
         reason = f'No longer following: {error.detail}'
 
@@ -666,7 +760,8 @@ async def configure(pool, link, client, checkpoint: dict) -> StepResult:
 
         return StepResult(finished=True, result={'stopped': reason}, message=reason, publish=removed)
 
-    restored = link['identity'] is not None and link['identity'] != config['identity']
+    current = primary_identity(config)
+    restored = link['identity'] is not None and not followers.same_identity(link['identity'], current)
     live = {
         row['origin_dataset_id']: dict(row)
         for row in await pool.fetch("SELECT * FROM mirrors WHERE link_id = $1 AND state <> 'stopped'", link['id'])
@@ -729,11 +824,11 @@ async def configure(pool, link, client, checkpoint: dict) -> StepResult:
         await connection.execute(
             'UPDATE primary_links SET identity = $2, follower_name = $3, last_error = NULL WHERE id = $1',
             link['id'],
-            config['identity'],
+            current,
             config['name'],
         )
 
-    checkpoint.update(configured=True, identity=config['identity'], caught_up=[], acked={})
+    checkpoint.update(configured=True, identity=current, caught_up=[], failed=[], acked={})
     waiting = sorted(entry['name'] for entry in config['datasets'] if not entry['ready'])
     message = f"{len(assigned)} datasets shared, {len(plans)} new copies"
     if waiting:
@@ -771,21 +866,36 @@ async def apply_state(pool, link, client, mirror, checkpoint: dict, *, views: bo
     )
 
 
-async def apply_blocks(pool, client, mirror, blocks: list, after_write=None) -> tuple:
-    """Fetch these blocks' samples, hashes and vectors from the primary, and a publish that writes them."""
+async def apply_blocks(pool, client, mirror, blocks: list, after_write=None, *, new_only: bool = False) -> tuple:
+    """Fetch these blocks' samples, hashes and vectors from the primary, and a publish that writes them. From the
+    feed (new_only), only the vectors of samples new here: the feed's vector log carries every change to the others,
+    and re-reading a block whose samples were tagged mustn't download all their vectors again."""
     dataset_id, origin = mirror['dataset_id'], mirror['origin_dataset_id']
     data = await fetch_blocks(client, origin, blocks)
     await ensure_array_columns(pool, dataset_id, data['array_fields'])
     origin_ids = [sample['id'] for sample in data['samples']]
-    vectors = decode_vectors(await fetch_vectors(client, origin, origin_ids)) if origin_ids else {}
+    wanted = origin_ids
+    if new_only and origin_ids:
+        known = {
+            row['origin_id']
+            for row in await pool.fetch(
+                'SELECT origin_id FROM mirror_samples WHERE dataset_id = $1 AND origin_id = ANY($2::int[])',
+                dataset_id,
+                origin_ids,
+            )
+        }
+        wanted = [origin_id for origin_id in origin_ids if origin_id not in known]
+    vectors = decode_vectors(await fetch_vectors(client, origin, wanted)) if wanted else {}
     coordinates = await fetch_coordinates(client, origin, blocks) if origin_ids else []
 
     async def publish(connection):
         await begin_mirror_write(connection, dataset_id)
         present = await write_samples(connection, dataset_id, blocks, data)
         await write_hashes(connection, dataset_id, present, data['hashes'])
-        # Every primary field of every sample present: what didn't come was deleted there.
-        await write_vectors(connection, dataset_id, [(sample_id, None) for sample_id in present], vectors)
+        # Every primary field of every sample asked for: what didn't come was deleted there.
+        wanted_ids = set(wanted)
+        asked = present if not new_only else [sample_id for sample_id in present if sample_id in wanted_ids]
+        await write_vectors(connection, dataset_id, [(sample_id, None) for sample_id in asked], vectors)
         await write_coordinates(connection, dataset_id, blocks, coordinates)
         if after_write is not None:
             await after_write(connection)
@@ -804,8 +914,8 @@ async def copy_step(pool, link, client, mirror, checkpoint: dict) -> StepResult:
         # Every block is here: copy the views, whose sample ids can now be translated, and follow the feed.
         async def following(connection):
             await connection.execute(
-                "UPDATE mirrors SET state = 'following', last_synced_at = now(), last_error = NULL "
-                'WHERE dataset_id = $1',
+                "UPDATE mirrors SET state = 'following', last_synced_at = now(), last_error = NULL, failures = 0, "
+                'retry_after = NULL WHERE dataset_id = $1',
                 dataset_id,
             )
 
@@ -816,7 +926,8 @@ async def copy_step(pool, link, client, mirror, checkpoint: dict) -> StepResult:
 
     async def progress(connection):
         await connection.execute(
-            'UPDATE mirrors SET copy_blocks = $2, last_synced_at = now() WHERE dataset_id = $1',
+            'UPDATE mirrors SET copy_blocks = $2, last_synced_at = now(), last_error = NULL, failures = 0, '
+            'retry_after = NULL WHERE dataset_id = $1',
             dataset_id,
             rest,
         )
@@ -872,7 +983,8 @@ async def rank_step(pool, mirror, checkpoint: dict):
 
 async def advance_cursor(connection, dataset_id: int, cursor: int) -> None:
     await connection.execute(
-        'UPDATE mirrors SET feed_cursor = $2, last_synced_at = now(), last_error = NULL WHERE dataset_id = $1',
+        'UPDATE mirrors SET feed_cursor = $2, last_synced_at = now(), last_error = NULL, failures = 0, '
+        'retry_after = NULL WHERE dataset_id = $1',
         dataset_id,
         cursor,
     )
@@ -894,7 +1006,12 @@ async def feed_step(pool, link, client, mirror, checkpoint: dict) -> StepResult:
                 client,
                 'GET',
                 f'/follower/datasets/{origin}/changes',
-                params={'after': mirror['feed_cursor'], 'identity': checkpoint['identity']},
+                params={
+                    'after': mirror['feed_cursor'],
+                    'identity': checkpoint['identity'],
+                    # Bounded pages: the page is kept in the job's checkpoint. An older primary ignores it.
+                    'vector_limit': followers.FEED_VECTOR_ROWS,
+                },
             )
         except PrimaryRefused as error:
             if error.status not in (404, 409, 410):
@@ -911,11 +1028,9 @@ async def feed_step(pool, link, client, mirror, checkpoint: dict) -> StepResult:
         hashed = {vector['sample_id'] // BLOCK for vector in changes['vectors'] if vector['kind'] == 'hash'}
         reread = set(changes['blocks']) | hashed
         blocks = sorted(reread)
-        # A vector change in a block being re-read comes with the block; the rest are fetched on their own.
+        # Every vector change is fetched on its own: a re-read block brings only the vectors of samples new here.
         loose = [
-            (vector['sample_id'], vector['field_name'])
-            for vector in changes['vectors']
-            if vector['kind'] == 'vector' and vector['sample_id'] // BLOCK not in reread
+            (vector['sample_id'], vector['field_name']) for vector in changes['vectors'] if vector['kind'] == 'vector'
         ]
         page = {
             'dataset_id': dataset_id,
@@ -944,7 +1059,7 @@ async def feed_step(pool, link, client, mirror, checkpoint: dict) -> StepResult:
 
     if page['blocks']:
         blocks, page['blocks'] = page['blocks'][:COPY_BLOCKS], page['blocks'][COPY_BLOCKS:]
-        count, publish = await apply_blocks(pool, client, mirror, blocks)
+        count, publish = await apply_blocks(pool, client, mirror, blocks, new_only=True)
         return StepResult(checkpoint=checkpoint, message=f'Applied {count:,} changed samples', publish=publish)
     if page['vectors']:
         part, page['vectors'] = page['vectors'][: followers.VECTOR_SAMPLES], page['vectors'][followers.VECTOR_SAMPLES :]
@@ -984,20 +1099,83 @@ async def feed_step(pool, link, client, mirror, checkpoint: dict) -> StepResult:
     return StepResult(checkpoint=checkpoint, message='Applied a page of the feed', publish=finish_page)
 
 
+class MirrorFieldClash(Exception):
+    """The primary's vectors don't fit a same-named field this instance indexes at another size."""
+
+
+def isolated(mirror, before: dict, result: StepResult) -> StepResult:
+    """One mirror's failure mustn't hold up the others of its primary. Its writes run in a savepoint: if they fail,
+    they're undone, the error goes on the mirror, and the job's checkpoint (written after this, from the same dict)
+    becomes the one from before the step with the mirror passed over in this run. A transient error (a lost
+    connection, a serialization failure) still fails the job, which then runs again."""
+    publish = result.publish
+    progress = result.checkpoint if result.checkpoint is not None else dict(before)
+
+    async def guarded(connection):
+        try:
+            async with connection.transaction():
+                if publish is not None:
+                    await publish(connection)
+        except Exception as error:
+            if job_queue.is_transient(error) or isinstance(error, asyncpg.InterfaceError):
+                raise
+            await note_failure(connection, mirror['dataset_id'], describe(error))
+            replacement = passed_over(before, mirror)
+            progress.clear()
+            progress.update(replacement)
+
+    return StepResult(
+        checkpoint=progress,
+        done=result.done,
+        total=result.total,
+        message=result.message,
+        result=result.result,
+        finished=result.finished,
+        publish=guarded,
+    )
+
+
+async def note_failure(connection, dataset_id: int, reason: str) -> None:
+    """Put the error on the mirror, and wait before trying it again: a mirror that fails until someone fixes it
+    shouldn't download its next page again every minute."""
+    await connection.execute(
+        """UPDATE mirrors SET last_error = $2, failures = failures + 1,
+                  retry_after = now() + make_interval(secs => least($3 * power(2, failures), $4))
+           WHERE dataset_id = $1""",
+        dataset_id,
+        reason,
+        RETRY_SECONDS,
+        RETRY_MAX_SECONDS,
+    )
+
+
+def describe(error: Exception) -> str:
+    return f'{type(error).__name__}: {error}'[:1000]
+
+
+def passed_over(checkpoint: dict, mirror) -> dict:
+    """The checkpoint with this mirror skipped for the rest of the run, and counted as failed."""
+    return {
+        **checkpoint,
+        'caught_up': [*checkpoint.get('caught_up', []), mirror['dataset_id']],
+        'failed': [*checkpoint.get('failed', []), mirror['dataset_id']],
+    }
+
+
 def handler(pool):
     async def step(job):
         link = await pool.fetchrow('SELECT * FROM primary_links WHERE id = $1', job['args']['link_id'])
         if link is None:
             return StepResult(finished=True, message='This primary was removed here')
         checkpoint = dict(job['checkpoint'])
-        async with connect(link) as client:
+        async with connect(link, await installation_id(pool)) as client:
             try:
                 if not checkpoint.get('configured'):
                     return await configure(pool, link, client, checkpoint)
                 mirror = await pool.fetchrow(
                     """SELECT m.* FROM mirrors m JOIN datasets d ON d.id = m.dataset_id
                        WHERE m.link_id = $1 AND m.state <> 'stopped' AND NOT d.deleting
-                         AND NOT (m.dataset_id = ANY($2::int[]))
+                         AND NOT (m.dataset_id = ANY($2::int[])) AND (m.retry_after IS NULL OR m.retry_after <= now())
                        ORDER BY m.dataset_id LIMIT 1""",
                     link['id'],
                     checkpoint.get('caught_up', []),
@@ -1010,10 +1188,54 @@ def handler(pool):
                             link['id'],
                         )
 
-                    return StepResult(finished=True, message='Every mirror is up to date', publish=synced)
-                if mirror['state'] == 'copying':
-                    return await copy_step(pool, link, client, mirror, checkpoint)
-                return await feed_step(pool, link, client, mirror, checkpoint)
+                    failed = checkpoint.get('failed', [])
+                    waiting = await pool.fetchval(
+                        """SELECT count(*) FROM mirrors WHERE link_id = $1 AND state <> 'stopped'
+                             AND retry_after > now() AND NOT (dataset_id = ANY($2::int[]))""",
+                        link['id'],
+                        failed,
+                    )
+                    problems = [
+                        *([f'{len(failed)} mirror(s) failed'] if failed else []),
+                        *([f'{waiting} wait(s) to try again after an error'] if waiting else []),
+                    ]
+                    message = (
+                        f"{'; '.join(problems)}; the others are up to date: see Settings → Primaries"
+                        if problems
+                        else 'Every mirror is up to date'
+                    )
+                    return StepResult(
+                        finished=True,
+                        message=message,
+                        result={'failed': failed, 'waiting': waiting},
+                        publish=synced,
+                    )
+                # The steps change the checkpoint in place: this is the one to go back to if the mirror fails.
+                before = copy.deepcopy(checkpoint)
+                try:
+                    if mirror['state'] == 'copying':
+                        result = await copy_step(pool, link, client, mirror, checkpoint)
+                    else:
+                        result = await feed_step(pool, link, client, mirror, checkpoint)
+                except PrimaryUnavailable:
+                    raise  # every mirror of this primary waits for it
+                except Exception as error:
+                    if job_queue.is_transient(error):
+                        raise
+                    reason = describe(error)
+
+                    async def note(connection):
+                        await note_failure(connection, mirror['dataset_id'], reason)
+
+                    logger.warning('Mirror %s failed this run: %s', mirror['dataset_id'], reason)
+                    return StepResult(
+                        checkpoint=passed_over(before, mirror),
+                        message=f'A mirror failed: {reason}',
+                        publish=note,
+                    )
+                if result.committed:
+                    return result
+                return isolated(mirror, before, result)
             except (PrimaryUnavailable, PrimaryRefused) as error:
                 # Shown on Settings → Primary as well as on the job.
                 await pool.execute('UPDATE primary_links SET last_error = $2 WHERE id = $1', link['id'], str(error))

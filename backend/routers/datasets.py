@@ -6790,7 +6790,16 @@ class BulkTargetRequest(BaseModel):
 async def _bulk_response(id, user, operation, payload):
     from .. import bulk_jobs
 
-    if await db.fetchval('SELECT 1 FROM mirrors WHERE dataset_id = $1', id):
+    mirror = await db.fetchrow('SELECT vector_fields FROM mirrors WHERE dataset_id = $1', id)
+    # A mirror's own vector fields (patch vectors imported here, say) are this instance's to delete; the database
+    # refuses the primary's anyway. Everything else of a mirror is the primary's.
+    own_vectors = operation == 'delete_embeddings' and mirror is not None
+    if own_vectors and payload['field_name'] in mirror['vector_fields']:
+        raise HTTPException(
+            status_code=409,
+            detail=f"{payload['field_name']} of this mirror comes from its primary: delete it there",
+        )
+    if mirror is not None and not own_vectors:
         raise HTTPException(
             status_code=409,
             detail='This dataset is a read-only mirror of a dataset on another Freedom Ridge instance: change it there',
@@ -6931,9 +6940,16 @@ async def bulk_tag_samples(id: int, request: BulkTagRequest, user: dict = Depend
         if count != len(request.sample_ids):
             raise HTTPException(status_code=400, detail=f"Some samples not found in dataset {id}")
 
-    # A mirror's tags are its primary's: sent there when its tags option is both ways, refused otherwise.
+    # A mirror's tags are its primary's: sent there when its tags option is both ways, refused otherwise. Its other
+    # array fields are the primary's alone: the tags option covers tags only.
     if await db.fetchval('SELECT 1 FROM mirrors WHERE dataset_id = $1', id):
         from .. import mirror_writes
+
+        if request.field_name != 'tags':
+            raise HTTPException(
+                status_code=409,
+                detail=f"{request.field_name} of a mirror is its primary's: only tags go back to the primary",
+            )
 
         return await mirror_writes.forward_tags(db, id, request)
 

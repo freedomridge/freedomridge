@@ -4,7 +4,8 @@ client bound to the app), then applies the primary's feed to it."""
 
 import io
 import os
-from unittest.mock import AsyncMock
+import uuid
+from unittest.mock import AsyncMock, Mock
 
 import asyncpg
 import httpx
@@ -16,6 +17,7 @@ from backend import follower_sync
 from backend.crypto import decrypt_secret, encrypt_secret
 from backend.models import ViewCreate
 from backend.routers import auth, datasets, followers, primaries, schedules, views
+from backend.tests import test_bulk_jobs
 from backend.tests import test_field_registry_postgres as registry_helpers
 
 registry_database = registry_helpers.registry_database
@@ -43,12 +45,11 @@ async def setup(monkeypatch, database):
         encrypt_secret(created['token']),
     )
 
-    def connect(link):
-        return httpx.AsyncClient(
-            transport=httpx.ASGITransport(app=app),
-            base_url=link['url'],
-            headers={'Authorization': f"Bearer {decrypt_secret(link['token_encrypted'])}"},
-        )
+    def connect(link, instance=None):
+        headers = {'Authorization': f"Bearer {decrypt_secret(link['token_encrypted'])}"}
+        if instance:
+            headers['X-Fridge-Instance'] = instance
+        return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=link['url'], headers=headers)
 
     monkeypatch.setattr(follower_sync, 'connect', connect)
     return created, link_id
@@ -540,9 +541,9 @@ def test_a_mirror_shows_the_images_its_primary_serves_when_their_option_is_on(mo
         requests = []
         connect = follower_sync.connect
 
-        def counted(link):
+        def counted(link, instance=None):
             requests.append(link)
-            return connect(link)
+            return connect(link, instance)
 
         monkeypatch.setattr(follower_sync, 'connect', counted)
         main._primary_clients.clear()
@@ -582,5 +583,441 @@ def test_a_mirror_shows_the_images_its_primary_serves_when_their_option_is_on(mo
         with pytest.raises(HTTPException) as elsewhere:
             await followers.follower_media(1, other, AsyncMock(), follower=sub)
         assert elsewhere.value.status_code == 404
+
+    registry_database(scenario)
+
+
+def test_a_restore_is_noticed_and_its_subscriptions_start_again_in_the_restored_database(
+    monkeypatch,
+    registry_database,
+):
+    async def scenario(database):
+        _, link_id = await setup(monkeypatch, database)
+        await ingest([{'crop': 'corn'}], dataset_id=1, prefix='s3://images/a')
+        follower = await database.fetchval('SELECT id FROM followers')
+        await followers.follow_dataset(follower, 1, followers.FollowOptions(), user=USER)
+        await sync(database, link_id)
+        sub = dict(await database.fetchrow('SELECT * FROM followers WHERE id = $1', follower))
+
+        # The identity is the cluster's and the database's: dropdb + createdb changes the second.
+        system_id, oid = (await followers.identity(database)).split(':')
+        assert system_id == str(await database.fetchval('SELECT system_identifier FROM pg_control_system()'))
+        assert oid == str(await database.fetchval('SELECT oid FROM pg_database WHERE datname = current_database()'))
+        cursor = (await mirror_of(database))['feed_cursor']
+        with pytest.raises(HTTPException) as restored:
+            await followers.follower_changes(1, cursor, f'{system_id}:1', 1000, follower=sub)
+        assert restored.value.status_code == 410
+
+        # Restored from another cluster: the subscription's txids are another database's. It starts again here.
+        await database.execute(
+            "UPDATE follower_datasets SET start_txid = start_txid + 10000000, acked_txid = start_txid + 10000000, "
+            "start_identity = '1:1'",
+        )
+        [entry] = (await followers.follower_config(follower=sub))['datasets']
+        row = await database.fetchrow('SELECT * FROM follower_datasets')
+        assert entry['ready'] and row['acked_txid'] is None
+        assert row['start_identity'] == await followers.identity(database)
+        assert row['start_txid'] <= await database.fetchval('SELECT txid_snapshot_xmax(txid_current_snapshot())')
+
+        # A subscription whose start was never set (its second statement failed) gets one too.
+        await database.execute('UPDATE follower_datasets SET start_txid = NULL, start_identity = NULL')
+        [entry] = (await followers.follower_config(follower=sub))['datasets']
+        assert entry['ready'] and entry['start_txid'] is not None
+
+    registry_database(scenario)
+
+
+def test_an_older_primary_s_identity_is_the_same_primary(monkeypatch, registry_database):
+    async def scenario(database):
+        _, link_id = await setup(monkeypatch, database)
+        await ingest([{'crop': 'corn'}], dataset_id=1, prefix='s3://images/a')
+        follower = await database.fetchval('SELECT id FROM followers')
+        await followers.follow_dataset(follower, 1, followers.FollowOptions(), user=USER)
+        await sync(database, link_id)
+        mirror = await mirror_of(database)
+        # Linked before the identity named the database: the bare system identifier.
+        system_id = await database.fetchval('SELECT system_identifier::text FROM pg_control_system()')
+        await database.execute('UPDATE primary_links SET identity = $1', system_id)
+        await sync(database, link_id)
+        assert (await mirror_of(database))['dataset_id'] == mirror['dataset_id']  # no new copy
+        assert (await mirror_of(database))['state'] == 'following'
+        assert await database.fetchval('SELECT identity FROM primary_links') == await followers.identity(database)
+
+    registry_database(scenario)
+
+
+def test_a_follower_before_2_6_1_keeps_following_an_upgraded_primary(monkeypatch, registry_database):
+    async def scenario(database):
+        _, link_id = await setup(monkeypatch, database)
+        await ingest([{'crop': 'corn'}], dataset_id=1, prefix='s3://images/a')
+        follower = await database.fetchval('SELECT id FROM followers')
+        await followers.follow_dataset(follower, 1, followers.FollowOptions(), user=USER)
+        await sync(database, link_id)
+        sub = dict(await database.fetchrow('SELECT * FROM followers WHERE id = $1', follower))
+        system_id, _ = (await followers.identity(database)).split(':')
+
+        # An older follower compares `identity` with the bare identifier it stored, and copies again on any change.
+        config = await followers.follower_config(follower=sub)
+        assert config['identity'] == system_id
+        assert config['database_identity'] == await followers.identity(database)
+
+        # Its cursor carries the bare identifier, also mid-sync across the primary's upgrade: still this primary.
+        cursor = (await mirror_of(database))['feed_cursor']
+        await followers.follower_changes(1, after=cursor, identity_=system_id, transactions=10, follower=sub)
+        with pytest.raises(HTTPException) as other:
+            await followers.follower_changes(1, after=cursor, identity_='1', transactions=10, follower=sub)
+        assert other.value.status_code == 410
+
+    registry_database(scenario)
+
+
+def test_one_failing_mirror_does_not_hold_up_the_other_mirrors_of_its_primary(monkeypatch, registry_database):
+    async def scenario(database):
+        _, link_id = await setup(monkeypatch, database)
+        await ingest([{'crop': 'corn'}], dataset_id=1, prefix='s3://images/a')
+        await ingest([{'crop': 'beet'}], dataset_id=2, prefix='s3://images/b')
+        follower = await database.fetchval('SELECT id FROM followers')
+        await followers.follow_dataset(follower, 1, followers.FollowOptions(), user=USER)
+        await followers.follow_dataset(follower, 2, followers.FollowOptions(), user=USER)
+        original = follower_sync.write_vectors
+
+        async def clashing(connection, dataset_id, named, vectors):
+            # The mirror of dataset 1 fails in its writes, as a vector field clash would, after writing something.
+            if (
+                await connection.fetchval('SELECT origin_dataset_id FROM mirrors WHERE dataset_id = $1', dataset_id)
+                == 1
+            ):
+                await connection.execute("UPDATE mirrors SET copy_total = -1 WHERE dataset_id = $1", dataset_id)
+                raise follower_sync.MirrorFieldClash("The primary's vector field 'clip' has 2 dimensions...")
+            await original(connection, dataset_id, named, vectors)
+
+        monkeypatch.setattr(follower_sync, 'write_vectors', clashing)
+        result = await sync(database, link_id)
+        mirrors = {row['origin_dataset_id']: dict(row) for row in await database.fetch('SELECT * FROM mirrors')}
+        assert mirrors[2]['state'] == 'following' and mirrors[2]['last_error'] is None
+        assert mirrors[1]['state'] == 'copying' and 'MirrorFieldClash' in mirrors[1]['last_error']
+        assert mirrors[1]['copy_total'] != -1  # its failed step's writes were undone
+        assert result.result == {'failed': [mirrors[1]['dataset_id']], 'waiting': 0}
+        assert '1 mirror(s) failed' in result.message
+
+        # It waits a minute before its next try, and the next run passes it over.
+        waits = 'SELECT failures, extract(epoch FROM retry_after - now()) AS wait FROM mirrors WHERE dataset_id = $1'
+        row = await database.fetchrow(waits, mirrors[1]['dataset_id'])
+        assert row['failures'] == 1 and 50 < row['wait'] <= 60
+        result = await sync(database, link_id)
+        assert result.result == {'failed': [], 'waiting': 1} and '1 wait(s) to try again' in result.message
+        await database.execute("UPDATE mirrors SET retry_after = now() - interval '1 second'")
+
+        # A failure before any write is set aside the same way, and waits twice as long.
+        monkeypatch.setattr(follower_sync, 'write_vectors', original)
+        copy_step = follower_sync.copy_step
+
+        async def refused(pool, link, client, mirror, checkpoint):
+            raise follower_sync.PrimaryRefused(400, 'Not that block')
+
+        monkeypatch.setattr(follower_sync, 'copy_step', refused)
+        result = await sync(database, link_id)
+        assert 'Not that block' in await database.fetchval(
+            'SELECT last_error FROM mirrors WHERE dataset_id = $1',
+            mirrors[1]['dataset_id'],
+        )
+        row = await database.fetchrow(waits, mirrors[1]['dataset_id'])
+        assert row['failures'] == 2 and 110 < row['wait'] <= 120
+        await database.execute("UPDATE mirrors SET retry_after = now() - interval '1 second'")
+
+        # Fixed: the next run copies it, its error goes, and its next failure waits a minute again.
+        monkeypatch.setattr(follower_sync, 'copy_step', copy_step)
+        result = await sync(database, link_id)
+        row = await database.fetchrow('SELECT * FROM mirrors WHERE dataset_id = $1', mirrors[1]['dataset_id'])
+        assert (row['state'], row['last_error'], row['failures'], row['retry_after']) == ('following', None, 0, None)
+        assert result.result == {'failed': [], 'waiting': 0}
+
+    registry_database(scenario)
+
+
+def test_only_a_final_refusal_stops_the_mirrors(monkeypatch, registry_database):
+    async def scenario(database):
+        _, link_id = await setup(monkeypatch, database)
+        await ingest([{'crop': 'corn'}], dataset_id=1, prefix='s3://images/a')
+        follower = await database.fetchval('SELECT id FROM followers')
+        await followers.follow_dataset(follower, 1, followers.FollowOptions(), user=USER)
+        await sync(database, link_id)
+        call = follower_sync.call
+
+        async def proxy_forbids(client, method, path, **kwargs):
+            if path == '/follower/config':
+                raise follower_sync.PrimaryRefused(403, 'Forbidden by the proxy')  # no code: not the primary's word
+            return await call(client, method, path, **kwargs)
+
+        monkeypatch.setattr(follower_sync, 'call', proxy_forbids)
+        with pytest.raises(follower_sync.PrimaryRefused):
+            await sync(database, link_id)
+        assert (await mirror_of(database))['state'] == 'following'
+        assert 'Forbidden by the proxy' in await database.fetchval('SELECT last_error FROM primary_links')
+
+        # The primary's own refusal says it's final.
+        monkeypatch.setattr(follower_sync, 'call', call)
+        await database.execute('DELETE FROM followers')  # removed there
+        with pytest.raises(HTTPException) as removed:
+            await followers.current_follower(
+                Mock(headers={}),
+                account={'id': await database.fetchval('SELECT id FROM users LIMIT 1')},
+            )
+        assert removed.value.status_code == 403 and getattr(removed.value, 'code', None) == 'follower_removed'
+
+    registry_database(scenario)
+
+
+def test_the_tags_option_covers_tags_only_and_a_concept_view_stays_where_it_was_made(monkeypatch, registry_database):
+    async def scenario(database):
+        _, link_id = await setup(monkeypatch, database)
+        monkeypatch.setattr(views, 'db', database)
+        await ingest([{'crop': 'corn'}], dataset_id=1, prefix='s3://images/a')
+        follower = await database.fetchval('SELECT id FROM followers')
+        await followers.follow_dataset(follower, 1, followers.FollowOptions(tags='both', views='both'), user=USER)
+        await sync(database, link_id)
+        mirror = (await mirror_of(database))['dataset_id']
+        [sample] = (await copied(database, {'dataset_id': mirror})).values()
+        sub = dict(await database.fetchrow('SELECT * FROM followers WHERE id = $1', follower))
+
+        # Another array field of the primary's: refused on both sides.
+        await datasets.create_array_field(1, datasets.CreateArrayFieldRequest(field_name='labels'), user=USER)
+        await sync(database, link_id)
+        with pytest.raises(ValueError):
+            followers.TagRequest(sample_ids=[sample['origin_id']], field_name='labels', add_tags=['x'])
+        with pytest.raises(HTTPException) as other:
+            await datasets.bulk_tag_samples(
+                mirror,
+                datasets.BulkTagRequest(sample_ids=[sample['id']], field_name='labels', add_tags=['x']),
+                user=USER,
+            )
+        assert other.value.status_code == 409
+
+        # A view using a concept: refused by the primary, and kept on the mirror, shared here.
+        concept = {'filters': CONCEPT_FILTER}
+        with pytest.raises(HTTPException) as refused:
+            await followers.follower_create_view(1, followers.ViewRequest(name='Weedy', content=concept), follower=sub)
+        assert refused.value.status_code == 400
+        view = await views.create_view(mirror, ViewCreate(name='Weedy', content=concept, is_public=True), user=USER)
+        assert not view.get('from_primary') and view['is_public']
+        assert not await database.fetchval("SELECT 1 FROM views WHERE dataset_id = 1 AND name = 'Weedy'")
+        await sync(database, link_id)
+        assert await database.fetchval("SELECT 1 FROM views WHERE dataset_id = $1 AND name = 'Weedy'", mirror)
+
+    registry_database(scenario)
+
+
+async def test_a_vector_field_clash_says_which_field_and_why(monkeypatch):
+    class Connection:  # a vector index of this name at another size refuses the primary's vectors
+        async def execute(self, sql, *args):
+            if sql.lstrip().startswith('INSERT INTO embeddings'):
+                raise asyncpg.exceptions.DataError('expected 768 dimensions, not 2')
+
+        async def copy_to_table(self, *args, **kwargs):
+            pass
+
+        async def fetchval(self, sql, *args):
+            return []  # no field of this instance's under that name
+
+    monkeypatch.setattr(follower_sync, 'require_free_space', AsyncMock())
+    monkeypatch.setattr(follower_sync, 'clear_placement', AsyncMock())
+    with pytest.raises(follower_sync.MirrorFieldClash) as clash:
+        await follower_sync.write_vectors(Connection(), 5, [(1, 'clip')], {'clip': [(1, [0.5, 0.25])]})
+    assert "vector field 'clip' has 2 dimensions" in str(clash.value) and 'expected 768' in str(clash.value)
+
+
+def test_a_primary_field_replaces_all_of_a_same_named_field_the_mirror_had(monkeypatch, registry_database):
+    async def scenario(database):
+        _, link_id = await setup(monkeypatch, database)
+        await ingest([{'crop': 'corn'}, {'crop': 'soy'}], dataset_id=1, prefix='s3://images/a')
+        corn, soy = [r['id'] for r in await database.fetch('SELECT id FROM samples WHERE dataset_id = 1 ORDER BY id')]
+        follower = await database.fetchval('SELECT id FROM followers')
+        await followers.follow_dataset(follower, 1, followers.FollowOptions(), user=USER)
+        await sync(database, link_id)
+        mirror = (await mirror_of(database))['dataset_id']
+        local = {row['origin_id']: row['id'] for row in (await copied(database, {'dataset_id': mirror})).values()}
+        # This instance's own vectors and map, on both samples, under a name the primary doesn't have yet.
+        await database.execute(
+            "INSERT INTO embeddings (sample_id, field_name, vector) "
+            "VALUES ($1, 'dino', '[9,9]'), ($2, 'dino', '[8,8]'), ($2, 'dino_patch_2x2_r0c0', '[7,7]')",
+            local[corn],
+            local[soy],
+        )
+        # A patch map is kept under its scale's name.
+        await database.execute(
+            "INSERT INTO embedding_viz_meta (dataset_id, field_name, total_points) "
+            "VALUES ($1, 'dino', 2), ($1, 'dino_patch_2x2', 1)",
+            mirror,
+        )
+
+        # The primary makes a field of that name, on one sample: all of the mirror's own goes, its map too.
+        await database.execute(
+            "INSERT INTO embeddings (sample_id, field_name, vector) "
+            "VALUES ($1, 'dino', '[1,0]'), ($1, 'dino_patch_2x2_r0c0', '[0,1]')",
+            corn,
+        )
+        await sync(database, link_id)
+        rows = {
+            row['sample_id']: row['vector']
+            for row in await database.fetch(
+                "SELECT sample_id, vector::text FROM embeddings "
+                "WHERE field_name = 'dino' AND sample_id = ANY($1::int[])",
+                [local[corn], local[soy]],
+            )
+        }
+        assert rows == {local[corn]: '[1,0]'}  # soy's own vector didn't stay beside the primary's field
+        assert 'dino' in (await mirror_of(database))['vector_fields']
+        assert not await database.fetchval(
+            "SELECT 1 FROM embedding_viz_meta WHERE dataset_id = $1 AND field_name IN ('dino', 'dino_patch_2x2')",
+            mirror,
+        )
+
+    registry_database(scenario)
+
+
+def test_a_mirror_s_own_vectors_can_be_deleted_and_the_primary_s_cannot(monkeypatch, registry_database):
+    async def scenario(database):
+        _, link_id = await setup(monkeypatch, database)
+        monkeypatch.setattr(datasets, 'db', database)
+        await ingest([{'crop': 'corn'}], dataset_id=1, prefix='s3://images/a')
+        corn = await database.fetchval('SELECT id FROM samples WHERE dataset_id = 1')
+        await database.execute(
+            "INSERT INTO embeddings (sample_id, field_name, vector) VALUES ($1, 'clip', '[1,0]')",
+            corn,
+        )
+        follower = await database.fetchval('SELECT id FROM followers')
+        await followers.follow_dataset(follower, 1, followers.FollowOptions(), user=USER)
+        await sync(database, link_id)
+        mirror = (await mirror_of(database))['dataset_id']
+        local = await database.fetchval('SELECT id FROM samples WHERE dataset_id = $1', mirror)
+        await database.execute(
+            "INSERT INTO embeddings (sample_id, field_name, vector) VALUES ($1, 'patches', '[0,1]')",
+            local,
+        )
+        everything = datasets.BulkTargetRequest(filters={})
+        submitted = await datasets.bulk_delete_embeddings(mirror, 'patches', everything, user=USER)
+        assert submitted.status_code == 202  # this instance's own field
+        assert (await test_bulk_jobs.finish(database))['result'] == {'deleted': 1}
+        fields = 'SELECT array_agg(field_name ORDER BY field_name) FROM embeddings WHERE sample_id = $1'
+        assert await database.fetchval(fields, local) == ['clip']  # the primary's field is untouched
+        with pytest.raises(HTTPException) as theirs:
+            await datasets.bulk_delete_embeddings(mirror, 'clip', everything, user=USER)
+        assert theirs.value.status_code == 409 and 'comes from its primary' in theirs.value.detail
+
+    registry_database(scenario)
+
+
+def test_one_link_per_primary_and_one_instance_per_follower_token(monkeypatch, registry_database):
+    async def scenario(database):
+        created, link_id = await setup(monkeypatch, database)
+        monkeypatch.setattr(primaries, 'db', database)
+        await sync(database, link_id)  # records the primary's identity, as adding it does
+        # The same primary under another address: refused, by its identity.
+        with pytest.raises(HTTPException) as again:
+            await primaries.add_primary(
+                primaries.PrimaryCreate(url='http://primary-by-another-name.example/api', token=created['token']),
+                user=USER,
+            )
+        assert again.value.status_code == 409 and 'already follows that primary' in again.value.detail
+
+        # The primary bound the token to the first instance that used it: this one, by its installation id, which
+        # a dump carries (a restored or moved follower is the same instance).
+        this = await follower_sync.installation_id(database)
+        assert await database.fetchval('SELECT instance FROM followers') == this
+        account = {'id': await database.fetchval('SELECT user_id FROM followers')}
+        await followers.current_follower(Mock(headers={'X-Fridge-Instance': this}), account=account)
+        await followers.current_follower(Mock(headers={}), account=account)  # an older follower: not checked
+        reinstalled = str(uuid.uuid4())
+        with pytest.raises(HTTPException) as other:
+            await followers.current_follower(Mock(headers={'X-Fridge-Instance': reinstalled}), account=account)
+        assert other.value.status_code == 409 and getattr(other.value, 'code', None) == 'follower_instance_mismatch'
+        assert await database.fetchval('SELECT instance FROM followers') == this
+
+        # Reinstalled from scratch: an admin there resets it, and the next installation that calls takes it.
+        monkeypatch.setattr(followers, 'db', database)
+        [listed] = await followers.list_followers(user=USER)
+        assert listed['bound']
+        await followers.reset_follower_instance(listed['id'], user=USER)
+        await followers.current_follower(Mock(headers={'X-Fridge-Instance': reinstalled}), account=account)
+        assert await database.fetchval('SELECT instance FROM followers') == reinstalled
+
+    registry_database(scenario)
+
+
+def test_the_feed_fetches_vectors_only_for_new_samples_and_keeps_the_id_sequence(monkeypatch, registry_database):
+    async def scenario(database):
+        _, link_id = await setup(monkeypatch, database)
+        await ingest([{'crop': 'corn'}], dataset_id=1, prefix='s3://images/a')
+        corn = await database.fetchval('SELECT id FROM samples WHERE dataset_id = 1')
+        await database.execute(
+            "INSERT INTO embeddings (sample_id, field_name, vector) VALUES ($1, 'clip', '[1,0]')",
+            corn,
+        )
+        follower = await database.fetchval('SELECT id FROM followers')
+        await followers.follow_dataset(follower, 1, followers.FollowOptions(), user=USER)
+        await sync(database, link_id)
+        asked = []
+        fetch_vectors = follower_sync.fetch_vectors
+
+        async def recorded(client, origin, origin_ids, fields=None):
+            asked.append(sorted(origin_ids))
+            return await fetch_vectors(client, origin, origin_ids, fields)
+
+        monkeypatch.setattr(follower_sync, 'fetch_vectors', recorded)
+        # A tag changes corn's block, and a new sample arrives in it with a vector: only the new one's are fetched.
+        await database.execute("UPDATE samples SET tags = '{reviewed}' WHERE id = $1", corn)
+        await ingest([{'crop': 'soy'}], dataset_id=1, prefix='s3://images/b')
+        soy = await database.fetchval("SELECT id FROM samples WHERE metadata->>'crop' = 'soy'")
+        await database.execute(
+            "INSERT INTO embeddings (sample_id, field_name, vector) VALUES ($1, 'clip', '[0,1]')",
+            soy,
+        )
+        await sync(database, link_id)
+        assert corn not in [origin_id for request in asked for origin_id in request]
+        mirror = await mirror_of(database)
+        local = {row['origin_id']: row['id'] for row in (await copied(database, mirror)).values()}
+        vectors = dict(
+            await database.fetch(
+                "SELECT sample_id, vector::text FROM embeddings "
+                "WHERE field_name = 'clip' AND sample_id = ANY($1::int[])",
+                [local[corn], local[soy]],
+            ),
+        )
+        assert vectors == {local[corn]: '[1,0]', local[soy]: '[0,1]'}  # corn's kept, soy's came
+
+        # A changed vector updates the mirror's row without taking a sequence value.
+        before = await database.fetchval('SELECT last_value FROM embeddings_id_seq')
+        await database.execute("UPDATE embeddings SET vector = '[0.5,0.5]' WHERE sample_id = $1", corn)
+        await sync(database, link_id)
+        assert await database.fetchval('SELECT vector::text FROM embeddings WHERE sample_id = $1', local[corn]) == (
+            '[0.5,0.5]'
+        )
+        assert await database.fetchval('SELECT last_value FROM embeddings_id_seq') == before
+
+    registry_database(scenario)
+
+
+def test_a_follower_can_ask_for_feed_pages_bounded_by_vector_changes(monkeypatch, registry_database):
+    async def scenario(database):
+        _, link_id = await setup(monkeypatch, database)
+        await ingest([{'crop': 'a'}, {'crop': 'b'}, {'crop': 'c'}], dataset_id=1, prefix='s3://images/a')
+        ids = [row['id'] for row in await database.fetch('SELECT id FROM samples WHERE dataset_id = 1 ORDER BY id')]
+        follower = await database.fetchval('SELECT id FROM followers')
+        await followers.follow_dataset(follower, 1, followers.FollowOptions(), user=USER)
+        await sync(database, link_id)
+        cursor = (await mirror_of(database))['feed_cursor']
+        for sample_id in ids:  # three transactions, one vector change each
+            await database.execute(
+                "INSERT INTO embeddings (sample_id, field_name, vector) VALUES ($1, 'clip', '[1,1]')",
+                sample_id,
+            )
+        sub = dict(await database.fetchrow('SELECT * FROM followers WHERE id = $1', follower))
+        ident = await followers.identity(database)
+        page = await followers.follower_changes(1, cursor, ident, 1000, vector_limit=1, follower=sub)
+        assert page['more'] and [v['sample_id'] for v in page['vectors']] == ids[:1]
+        rest = await followers.follower_changes(1, page['cursor'], ident, 1000, vector_limit=2, follower=sub)
+        assert not rest['more'] and [v['sample_id'] for v in rest['vectors']] == ids[1:]
+        whole = await followers.follower_changes(1, cursor, ident, 1000, follower=sub)  # an older follower
+        assert not whole['more'] and len(whole['vectors']) == 3
 
     registry_database(scenario)
