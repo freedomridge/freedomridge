@@ -7,7 +7,8 @@
 # development ones, and the ports listen on 127.0.0.1. Put images in ./data. It is mounted at the same
 # path in the containers (FRIDGE_DATA_ROOT), so paths you give the SDK on this machine work as they are.
 # Run Compose from this folder: the path comes from the shell's $PWD. MAPBOX_TOKEN in the environment or
-# a .env file turns the map on. A server needs docker-compose.prod.yml (docs/DOCKER_DEPLOYMENT.md).
+# a .env file turns the map on; FRIDGE_PORT and FRIDGE_API_PORT move the two ports. `npx freedomridge` runs
+# this file for you. A server needs docker-compose.prod.yml (docs/DOCKER_DEPLOYMENT.md).
 name: freedomridge-try
 
 services:
@@ -43,7 +44,7 @@ services:
       FRIDGE_CROP_CACHE_PATH: /cache/crop
       FRIDGE_UMAP_MODEL_DIR: /models
     ports:
-      - "127.0.0.1:8000:8000"  # the API, for the SDK: fridge.connect("http://localhost:8000/api", ...)
+      - "127.0.0.1:${FRIDGE_API_PORT:-8000}:8000"  # the API, for the SDK: fridge.connect("http://localhost:8000/api", ...)
     volumes:
       - ./data:${PWD}/data:ro
       - cache:/cache
@@ -78,7 +79,7 @@ services:
       HOSTNAME: 0.0.0.0
       MAPBOX_TOKEN: ${MAPBOX_TOKEN:-}
     ports:
-      - "127.0.0.1:3000:3000"
+      - "127.0.0.1:${FRIDGE_PORT:-3000}:3000"
     depends_on:
       - backend
     restart: unless-stopped

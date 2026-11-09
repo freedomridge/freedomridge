@@ -46,6 +46,16 @@ and enforced on the server: you get to see all of it.
 
 ## Try it locally
 
+**With Docker and Node.js** (from 2.5.0):
+
+```bash
+npx freedomridge
+```
+
+It starts the release's published images from `~/freedomridge` and opens http://localhost:3000; run it again
+with a newer version to upgrade, and `npx freedomridge stop` to stop. More in
+[launcher/README.md](launcher/README.md).
+
 **With only Docker** (from 2.2.0): download a release and start its published images.
 
 ```bash

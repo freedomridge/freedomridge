@@ -24,6 +24,13 @@ it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
   architecture, so an x86_64 `instance_type` works as before. An existing deployment is unchanged: the module
   never replaces or resizes a running instance. Moving one to Arm means a new instance.
 
+- **`npx freedomridge`** ([launcher/README.md](launcher/README.md)): runs this release on one machine with Docker
+  and Node.js. It puts the release's try-it Compose file in `~/freedomridge`, pulls the images, brings the
+  folder's database up to the release with the release's own migrations, starts it and opens the app. Run with
+  a newer version, it upgrades; it refuses a folder a newer release runs. `stop`, `status` and `logs`, and
+  `--port`/`--api-port`, kept in the folder's `.env`. `docker-compose.try.yml` takes `FRIDGE_PORT` and
+  `FRIDGE_API_PORT` for the same. The launcher is published to npm by the release tag, after approval, like the SDK.
+
 ### Changed
 
 - **On-demand workers start Arm (Graviton) machines by default**, `r7g.2xlarge`: the same 8 vCPUs and 64 GiB as

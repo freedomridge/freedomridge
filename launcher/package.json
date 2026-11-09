@@ -1,0 +1,26 @@
+{
+  "name": "freedomridge",
+  "version": "2.4.0",
+  "description": "Run Freedom Ridge, the self-hosted tool for exploring and curating computer vision datasets, on this machine with Docker: npx freedomridge",
+  "license": "MIT",
+  "homepage": "https://github.com/freedomridge/freedomridge",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/freedomridge/freedomridge.git",
+    "directory": "launcher"
+  },
+  "bin": {
+    "freedomridge": "bin/freedomridge.js"
+  },
+  "files": [
+    "bin/",
+    "release/"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "prepack": "node scripts/bundle.js",
+    "test": "node --test test/"
+  }
+}

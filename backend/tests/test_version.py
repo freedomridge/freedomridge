@@ -20,6 +20,8 @@ def test_every_manifest_carries_the_version():
         "pyproject.toml": tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]["version"],
         "python/pyproject.toml": tomllib.loads((ROOT / "python/pyproject.toml").read_text())["project"]["version"],
         "frontend/package.json": json.loads((ROOT / "frontend/package.json").read_text())["version"],
+        # npx freedomridge: it runs the images of its own version.
+        "launcher/package.json": json.loads((ROOT / "launcher/package.json").read_text())["version"],
     }
     lock = json.loads((ROOT / "frontend/package-lock.json").read_text())
     found["frontend/package-lock.json"] = lock["version"]
@@ -28,7 +30,7 @@ def test_every_manifest_carries_the_version():
     for package in uv_lock["package"]:
         if package["name"] in ("freedomridge", "freedomridge-app"):
             found[f"uv.lock ({package['name']})"] = package["version"]
-    assert len(found) == 7
+    assert len(found) == 8
     assert {name: version for name, version in found.items() if version != VERSION} == {}
 
 

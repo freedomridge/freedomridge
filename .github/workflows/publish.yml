@@ -1,8 +1,8 @@
-# Publishes the Python SDK (python/) to PyPI as freedomridge when a release is tagged. PyPI trusts this
-# workflow in this repository through OpenID Connect (trusted publishing), so no token is stored, and the
-# upload waits for a maintainer's approval in the pypi environment: PyPI never takes a version number twice,
-# so an upload can't be replaced. Only freedomridge/freedomridge publishes; the development repository and
-# forks skip both jobs.
+# Publishes the Python SDK (python/) to PyPI, and the launcher (launcher/, `npx freedomridge`) to npm, both as
+# freedomridge, when a release is tagged. PyPI and npm trust this workflow in this repository through OpenID
+# Connect (trusted publishing), so no token is stored, and each upload waits for a maintainer's approval in its
+# environment (pypi, npm): neither registry takes a version number twice, so an upload can't be replaced. Only
+# freedomridge/freedomridge publishes; the development repository and forks skip every job.
 #
 # A release tagged before this workflow is published by starting it by hand with the tag.
 #
@@ -52,6 +52,20 @@ jobs:
           name: sdk
           path: dist/
           if-no-files-found: error
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7.1.0
+        with:
+          node-version: 26
+      - name: The launcher, with this release's Compose file and schema (its prepack checks the versions agree)
+        working-directory: launcher
+        run: |
+          node --test test/
+          npm pack --pack-destination ../dist-npm
+          ls "../dist-npm/freedomridge-${TAG#v}.tgz"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: launcher
+          path: dist-npm/
+          if-no-files-found: error
 
   publish:
     needs: build
@@ -68,3 +82,25 @@ jobs:
           name: sdk
           path: dist/
       - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086  # v1.14.3
+
+  publish-npm:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: npm
+      url: https://www.npmjs.com/package/freedomridge
+    permissions:
+      id-token: write  # trusted publishing, which also records the package's provenance
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          name: launcher
+          path: dist-npm/
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7.1.0
+        with:
+          node-version: 26
+      - name: Publish (trusted publishing needs npm 11.5.1 or newer)
+        run: |
+          npm --version
+          npm publish dist-npm/freedomridge-*.tgz --access public
