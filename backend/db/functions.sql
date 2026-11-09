@@ -387,11 +387,13 @@ BEGIN
             IF OLD.tags IS DISTINCT FROM NEW.tags THEN affected := affected || ARRAY['tags']; END IF;
             IF OLD.media_type IS DISTINCT FROM NEW.media_type THEN affected := affected || ARRAY['media_type']; END IF;
         END IF;
+        PERFORM sample_block_changed(NEW.dataset_id, NEW.id::bigint / 4096);
         PERFORM record_stats_work(NEW.dataset_id, NEW.id::bigint / 4096, affected);
     END IF;
     IF TG_OP = 'DELETE' OR (TG_OP = 'UPDATE' AND
         (OLD.dataset_id, OLD.id::bigint / 4096) IS DISTINCT FROM (NEW.dataset_id, NEW.id::bigint / 4096)) THEN
         IF EXISTS (SELECT 1 FROM datasets WHERE id = OLD.dataset_id) THEN
+            PERFORM sample_block_changed(OLD.dataset_id, OLD.id::bigint / 4096);
             PERFORM record_stats_work(OLD.dataset_id, OLD.id::bigint / 4096, NULL);
         END IF;
     END IF;
@@ -1190,3 +1192,60 @@ BEGIN
                                          'model_id', current_model)::text;
 END;
 $$ LANGUAGE plpgsql STABLE PARALLEL SAFE;
+
+CREATE OR REPLACE FUNCTION sample_block_changed(target_dataset INTEGER, target_block BIGINT) RETURNS VOID AS $$
+BEGIN
+    IF current_setting('fridge.deletion_dataset', TRUE) = target_dataset::text THEN
+        RETURN;
+    END IF;
+    INSERT INTO sample_block_changes (dataset_id, block_id)
+    SELECT target_dataset, target_block FROM datasets WHERE id = target_dataset AND followed
+    ON CONFLICT DO NOTHING;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION log_vector_changes() RETURNS trigger AS $$
+BEGIN
+    -- Most installations follow nothing: skip reading the changed rows at all.
+    IF NULLIF(current_setting('fridge.deletion_dataset', TRUE), '') IS NOT NULL
+       OR NOT EXISTS (SELECT 1 FROM datasets WHERE followed) THEN
+        RETURN NULL;
+    END IF;
+    INSERT INTO vector_changes (dataset_id, sample_id, kind, field_name)
+    SELECT DISTINCT s.dataset_id, c.sample_id, TG_ARGV[0], c.field_name
+    FROM changed c JOIN samples s ON s.id = c.sample_id JOIN datasets d ON d.id = s.dataset_id
+    WHERE d.followed;
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION log_dataset_change() RETURNS trigger AS $$
+BEGIN
+    -- Most installations follow nothing: skip reading the changed rows at all.
+    IF NULLIF(current_setting('fridge.deletion_dataset', TRUE), '') IS NOT NULL
+       OR NOT EXISTS (SELECT 1 FROM datasets WHERE followed) THEN
+        RETURN NULL;
+    END IF;
+    INSERT INTO dataset_changes (dataset_id, kind)
+    SELECT DISTINCT c.dataset_id, TG_ARGV[0] FROM changed c JOIN datasets d ON d.id = c.dataset_id WHERE d.followed;
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION log_dataset_settings() RETURNS trigger AS $$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        IF OLD.followed THEN
+            INSERT INTO dataset_changes (dataset_id, kind) VALUES (OLD.id, 'deleted');
+        END IF;
+        RETURN NULL;
+    END IF;
+    IF NEW.followed AND (OLD.name, OLD.description, OLD.media_fields, OLD.grid_media_field, OLD.modal_media_field,
+                         OLD.segmentation_config, OLD.default_view_id)
+        IS DISTINCT FROM (NEW.name, NEW.description, NEW.media_fields, NEW.grid_media_field, NEW.modal_media_field,
+                          NEW.segmentation_config, NEW.default_view_id) THEN
+        INSERT INTO dataset_changes (dataset_id, kind) VALUES (NEW.id, 'settings');
+    END IF;
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;

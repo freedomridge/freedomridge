@@ -4,6 +4,27 @@ Freedom Ridge has one version for the server, the web app and the Python SDK (th
 file), following [Semantic Versioning](https://semver.org). A release lists **upgrade notes** when
 it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
 
+## Unreleased
+
+### Upgrade notes
+
+- One database migration, `0007_follower_change_log.sql`. It adds the `datasets.followed` column, the
+  `sample_block_changes`, `vector_changes` and `dataset_changes` tables and their triggers, and rewrites nothing. Apply it with
+  `scripts/apply_migrations.sh` (step 4 of [Upgrading](docs/UPGRADING.md)). It waits at most 2 seconds for its
+  locks: if it stops with a lock timeout, run it again.
+
+### Added
+
+- **A change log for follower instances.** Every change to a followed dataset is logged with the transaction
+  that made it, by triggers, whatever path made it:
+  - samples inserted, changed or deleted, by block of 4096 ids, from the statistics trigger already on samples;
+  - vectors and hashes, per sample and field;
+  - its field registry, settings and saved views;
+  - its deletion.
+
+  It's what a follower's change feed will read. A dataset nobody follows logs nothing, and no dataset is
+  followed until followers can be added.
+
 ## 2.3.0 (2026-11-08)
 
 2.3.0 adds what a follower instance needs first: one image's patch vectors computed without a server, and a
