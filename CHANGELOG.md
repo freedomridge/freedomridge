@@ -4,7 +4,11 @@ Freedom Ridge has one version for the server, the web app and the Python SDK (th
 file), following [Semantic Versioning](https://semver.org). A release lists **upgrade notes** when
 it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
 
-## Unreleased
+## 2.6.0 (2026-11-09)
+
+2.6.0 lets a primary serve a followed dataset's images to its follower, an option off by default, and shows 16-bit
+and float greyscale images (multispectral bands, thermal frames) instead of a white picture. The AWS guide shows how
+to move an x86_64 server to Arm. One migration.
 
 ### Upgrade notes
 
