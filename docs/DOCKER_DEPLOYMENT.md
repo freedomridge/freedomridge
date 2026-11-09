@@ -103,7 +103,9 @@ with the RAM, CPU or GPU for them; the server does not need to be sized for that
 work the same way: set `JOB_RUNNER_PLACEMENTS=server` in `.env` and run `python -m fridge.worker` on a
 machine with the memory ([SDK](SDK.md), "Compute workers"). The server still exports the vectors and swaps
 the new map in; only the fit moves, so the server needs no `JOB_RUNNER_MEMORY_LIMIT` for it. A fit that no
-worker claims within 12 hours is cancelled, and the old map stays.
+worker claims within 12 hours is cancelled, and the old map stays. Without a machine of your own, the server
+can start one on AWS for the waiting fits and let it power off afterwards ([On-demand compute
+workers](ON_DEMAND_WORKERS.md)).
 
 ## TLS, startup and admin login
 

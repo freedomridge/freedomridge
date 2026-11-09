@@ -115,6 +115,18 @@ job's lease meanwhile; if the lease is lost, or someone cancels the job, the fit
 SIGTERM) gives the job back. Work files live in `FRIDGE_WORKER_DIR` (default `~/.fridge/worker`), one folder
 per job, removed when it ends.
 
+`--exit-when-idle SECONDS` makes the worker exit once it has had no job for that long, an unreachable server
+included, so a machine started for some jobs can power off when they're done.
+
+With Docker, the server's own `backend` image has the worker and everything a fit needs. Use the server's
+version, so the two match:
+
+```bash
+docker run --rm -e FRIDGE_API_URL=https://YOUR_DOMAIN/api -e FRIDGE_API_TOKEN=<worker token> \
+  -e FRIDGE_WORKER_DIR=/tmp/fridge-worker ghcr.io/freedomridge/backend:<server version> \
+  python -m fridge.worker --exit-when-idle 600
+```
+
 ## Core Classes
 
 ### Dataset

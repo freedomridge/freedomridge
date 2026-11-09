@@ -2746,6 +2746,47 @@ CREATE TRIGGER coordinates_log_delete AFTER DELETE ON embedding_coordinates REFE
 CREATE TRIGGER viz_meta_log_ranked AFTER INSERT OR UPDATE ON embedding_viz_meta
     FOR EACH ROW EXECUTE FUNCTION log_map_ranked();
 
+-- On-demand compute workers (0010, docs/ON_DEMAND_WORKERS.md): the launcher's settings and the machines it started.
+CREATE TABLE IF NOT EXISTS compute_launcher (
+    singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
+    enabled BOOLEAN NOT NULL DEFAULT FALSE,
+    region TEXT NOT NULL DEFAULT '',
+    instance_type TEXT NOT NULL DEFAULT 'r7i.2xlarge',
+    subnet_id TEXT,                                      -- NULL: the region's default VPC
+    security_group_ids TEXT[] NOT NULL DEFAULT '{}',     -- empty: the VPC's default security group
+    server_url TEXT NOT NULL DEFAULT '',                 -- the API address the machines reach this server at
+    image TEXT,                                          -- NULL: this version's ghcr.io/freedomridge/backend
+    access_key_id TEXT,                                  -- NULL: the server's own AWS credentials (its role)
+    secret_access_key_encrypted TEXT,                    -- with STORAGE_ENCRYPTION_KEY
+    wait_minutes INTEGER NOT NULL DEFAULT 5 CHECK (wait_minutes >= 1),
+    idle_minutes INTEGER NOT NULL DEFAULT 10 CHECK (idle_minutes >= 1),
+    max_machines INTEGER NOT NULL DEFAULT 1 CHECK (max_machines >= 1),
+    max_hours_per_machine DOUBLE PRECISION NOT NULL DEFAULT 6 CHECK (max_hours_per_machine > 0),
+    monthly_hours DOUBLE PRECISION NOT NULL DEFAULT 40 CHECK (monthly_hours > 0),
+    last_error TEXT,
+    last_error_at TIMESTAMPTZ,
+    updated_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+INSERT INTO compute_launcher DEFAULT VALUES ON CONFLICT DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS compute_launches (
+    id SERIAL PRIMARY KEY,
+    job_id UUID REFERENCES jobs(id) ON DELETE SET NULL,  -- the job it was started for
+    instance_id TEXT UNIQUE,                             -- NULL until AWS answers
+    region TEXT NOT NULL,
+    instance_type TEXT NOT NULL,
+    market TEXT NOT NULL CHECK (market IN ('spot', 'on-demand')),
+    worker_name TEXT NOT NULL,                           -- the name its worker registers with
+    token_id INTEGER REFERENCES api_tokens(id) ON DELETE SET NULL,
+    state TEXT NOT NULL DEFAULT 'starting' CHECK (state IN ('starting', 'running', 'ended')),
+    launched_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    connected_at TIMESTAMPTZ,
+    ended_at TIMESTAMPTZ,
+    end_reason TEXT
+);
+CREATE INDEX IF NOT EXISTS compute_launches_live ON compute_launches (launched_at) WHERE state <> 'ended';
+
 -- Ledger of applied migrations: the 1.0.0 baseline, then the files in backend/db/migrations/
 -- (0001_..., 0002_...) that scripts/apply_migrations.sh applies to existing databases. A fresh install
 -- from this file IS current: when you add a migration, make the same change here and ADD ITS
@@ -2764,5 +2805,6 @@ INSERT INTO schema_migrations (filename) VALUES
     ('0006_map_placement_hold.sql'),
     ('0007_follower_change_log.sql'),
     ('0008_followers.sql'),
-    ('0009_mirrors.sql')
+    ('0009_mirrors.sql'),
+    ('0010_compute_launcher.sql')
 ON CONFLICT (filename) DO NOTHING;

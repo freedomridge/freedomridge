@@ -16,6 +16,8 @@ it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
   `follower` scope. It's applied the same way.
 - A third, `0009_mirrors.sql`: the follower's tables (`primary_links`, `mirrors`, `mirror_samples`,
   `mirror_views`) and the checks that keep a mirror read-only. Also applied the same way.
+- A fourth, `0010_compute_launcher.sql`: the on-demand workers' settings (off) and the machines they start. Also
+  applied the same way.
 
 ### Added
 
@@ -49,6 +51,20 @@ it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
   - Views that use a concept stay on the primary.
   - A mirror stops when the primary stops sharing it, removes the follower or is restored into a new database;
     it then stays as a read-only copy to keep or delete.
+- **`python -m fridge.worker --exit-when-idle SECONDS`:** a compute worker exits once it has had no job for that
+  long, an unreachable server included, so a machine started for some jobs can power off afterwards. The SDK
+  docs show running a worker from the server's `backend` image with Docker.
+- **On-demand compute workers** ([ON_DEMAND_WORKERS.md](docs/ON_DEMAND_WORKERS.md)), off until an admin turns
+  them on under Settings → Compute Workers.
+  - When a compute job (a map re-fit) has waited with no worker free, the job runner starts an AWS spot machine,
+    or on-demand when AWS has no spot capacity. The machine runs the worker from this version's backend image
+    and powers off, and so terminates, once the worker is idle.
+  - Limits are times: machines at once, hours per machine, machine-hours a month. A job held back by one says
+    which.
+  - Each machine has its own worker token, revoked when it ends. Machines that AWS ended, that are over their
+    time, or whose worker never came or went quiet are ended once a minute.
+  - **Check with AWS** dry-runs a launch with the settings. The Terraform module attaches the AWS permissions
+    with `on_demand_workers = true`.
 
 ## 2.3.0 (2026-11-08)
 

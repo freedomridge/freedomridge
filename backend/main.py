@@ -23,6 +23,7 @@ from .request_limits import RequestLimitsMiddleware
 from .routers import (
     auth,
     backup_settings,
+    compute_launcher,
     concepts,
     datasets,
     embeddings,
@@ -252,6 +253,7 @@ app.include_router(index_advisor.router, prefix="/api")
 app.include_router(workers.router, prefix="/api")
 app.include_router(followers.router, prefix="/api")
 app.include_router(primaries.router, prefix="/api")
+app.include_router(compute_launcher.router, prefix="/api")
 
 
 @app.get("/api/health")

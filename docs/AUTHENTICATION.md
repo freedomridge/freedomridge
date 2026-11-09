@@ -218,6 +218,8 @@ the variable.
 | `/api/follower/datasets/{id}/tags`, `.../views`, `.../views/{view_id}` | POST, DELETE | follower token | Edits sent up, when the dataset's tags or views option is both ways |
 | `/api/primaries` | POST, GET | admin | On a follower: follow a primary (its follower token is checked first); list primaries and their mirrors |
 | `/api/primaries/{id}` | DELETE | admin | Stop following a primary; its mirrors stay as read-only copies |
+| `/api/compute-launcher` | GET, PUT | admin | On-demand compute workers: their settings (never the secret), and the machines started |
+| `/api/compute-launcher/check` | POST | admin | Ask AWS whether it would start a machine with the saved settings (a dry run) |
 
 ## Troubleshooting
 

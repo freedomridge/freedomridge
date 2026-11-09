@@ -207,6 +207,37 @@ def test_the_worker_retries_registers_again_when_dropped_and_stops_on_a_refused_
     assert waits == [sdk_worker.RETRY_SECONDS] * 5
 
 
+def test_the_worker_exits_when_idle_counting_from_its_last_job():
+    now = [0.0]
+    server = FakeServer([None, None, 'down', None, None])
+    worked = []
+
+    def claim(worker_id, wait_seconds):
+        server.answer(f'claim {worker_id}')
+        now[0] += wait_seconds  # each claim waits on the server
+        return {'id': 7, 'lease_token': 't'} if len(server.calls) == 2 else None
+
+    def work(client, worker_id, job):
+        now[0] += 500  # the job takes a while: not idle
+        worked.append(job['id'])
+        return True
+
+    setattr(server, 'claim_worker_job', claim)  # this test's claims, which advance the clock
+    sdk_worker.run(
+        server,
+        'desk',
+        ['map_refit'],
+        sleep=lambda seconds: now.__setitem__(0, now[0] + seconds),
+        work=work,
+        idle_seconds=60,
+        clock=lambda: now[0],
+    )
+    # A job at the first claim; then idle from its end: the server down (20 s), then two claims (25 s each): 70 s.
+    assert worked == [7]
+    assert server.calls == ['register', 'claim compute-1', 'claim compute-1', 'claim compute-1', 'claim compute-1']
+    assert now[0] - 525 >= 60
+
+
 def test_the_worker_stops_on_a_mistake_only_a_person_can_fix():
     server = FakeServer([400])  # e.g. a --kinds the server doesn't have
     with pytest.raises(requests.HTTPError, match='400'):

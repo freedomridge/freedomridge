@@ -12,6 +12,7 @@ if TYPE_CHECKING:
 
 from backend import (
     auth_cleanup,
+    compute_launcher,
     concept_jobs,
     dataset_schedules,
     duplicate_jobs,
@@ -162,6 +163,7 @@ def test_service_logs_migration_and_outage_transitions_only(monkeypatch, caplog)
         monkeypatch.setattr(map_refit, 'expire_unclaimed_fits', schedule_statistics)
         monkeypatch.setattr(map_placement, 'schedule_placements', schedule_statistics)
         monkeypatch.setattr(follower_sync, 'schedule_sync', schedule_statistics)
+        monkeypatch.setattr(compute_launcher, 'schedule', schedule_statistics)
         monkeypatch.setattr(auth_cleanup, 'scheduled_cleanup', schedule_statistics)
         monkeypatch.setenv('JOB_STATISTICS_SECONDS', '1000000')
         monkeypatch.setenv('JOB_CONCEPT_SECONDS', '1000000')
