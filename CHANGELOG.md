@@ -4,7 +4,12 @@ Freedom Ridge has one version for the server, the web app and the Python SDK (th
 file), following [Semantic Versioning](https://semver.org). A release lists **upgrade notes** when
 it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
 
-## Unreleased
+## 2.6.1 (2026-11-09)
+
+2.6.1 fixes followers, from a review of the feature: a restored primary is detected and its followers copy again,
+one failing mirror no longer holds up the others and backs off, a follower can change only tags on the primary, a
+token is bound to one follower installation, and re-read blocks and big embedding jobs no longer make the follower
+re-download vectors. Primaries and followers can be upgraded in either order. Two migrations.
 
 ### Upgrade notes
 
