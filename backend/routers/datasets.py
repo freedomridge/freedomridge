@@ -2570,6 +2570,15 @@ async def add_array_column(pool, dataset_id: int, name: str) -> None:
     async with pool.acquire() as conn, _field_index_operation(conn, dataset_id, index_ddl=True):
         # Bounded: ACCESS EXCLUSIVE queued behind a long reader would stall every samples read and
         # write queued behind it (ingest included) until the request timed out. Busy: 409, retry.
+        # _RESERVED_COLUMNS is a list someone has to keep; the catalog knows every column samples really has. Over a
+        # column of another type, ADD COLUMN IF NOT EXISTS does nothing and the name would be registered as an array.
+        taken = await conn.fetchval(
+            """SELECT format_type(atttypid, atttypmod) FROM pg_attribute
+               WHERE attrelid = 'samples'::regclass AND attname = $1 AND attnum > 0 AND NOT attisdropped""",
+            name,
+        )
+        if taken is not None and taken != 'text[]':
+            raise HTTPException(status_code=400, detail=f"'{name}' is a reserved column name")
         try:
             async with conn.transaction():
                 await conn.execute("SET LOCAL lock_timeout = '2s'")

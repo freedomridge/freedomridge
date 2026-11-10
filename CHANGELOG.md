@@ -16,6 +16,9 @@ it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
   machine timed out, the launch was recorded as refused, so a machine AWS had in fact started ran on with no record
   and no one to end it. The launch now stays open: the next minute finds the machine by its tag, or ends the launch
   after 15 minutes if there is none.
+- **An array field can't take the name of a column samples already has.** `lon`, `lat`, `created_by_user_id` and
+  `modified_by_user_id` were missing from the reserved names. Creating an array field by one of them (or following
+  a primary that has one) changed no column and registered the name as an array field anyway. It is refused now.
 - **A similarity search no longer comes back short when more samples match.** A search of up to 1,000 results
   walks the vector index within a budget of 200,000 vectors. Under a narrow filter it could reach the budget with
   matches left and answer with fewer results than asked, which looked the same as "nothing else matches". A short

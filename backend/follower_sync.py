@@ -274,6 +274,8 @@ async def ensure_array_columns(pool, dataset_id: int, names: list) -> None:
         except HTTPException as error:
             if error.status_code == 409:
                 raise job_queue.QueueContended(error.detail) from None
+            if error.status_code == 400:
+                raise ValueError(f'The primary sent an array field this instance cannot hold: {name!r}') from None
             raise
 
 
