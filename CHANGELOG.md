@@ -8,8 +8,8 @@ it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
 
 ### Upgrade notes
 
-- Two database migrations, `0015_follower_fields.sql` and `0016_follower_searches.sql`, applied with
-  `scripts/apply_migrations.sh` (step 4 of [Upgrading](docs/UPGRADING.md)).
+- Three database migrations, `0015_follower_fields.sql`, `0016_follower_searches.sql` and `0017_mirror_resume.sql`,
+  applied with `scripts/apply_migrations.sh` (step 4 of [Upgrading](docs/UPGRADING.md)).
 
 ### Added
 
@@ -21,6 +21,10 @@ it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
   primary, the sample viewer offers the scales a follower holds, and a patch search on one runs on the follower,
   which polls for them over its own connection: a small hosted primary can offer 8×8 patch search without holding
   the vectors. The results are the primary's own samples, as a local search shows them.
+- **A follower's new copy of a dataset resumes into its stopped mirror** ([FOLLOWERS.md](docs/FOLLOWERS.md#when-it-stops)),
+  when the same primary database shares it again (re-shared, the primary added again, or after a 409), keeping
+  what the follower added there: patch vectors computed on its own GPU no longer have to be computed again.
+  Samples gone from the primary go. A stopped copy can be kept as a separate copy instead.
 
 ## 2.6.1 (2026-11-09)
 

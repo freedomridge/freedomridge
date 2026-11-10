@@ -68,18 +68,51 @@ async def list_primaries(user: dict = Depends(require_role('admin'))):
         """SELECT m.link_id, m.dataset_id, d.name, m.origin_dataset_id, m.state, m.tags, m.views, m.images,
                   m.copy_total,
                   cardinality(m.copy_blocks) AS copy_left, m.concept_views, m.last_synced_at, m.last_error,
-                  m.retry_after,
+                  m.retry_after, m.stopped_at, m.keep_separate, m.primary_identity, l.identity AS link_identity,
                   (SELECT count(*) FROM mirror_samples s WHERE s.dataset_id = m.dataset_id) AS samples
-           FROM mirrors m JOIN datasets d ON d.id = m.dataset_id
+           FROM mirrors m JOIN datasets d ON d.id = m.dataset_id LEFT JOIN primary_links l ON l.id = m.link_id
            ORDER BY d.name""",
     )
+    stopped: dict[int, list] = {}
+    for row in await db.fetch(f'{follower_sync.RESUMABLE} {follower_sync.RESUMABLE_ORDER}'):
+        stopped.setdefault(row['origin_dataset_id'], []).append(row)
+    live = [mirror for mirror in mirrors if mirror['state'] != 'stopped']
     listed = [{**dict(link), 'mirrors': []} for link in links]
     by_id = {link['id']: link for link in listed}
     unlinked: list = []
     for mirror in mirrors:
         entry = dict(mirror)
+        link_identity, own_identity = entry.pop('link_identity'), entry.pop('primary_identity')
+        identity = link_identity or own_identity
+        origin = mirror['origin_dataset_id']
+        # The copy a new copy of its dataset would resume into, as configure picks it: the latest stopped one of the
+        # same primary database (its link's, or its own once the link is gone). Not while a copy of that database
+        # still follows the dataset: that one would stop and be resumed instead.
+        picked = None if identity is None else follower_sync.resumed_from(stopped.get(origin, []), identity)
+        entry['resumable'] = (
+            picked is not None
+            and picked['dataset_id'] == mirror['dataset_id']
+            and not any(
+                other['origin_dataset_id'] == origin and followers.same_identity(other['primary_identity'], identity)
+                for other in live
+            )
+        )
         (by_id[mirror['link_id']]['mirrors'] if mirror['link_id'] in by_id else unlinked).append(entry)
     return {'primaries': listed, 'unlinked_mirrors': unlinked}
+
+
+@router.post('/primaries/mirrors/{dataset_id}/keep-separate')
+async def keep_mirror_separate(dataset_id: int, user: dict = Depends(require_role('admin'))):
+    """Keep a stopped copy as it is: a new copy of its dataset from its primary makes a new dataset instead of
+    resuming into this one (which would delete the samples gone there, with what this instance added to them)."""
+    name = await db.fetchval(
+        """UPDATE mirrors m SET keep_separate = TRUE FROM datasets d
+           WHERE m.dataset_id = $1 AND d.id = m.dataset_id AND m.state = 'stopped' RETURNING d.name""",
+        dataset_id,
+    )
+    if name is None:
+        raise HTTPException(status_code=409, detail='Only a stopped copy can be kept as a separate copy')
+    return {'kept': name}
 
 
 @router.delete('/primaries/{link_id}')
@@ -87,7 +120,8 @@ async def remove_primary(link_id: int, user: dict = Depends(require_role('admin'
     """Stop following a primary. Its mirrors stay as read-only copies, marked as no longer following."""
     async with db.pool.acquire() as connection, connection.transaction():
         await connection.execute(
-            "UPDATE mirrors SET state = 'stopped', last_error = $2 WHERE link_id = $1 AND state <> 'stopped'",
+            """UPDATE mirrors SET state = 'stopped', last_error = $2, stopped_at = now()
+               WHERE link_id = $1 AND state <> 'stopped'""",
             link_id,
             'No longer following: the primary was removed on this instance',
         )

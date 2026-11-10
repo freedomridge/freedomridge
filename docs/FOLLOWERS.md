@@ -212,6 +212,19 @@ field. The error names the field.
 A stopped mirror stays as a read-only copy, marked **no longer following**, to keep or delete. A mirror that's still
 following can't be deleted here: stop sharing it on the primary first.
 
+**A new copy resumes into the stopped one.** When the same primary database shares the dataset with this
+instance again (re-shared, the primary added here again with a new token, or a copy started again after a 409),
+the copy goes into the latest stopped mirror of that dataset instead of a new dataset. What this instance added
+there stays: its own vector fields (patch vectors computed here, say), indexes, concepts, access grants and views.
+Every block is read again, so the samples the primary no longer has go, with what this instance added to them. A
+copy whose primary was restored into a new database (410) is never resumed, because the restore can hand sample
+ids out again: it makes a new dataset, as before. A copy that had already stopped when migration 0017 was applied
+doesn't record its primary database, so it's never resumed either.
+
+On the Primaries page, the stopped copy a new copy would resume into says so: only the latest one of its primary
+database, and none while a copy of that database still follows the dataset. **Keep as a separate copy** freezes
+it: a new copy of its dataset then makes a new dataset (`POST /api/primaries/mirrors/{id}/keep-separate`).
+
 ## Endpoints
 
 The endpoints are listed in [Authentication](AUTHENTICATION.md#endpoints).

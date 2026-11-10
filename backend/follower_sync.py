@@ -734,10 +734,36 @@ def host_of(link) -> str:
 
 async def stop_mirrors(connection, where: str, args: tuple, reason: str) -> None:
     await connection.execute(
-        f"UPDATE mirrors SET state = 'stopped', last_error = ${len(args) + 1} WHERE state <> 'stopped' AND {where}",
+        f"""UPDATE mirrors SET state = 'stopped', last_error = ${len(args) + 1}, stopped_at = now()
+            WHERE state <> 'stopped' AND {where}""",
         *args,
         reason,
     )
+
+
+# The stopped mirrors a new copy can resume into, latest first: not being deleted or kept as a separate copy, and of a
+# known primary database. A mirror stopped before mirrors recorded it has none, and is never resumed.
+RESUMABLE = """SELECT m.* FROM mirrors m JOIN datasets d ON d.id = m.dataset_id
+               WHERE m.state = 'stopped' AND NOT m.keep_separate AND NOT d.deleting
+                 AND m.primary_identity IS NOT NULL"""
+RESUMABLE_ORDER = 'ORDER BY m.stopped_at DESC NULLS LAST, m.dataset_id DESC'
+
+
+def resumed_from(stopped: list, identity: str):
+    """Of one dataset's RESUMABLE mirrors, in RESUMABLE_ORDER: the one a new copy from the primary database
+    `identity` resumes into, the latest of that database. None: the copy makes a new dataset."""
+    return next((row for row in stopped if followers.same_identity(row['primary_identity'], identity)), None)
+
+
+async def resumable_mirror(connection, origin: int, identity: str):
+    """The stopped mirror a new copy of the primary's dataset `origin` resumes into, locked until the copy is set up,
+    so a "Keep as a separate copy" can't land in between."""
+    rows = await connection.fetch(
+        f'{RESUMABLE} AND m.origin_dataset_id = $1 {RESUMABLE_ORDER} FOR UPDATE OF m',
+        origin,
+    )
+    row = resumed_from(rows, identity)
+    return None if row is None else dict(row)
 
 
 def primary_identity(config: dict) -> str:
@@ -773,7 +799,10 @@ async def configure(pool, link, client, checkpoint: dict) -> StepResult:
         if entry['ready'] and (restored or origin not in live):
             plans[origin] = await call(client, 'GET', f'/follower/datasets/{origin}/blocks')
 
+    resumed: list[int] = []
+
     async def publish(connection):
+        resumed.clear()
         if restored:
             await stop_mirrors(
                 connection,
@@ -801,17 +830,50 @@ async def configure(pool, link, client, checkpoint: dict) -> StepResult:
                     )
         for origin, plan in plans.items():
             entry = assigned[origin]
+            blocks = [row['block'] for row in plan['blocks']]
+            # The same primary database copied this dataset here before: resume into that copy, keeping what this
+            # instance added (its own fields, indexes, concepts, grants, views). Never after a restore: its sample
+            # ids may have been handed out again.
+            previous = None if restored else await resumable_mirror(connection, origin, current)
+            if previous is not None:
+                # Every block it holds is read again with the primary's: a block the primary no longer has comes
+                # back empty, and its samples go here, as samples gone from a re-read block always do.
+                held = [
+                    row['block']
+                    for row in await connection.fetch(
+                        f'SELECT DISTINCT origin_id / {BLOCK} AS block FROM mirror_samples WHERE dataset_id = $1',
+                        previous['dataset_id'],
+                    )
+                ]
+                blocks = sorted({*blocks, *held})
+                await connection.execute(
+                    """UPDATE mirrors SET link_id = $2, state = 'copying', tags = $3, views = $4, images = $5,
+                              copy_blocks = $6, copy_total = $7, feed_cursor = $8, primary_identity = $9,
+                              stopped_at = NULL, last_error = NULL, failures = 0, retry_after = NULL,
+                              fields_reported_at = NULL
+                       WHERE dataset_id = $1""",
+                    previous['dataset_id'],
+                    link['id'],
+                    entry['tags'],
+                    entry['views'],
+                    entry.get('images', False),
+                    blocks,
+                    len(blocks),
+                    entry['start_txid'] - 1,
+                    current,
+                )
+                resumed.append(previous['dataset_id'])
+                continue
             name = await local_name(connection, entry['name'], host_of(link), origin)
             dataset_id = await connection.fetchval(
                 'INSERT INTO datasets (name, owner_id, is_global) VALUES ($1, $2, FALSE) RETURNING id',
                 name,
                 link['created_by'],
             )
-            blocks = [row['block'] for row in plan['blocks']]
             await connection.execute(
                 """INSERT INTO mirrors (dataset_id, link_id, origin_dataset_id, tags, views, images, copy_blocks,
-                                        copy_total, feed_cursor)
-                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)""",
+                                        copy_total, feed_cursor, primary_identity)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)""",
                 dataset_id,
                 link['id'],
                 origin,
@@ -821,6 +883,7 @@ async def configure(pool, link, client, checkpoint: dict) -> StepResult:
                 blocks,
                 len(blocks),
                 entry['start_txid'] - 1,
+                current,
             )
         await connection.execute(
             'UPDATE primary_links SET identity = $2, follower_name = $3, last_error = NULL WHERE id = $1',

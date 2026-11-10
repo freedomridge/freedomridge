@@ -24,6 +24,9 @@ interface Mirror {
     last_synced_at: string | null;
     last_error: string | null;
     retry_after: string | null;
+    stopped_at: string | null;
+    keep_separate: boolean;
+    resumable: boolean;  // a new copy of its dataset from its primary resumes into it
 }
 interface Primary {
     id: number;
@@ -56,6 +59,11 @@ async function send(method: string, path: string, body?: unknown) {
 }
 
 function MirrorRow({ mirror }: { mirror: Mirror }) {
+    const queryClient = useQueryClient();
+    const keep = useMutation({
+        mutationFn: () => send('POST', `/primaries/mirrors/${mirror.dataset_id}/keep-separate`),
+        onSuccess: () => queryClient.invalidateQueries({ queryKey: ['primaries'] }),
+    });
     const copied = mirror.copy_total - mirror.copy_left;
     return (
         <div data-testid="mirror-row" className="text-sm space-y-1">
@@ -79,6 +87,29 @@ function MirrorRow({ mirror }: { mirror: Mirror }) {
             {mirror.concept_views.length > 0 && (
                 <p className="text-xs text-zinc-400">
                     Not copied, because they use a concept and concepts belong to each instance: {mirror.concept_views.join(', ')}
+                </p>
+            )}
+            {mirror.state === 'stopped' && (
+                <p data-testid="mirror-resume" className="text-xs text-zinc-400 flex flex-wrap items-center gap-2">
+                    {mirror.resumable ? (
+                        <>
+                            <span>
+                                If its primary shares this dataset again, the copy resumes here: this instance&apos;s
+                                own fields stay, and samples gone from the primary go.
+                            </span>
+                            <button
+                                data-testid="mirror-keep-separate"
+                                onClick={() => keep.mutate()}
+                                disabled={keep.isPending}
+                                className="text-zinc-300 hover:text-white underline"
+                            >
+                                Keep as a separate copy
+                            </button>
+                        </>
+                    ) : mirror.keep_separate ? (
+                        <span>Kept as a separate copy: a new copy of its dataset makes a new dataset.</span>
+                    ) : null}
+                    {keep.error && <span className="text-red-300">{(keep.error as Error).message}</span>}
                 </p>
             )}
             {mirror.last_error && (

@@ -2666,7 +2666,10 @@ CREATE TABLE IF NOT EXISTS mirrors (
     images BOOLEAN NOT NULL DEFAULT FALSE,  -- the primary serves its images to this instance (0012)
     failures INTEGER NOT NULL DEFAULT 0,  -- failed runs in a row (0013)
     retry_after TIMESTAMP WITH TIME ZONE,  -- after a failure, not tried again before this (0013)
-    fields_reported_at TIMESTAMP WITH TIME ZONE  -- when this instance last reported its own patch scales (0015)
+    fields_reported_at TIMESTAMP WITH TIME ZONE,  -- when this instance last reported its own patch scales (0015)
+    primary_identity TEXT,  -- the primary database it copies, so a new copy of it can resume into this one (0017)
+    stopped_at TIMESTAMP WITH TIME ZONE,  -- when it stopped following; the latest stopped copy is the one resumed (0017)
+    keep_separate BOOLEAN NOT NULL DEFAULT FALSE  -- a stopped copy kept as it is, never resumed (0017)
 );
 -- One live mirror per primary dataset; a stopped one stays beside a new copy.
 CREATE UNIQUE INDEX IF NOT EXISTS mirrors_live_origin ON mirrors (link_id, origin_dataset_id) WHERE state <> 'stopped';
@@ -2863,5 +2866,6 @@ INSERT INTO schema_migrations (filename) VALUES
     ('0013_follower_restarts.sql'),
     ('0014_follower_instance.sql'),
     ('0015_follower_fields.sql'),
-    ('0016_follower_searches.sql')
+    ('0016_follower_searches.sql'),
+    ('0017_mirror_resume.sql')
 ON CONFLICT (filename) DO NOTHING;

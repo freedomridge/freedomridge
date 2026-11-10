@@ -220,6 +220,7 @@ the variable.
 | `/api/follower/searches`, `/api/follower/searches/{id}` | GET, POST | follower token | Claim a patch search the primary relays to the follower (long poll); answer it |
 | `/api/primaries` | POST, GET | admin | On a follower: follow a primary (its follower token is checked first); list primaries and their mirrors |
 | `/api/primaries/{id}` | DELETE | admin | Stop following a primary; its mirrors stay as read-only copies |
+| `/api/primaries/mirrors/{id}/keep-separate` | POST | admin | Keep a stopped copy as it is: a new copy of its dataset makes a new dataset instead of resuming into it |
 | `/api/compute-launcher` | GET, PUT | admin | On-demand compute workers: their settings (never the secret), and the machines started |
 | `/api/compute-launcher/check` | POST | admin | Ask AWS whether it would start a machine with the saved settings (a dry run) |
 

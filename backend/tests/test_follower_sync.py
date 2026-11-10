@@ -1421,3 +1421,216 @@ def test_a_follower_answers_running_searches_before_it_reconnects(monkeypatch):
     monkeypatch.setattr(follower_search, 'run_search', run_search)
     asyncio.run(asyncio.wait_for(follower_search.serve_link(Pool(), 1, stopping), 10))
     assert events == ['answered', 'closed']
+
+
+async def mirror_with_own_field(monkeypatch, database):
+    """Dataset 1 (corn, soy) copied into a mirror, with a vector field only this instance has on both samples."""
+    created, link_id = await setup(monkeypatch, database)
+    await ingest([{'crop': 'corn'}, {'crop': 'soy'}], dataset_id=1, prefix='s3://images/r')
+    follower = await database.fetchval('SELECT id FROM followers')
+    await followers.follow_dataset(follower, 1, followers.FollowOptions(), user=USER)
+    await sync(database, link_id)
+    mirror = await mirror_of(database)
+    for row in (await copied(database, mirror)).values():
+        await database.execute(
+            "INSERT INTO embeddings (sample_id, field_name, vector) VALUES ($1, 'mine', '[1,2]')",
+            row['id'],
+        )
+    return created, link_id, follower, mirror
+
+
+async def crops_with_own_field(database, dataset_id):
+    return sorted(
+        row['crop']
+        for row in await database.fetch(
+            """SELECT s.metadata->>'crop' AS crop FROM samples s JOIN embeddings e ON e.sample_id = s.id
+               WHERE s.dataset_id = $1 AND e.field_name = 'mine'""",
+            dataset_id,
+        )
+    )
+
+
+async def resumable(database):
+    """Which copies the Primaries page says a new copy resumes into, by dataset."""
+    listed = await primaries.list_primaries(user=USER)
+    mirrors = [m for p in listed['primaries'] for m in p['mirrors']] + listed['unlinked_mirrors']
+    return {m['dataset_id']: m['resumable'] for m in mirrors}
+
+
+def test_shared_again_the_copy_resumes_into_its_stopped_mirror_and_keeps_its_own_fields(monkeypatch, registry_database):
+    async def scenario(database):
+        _, link_id, follower, mirror = await mirror_with_own_field(monkeypatch, database)
+        await followers.unfollow_dataset(follower, 1, user=USER)
+        await sync(database, link_id)
+        stopped = await mirror_of(database)
+        assert stopped['state'] == 'stopped' and stopped['stopped_at'] is not None and stopped['primary_identity']
+        # Deleted on the primary while not followed: it goes here when the copy resumes, with its own field.
+        await database.execute("DELETE FROM samples WHERE dataset_id = 1 AND metadata->>'crop' = 'soy'")
+        await followers.follow_dataset(follower, 1, followers.FollowOptions(), user=USER)
+        await sync(database, link_id)
+        resumed = await mirror_of(database)
+        assert await database.fetchval('SELECT count(*) FROM mirrors') == 1  # no new dataset
+        assert resumed['dataset_id'] == mirror['dataset_id'] and resumed['state'] == 'following'
+        assert resumed['stopped_at'] is None
+        assert await crops_with_own_field(database, mirror['dataset_id']) == ['corn']
+        assert sorted(r['metadata']['crop'] for r in (await copied(database, resumed)).values()) == ['corn']
+
+    registry_database(scenario)
+
+
+def test_the_primary_added_again_resumes_its_copies(monkeypatch, registry_database):
+    async def scenario(database):
+        created, link_id, follower, mirror = await mirror_with_own_field(monkeypatch, database)
+        monkeypatch.setattr(primaries, 'db', database)
+        await primaries.remove_primary(link_id, user=USER)
+        assert (await mirror_of(database))['link_id'] is None
+        again = await database.fetchval(
+            "INSERT INTO primary_links (url, token_encrypted, created_by) VALUES ('http://primary/api', $1, 1) "
+            'RETURNING id',
+            encrypt_secret(created['token']),
+        )
+        await sync(database, again)
+        resumed = await mirror_of(database)
+        assert await database.fetchval('SELECT count(*) FROM mirrors') == 1
+        assert (resumed['dataset_id'], resumed['link_id'], resumed['state']) == (
+            mirror['dataset_id'],
+            again,
+            'following',
+        )
+        assert await crops_with_own_field(database, mirror['dataset_id']) == ['corn', 'soy']
+
+    registry_database(scenario)
+
+
+def test_removed_on_the_primary_then_followed_again_the_copy_resumes(monkeypatch, registry_database):
+    async def scenario(database):
+        _, link_id, follower, mirror = await mirror_with_own_field(monkeypatch, database)
+        monkeypatch.setattr(primaries, 'db', database)
+        # The primary's admin removes the follower: the copy stops on the refusal, and the link stays.
+        await followers.remove_follower(follower, user=USER)
+        await sync(database, link_id)
+        stopped = await mirror_of(database)
+        assert (stopped['state'], stopped['link_id']) == ('stopped', link_id)
+        # Followed again: a new follower there, and this instance stops following and adds the primary with its token.
+        created = await followers.create_follower(followers.FollowerCreate(name='lab-2'), user=USER)
+        await followers.follow_dataset(
+            await database.fetchval('SELECT id FROM followers'),
+            1,
+            followers.FollowOptions(),
+            user=USER,
+        )
+        await primaries.remove_primary(link_id, user=USER)
+        again = await database.fetchval(
+            "INSERT INTO primary_links (url, token_encrypted, created_by) VALUES ('http://primary/api', $1, 1) "
+            'RETURNING id',
+            encrypt_secret(created['token']),
+        )
+        await sync(database, again)
+        resumed = await mirror_of(database)
+        assert await database.fetchval('SELECT count(*) FROM mirrors') == 1
+        assert (resumed['dataset_id'], resumed['link_id'], resumed['state']) == (
+            mirror['dataset_id'],
+            again,
+            'following',
+        )
+        assert await crops_with_own_field(database, mirror['dataset_id']) == ['corn', 'soy']
+
+    registry_database(scenario)
+
+
+def test_a_cursor_too_old_copies_again_into_the_same_mirror(monkeypatch, registry_database):
+    async def scenario(database):
+        _, link_id, follower, mirror = await mirror_with_own_field(monkeypatch, database)
+        # A cursor from before the copy's start: the feed answers 409, the copy stops and starts again, resumed.
+        await database.execute('UPDATE mirrors SET feed_cursor = 0')
+        await database.execute("UPDATE samples SET tags = '{fresh}' WHERE dataset_id = 1")
+        await sync(database, link_id)
+        resumed = await mirror_of(database)
+        assert await database.fetchval('SELECT count(*) FROM mirrors') == 1
+        assert resumed['dataset_id'] == mirror['dataset_id'] and resumed['state'] == 'following'
+        assert await crops_with_own_field(database, mirror['dataset_id']) == ['corn', 'soy']
+
+    registry_database(scenario)
+
+
+def test_a_copy_kept_separate_is_never_resumed_and_the_latest_stopped_copy_is(monkeypatch, registry_database):
+    async def scenario(database):
+        _, link_id, follower, first = await mirror_with_own_field(monkeypatch, database)
+        monkeypatch.setattr(primaries, 'db', database)
+        await followers.unfollow_dataset(follower, 1, user=USER)
+        await sync(database, link_id)
+        with pytest.raises(HTTPException) as live:  # only a stopped copy
+            await primaries.keep_mirror_separate(999999, user=USER)
+        assert live.value.status_code == 409
+        await primaries.keep_mirror_separate(first['dataset_id'], user=USER)
+        listed = await primaries.list_primaries(user=USER)
+        kept = next(m for m in listed['primaries'][0]['mirrors'] if m['dataset_id'] == first['dataset_id'])
+        assert kept['keep_separate'] is True and kept['resumable'] is False
+        # Shared again: a new dataset, the kept copy untouched.
+        await followers.follow_dataset(follower, 1, followers.FollowOptions(), user=USER)
+        await sync(database, link_id)
+        second = await mirror_of(database)
+        assert second['dataset_id'] != first['dataset_id'] and second['state'] == 'following'
+        assert (await database.fetchrow('SELECT state FROM mirrors WHERE dataset_id = $1', first['dataset_id']))[
+            'state'
+        ] == 'stopped'
+        # Both stopped, the first no longer kept apart: the latest stopped (the second) is the one resumed, and the
+        # only one the page says resumes.
+        await followers.unfollow_dataset(follower, 1, user=USER)
+        await sync(database, link_id)
+        await database.execute('UPDATE mirrors SET keep_separate = FALSE')
+        assert await resumable(database) == {first['dataset_id']: False, second['dataset_id']: True}
+        await followers.follow_dataset(follower, 1, followers.FollowOptions(), user=USER)
+        await sync(database, link_id)
+        states = dict(await database.fetch('SELECT dataset_id, state FROM mirrors'))
+        assert states == {first['dataset_id']: 'stopped', second['dataset_id']: 'following'}
+        # While the second follows, the first doesn't resume either: the second would stop and be resumed.
+        assert await resumable(database) == {first['dataset_id']: False, second['dataset_id']: False}
+
+    registry_database(scenario)
+
+
+def test_a_copy_of_another_primary_database_is_not_resumed(monkeypatch, registry_database):
+    async def scenario(database):
+        _, link_id, follower, first = await mirror_with_own_field(monkeypatch, database)
+        await followers.unfollow_dataset(follower, 1, user=USER)
+        await sync(database, link_id)
+        # As after a restore into a new database: its sample ids can't be trusted, so it isn't resumed.
+        await database.execute("UPDATE mirrors SET primary_identity = '1:1'")
+        monkeypatch.setattr(primaries, 'db', database)
+        assert await resumable(database) == {first['dataset_id']: False}
+        await followers.follow_dataset(follower, 1, followers.FollowOptions(), user=USER)
+        await sync(database, link_id)
+        assert await database.fetchval('SELECT count(*) FROM mirrors') == 2
+        assert (await mirror_of(database))['dataset_id'] != first['dataset_id']
+
+    registry_database(scenario)
+
+
+def test_the_0017_backfill_gives_no_identity_to_a_stopped_copy_which_is_then_never_resumed(
+    monkeypatch,
+    registry_database,
+):
+    async def scenario(database):
+        _, link_id, _, mirror = await mirror_with_own_field(monkeypatch, database)
+        path = os.path.join(os.path.dirname(__file__), '..', 'db', 'migrations', '0017_mirror_resume.sql')
+        with open(path) as migration:
+            backfill = next(statement for statement in migration.read().split(';') if 'UPDATE mirrors' in statement)
+        # A following copy gets its link's identity.
+        await database.execute('UPDATE mirrors SET primary_identity = NULL')
+        await database.execute(backfill)
+        assert (await mirror_of(database))['primary_identity'] is not None
+        # Stopped by a restore before 0017: its link holds the restored database's identity now, which isn't the
+        # copy's, so it gets none.
+        await database.execute(
+            "UPDATE mirrors SET state = 'stopped', stopped_at = now(), primary_identity = NULL, last_error = $1",
+            'The primary was restored into a new database: this copy stopped, and a new one started',
+        )
+        await database.execute(backfill)
+        assert (await mirror_of(database))['primary_identity'] is None
+        # The next copy makes a new dataset, though no newer stopped copy is there to be preferred.
+        await sync(database, link_id)
+        assert await database.fetchval('SELECT count(*) FROM mirrors') == 2
+        assert (await mirror_of(database))['dataset_id'] != mirror['dataset_id']
+
+    registry_database(scenario)
