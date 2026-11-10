@@ -579,6 +579,49 @@ async def follower_blocks(dataset_id: int, follower: dict = Depends(current_foll
     return {'block_size': BLOCK, 'blocks': [dict(row) for row in rows]}
 
 
+MATCH_KEYS = 5000  # samples per page of /match-keys
+MATCH_HASH_FIELDS = 8  # hash fields one page may ask for
+
+
+@router.get('/follower/datasets/{dataset_id}/match-keys')
+async def follower_match_keys(
+    dataset_id: int,
+    after: int = Query(0, ge=0),
+    limit: int = Query(MATCH_KEYS, ge=1, le=MATCH_KEYS),
+    hash_fields: Annotated[List[str], Query(max_length=MATCH_HASH_FIELDS)] = [],
+    follower: dict = Depends(current_follower),
+):
+    """A page of the dataset's samples, in id order, with what a follower matches its own copy by after this
+    primary was restored (docs/FOLLOWERS.md): each sample's id, file path and its hashes among `hash_fields`. A key is
+    an object, so it can carry more later (a digest of the copied columns, say). `next` is the next `after`, or null
+    on the last page. The first page also says which of `hash_fields` the dataset has."""
+    await subscription(db, follower, dataset_id)
+    rows = await db.fetch(
+        """SELECT s.id, s.filepath,
+                  COALESCE((SELECT jsonb_object_agg(h.field_name, h.hash_hex) FROM sample_hashes h
+                            WHERE h.sample_id = s.id AND h.field_name = ANY($4::text[])), '{}'::jsonb) AS hashes
+           FROM samples s WHERE s.dataset_id = $1 AND s.id > $2 ORDER BY s.id LIMIT $3""",
+        dataset_id,
+        after,
+        limit,
+        hash_fields,
+    )
+    page = {'keys': [dict(row) for row in rows], 'next': rows[-1]['id'] if len(rows) == limit else None}
+    if after == 0:  # which of the asked hash fields the dataset has at all, so the follower picks one both sides have
+        page['hash_fields'] = [
+            row['field_name']
+            for row in await db.fetch(
+                """SELECT f AS field_name FROM unnest($2::text[]) f
+                   WHERE EXISTS (SELECT 1 FROM sample_hashes h JOIN samples s ON s.id = h.sample_id
+                                 WHERE h.field_name = f AND s.dataset_id = $1)
+                   ORDER BY 1""",
+                dataset_id,
+                hash_fields,
+            )
+        ]
+    return page
+
+
 @router.get('/follower/datasets/{dataset_id}/changes')
 async def follower_changes(
     dataset_id: int,

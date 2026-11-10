@@ -84,3 +84,47 @@ test('an instance follows a primary and mirrors the dataset it shares', async ({
         await apiFetch(cookie, `/datasets/${source.id}`, { method: 'DELETE' });
     }
 });
+
+// After its primary was restored into a new database, a copy is held and asks its admin whether to resume into it.
+// A restore can't be made here, so the list the page reads is the held copy's; the answer goes to the server as is.
+test('a copy held after its primary was restored asks whether to resume', async ({ page }) => {
+    const held = {
+        dataset_id: 9001, name: 'coco (lab)', origin_dataset_id: 7, state: 'stopped', tags: 'primary', views: 'primary',
+        images: false, copy_total: 0, copy_left: 0, samples: 42000, concept_views: [], last_synced_at: null,
+        last_error: 'The primary was restored into a new database: choose on the Primaries page whether this copy resumes',
+        retry_after: null, stopped_at: new Date().toISOString(), keep_separate: false, resumable: false,
+        restore: {
+            origin_name: 'coco', hash_field: 'dhash_8', total: 42000, matched: 41982, matched_hash: 41950,
+            only_here: 6, phase: 'ask', decision: null, compared: true, last_error: null, retry_after: null,
+        },
+    };
+    await page.route('**/api/primaries', route => route.fulfill({
+        json: {
+            primaries: [{
+                id: 1, url: 'https://primary.example.com/api', follower_name: 'lab', created_at: new Date().toISOString(),
+                last_synced_at: null, last_error: null, mirrors: [held],
+            }],
+            unlinked_mirrors: [],
+        },
+    }));
+    let decision: unknown;
+    await page.route('**/api/primaries/mirrors/9001/restore-decision', async route => {
+        decision = route.request().postDataJSON();
+        await route.fulfill({ json: { decision: 'resume' } });
+    });
+    await page.goto('/settings/primaries');
+    const row = page.getByTestId('mirror-row').filter({ hasText: 'coco (lab)' });
+    await expect(row.getByTestId('mirror-state')).toHaveText('On hold');
+    await expect(row.getByTestId('mirror-restore-counts')).toHaveText(
+        /41,982 of 42,000 samples in “coco” match it by file path \(41,950 also by image hash\)\./,
+    );
+    await expect(row.getByTestId('mirror-restore')).toContainText('18 don\'t match: they\'re copied fresh.');
+    await expect(row.getByTestId('mirror-restore')).toContainText('6 here that the primary no longer has go.');
+    await expect(row.getByTestId('mirror-error')).toHaveCount(0);  // held, not failing
+    // Resuming deletes the copy's samples the primary doesn't have: it says how many before it does.
+    await row.getByTestId('mirror-restore-resume').click();
+    await expect(row.getByTestId('mirror-restore-confirm')).toContainText('deletes 6 samples here');
+    expect(decision).toBeUndefined();
+    await row.getByTestId('mirror-restore-confirm-resume').click();
+    await expect.poll(() => decision).toEqual({ decision: 'resume' });
+});

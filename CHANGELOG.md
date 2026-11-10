@@ -6,6 +6,24 @@ it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
 
 ## Unreleased
 
+### Upgrade notes
+
+- One database migration, `0020_mirror_restores.sql`, applied with `scripts/apply_migrations.sh` (step 4 of
+  [Upgrading](docs/UPGRADING.md)).
+- A follower asks before resuming only when the restored primary runs this release too (it answers `match-keys`).
+  A primary on an older release gets a new copy on its followers, as before.
+
+### Added
+
+- **After a primary is restored from a backup, a follower asks before resuming into its copy**
+  ([FOLLOWERS.md](docs/FOLLOWERS.md#when-it-stops)). Until now each copy stopped and a new dataset was copied, so
+  what the follower had added (patch vectors computed on its own GPU, indexes, concepts, views, access grants) had to
+  be made again. Now the copy of each dataset the primary still shares is held, and the primary's other datasets keep
+  syncing. The follower matches the primary's samples to the copy's by file path, and by image hash where both have
+  one, without changing anything. The copy's row on Settings → Primaries then shows the counts and asks: **Resume
+  into this copy** keeps what this follower added on the matched samples, deletes the ones the primary no longer
+  has (after a second confirmation), and copies the rest fresh. **Make a new copy** does what happened before.
+
 ### Fixed
 
 - **A big Select All's chip no longer offers Exclude.** Above 50,000 samples a Select All is applied as one

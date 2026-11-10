@@ -233,8 +233,10 @@ both. Every other edit of a mirror (bulk set, rename, clear or delete) is refuse
   own answer counts (it says which, with a code). Any other refusal, such as a proxy's 403 or a maintenance page,
   is shown as the primary's last error and retried on the next sync.
 - The primary stops sharing a dataset: its mirror stops.
-- The primary was restored into a new database (410), or a mirror's cursor is too old (409): that mirror stops,
-  and a new copy starts if the dataset is still shared.
+- A mirror's cursor is too old (409): that mirror stops, and a new copy resumes into it if the dataset is still
+  shared.
+- The primary was restored into a new database (410): each mirror stops. One of a dataset it still shares is held,
+  and asks whether to resume into it (below). A mirror of a dataset it no longer shares just stops.
 - Removing the primary here (Stop following) stops all its mirrors, and tells the primary (below).
 
 A mirror whose sync fails, a vector field clash say, doesn't hold up the other mirrors of its primary: its error
@@ -251,9 +253,33 @@ instance again (re-shared, the primary added here again with a new token, or a c
 the copy goes into the latest stopped mirror of that dataset instead of a new dataset. What this instance added
 there stays: its own vector fields (patch vectors computed here, say), indexes, concepts, access grants and views.
 Every block is read again, so the samples the primary no longer has go, with what this instance added to them. A
-copy whose primary was restored into a new database (410) is never resumed, because the restore can hand sample
-ids out again: it makes a new dataset, as before. A copy that had already stopped when migration 0017 was applied
-doesn't record its primary database, so it's never resumed either.
+copy that had already stopped when migration 0017 was applied doesn't record its primary database, so it's never
+resumed.
+
+**When the primary was restored, the copy asks first.** A restore into a new database can hand sample ids out again,
+so a copy can't simply carry on by them. Each copy of a dataset the restored primary still shares is held instead, and
+the primary's other datasets keep syncing:
+
+1. The follower compares the primary's samples with the copy's, changing nothing. It reads them a page at a time
+   (`GET /api/follower/datasets/{id}/match-keys`) and matches them by file path. An object sample has a path of its
+   own (`img.jpg#o0`), so objects match the same way. Where both sides have an image hash (the lowest field name both
+   have), the hashes must agree too. These are perceptual hashes, so two different files can share one.
+2. The copy's row on the Primaries page then asks, with the counts: how many of the primary's samples match by file
+   path (and by image hash), how many don't and would be copied fresh, and how many here the primary no longer has.
+   Its badge reads **On hold**, and it waits until an admin here answers
+   (`POST /api/primaries/mirrors/{id}/restore-decision`).
+3. **Resume into this copy:** first it says how many samples here will be deleted, and asks again. It's refused when
+   nothing matches. Then the copy's samples the primary no longer has go, with what this instance added to
+   them. The matched ones take the primary's new ids, keeping this instance's own vector fields, indexes, concepts and
+   views on them. The copies of the primary's shared views are made again. Then every block is read again, as for a
+   resumed copy. All of it runs in bounded steps of the sync job, so a large copy is resumed over several of them.
+4. **Make a new copy:** a new dataset is copied, and the held one is kept as a separate copy.
+
+If the primary is restored again before the answer, the copy is compared again. If it stops sharing the dataset, the
+question goes, and the copy stays as it is. Once a resume has started, it finishes first, so the copy's sample ids
+are never left half moved. A primary restored onto a release that can't compare copies (no `match-keys`) gets a new
+copy, as before, and the held one is kept as it is. A held copy whose step fails is treated like a failing mirror:
+its error shows on its row, it's tried again later, and the primary's other mirrors carry on.
 
 On the Primaries page, the stopped copy a new copy would resume into says so: only the latest one of its primary
 database, and none while a copy of that database still follows the dataset. **Keep as a separate copy** freezes
