@@ -91,6 +91,13 @@ class Condition:
         result._conditions = [self]
         return result
 
+    def __bool__(self) -> bool:
+        """A condition has no truth value: `and`, `or`, `not` and `0 < s.x < 1` would silently drop a clause."""
+        raise TypeError(
+            "A filter condition can't be used as True or False. Combine conditions with & | ~ and brackets, "
+            "for example (s.a > 1) & (s.b < 2), not `and`, `or`, `not` or a chained comparison like 0 < s.a < 1.",
+        )
+
     def __repr__(self) -> str:
         if self._logic:
             conds = ", ".join(repr(c) for c in self._conditions)

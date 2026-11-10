@@ -4,6 +4,16 @@ Freedom Ridge has one version for the server, the web app and the Python SDK (th
 file), following [Semantic Versioning](https://semver.org). A release lists **upgrade notes** when
 it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
 
+## Unreleased
+
+### Fixed
+
+- **SDK: `and`, `or`, `not` and chained comparisons on filter conditions raise.** `ds.match((s.a > 1) and (s.b < 2))`
+  kept only the second condition, and `0 < s.a < 1` only `s.a < 1`, because Python asks a condition for its truth
+  value and every object is true. A bulk tag or delete then hit more samples than the filter said. A condition now
+  raises `TypeError` there, and the message names `&`, `|` and `~`. Scripts that relied on the old behaviour were
+  filtering on one clause.
+
 ## 2.7.0 (2026-11-10)
 
 2.7.0 completes followers. A primary can run patch searches on the patch vectors a follower computed itself, a new
