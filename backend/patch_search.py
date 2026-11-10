@@ -38,12 +38,16 @@ async def indexed_patch_fields(conn, dataset_id: int, base_field: str, scale: st
     return indexed_grid(base_field, scale, await index_jobs.cosine_hnsw_fields(conn, dims) if dims else set())
 
 
-async def patch_scales(conn, dataset_id: int, base_field: str) -> dict[str, dict]:
-    """The patch scales of a dataset's base field: {scale: {local, dims, indexed_fields, providers}}.
+# A tile field's base field, scale and position, e.g. clip_patch_8x8_r2c3.
+PATCH_TILE = re.compile(r'^(.+)_patch_(\d+x\d+)_r(\d+)c(\d+)$')
+# A follower that checked in this recently counts as online: its search poll returns every 25 s or less.
+ONLINE_SECONDS = 60
 
-    `local` scales have tile vectors in this dataset, with their size (`dims`) and the tile fields indexed for it
-    (None: searched by an exact scan). `providers` are the followers that hold a scale this dataset doesn't, empty
-    until they report their own fields."""
+
+async def dataset_patch_scales(conn, dataset_id: int, base_field: str | None = None) -> dict[tuple[str, str], dict]:
+    """The patch scales with tile vectors in this dataset, of one base field or all:
+    {(base_field, scale): {dims, tiles, indexed_fields}}. `tiles` are the scale's tile fields present here, and
+    `indexed_fields` the grid when each tile has its own HNSW index (None: an exact scan)."""
     rows = await conn.fetch(
         """
         SELECT DISTINCT e.field_name
@@ -52,25 +56,53 @@ async def patch_scales(conn, dataset_id: int, base_field: str) -> dict[str, dict
         WHERE s.dataset_id = $1 AND e.field_name LIKE $2
         """,
         dataset_id,
-        f"{base_field}_patch_%",
+        f"{base_field}_patch_%" if base_field else '%_patch_%',
     )
-    # Scales from field names like "clip_patch_4x4_r0c0".
-    prefix = f"{base_field}_patch_"
-    tiles: dict[str, str] = {}
+    tiles: dict[tuple[str, str], list[str]] = {}
     for row in rows:
-        scale = row['field_name'][len(prefix) :].split('_')[0]
-        tiles.setdefault(scale, row['field_name'])
-    scales: dict[str, dict] = {}
-    for scale, tile in sorted(tiles.items()):
+        match = PATCH_TILE.match(row['field_name'])
+        if match and (base_field is None or match.group(1) == base_field):
+            tiles.setdefault((match.group(1), match.group(2)), []).append(row['field_name'])
+    scales: dict[tuple[str, str], dict] = {}
+    for (base, scale), fields in sorted(tiles.items()):
         dims = await conn.fetchval(
             """SELECT vector_dims(e.vector) FROM embeddings e JOIN samples s ON e.sample_id = s.id
                WHERE s.dataset_id = $1 AND e.field_name = $2 LIMIT 1""",
             dataset_id,
-            tile,
+            min(fields),
         )
-        indexed = await indexed_patch_fields(conn, dataset_id, base_field, scale, dims) if dims else None
-        scales[scale] = {'local': True, 'dims': dims, 'indexed_fields': indexed, 'providers': []}
+        indexed = await indexed_patch_fields(conn, dataset_id, base, scale, dims) if dims else None
+        scales[(base, scale)] = {'dims': dims, 'tiles': sorted(fields), 'indexed_fields': indexed}
     return scales
+
+
+async def patch_scales(conn, dataset_id: int, base_field: str) -> dict[str, dict]:
+    """The patch scales of a dataset's base field: {scale: {local, dims, indexed_fields, providers}}.
+
+    `local` scales have tile vectors in this dataset, with their size (`dims`) and the tile fields indexed for it
+    (None: searched by an exact scan). `providers` are the followers that reported a scale of their own
+    (docs/FOLLOWERS.md), each {follower_id, name, dims, indexed, online, last_seen_at}: a scale only they hold
+    has `local` false."""
+    scales: dict[str, dict] = {
+        scale: {'local': True, 'dims': found['dims'], 'indexed_fields': found['indexed_fields'], 'providers': []}
+        for (_, scale), found in (await dataset_patch_scales(conn, dataset_id, base_field)).items()
+    }
+    providers = await conn.fetch(
+        f"""SELECT r.scale, r.follower_id, f.name, r.dims, r.indexed, f.last_seen_at,
+                  COALESCE(f.last_seen_at > now() - interval '{ONLINE_SECONDS} seconds', FALSE) AS online
+           FROM follower_fields r JOIN followers f ON f.id = r.follower_id
+           WHERE r.dataset_id = $1 AND r.base_field = $2
+           ORDER BY r.scale, r.first_reported_at, f.name""",
+        dataset_id,
+        base_field,
+    )
+    for row in providers:
+        entry = scales.setdefault(
+            row['scale'],
+            {'local': False, 'dims': row['dims'], 'indexed_fields': None, 'providers': []},
+        )
+        entry['providers'].append({key: row[key] for key in row.keys() if key != 'scale'})
+    return dict(sorted(scales.items()))
 
 
 async def nearest_patches(

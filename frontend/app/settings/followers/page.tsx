@@ -20,6 +20,14 @@ interface FollowedDataset {
     start_txid: number | null;
     acked_txid: number | null;
     held_rows: number;
+    own_scales: OwnScale[];  // patch scales the follower computed itself and reported (protocol 2)
+}
+interface OwnScale {
+    base_field: string;
+    scale: string;
+    dims: number;
+    indexed: boolean;
+    reported_at: string;
 }
 interface Follower {
     id: number;
@@ -134,6 +142,15 @@ function FollowerCard({ follower, datasets }: { follower: Follower; datasets: { 
                             <span className="text-zinc-500" title="Changes kept on this server until the follower applies them">
                                 {dataset.held_rows.toLocaleString()} changes held
                             </span>
+                            {dataset.own_scales.length > 0 && (
+                                <span
+                                    data-testid="follower-own-scales"
+                                    className="text-zinc-400"
+                                    title="Patch vectors the follower computed itself: this server doesn't hold them"
+                                >
+                                    Holds {dataset.own_scales.map(own => `${own.base_field} ${own.scale.replace('x', '×')}${own.indexed ? '' : ' (no index)'}`).join(', ')}
+                                </span>
+                            )}
                             <button
                                 onClick={() => unfollow.mutate(dataset.dataset_id)}
                                 className="text-zinc-400 hover:text-red-300"

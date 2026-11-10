@@ -58,7 +58,8 @@ it.
 
 Every call takes the follower token (`Authorization: Bearer <token>`) and records the follower as seen.
 
-1. `GET /api/follower/config` returns its datasets, their options, the primary's `database_identity` (its
+1. `GET /api/follower/config` returns its datasets, their options, the API's `protocol` version (2 for a primary that
+   takes the follower's own patch scales; absent from older ones), the primary's `database_identity` (its
    cluster's system identifier and its database's oid; `identity` is the cluster's alone, as followers before
    2.6.1 read it), and whether each dataset is `ready`. A dataset becomes ready once every transaction that might have written to it without
    being logged has ended. Those are writes already in flight when it became followed.
@@ -144,6 +145,15 @@ its last sync, and any error. The job's successful runs are pruned from the job 
   has the dataset's `images` option on, it asks the primary for the image, thumbnail, crop or overlay and keeps
   the answer in its media cache (`S3_LOCAL_CACHE_PATH`, pruned with it). With the option off, those images don't
   load. Patch vectors never need them.
+
+### Patch scales of its own
+
+A follower can hold patch vectors the primary doesn't, computed on its own machine (a GPU, and the disk for 8×8
+patches and their indexes). With a primary on protocol 2, each mirror reports its own patch scales: the base field,
+the scale, the vectors' size and whether every tile has its index. It reports with `POST
+/api/follower/datasets/{id}/fields`, at most every 10 minutes and once the copy is following, and each report
+replaces the last one. The primary keeps them while the dataset stays followed and shows them on Settings →
+Followers ("Holds clip 8×8"). Patch scales that came from the primary aren't reported.
 
 ### Edits sent to the primary
 

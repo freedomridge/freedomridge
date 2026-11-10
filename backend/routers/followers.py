@@ -43,6 +43,9 @@ FEED_VECTOR_ROWS = 20000  # vector changes per page a follower asks for (vector_
 SAMPLE_BLOCKS = 16  # blocks per samples request
 VECTOR_SAMPLES = 2000  # samples per vectors request
 TAG_SAMPLES = 50000  # samples per tags request from a follower
+# The follower API's version, in /follower/config. 2 adds the follower's reports of its own patch scales.
+PROTOCOL = 2
+REPORTED_SCALES = 100  # patch scales per report (base fields × scales)
 # The change log's tables, each with dataset_id and transaction_id.
 LOG_TABLES = ('sample_block_changes', 'vector_changes', 'dataset_changes', 'map_block_changes')
 
@@ -83,6 +86,17 @@ class TagRequest(BaseModel):
 class ViewRequest(BaseModel):
     name: str = Field(min_length=1, max_length=200)
     content: dict
+
+
+class ReportedScale(BaseModel):
+    base_field: str = Field(pattern=r'^[a-zA-Z0-9_]{1,100}$')
+    scale: str = Field(pattern=r'^[1-9][0-9]?x[1-9][0-9]?$')
+    dims: int = Field(ge=1, le=16000)
+    indexed: bool
+
+
+class FieldReport(BaseModel):
+    scales: List[ReportedScale] = Field(max_length=REPORTED_SCALES)
 
 
 async def identity(source=None) -> str:
@@ -195,11 +209,22 @@ async def list_followers(user: dict = Depends(require_role('admin'))):
                    {held} AS held_rows
             FROM follower_datasets f JOIN datasets d ON d.id = f.dataset_id ORDER BY d.name""",
     )
+    reported = await db.fetch(
+        """SELECT follower_id, dataset_id, base_field, scale, dims, indexed, reported_at
+           FROM follower_fields ORDER BY base_field, scale""",
+    )
     result = []
     for follower in followers:
         entry = dict(follower)
         entry['datasets'] = [
-            {key: row[key] for key in row.keys() if key != 'follower_id'}
+            {
+                **{key: row[key] for key in row.keys() if key != 'follower_id'},
+                'own_scales': [
+                    {key: own[key] for key in ('base_field', 'scale', 'dims', 'indexed', 'reported_at')}
+                    for own in reported
+                    if own['follower_id'] == follower['id'] and own['dataset_id'] == row['dataset_id']
+                ],
+            }
             for row in datasets
             if row['follower_id'] == follower['id']
         ]
@@ -364,6 +389,7 @@ async def follower_config(follower: dict = Depends(current_follower)):
     )
     return {
         'name': follower['name'],
+        'protocol': PROTOCOL,
         # A follower before 2.6.1 compares `identity` exactly and copies everything again when it changes: it
         # keeps the cluster's identifier alone. Newer followers read the database's.
         'identity': current.split(':')[0],
@@ -606,6 +632,36 @@ async def follower_ack(dataset_id: int, ack: Ack, follower: dict = Depends(curre
 
 
 # --- Images, for a dataset whose images option is on ----------------------------------------------------------------
+
+
+@router.post('/follower/datasets/{dataset_id}/fields')
+async def follower_fields_report(dataset_id: int, report: FieldReport, follower: dict = Depends(current_follower)):
+    """The patch scales this follower holds of a dataset it follows, computed there and not sent by the primary: they
+    replace its previous report. A patch search on such a scale can then go to it (docs/FOLLOWERS.md)."""
+    unique = {(scale.base_field, scale.scale): scale for scale in report.scales}
+    async with db.pool.acquire() as connection, connection.transaction():
+        await subscription(connection, follower, dataset_id)
+        # A scale reported again keeps its first_reported_at: providers are taken in that order, so the same search
+        # keeps going to the same follower.
+        await connection.execute(
+            """DELETE FROM follower_fields WHERE follower_id = $1 AND dataset_id = $2
+                 AND (base_field, scale) NOT IN (SELECT * FROM unnest($3::text[], $4::text[]))""",
+            follower['id'],
+            dataset_id,
+            [base for base, _ in unique],
+            [scale for _, scale in unique],
+        )
+        await connection.executemany(
+            """INSERT INTO follower_fields (follower_id, dataset_id, base_field, scale, dims, indexed)
+               VALUES ($1, $2, $3, $4, $5, $6)
+               ON CONFLICT (follower_id, dataset_id, base_field, scale)
+               DO UPDATE SET dims = EXCLUDED.dims, indexed = EXCLUDED.indexed, reported_at = now()""",
+            [
+                (follower['id'], dataset_id, scale.base_field, scale.scale, scale.dims, scale.indexed)
+                for scale in unique.values()
+            ],
+        )
+    return {'scales': len(unique)}
 
 
 @router.get('/follower/datasets/{dataset_id}/samples/{sample_id}/media')

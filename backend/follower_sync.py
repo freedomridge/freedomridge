@@ -20,7 +20,7 @@ import httpx
 import numpy as np
 from fastapi import HTTPException
 
-from . import job_queue
+from . import job_queue, patch_search
 from .crypto import decrypt_secret
 from .diskspace import INGEST_ROW_BYTES, require_free_space
 from .field_registry import lock_field_lifecycle
@@ -40,6 +40,7 @@ REQUEST_SECONDS = 120
 LOCK_SECONDS = 5
 RETRY_SECONDS = 60  # a failed mirror's wait before its next try, doubling after each failure in a row
 RETRY_MAX_SECONDS = 3600
+REPORT_SECONDS = 600  # how often a mirror reports its own patch scales to a primary that takes them
 SAMPLE_COLUMNS = (
     ('id', 'integer'),
     ('filepath', 'text'),
@@ -828,7 +829,15 @@ async def configure(pool, link, client, checkpoint: dict) -> StepResult:
             config['name'],
         )
 
-    checkpoint.update(configured=True, identity=current, caught_up=[], failed=[], acked={})
+    checkpoint.update(
+        configured=True,
+        identity=current,
+        protocol=config.get('protocol', 1),
+        caught_up=[],
+        failed=[],
+        acked={},
+        reported=[],
+    )
     waiting = sorted(entry['name'] for entry in config['datasets'] if not entry['ready'])
     message = f"{len(assigned)} datasets shared, {len(plans)} new copies"
     if waiting:
@@ -1162,6 +1171,43 @@ def passed_over(checkpoint: dict, mirror) -> dict:
     }
 
 
+async def own_patch_scales(pool, mirror) -> list[dict]:
+    """The patch scales this instance computed for a mirror itself: those whose tiles aren't the primary's."""
+    async with pool.acquire() as connection:
+        found = await patch_search.dataset_patch_scales(connection, mirror['dataset_id'])
+    theirs = set(mirror['vector_fields'])
+    return [
+        {'base_field': base, 'scale': scale, 'dims': entry['dims'], 'indexed': entry['indexed_fields'] is not None}
+        for (base, scale), entry in found.items()
+        if entry['dims'] and not theirs.intersection(entry['tiles'])
+    ]
+
+
+async def report_step(pool, client, mirror, checkpoint: dict) -> StepResult:
+    """Tell the primary the patch scales this instance holds of one mirror (docs/FOLLOWERS.md), so a patch search on
+    one of them can come here. Each mirror reports every REPORT_SECONDS."""
+    dataset_id = mirror['dataset_id']
+    scales = await own_patch_scales(pool, mirror)
+    try:
+        await call(
+            client,
+            'POST',
+            f"/follower/datasets/{mirror['origin_dataset_id']}/fields",
+            body={'scales': scales},
+        )
+        message = f'Reported {len(scales)} patch scale(s) of mirror {dataset_id}'
+    except PrimaryRefused as error:
+        # Not followed there any more, say: the next config read stops the mirror. Try again next time.
+        message = f'The primary refused the patch scales of mirror {dataset_id}: {error.detail}'
+        logger.warning(message)
+    checkpoint.setdefault('reported', []).append(dataset_id)
+
+    async def reported(connection):
+        await connection.execute('UPDATE mirrors SET fields_reported_at = now() WHERE dataset_id = $1', dataset_id)
+
+    return StepResult(checkpoint=checkpoint, message=message, publish=reported)
+
+
 def handler(pool):
     async def step(job):
         link = await pool.fetchrow('SELECT * FROM primary_links WHERE id = $1', job['args']['link_id'])
@@ -1180,6 +1226,19 @@ def handler(pool):
                     link['id'],
                     checkpoint.get('caught_up', []),
                 )
+                if mirror is None and checkpoint.get('protocol', 1) >= 2:
+                    due = await pool.fetchrow(
+                        f"""SELECT m.* FROM mirrors m JOIN datasets d ON d.id = m.dataset_id
+                           WHERE m.link_id = $1 AND m.state = 'following' AND NOT d.deleting
+                             AND NOT (m.dataset_id = ANY($2::int[]))
+                             AND (m.fields_reported_at IS NULL
+                                  OR m.fields_reported_at < now() - interval '{REPORT_SECONDS} seconds')
+                           ORDER BY m.dataset_id LIMIT 1""",
+                        link['id'],
+                        checkpoint.get('reported', []),
+                    )
+                    if due is not None:
+                        return await report_step(pool, client, due, checkpoint)
                 if mirror is None:
 
                     async def synced(connection):

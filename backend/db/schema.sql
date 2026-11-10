@@ -2569,6 +2569,22 @@ CREATE TABLE IF NOT EXISTS follower_datasets (
 );
 CREATE INDEX IF NOT EXISTS follower_datasets_dataset ON follower_datasets (dataset_id);
 
+-- Patch scales a follower holds of a dataset it follows, computed there and not sent by the primary (0015): it
+-- reports them, so a patch search on such a scale can go to it.
+CREATE TABLE IF NOT EXISTS follower_fields (
+    follower_id INTEGER NOT NULL,
+    dataset_id INTEGER NOT NULL,
+    base_field TEXT NOT NULL,
+    scale TEXT NOT NULL,
+    dims INTEGER NOT NULL,
+    indexed BOOLEAN NOT NULL,
+    first_reported_at TIMESTAMPTZ NOT NULL DEFAULT now(),  -- providers are taken in this order
+    reported_at TIMESTAMPTZ NOT NULL DEFAULT now(),  -- the latest report naming it
+    PRIMARY KEY (follower_id, dataset_id, base_field, scale),
+    FOREIGN KEY (follower_id, dataset_id) REFERENCES follower_datasets (follower_id, dataset_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS follower_fields_dataset ON follower_fields (dataset_id, base_field, scale);
+
 CREATE OR REPLACE FUNCTION sync_dataset_followed() RETURNS trigger AS $$
 BEGIN
     UPDATE datasets d SET followed = EXISTS (SELECT 1 FROM follower_datasets f WHERE f.dataset_id = d.id)
@@ -2630,7 +2646,8 @@ CREATE TABLE IF NOT EXISTS mirrors (
     last_error TEXT,
     images BOOLEAN NOT NULL DEFAULT FALSE,  -- the primary serves its images to this instance (0012)
     failures INTEGER NOT NULL DEFAULT 0,  -- failed runs in a row (0013)
-    retry_after TIMESTAMP WITH TIME ZONE  -- after a failure, not tried again before this (0013)
+    retry_after TIMESTAMP WITH TIME ZONE,  -- after a failure, not tried again before this (0013)
+    fields_reported_at TIMESTAMP WITH TIME ZONE  -- when this instance last reported its own patch scales (0015)
 );
 -- One live mirror per primary dataset; a stopped one stays beside a new copy.
 CREATE UNIQUE INDEX IF NOT EXISTS mirrors_live_origin ON mirrors (link_id, origin_dataset_id) WHERE state <> 'stopped';
@@ -2825,5 +2842,6 @@ INSERT INTO schema_migrations (filename) VALUES
     ('0011_compute_launcher_arm.sql'),
     ('0012_follower_images.sql'),
     ('0013_follower_restarts.sql'),
-    ('0014_follower_instance.sql')
+    ('0014_follower_instance.sql'),
+    ('0015_follower_fields.sql')
 ON CONFLICT (filename) DO NOTHING;

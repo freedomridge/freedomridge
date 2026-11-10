@@ -1021,3 +1021,100 @@ def test_a_follower_can_ask_for_feed_pages_bounded_by_vector_changes(monkeypatch
         assert not whole['more'] and len(whole['vectors']) == 3
 
     registry_database(scenario)
+
+
+def test_a_follower_reports_the_patch_scales_it_holds_itself(monkeypatch, registry_database):
+    async def scenario(database):
+        from backend import patch_search
+        from backend.routers import embeddings as embeddings_router
+
+        _, link_id = await setup(monkeypatch, database)
+        monkeypatch.setattr(embeddings_router, 'db', database)
+        await ingest([{'crop': 'corn'}, {'crop': 'soy'}], dataset_id=1, prefix='s3://images/a')
+        corn = await database.fetchval("SELECT id FROM samples WHERE dataset_id = 1 AND metadata->>'crop' = 'corn'")
+        await database.execute(
+            "INSERT INTO embeddings (sample_id, field_name, vector) VALUES ($1, 'clip', '[1,0]')",
+            corn,
+        )
+        follower = await database.fetchval('SELECT id FROM followers')
+        await followers.follow_dataset(follower, 1, followers.FollowOptions(), user=USER)
+        await sync(database, link_id)
+        mirror = await mirror_of(database)
+        assert mirror['state'] == 'following' and mirror['vector_fields'] == ['clip']
+        # Nothing of its own yet: the report is empty, and the primary keeps nothing for it.
+        assert await database.fetchval('SELECT count(*) FROM follower_fields') == 0
+        assert await database.fetchval('SELECT fields_reported_at FROM mirrors') is not None
+
+        # Patch vectors computed here, on the mirror's samples: a 2x2 scale only this instance has.
+        local = [
+            row['id']
+            for row in await database.fetch('SELECT id FROM samples WHERE dataset_id = $1', mirror['dataset_id'])
+        ]
+        for sample_id in local:
+            for tile in ('r0c0', 'r0c1', 'r1c0', 'r1c1'):
+                await database.execute(
+                    "INSERT INTO embeddings (sample_id, field_name, vector) VALUES ($1, $2, '[0.5,0.5,0.5]')",
+                    sample_id,
+                    f'clip_patch_2x2_{tile}',
+                )
+        # Reported again once its last report is old enough.
+        await database.execute("UPDATE mirrors SET fields_reported_at = now() - interval '1 hour'")
+        await sync(database, link_id)
+        rows = await database.fetch('SELECT base_field, scale, dims, indexed FROM follower_fields')
+        assert [dict(row) for row in rows] == [{'base_field': 'clip', 'scale': '2x2', 'dims': 3, 'indexed': False}]
+
+        listed = await followers.list_followers(user=USER)
+        assert [(own['base_field'], own['scale']) for own in listed[0]['datasets'][0]['own_scales']] == [
+            ('clip', '2x2'),
+        ]
+        async with database.pool.acquire() as connection:
+            scales = await patch_search.patch_scales(connection, 1, 'clip')
+        assert scales['2x2']['local'] is False
+        assert [(p['name'], p['online'], p['dims']) for p in scales['2x2']['providers']] == [('lab', True, 3)]
+        # Not offered as a scale of the primary's own until a search can go to the follower.
+        assert await embeddings_router.get_patch_scales(1, 'clip') == []
+
+        # Stopping the follow drops what it reported.
+        await followers.unfollow_dataset(follower, 1, user=USER)
+        assert await database.fetchval('SELECT count(*) FROM follower_fields') == 0
+
+    registry_database(scenario)
+
+
+def test_a_report_is_checked_and_only_for_a_followed_dataset(monkeypatch, registry_database):
+    async def scenario(database):
+        created, _ = await setup(monkeypatch, database)
+        from backend.main import app
+
+        with pytest.raises(ValueError):
+            followers.ReportedScale(base_field='clip', scale='0x2', dims=3, indexed=False)
+        with pytest.raises(ValueError):
+            followers.ReportedScale(base_field='clip; DROP', scale='2x2', dims=3, indexed=False)
+        headers = {'Authorization': f"Bearer {created['token']}"}
+        body = {'scales': [{'base_field': 'clip', 'scale': '2x2', 'dims': 3, 'indexed': True}]}
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://primary/api') as client:
+            refused = await client.post('/follower/datasets/1/fields', json=body, headers=headers)
+            assert refused.status_code == 404  # not followed
+            config = await client.get('/follower/config', headers=headers)
+            assert config.json()['protocol'] == followers.PROTOCOL
+        follower = await database.fetchval('SELECT id FROM followers')
+        await followers.follow_dataset(follower, 1, followers.FollowOptions(), user=USER)
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://primary/api') as client:
+            twice = {'scales': body['scales'] * 2}  # the same scale twice counts once
+            accepted = await client.post('/follower/datasets/1/fields', json=twice, headers=headers)
+        assert accepted.status_code == 200 and accepted.json() == {'scales': 1}
+        assert await database.fetchval('SELECT indexed FROM follower_fields') is True
+        first = await database.fetchval('SELECT first_reported_at FROM follower_fields')
+        # Reported again (no index now) and with another scale: the first keeps its place among providers.
+        again = {'scales': [{**body['scales'][0], 'indexed': False}, {**body['scales'][0], 'scale': '4x4'}]}
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://primary/api') as client:
+            assert (await client.post('/follower/datasets/1/fields', json=again, headers=headers)).status_code == 200
+        rows = {r['scale']: r for r in await database.fetch('SELECT * FROM follower_fields')}
+        assert rows['2x2']['first_reported_at'] == first and rows['2x2']['indexed'] is False
+        assert rows['2x2']['reported_at'] > first and set(rows) == {'2x2', '4x4'}
+        # A scale no longer reported goes.
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://primary/api') as client:
+            assert (await client.post('/follower/datasets/1/fields', json=body, headers=headers)).status_code == 200
+        assert [r['scale'] for r in await database.fetch('SELECT scale FROM follower_fields')] == ['2x2']
+
+    registry_database(scenario)

@@ -1597,7 +1597,8 @@ async def get_patch_scales(id: int, field_name: str = "clip"):
     """
     async with db.pool.acquire() as conn:
         scales = await patch_search.patch_scales(conn, id, field_name)
-    return [{"scale": s} for s in sorted(scales)]
+    # The scales this dataset holds. A follower's own scales aren't searchable from here yet.
+    return [{"scale": s} for s, source in scales.items() if source['local']]
 
 
 # --- Raw vectors (for SDK UMAP computation) ---

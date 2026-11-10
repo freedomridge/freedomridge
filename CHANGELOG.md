@@ -4,6 +4,20 @@ Freedom Ridge has one version for the server, the web app and the Python SDK (th
 file), following [Semantic Versioning](https://semver.org). A release lists **upgrade notes** when
 it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
 
+## Unreleased
+
+### Upgrade notes
+
+- One database migration, `0015_follower_fields.sql`, applied with `scripts/apply_migrations.sh` (step 4 of
+  [Upgrading](docs/UPGRADING.md)).
+
+### Added
+
+- **Followers report the patch scales they hold themselves** ([FOLLOWERS.md](docs/FOLLOWERS.md#patch-scales-of-its-own)).
+  A follower with patch vectors the primary doesn't have (computed on its own GPU, say) tells the primary which
+  scales, at most every 10 minutes, and Settings → Followers shows them. The follower API is now `protocol: 2`. This
+  is the first step to patch searches on the primary that run on a follower's patch vectors.
+
 ## 2.6.1 (2026-11-09)
 
 2.6.1 fixes followers, from a review of the feature: a restored primary is detected and its followers copy again,
