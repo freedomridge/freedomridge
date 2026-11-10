@@ -41,6 +41,8 @@ NO_SPOT_CAPACITY = (
     'InsufficientCapacityOnHost',
     'UnfulfillableCapacity',
 )
+# botocore errors raised before a request is sent (by class name: botocore is imported only when a client is made).
+NEVER_SENT = ('ParamValidationError', 'NoCredentialsError', 'PartialCredentialsError')
 # AWS's reason for an instance ending, in words.
 END_REASONS = {
     'Client.InstanceInitiatedShutdown': 'its worker finished and the machine powered off',
@@ -240,10 +242,13 @@ async def reap(pool, ec2, settings, live: list, identity: str) -> None:
                 await record_error(pool, f'Could not look for launch {launch["id"]}: {error}')
                 continue
             if tagged:
+                instance_id, found = next(iter(tagged.items()))
                 await pool.execute(
-                    'UPDATE compute_launches SET instance_id = $2 WHERE id = $1',
+                    # The market too: the lost answer may have been the on-demand request's.
+                    'UPDATE compute_launches SET instance_id = $2, market = $3 WHERE id = $1',
                     launch['id'],
-                    next(iter(tagged)),
+                    instance_id,
+                    'spot' if found.get('InstanceLifecycle') == 'spot' else 'on-demand',
                 )
             elif now - launch['launched_at'] > timedelta(minutes=BOOT_MINUTES):
                 await end_launch(pool, launch['id'], 'AWS never answered the launch')
@@ -381,8 +386,10 @@ async def launch(pool, ec2, settings, job_id, identity: str) -> None:
         )
     script = user_data(settings, raw, worker_name)
     market = 'spot'
+    asked = False
     try:
         image_id = await image_for(ec2, settings['instance_type'])
+        asked = True
         try:
             answer = await asyncio.to_thread(
                 ec2.run_instances,
@@ -411,6 +418,11 @@ async def launch(pool, ec2, settings, job_id, identity: str) -> None:
                 ),
             )
     except Exception as error:
+        if asked and not error_code(error) and type(error).__name__ not in NEVER_SENT:
+            # No answer from AWS (a timeout, a dropped connection): it may have started the machine. The launch
+            # stays open, so reap() finds the machine by its tag or ends the launch after BOOT_MINUTES.
+            await record_error(pool, f"AWS didn't answer the launch, looking for its machine: {error}")
+            return
         await end_launch(pool, launch_id, f'AWS refused the launch: {error}')
         await record_error(pool, f'Could not start a machine: {error}')
         return

@@ -37,6 +37,11 @@ POLICY = job_queue.JobPolicy(max_unit_seconds=1800, max_failures=5, retry_second
 RANK_SECONDS = 1800
 BLOCK = followers.BLOCK
 COPY_BLOCKS = 2  # blocks per step: up to 8192 samples and their vectors
+RESTORE_ROWS = 2000  # rows per step when a held copy is resumed into after a primary restore
+HELD_REASON = 'The primary was restored into a new database: choose on the Primaries page whether this copy resumes'
+OLDER_PRIMARY_REASON = (
+    "The restored primary runs a release that can't compare copies: a new copy was made, and this one is kept"
+)
 REQUEST_SECONDS = 120
 RETURN_SECONDS = 10  # a sync's own /follower/return holds the link row meanwhile (return_if_linked)
 LOCK_SECONDS = 5
@@ -274,6 +279,8 @@ async def ensure_array_columns(pool, dataset_id: int, names: list) -> None:
         except HTTPException as error:
             if error.status_code == 409:
                 raise job_queue.QueueContended(error.detail) from None
+            if error.status_code == 400:
+                raise ValueError(f'The primary sent an array field this instance cannot hold: {name!r}') from None
             raise
 
 
@@ -785,6 +792,365 @@ async def return_if_linked(pool, link, client) -> bool:
     return True
 
 
+# --- A copy held after a primary restore (docs/FOLLOWERS.md, "When the primary was restored") ----------------------
+
+
+# A held copy compared afresh: the primary was restored again before it was resumed.
+COMPARE_AGAIN = """UPDATE mirror_restores SET phase = 'compare', decision = NULL, decided_by = NULL, decided_at = NULL,
+                          compare_after = 0, total = 0, matched = 0, matched_hash = 0, only_here = NULL,
+                          computed_at = NULL, hash_field = NULL, primary_identity = COALESCE($2, primary_identity)
+                   WHERE dataset_id = $1"""
+
+
+async def restore_step(pool, link, client, checkpoint: dict) -> StepResult | None:
+    """One step for a copy held after its primary was restored: comparing it with the primary, or, once its admin has
+    chosen, resuming into it or letting it go, in steps of RESTORE_ROWS rows. The held copies take turns, and one
+    whose step fails is isolated as a mirror is: the error on its row, tried again later, the others carry on.
+    None: nothing to do now."""
+    rows = await pool.fetch(
+        """SELECT r.*, m.hash_fields FROM mirror_restores r JOIN mirrors m ON m.dataset_id = r.dataset_id
+           WHERE r.link_id = $1 AND r.phase <> 'ask' AND (r.retry_after IS NULL OR r.retry_after <= now())
+           ORDER BY (r.dataset_id <= $2), r.dataset_id""",
+        link['id'],
+        checkpoint.get('held_turn', 0),
+    )
+    for row in rows:
+        before = copy.deepcopy(checkpoint)
+        try:
+            result = await held_step(pool, link, client, dict(row), checkpoint)
+        except PrimaryUnavailable:
+            raise  # every mirror of this primary waits for it
+        except Exception as error:
+            if job_queue.is_transient(error):
+                raise
+            reason = describe(error)
+
+            async def note(connection, dataset_id=row['dataset_id'], reason=reason):
+                await note_held_failure(connection, dataset_id, reason)
+
+            logger.warning('Held copy %s failed this run: %s', row['dataset_id'], reason)
+            return StepResult(
+                checkpoint={**before, 'held_turn': row['dataset_id']},
+                message=f'A held copy failed: {reason}',
+                publish=note,
+            )
+        if result is None:
+            continue
+        checkpoint['held_turn'] = row['dataset_id']
+        if row['failures'] or row['last_error']:  # it works again: the error goes, as a mirror's does
+            inner = result.publish
+
+            async def cleared(connection, inner=inner, dataset_id=row['dataset_id']):
+                if inner is not None:
+                    await inner(connection)
+                await connection.execute(
+                    """UPDATE mirror_restores SET last_error = NULL, failures = 0, retry_after = NULL
+                       WHERE dataset_id = $1""",
+                    dataset_id,
+                )
+
+            result.publish = cleared
+        return held_isolated(row['dataset_id'], before, result)
+    return None
+
+
+async def note_held_failure(connection, dataset_id: int, reason: str) -> None:
+    """Put the error on the held copy's row and wait before trying it again, as note_failure does for a mirror."""
+    await connection.execute(
+        """UPDATE mirror_restores SET last_error = $2, failures = failures + 1,
+                  retry_after = now() + make_interval(secs => least($3 * power(2, failures), $4))
+           WHERE dataset_id = $1""",
+        dataset_id,
+        reason,
+        RETRY_SECONDS,
+        RETRY_MAX_SECONDS,
+    )
+
+
+def held_isolated(dataset_id: int, before: dict, result: StepResult) -> StepResult:
+    """A held copy's writes run in a savepoint, as a mirror's do (isolated): if they fail, they're undone, the error
+    goes on its row, and the job carries on from the checkpoint before the step. A transient error still fails the
+    job, which then runs again."""
+    publish = result.publish
+    progress = result.checkpoint if result.checkpoint is not None else dict(before)
+
+    async def guarded(connection):
+        try:
+            async with connection.transaction():
+                if publish is not None:
+                    await publish(connection)
+        except Exception as error:
+            if job_queue.is_transient(error) or isinstance(error, asyncpg.InterfaceError):
+                raise
+            await note_held_failure(connection, dataset_id, describe(error))
+            progress.clear()
+            progress.update({**before, 'held_turn': dataset_id})
+
+    return StepResult(
+        checkpoint=progress,
+        done=result.done,
+        total=result.total,
+        message=result.message,
+        result=result.result,
+        finished=result.finished,
+        publish=guarded,
+    )
+
+
+async def held_step(pool, link, client, row: dict, checkpoint: dict) -> StepResult | None:
+    """The next step of one held copy (restore_step)."""
+    dataset_id, phase = row['dataset_id'], row['phase']
+    if phase == 'compare':
+        return await compare_step(pool, client, dict(row), checkpoint)
+    if phase == 'resume':
+        return await resume_held(pool, link, client, dict(row), checkpoint)
+    queries = {
+        # The copy's samples the primary no longer has, matched to none of its: they go, with what was added here.
+        'unmatched': """SELECT s.id FROM samples s WHERE s.dataset_id = $1
+                          AND NOT EXISTS (SELECT 1 FROM mirror_restore_map p
+                                          WHERE p.dataset_id = $1 AND p.sample_id = s.id)
+                        ORDER BY s.id LIMIT $2""",
+        # The matched ones take the primary's new ids in two passes, through negative ids, so the unique
+        # (dataset_id, origin_id) never clashes.
+        'negate': """SELECT m.sample_id AS id FROM mirror_samples m
+                       JOIN mirror_restore_map p ON p.dataset_id = m.dataset_id AND p.sample_id = m.sample_id
+                     WHERE m.dataset_id = $1 AND m.origin_id <> -p.new_origin_id ORDER BY m.sample_id LIMIT $2""",
+        'move': """SELECT sample_id AS id FROM mirror_samples WHERE dataset_id = $1 AND origin_id < 0
+                   ORDER BY sample_id LIMIT $2""",
+        'map': 'SELECT sample_id AS id FROM mirror_restore_map WHERE dataset_id = $1 ORDER BY sample_id LIMIT $2',
+    }
+    ids = [] if phase == 'views' else [r['id'] for r in await pool.fetch(queries[phase], dataset_id, RESTORE_ROWS)]
+    following = {'unmatched': 'negate', 'negate': 'move', 'move': 'views', 'views': 'map'}
+    checkpoint['mirror_turn'] = True
+    if ids or phase == 'views':
+
+        async def publish(connection):
+            await begin_mirror_write(connection, dataset_id)
+            if phase == 'unmatched':
+                await connection.execute(
+                    'DELETE FROM samples WHERE dataset_id = $1 AND id = ANY($2::int[])',
+                    dataset_id,
+                    ids,
+                )
+            elif phase == 'negate':
+                await connection.execute(
+                    """UPDATE mirror_samples m SET origin_id = -p.new_origin_id FROM mirror_restore_map p
+                       WHERE m.dataset_id = $1 AND p.dataset_id = $1 AND p.sample_id = m.sample_id
+                         AND m.sample_id = ANY($2::int[])""",
+                    dataset_id,
+                    ids,
+                )
+            elif phase == 'move':
+                await connection.execute(
+                    """UPDATE mirror_samples SET origin_id = -origin_id
+                       WHERE dataset_id = $1 AND sample_id = ANY($2::int[])""",
+                    dataset_id,
+                    ids,
+                )
+            elif phase == 'views':
+                # The copies of the primary's shared views: its view ids can name other views now. The next sync copies
+                # its shared views again; views made here stay.
+                await connection.execute(
+                    'DELETE FROM views WHERE id IN (SELECT view_id FROM mirror_views WHERE dataset_id = $1)',
+                    dataset_id,
+                )
+                await connection.execute("UPDATE mirror_restores SET phase = 'map' WHERE dataset_id = $1", dataset_id)
+            else:
+                await connection.execute(
+                    'DELETE FROM mirror_restore_map WHERE dataset_id = $1 AND sample_id = ANY($2::int[])',
+                    dataset_id,
+                    ids,
+                )
+
+        return StepResult(
+            checkpoint=checkpoint,
+            message=f'Resuming a copy held after a primary restore ({phase})',
+            publish=publish,
+        )
+    if phase != 'map':
+        nxt = following[phase]
+
+        async def advance(connection):
+            await connection.execute('UPDATE mirror_restores SET phase = $2 WHERE dataset_id = $1', dataset_id, nxt)
+
+        return StepResult(checkpoint=checkpoint, publish=advance)
+    # The matches are cleared: what comes next is the admin's choice, or why the question went.
+    decision = row['decision']
+
+    async def settle(connection):
+        if decision == 'resume':
+            await connection.execute("UPDATE mirror_restores SET phase = 'resume' WHERE dataset_id = $1", dataset_id)
+        elif decision == 'redo':
+            await connection.execute(COMPARE_AGAIN, dataset_id, None)
+        else:
+            if decision == 'new':  # kept as it is: the new copy is made by the next configure
+                await connection.execute('UPDATE mirrors SET keep_separate = TRUE WHERE dataset_id = $1', dataset_id)
+            await connection.execute('DELETE FROM mirror_restores WHERE dataset_id = $1', dataset_id)
+
+    if decision == 'new':
+        checkpoint['configured'] = False
+    return StepResult(checkpoint=checkpoint, publish=settle)
+
+
+async def compare_step(pool, client, row: dict, checkpoint: dict) -> StepResult:
+    """A page of the restored primary's samples compared with the held copy's, by file path, and by image hash where
+    both have one (a matched path with another hash doesn't match). Changes nothing on the copy."""
+    dataset_id = row['dataset_id']
+    first = row['total'] == 0 and row['compare_after'] == 0
+    # The first page asks for the copy's hash fields (as many as a page takes, lowest names first), to see which
+    # the primary has too.
+    asked = (
+        sorted(row['hash_fields'])[: followers.MATCH_HASH_FIELDS]
+        if first
+        else [row['hash_field']]
+        if row['hash_field']
+        else []
+    )
+    try:
+        page = await call(
+            client,
+            'GET',
+            f"/follower/datasets/{row['origin_dataset_id']}/match-keys",
+            params={'after': row['compare_after'], 'hash_fields': asked},
+        )
+    except PrimaryRefused as error:
+        # Only a primary without the route answers FastAPI's own 404; one for a dataset unshared meanwhile ("does not
+        # follow") is an ordinary failure, and the next configure lets the question go.
+        if error.status != 404 or error.detail != 'Not Found':
+            raise
+        # The restored primary runs a release that can't compare copies: as before, a new copy, this one kept.
+
+        async def older(connection):
+            await connection.execute(
+                "UPDATE mirror_restores SET decision = 'new', phase = 'map' WHERE dataset_id = $1",
+                dataset_id,
+            )
+            await connection.execute(
+                'UPDATE mirrors SET last_error = $2 WHERE dataset_id = $1',
+                dataset_id,
+                OLDER_PRIMARY_REASON,
+            )
+
+        checkpoint['mirror_turn'] = True
+        return StepResult(checkpoint=checkpoint, message=OLDER_PRIMARY_REASON, publish=older)
+    keys = page['keys']
+    hash_field = row['hash_field']
+    if first:  # the lowest field name both sides have (the primary says which it has), kept for the whole comparison
+        present = set(page.get('hash_fields') or [])
+        hash_field = min(present) if present else None
+    here = {
+        r['filepath']: r
+        for r in await pool.fetch(
+            """SELECT s.id, s.filepath, h.hash_hex FROM samples s
+               LEFT JOIN sample_hashes h ON h.sample_id = s.id AND h.field_name = $3
+               WHERE s.dataset_id = $1 AND s.filepath = ANY($2::text[])""",
+            dataset_id,
+            [key['filepath'] for key in keys],
+            hash_field,
+        )
+    }
+    pairs, by_hash = [], 0
+    for key in keys:
+        mine = here.get(key['filepath'])
+        if mine is None:
+            continue
+        theirs = key['hashes'].get(hash_field) if hash_field else None
+        if theirs is not None and mine['hash_hex'] is not None:
+            if theirs != mine['hash_hex']:
+                continue
+            by_hash += 1
+        pairs.append((mine['id'], key['id']))
+    done = page['next'] is None
+    after = page['next'] if page['next'] is not None else (keys[-1]['id'] if keys else row['compare_after'])
+
+    async def publish(connection):
+        await connection.execute(
+            """INSERT INTO mirror_restore_map (dataset_id, sample_id, new_origin_id)
+               SELECT $1, p.sample_id, p.origin_id FROM unnest($2::int[], $3::int[]) AS p(sample_id, origin_id)
+               ON CONFLICT DO NOTHING""",
+            dataset_id,
+            [pair[0] for pair in pairs],
+            [pair[1] for pair in pairs],
+        )
+        await connection.execute(
+            """UPDATE mirror_restores SET hash_field = $2, compare_after = $3, total = total + $4,
+                      matched = matched + $5, matched_hash = matched_hash + $6
+               WHERE dataset_id = $1""",
+            dataset_id,
+            hash_field,
+            after,
+            len(keys),
+            len(pairs),
+            by_hash,
+        )
+        if done:
+            await connection.execute(
+                """UPDATE mirror_restores SET phase = 'ask', computed_at = now(),
+                          only_here = (SELECT count(*) FROM samples WHERE dataset_id = $1) - matched
+                   WHERE dataset_id = $1""",
+                dataset_id,
+            )
+
+    checkpoint['mirror_turn'] = True
+    return StepResult(
+        checkpoint=checkpoint,
+        message=f'Comparing a held copy with the restored primary: {row["total"] + len(keys):,} samples',
+        publish=publish,
+    )
+
+
+async def resume_held(pool, link, client, row: dict, checkpoint: dict) -> StepResult | None:
+    """The last step of resuming into a held copy: its samples carry the restored primary's ids now, so it copies
+    again as a resumed copy does (case A): every block read again, the feed from the subscription's start."""
+    dataset_id, origin = row['dataset_id'], row['origin_dataset_id']
+    config = await call(client, 'GET', '/follower/config')
+    entry = next((item for item in config['datasets'] if item['dataset_id'] == origin), None)
+    if entry is not None and not entry['ready']:
+        return None  # waiting for writes in flight on the primary, as a new copy does
+    current = primary_identity(config)
+    plan = await call(client, 'GET', f'/follower/datasets/{origin}/blocks') if entry is not None else {'blocks': []}
+
+    async def publish(connection):
+        if entry is None:  # no longer shared: the copy stays stopped
+            await connection.execute('DELETE FROM mirror_restores WHERE dataset_id = $1', dataset_id)
+            return
+        if not followers.same_identity(row['primary_identity'], current):
+            await connection.execute(COMPARE_AGAIN, dataset_id, current)
+            return
+        held = [
+            r['block']
+            for r in await connection.fetch(
+                f'SELECT DISTINCT origin_id / {BLOCK} AS block FROM mirror_samples WHERE dataset_id = $1',
+                dataset_id,
+            )
+        ]
+        blocks = sorted({*(item['block'] for item in plan['blocks']), *held})
+        await connection.execute(
+            """UPDATE mirrors SET link_id = $2, state = 'copying', tags = $3, views = $4, images = $5,
+                      copy_blocks = $6, copy_total = $7, feed_cursor = $8, primary_identity = $9,
+                      stopped_at = NULL, last_error = NULL, failures = 0, retry_after = NULL,
+                      fields_reported_at = NULL, keep_separate = FALSE
+               WHERE dataset_id = $1""",
+            dataset_id,
+            link['id'],
+            entry['tags'],
+            entry['views'],
+            entry.get('images', False),
+            blocks,
+            len(blocks),
+            entry['start_txid'] - 1,
+            current,
+        )
+        await connection.execute('DELETE FROM mirror_restores WHERE dataset_id = $1', dataset_id)
+
+    checkpoint['mirror_turn'] = True
+    return StepResult(
+        checkpoint=checkpoint,
+        message='Resumed into a copy held after a primary restore',
+        publish=publish,
+    )
+
+
 async def configure(pool, link, client, checkpoint: dict) -> StepResult:
     """Read what the primary assigns this follower: start a copy of each newly ready dataset, update the options,
     and stop the mirrors of datasets it no longer shares."""
@@ -810,9 +1176,18 @@ async def configure(pool, link, client, checkpoint: dict) -> StepResult:
         for row in await pool.fetch("SELECT * FROM mirrors WHERE link_id = $1 AND state <> 'stopped'", link['id'])
     }
     assigned = {entry['dataset_id']: entry for entry in config['datasets']}
+    restores = {
+        row['origin_dataset_id']: dict(row)
+        for row in await pool.fetch('SELECT * FROM mirror_restores WHERE link_id = $1', link['id'])
+    }
+    # After a restore, each copy of a dataset the primary still shares is held, and its admin chooses whether it
+    # resumes (docs/FOLLOWERS.md): its sample ids can't be trusted. One held already waits too, unless they chose
+    # a new copy.
+    holding = {origin for origin in live if origin in assigned} if restored else set()
+    held = holding | {origin for origin, row in restores.items() if row['decision'] != 'new'}
     plans = {}
     for origin, entry in assigned.items():
-        if entry['ready'] and (restored or origin not in live):
+        if entry['ready'] and origin not in held and (restored or origin not in live):
             plans[origin] = await call(client, 'GET', f'/follower/datasets/{origin}/blocks')
 
     resumed: list[int] = []
@@ -822,10 +1197,49 @@ async def configure(pool, link, client, checkpoint: dict) -> StepResult:
         if restored:
             await stop_mirrors(
                 connection,
+                'link_id = $1 AND origin_dataset_id = ANY($2::int[])',
+                (link['id'], sorted(holding)),
+                HELD_REASON,
+            )
+            await stop_mirrors(
+                connection,
                 'link_id = $1',
                 (link['id'],),
                 'The primary was restored into a new database: this copy stopped, and a new one started',
             )
+            for origin in sorted(holding):
+                await connection.execute(
+                    """INSERT INTO mirror_restores
+                           (dataset_id, link_id, origin_dataset_id, origin_name, primary_identity)
+                       VALUES ($1, $2, $3, $4, $5) ON CONFLICT (dataset_id) DO NOTHING""",
+                    live[origin]['dataset_id'],
+                    link['id'],
+                    origin,
+                    assigned[origin]['name'],
+                    current,
+                )
+        for origin, row in restores.items():
+            # Only a question not yet acted on: a resume half applied finishes first (resume_held then finds the
+            # dataset unshared, or the primary restored again), so the copy's sample ids are never left half moved.
+            if row['phase'] not in ('compare', 'ask'):
+                continue
+            if origin not in assigned and row['decision'] != 'drop':
+                # No longer shared: the question goes (its matches cleared in steps), and the copy stays stopped.
+                await connection.execute(
+                    """UPDATE mirror_restores SET decision = 'drop', phase = 'map'
+                       WHERE dataset_id = $1 AND phase IN ('compare', 'ask')""",
+                    row['dataset_id'],
+                )
+            elif row['decision'] != 'drop' and not followers.same_identity(row['primary_identity'], current):
+                # Restored again before it was resumed: compare again, with the primary as it is now.
+                await connection.execute(
+                    """UPDATE mirror_restores SET decision = 'redo', phase = 'map', primary_identity = $2,
+                              origin_name = $3
+                       WHERE dataset_id = $1 AND phase IN ('compare', 'ask')""",
+                    row['dataset_id'],
+                    current,
+                    assigned[origin]['name'],
+                )
         else:
             gone = [origin for origin in live if origin not in assigned]
             await stop_mirrors(
@@ -1298,6 +1712,12 @@ def handler(pool):
             try:
                 if not checkpoint.get('configured'):
                     return await configure(pool, link, client, checkpoint)
+                # A copy held after a primary restore takes a step turn about with the mirrors, so neither holds up the
+                # other (its steps set mirror_turn).
+                if not checkpoint.pop('mirror_turn', False):
+                    held = await restore_step(pool, link, client, checkpoint)
+                    if held is not None:
+                        return held
                 # The mirrors take turns, so a long first copy or a busy feed doesn't hold up the others of this
                 # primary: the mirror whose page of the feed is half applied carries on with it (the page is in the
                 # checkpoint), and otherwise the next one after the mirror served last.
@@ -1328,6 +1748,9 @@ def handler(pool):
                     if due is not None:
                         return await report_step(pool, client, due, checkpoint)
                 if mirror is None:
+                    held = await restore_step(pool, link, client, checkpoint)
+                    if held is not None:
+                        return held
 
                     async def synced(connection):
                         await connection.execute(

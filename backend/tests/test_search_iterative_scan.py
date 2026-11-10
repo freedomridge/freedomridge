@@ -10,10 +10,13 @@ reproduce candidate exhaustion.
 """
 
 import asyncio
+import json
+from typing import Any
 
+import asyncpg
 import pytest
 
-from backend.models import SearchRequest
+from backend.models import Sample, SearchRequest
 from backend.routers import search as search_router
 
 
@@ -26,14 +29,30 @@ class _Ctx:
 
 
 class _Conn:
-    def __init__(self):
+    def __init__(self, found=0, matching=0, slow=None):
         self.executed: list[str] = []
+        self.found, self.matching, self.slow = found, matching, slow
+        self.answer: Any = None
+        self.fetched: list[str] = []
+        self.counted = 0
 
     async def execute(self, query, *args):
         self.executed.append(query)
 
     async def fetch(self, query, *args):
-        return []
+        self.fetched.append(query)
+        if self.slow == 'exact' and len(self.fetched) == 2:
+            raise asyncpg.QueryCanceledError('canceling statement due to statement timeout')
+        return [
+            {'id': i, 'filepath': f'{i}.jpg', 'media_type': 'image', 'metadata': None, 'location': None}
+            for i in range(self.found)
+        ]
+
+    async def fetchval(self, query, *args):
+        self.counted += 1
+        if self.slow == 'count':
+            raise asyncpg.QueryCanceledError('canceling statement due to statement timeout')
+        return self.matching
 
     def transaction(self):
         return _Ctx()
@@ -71,8 +90,8 @@ class _DB:
         return None
 
 
-def _run(limit, monkeypatch):
-    conn = _Conn()
+def _run(limit, monkeypatch, conn=None):
+    conn = conn or _Conn()
     monkeypatch.setattr(search_router, "db", _DB(conn))
 
     class _Req:
@@ -88,7 +107,7 @@ def _run(limit, monkeypatch):
     monkeypatch.setattr(search_router, "get_optional_user", fake_user)
     monkeypatch.setattr(search_router, "check_dataset_access", fake_access)
     req = SearchRequest(dataset_id=1, vector=[0.1] * 8, field_name="clip", limit=limit)
-    asyncio.run(search_router.vector_search(req, _Req()))  # type: ignore[arg-type]
+    conn.answer = asyncio.run(search_router.vector_search(req, _Req()))  # type: ignore[arg-type]
     return conn.executed
 
 
@@ -112,3 +131,44 @@ def test_exact_branch_disables_the_index_and_leaves_hnsw_gucs_alone(monkeypatch)
 def test_scan_budget_is_well_above_pgvectors_default():
     # 20,000 is pgvector's default and is exhausted by a 1% filter at ~200 survivors.
     assert search_router._HNSW_MAX_SCAN_TUPLES >= 100_000
+
+
+def test_a_short_indexed_answer_is_ranked_again_only_when_matches_were_left_behind(monkeypatch):
+    """Past its tuple budget the index scan stops with matches left, and the short answer looked like "no more
+    match". A short answer is checked with a count that stops at the limit, and ranked again off the vector index
+    only when more match than came back."""
+    left_behind = _Conn(found=49, matching=50)
+    _run(50, monkeypatch, left_behind)
+    assert left_behind.counted == 1 and len(left_behind.fetched) == 2
+    assert "+ 0 ASC" in left_behind.fetched[1] and "+ 0 ASC" not in left_behind.fetched[0]
+
+    all_there = _Conn(found=49, matching=49)
+    _run(50, monkeypatch, all_there)
+    assert all_there.counted == 1 and len(all_there.fetched) == 1
+
+    full = _Conn(found=50)
+    _run(50, monkeypatch, full)
+    assert full.counted == 0 and len(full.fetched) == 1
+
+    exact = _Conn(found=10)  # limit > 1000 is exact already
+    _run(1001, monkeypatch, exact)
+    assert exact.counted == 0 and len(exact.fetched) == 1
+
+
+@pytest.mark.parametrize('slow', ['count', 'exact'])
+def test_the_check_of_a_short_answer_has_a_time_budget(slow, monkeypatch):
+    """Under a narrow filter with no index the count and the exact pass each read the whole dataset (77 s measured
+    on 3.7M samples). They share a statement timeout; past it the index's rows are the answer, marked incomplete."""
+    conn = _Conn(found=3, matching=50, slow=slow)
+    executed = _run(50, monkeypatch, conn)
+    budget = f"SET LOCAL statement_timeout = '{int(search_router._SHORT_CHECK_SECONDS * 1000)}ms'"
+    assert executed.index(budget) > executed.index("SET LOCAL hnsw.iterative_scan = relaxed_order")
+    assert conn.answer.headers[search_router.SEARCH_INCOMPLETE_HEADER] == '1'
+    rows = json.loads(conn.answer.body)
+    assert [row['id'] for row in rows] == [0, 1, 2]
+    # The same keys as a complete answer, which goes through the route's response_model.
+    assert set(rows[0]) == set(Sample.model_fields)
+
+    checked = _Conn(found=3, matching=3)  # a check that finishes says nothing
+    _run(50, monkeypatch, checked)
+    assert isinstance(checked.answer, list)

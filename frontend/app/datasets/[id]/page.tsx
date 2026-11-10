@@ -755,7 +755,8 @@ function DatasetPageContent() {
             const resultIds = results.map(s => s.id);
             // Say how many came back vs. how many were asked for: a short result is then explained
             // on the chip instead of looking like a broken search.
-            const got = resultIds.length < limit ? `${resultIds.length} of ${limit} requested` : `${resultIds.length}`;
+            const got = (resultIds.length < limit ? `${resultIds.length} of ${limit} requested` : `${resultIds.length}`)
+                + (results.incomplete ? ', more may match' : '');
             const description = isObjectSeed ? `Similar objects (${got})` : `Similarity Search (${got})`;
 
             const similarityFilter: ComplexFilter = {
@@ -825,14 +826,15 @@ function DatasetPageContent() {
         : undefined);
     // The search's chip. Its label, the count it asked for and the count it found are kept, so the page's latest
     // search can offer "top N" on its chip.
-    const searchStage = (label: string, kept: ViewStage[], resultIds: number[], limit: number, searchId: string): ViewStage => {
+    const searchStage = (label: string, kept: ViewStage[], resultIds: number[], limit: number, searchId: string, incomplete = false): ViewStage => {
         const scoped = kept.length ? `${label} · within filters` : label;
-        const got = resultIds.length < limit ? `${resultIds.length} of ${limit} requested` : `${resultIds.length}`;
+        const got = (resultIds.length < limit ? `${resultIds.length} of ${limit} requested` : `${resultIds.length}`)
+            + (incomplete ? ', more may match' : '');
         return {
             type: 'similarity',
             description: `${scoped} · top ${got}`,
             filter: { logic: 'AND', filters: [{ field: 'id', operator: 'in', value: resultIds }] },
-            metadata: { search: { id: searchId, label: scoped, found: resultIds.length, limit } },
+            metadata: { search: { id: searchId, label: scoped, found: resultIds.length, limit, incomplete } },
         };
     };
     // The results land on the stages as they are when they arrive, so a chip added or removed while the search ran
@@ -875,7 +877,7 @@ function DatasetPageContent() {
             const results = await searchSimilar({ datasetId, text: prompt, embeddingField: field, limit, filters: searchFilters(kept) });
             if (seq !== textSearchSeq.current) return;
             const resultIds = results.map(s => s.id);
-            showSearchResults(searchStage(`Similar to “${prompt}”`, kept, resultIds, limit, searchId), scope, rerun);
+            showSearchResults(searchStage(`Similar to “${prompt}”`, kept, resultIds, limit, searchId, results.incomplete), scope, rerun);
         } catch (error) {
             // The server explains 501 (encoder not installed) / 400 (non-CLIP field) precisely.
             alert(`❌ Text search failed: ${error instanceof Error ? error.message : error}`);
@@ -907,7 +909,7 @@ function DatasetPageContent() {
             if (seq !== textSearchSeq.current) return;
             const resultIds = results.map(s => s.id);
             const shortLabel = input.label.length > 40 ? `${input.label.slice(0, 37)}…` : input.label;
-            showSearchResults(searchStage(`Similar to 🖼 ${shortLabel}`, kept, resultIds, limit, searchId), scope, rerun);
+            showSearchResults(searchStage(`Similar to 🖼 ${shortLabel}`, kept, resultIds, limit, searchId, results.incomplete), scope, rerun);
         } catch (error) {
             // The server explains 501 (encoder not installed) / 400 (non-CLIP field / bad image) precisely.
             alert(`❌ Image search failed: ${error instanceof Error ? error.message : error}`);
@@ -1169,6 +1171,8 @@ function DatasetPageContent() {
                             selectedIds={selectedIds}
                             onSelection={(ids) => {
                                 setSelectionSource('Duplicates');
+                                // A lasso still held would keep filtering and these ids would be ignored.
+                                setCurrentEmbeddingRegion(null);
                                 setBrushedIds(ids);
                             }}
                             onSampleClick={(s) => { setModalSourcePanelId(null); setSelectedSample(s); }}
@@ -1200,6 +1204,8 @@ function DatasetPageContent() {
                             filters={imageGrainFilters}
                             onSelection={(ids) => {
                                 setSelectionSource('Sparse Sample');
+                                // A lasso still held would keep filtering and these ids would be ignored.
+                                setCurrentEmbeddingRegion(null);
                                 setBrushedIds(ids);
                             }}
                         />
@@ -1566,6 +1572,7 @@ function DatasetPageContent() {
                             // Apply the version-diff selection as a server-side stage
                             // (in_selection token) — no id list materialized client-side.
                             setSelectionSource(`Version: ${label}`);
+                            setCurrentEmbeddingRegion(null);
                             setBrushedIds([]);
                             setViewStages([{
                                 type: 'filter',

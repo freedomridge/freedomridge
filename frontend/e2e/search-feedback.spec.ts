@@ -45,6 +45,23 @@ test('reverse image search shows a Searching sign while it runs and says how man
     await expectTotal(page, 3);
 });
 
+// A short answer the server could not finish checking (its check for matches the index left behind ran out of
+// time) says so on the chip; before, "3 found" read as "only 3 match".
+test('a search the server could not finish checking says more may match', async ({ page }) => {
+    const results = await fixtureSamples(page, 3);
+    await page.route(u => u.pathname.endsWith('/api/search'), async route => {
+        await route.fulfill({
+            status: 200, contentType: 'application/json', headers: { 'X-Search-Incomplete': '1' }, body: JSON.stringify(results),
+        });
+    });
+    await gotoDataset(page);
+    await expectTotal(page, 12);
+    await searchText(page, 'a river');
+    const chip = page.getByTestId('query-stage-chip').first();
+    await expect(chip).toContainText('(3 found, more may match)', { timeout: 10_000 });
+    await expectTotal(page, 3);
+});
+
 test('text search asks for the results count set in the panel; the chip runs it again for another count', async ({ page }) => {
     const results = await fixtureSamples(page, 3);
     const limits: number[] = [];

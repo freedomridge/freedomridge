@@ -82,7 +82,7 @@ def sync(
     print(f"\n--- Syncing {total:,} samples ---")
 
     # Build mapping: source sample_id -> target sample_id
-    id_map = {}
+    id_map: Dict[int, int] = {}
     offset = 0
     synced = 0
     # Per-field (name, transferred, expected) so the end of the run can refuse to claim success
@@ -103,6 +103,11 @@ def sync(
             if name not in existing:
                 target.create_array_field(target_id, name)
 
+    # An object's metadata.parent_id is its image's sample id here; the target numbers its samples itself. Each
+    # object is sent with its parent's target id when the parent is already there, and given it afterwards
+    # otherwise (a parent paged after its objects); on a re-sync, existing objects get it the same way.
+    parents: Dict[int, int] = {}
+
     while offset < total:
         # query_samples (POST /samples/query), NOT get_samples: GET /samples declares
         # response_model=SampleListResponse, whose Sample model has no keys for the dynamic array
@@ -117,11 +122,19 @@ def sync(
 
         payload = []
         for item in items:
+            metadata = dict(item.get('metadata') or {})
+            parent = _sample_id(metadata.get('parent_id'))
+            if parent is not None:
+                parents[item['id']] = parent
+                if parent in id_map:
+                    metadata['parent_id'] = id_map[parent]
+                else:
+                    del metadata['parent_id']
             row = {
                 'filepath': item['filepath'],
                 'media_type': item.get('media_type', 'image'),
                 'tags': item.get('tags', []),
-                'metadata': item.get('metadata', {}),
+                'metadata': metadata,
                 'location': item.get('location'),
                 'heading': item.get('heading'),
             }
@@ -153,6 +166,20 @@ def sync(
         print(f"  Samples: {synced:,} / {total:,} ({rate:.0f}/s)")
 
     print(f"Samples complete: {synced:,} in {time.time() - start:.0f}s")
+
+    if parents:
+        updates = [
+            {'sample_id': id_map[child], 'metadata': {'parent_id': id_map.get(parent)}}
+            for child, parent in parents.items()
+            if child in id_map
+        ]
+        for begin in range(0, len(updates), batch_size):
+            target.bulk_set_metadata(target_id, updates=updates[begin : begin + batch_size])
+        orphans = sum(1 for parent in parents.values() if parent not in id_map)
+        print(f"Parents set on {len(updates):,} object samples")
+        if orphans:
+            noun = "object's parent isn't" if orphans == 1 else "objects' parents aren't"
+            print(f"  {orphans:,} {noun} in the dataset: their parent_id is empty on the target")
 
     # --- Sync embeddings ---
     if not skip_embeddings:
@@ -320,6 +347,17 @@ def sync(
 
     print(f"\n✅ Sync complete: '{dataset_name}' → {target_url} (dataset id {target_id})")
     return target_id
+
+
+def _sample_id(value):
+    """A metadata.parent_id as a sample id (stored as a number or a string of digits), or None."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.lstrip('-').isdigit():
+        return int(value)
+    return None
 
 
 def main():

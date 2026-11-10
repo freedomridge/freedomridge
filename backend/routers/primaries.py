@@ -101,6 +101,15 @@ async def list_primaries(user: dict = Depends(require_role('admin'))):
     for row in await db.fetch(f'{follower_sync.RESUMABLE} {follower_sync.RESUMABLE_ORDER}'):
         stopped.setdefault(row['origin_dataset_id'], []).append(row)
     live = [mirror for mirror in mirrors if mirror['state'] != 'stopped']
+    # A copy held after its primary was restored, and the question its admin answers (docs/FOLLOWERS.md).
+    held = {
+        row['dataset_id']: dict(row)
+        for row in await db.fetch(
+            """SELECT dataset_id, origin_name, hash_field, total, matched, matched_hash, only_here, phase,
+                      decision, computed_at IS NOT NULL AS compared, last_error, retry_after
+               FROM mirror_restores""",
+        )
+    }
     listed = [{**dict(link), 'mirrors': []} for link in links]
     by_id = {link['id']: link for link in listed}
     unlinked: list = []
@@ -121,6 +130,7 @@ async def list_primaries(user: dict = Depends(require_role('admin'))):
                 for other in live
             )
         )
+        entry['restore'] = held.get(mirror['dataset_id'])
         (by_id[mirror['link_id']]['mirrors'] if mirror['link_id'] in by_id else unlinked).append(entry)
     return {'primaries': listed, 'unlinked_mirrors': unlinked}
 
@@ -137,6 +147,40 @@ async def keep_mirror_separate(dataset_id: int, user: dict = Depends(require_rol
     if name is None:
         raise HTTPException(status_code=409, detail='Only a stopped copy can be kept as a separate copy')
     return {'kept': name}
+
+
+class RestoreDecision(BaseModel):
+    decision: str = Field(pattern='^(resume|new)$')
+
+
+@router.post('/primaries/mirrors/{dataset_id}/restore-decision')
+async def decide_restore(dataset_id: int, request: RestoreDecision, user: dict = Depends(require_role('admin'))):
+    """Answer the question a copy held after its primary was restored asks: resume into it (its matched samples
+    keep what this instance added to them; the others go, and the primary's unmatched ones are copied fresh), or make
+    a new copy and keep this one as it is."""
+    if request.decision == 'resume' and await db.fetchval(
+        "SELECT matched = 0 FROM mirror_restores WHERE dataset_id = $1 AND phase = 'ask'",
+        dataset_id,
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail='Nothing in this copy matches the restored primary: resuming would only delete it. Make a new copy',
+        )
+    row = await db.fetchrow(
+        """UPDATE mirror_restores SET decision = $2, decided_by = $3, decided_at = now(),
+                  phase = CASE WHEN $2 = 'resume' THEN 'unmatched' ELSE 'map' END
+           WHERE dataset_id = $1 AND phase = 'ask' AND decision IS NULL RETURNING link_id""",
+        dataset_id,
+        request.decision,
+        user['id'],
+    )
+    if row is None:
+        raise HTTPException(
+            status_code=409,
+            detail='This copy has no question waiting: it may be comparing, or answered',
+        )
+    await follower_sync.queue_sync(db.pool, row['link_id'])
+    return {'decision': request.decision}
 
 
 @router.delete('/primaries/{link_id}')

@@ -160,6 +160,34 @@ def test_condition_not():
     print("  All NOT tests passed!\n")
 
 
+def test_a_condition_has_no_truth_value():
+    """`and`, `or`, `not` and a chained comparison would each drop a clause without a word, so they raise."""
+    from fridge.core.view import FieldExpression
+
+    a = FieldExpression("brightness")
+    b = FieldExpression("scene")
+
+    with pytest.raises(TypeError, match="&"):
+        (a > 0.5) and (b == "city")
+    with pytest.raises(TypeError, match="&"):
+        (a > 0.5) or (b == "city")
+    with pytest.raises(TypeError, match="&"):
+        not (a > 0.5)
+    with pytest.raises(TypeError, match="&"):
+        0.2 < a < 0.8
+
+
+def test_filter_refuses_what_is_not_a_condition():
+    """A bare field or a dict used to be skipped, which left no filter: the whole dataset."""
+    from fridge.core.dataset import Dataset
+    from fridge.core.view import FieldExpression
+
+    with pytest.raises(TypeError, match="conditions"):
+        Dataset.filter(Mock(), FieldExpression("reviewed"))
+    with pytest.raises(TypeError, match="conditions"):
+        Dataset.filter(Mock(), {"field": "split", "operator": "=", "value": "train"})
+
+
 def test_complex_nested():
     """Test complex nested conditions."""
     from fridge.core.view import FieldExpression

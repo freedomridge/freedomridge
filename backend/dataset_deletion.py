@@ -43,6 +43,8 @@ DATASET_TABLES = (
     ('vector_changes', ('dataset_id', 'transaction_id', 'id')),
     ('dataset_changes', ('dataset_id', 'transaction_id', 'id')),
     ('map_block_changes', ('dataset_id', 'transaction_id', 'field_name', 'block_id')),
+    # A follower's copy held after its primary was restored: its matches with the primary (mirror_restores).
+    ('mirror_restore_map', ('dataset_id', 'sample_id')),
 )
 CONCEPT_TABLES = (
     ('embedding_concept_scores', ('concept_id', 'sample_id')),

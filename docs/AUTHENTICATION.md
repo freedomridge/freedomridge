@@ -213,6 +213,7 @@ the variable.
 | `/api/followers/{id}/datasets/{dataset_id}` | PUT, DELETE | admin | Follow a dataset (`tags`, `views`: `primary` or `both`), or stop |
 | `/api/follower/config` | GET | follower token | What this follower follows, and the primary's identity |
 | `/api/follower/datasets/{id}/blocks`, `.../blocks/samples`, `.../vectors`, `.../state` | GET, POST | follower token | Copy a followed dataset |
+| `/api/follower/datasets/{id}/match-keys` | GET | follower token | Match a held copy with a restored primary: its samples' ids, file paths and image hashes, a page at a time |
 | `/api/follower/datasets/{id}/changes`, `.../ack` | GET, POST | follower token | Read what changed since a cursor; acknowledge it |
 | `/api/follower/datasets/{id}/coordinates` | POST | follower token | Copy a followed dataset's map coordinates |
 | `/api/follower/datasets/{id}/tags`, `.../views`, `.../views/{view_id}` | POST, DELETE | follower token | Edits sent up, when the dataset's tags or views option is both ways |
@@ -222,6 +223,7 @@ the variable.
 | `/api/primaries` | POST, GET | admin | On a follower: follow a primary (its follower token is checked first); list primaries and their mirrors |
 | `/api/primaries/{id}` | DELETE | admin | Stop following a primary; its mirrors stay as read-only copies |
 | `/api/primaries/mirrors/{id}/keep-separate` | POST | admin | Keep a stopped copy as it is: a new copy of its dataset makes a new dataset instead of resuming into it |
+| `/api/primaries/mirrors/{id}/restore-decision` | POST | admin | Answer a copy held after its primary was restored: `resume` into it, or make a `new` copy |
 | `/api/compute-launcher` | GET, PUT | admin | On-demand compute workers: their settings (never the secret), and the machines started |
 | `/api/compute-launcher/check` | POST | admin | Ask AWS whether it would start a machine with the saved settings (a dry run) |
 

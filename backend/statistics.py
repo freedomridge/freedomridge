@@ -12,10 +12,17 @@ from .job_runner import StepResult
 
 KIND = 'statistics'
 POLICY = job_queue.JobPolicy(max_unit_seconds=30, max_failures=3, retry_seconds=2, max_retry_seconds=120)
+# A full refresh queued or running, whoever asked: it re-measures every block and publishes every cache.
+FULL_REFRESH_ACTIVE = f"""SELECT {job_queue.JOB_COLUMNS} FROM {job_queue.JOB_TABLE}
+    WHERE kind='{KIND}' AND dataset_id=$1 AND state IN ('queued','running')
+      AND (barrier->>'full')::boolean AND NOT cancel_requested
+    ORDER BY created_at,id LIMIT 1"""
 
 
-async def request_refresh(pool, dataset_id, *, created_by=None, force=False):
-    if force:
+async def request_refresh(pool, dataset_id, *, created_by=None, force=False, unless_full_active=False):
+    """unless_full_active: a full refresh already queued or running is returned instead, with no new request,
+    checked under the enqueue's lock so callers arriving together get one job."""
+    if force and not unless_full_active:
         async with job_queue._transaction(pool) as connection:
             await connection.execute(REQUEST_FULL_REFRESH, dataset_id)
     owner = 'system' if created_by is None else f'user:{created_by}'
@@ -24,6 +31,12 @@ async def request_refresh(pool, dataset_id, *, created_by=None, force=False):
             'SELECT pg_advisory_xact_lock(hashtextextended($1,0))',
             f'statistics:{dataset_id}:{owner}',
         )
+        if unless_full_active:
+            active = await connection.fetchrow(FULL_REFRESH_ACTIVE + ' FOR UPDATE OF jobs', dataset_id)
+            if active is not None:
+                return dict(active)
+            if force:
+                await connection.execute(REQUEST_FULL_REFRESH, dataset_id)
         boundary = await connection.fetchrow(
             """SELECT txid_current_snapshot()::text AS snapshot, stats_full_requests,
                       GREATEST(COALESCE((SELECT max(id) FROM samples WHERE dataset_id=$1),0),

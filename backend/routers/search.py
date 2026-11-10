@@ -6,11 +6,15 @@ import json
 import logging
 import re
 import socket
+import time
 from typing import Any
 from urllib.parse import urlparse
 
+import asyncpg
 import httpx
 from fastapi import APIRouter, HTTPException, Request
+from fastapi.responses import JSONResponse
+from pydantic import TypeAdapter
 
 from .. import follower_search, index_jobs
 from .. import patch_search as patch_core
@@ -25,6 +29,10 @@ router = APIRouter()
 
 # Budget for an iterative HNSW scan: the same as patch searches' (patch_search.py).
 _HNSW_MAX_SCAN_TUPLES = patch_core.HNSW_MAX_SCAN_TUPLES
+# A search the index answered short is checked for matches it left behind, for at most this long.
+_SHORT_CHECK_SECONDS = 5.0
+SEARCH_INCOMPLETE_HEADER = 'X-Search-Incomplete'
+_SAMPLES = TypeAdapter(list[Sample])
 
 # Reverse-image-search URL fetch caps (SSRF-guarded — see _fetch_image_from_url).
 log = logging.getLogger("fridge.search")
@@ -170,6 +178,8 @@ async def vector_search(req: SearchRequest, request: Request):
     args.append(req.field_name)
     conditions.append(f"e.field_name = ${arg_idx}")
     arg_idx += 1
+    # A row without a vector has no distance: the index never returns it, so neither do the count and exact pass.
+    conditions.append("e.vector IS NOT NULL")
 
     # Add optional filters
     if req.filters:
@@ -225,7 +235,8 @@ async def vector_search(req: SearchRequest, request: Request):
     else:
         dist_expr = f"(e.vector <=> {vector_param})"
 
-    query = f"""
+    def ranked(order_by: str) -> str:
+        return f"""
         SELECT s.id, s.filepath, s.metadata, s.media_type, s.tags,
                ST_AsGeoJSON(s.location)::json as location,
                s.created_at, s.last_modified_at,
@@ -233,9 +244,11 @@ async def vector_search(req: SearchRequest, request: Request):
         FROM embeddings e
         JOIN samples s ON e.sample_id = s.id
         WHERE {where_clause}
-        ORDER BY {dist_expr} ASC
+        ORDER BY {order_by} ASC
         LIMIT {limit_param}
     """
+
+    query = ranked(dist_expr)
 
     # HNSW returns at most hnsw.ef_search candidates, and pgvector caps ef_search at 1000.
     # So there's no single fast path for an arbitrary top-K:
@@ -244,6 +257,7 @@ async def vector_search(req: SearchRequest, request: Request):
     #  - limit  > 1000: EXACT scan (disable the index) — sorts the whole field by distance
     #    and returns the true top-K for ANY K (slower; full scan, ~seconds).
     # No artificial cap: a LIMIT beyond the available count simply returns everything.
+    incomplete = False
     async with db.pool.acquire() as conn:
         async with conn.transaction():
             if req.limit <= 1000:
@@ -261,6 +275,47 @@ async def vector_search(req: SearchRequest, request: Request):
                 await conn.execute("SET LOCAL enable_indexscan = off")
                 await conn.execute("SET LOCAL enable_indexonlyscan = off")
             rows = await conn.fetch(query, *args)
+            if req.limit <= 1000 and len(rows) < req.limit:
+                # Fewer rows than asked from the index means either that no more match or that the scan reached
+                # its tuple budget with matches left, and nothing in the answer tells them apart. Count the
+                # matches, stopping at the limit (no distances; the vector is named only to keep the arguments).
+                # Under a narrow filter with no index of its own both statements can read the whole dataset
+                # (77 s measured on 3.7M samples), so together they get _SHORT_CHECK_SECONDS; past that the index's
+                # rows are the answer, marked as possibly incomplete.
+                started, indexed = time.monotonic(), len(rows)
+                try:
+                    async with conn.transaction():  # a savepoint: a cancelled statement leaves the outer one usable
+                        await conn.execute(f"SET LOCAL statement_timeout = '{int(_SHORT_CHECK_SECONDS * 1000)}ms'")
+                        matching = await conn.fetchval(
+                            f"""SELECT count(*) FROM (
+                                    SELECT 1 FROM embeddings e JOIN samples s ON e.sample_id = s.id
+                                    WHERE {where_clause} AND {vector_param}::text IS NOT NULL
+                                    LIMIT {limit_param}
+                                ) matches""",
+                            *args,
+                        )
+                        if matching > indexed:
+                            # Matches were left behind: rank them all. "+ 0" keeps the ORDER BY off the vector
+                            # index and leaves the other indexes usable, so the filters still narrow the scan.
+                            left = _SHORT_CHECK_SECONDS - (time.monotonic() - started)
+                            await conn.execute(f"SET LOCAL statement_timeout = '{max(1, int(left * 1000))}ms'")
+                            rows = await conn.fetch(ranked(f"{dist_expr} + 0"), *args)
+                            log.info(
+                                "vector_search: %d of %d from the index of %s, ranked exactly in %.1fs",
+                                indexed,
+                                req.limit,
+                                req.field_name,
+                                time.monotonic() - started,
+                            )
+                except asyncpg.QueryCanceledError:
+                    incomplete = True
+                    log.warning(
+                        "vector_search: %d of %d from the index of %s, and the check for more ran out of its %gs",
+                        indexed,
+                        req.limit,
+                        req.field_name,
+                        _SHORT_CHECK_SECONDS,
+                    )
 
     results = []
     for row in rows:
@@ -278,6 +333,11 @@ async def vector_search(req: SearchRequest, request: Request):
 
         results.append(data)
 
+    if incomplete:
+        # The page shows it on the search's chip ("more may match"). A Response skips the route's response_model, so
+        # the rows go through it here: the same keys as a complete answer.
+        body = _SAMPLES.dump_python(_SAMPLES.validate_python(results), mode='json')
+        return JSONResponse(body, headers={SEARCH_INCOMPLETE_HEADER: '1'})
     return results
 
 

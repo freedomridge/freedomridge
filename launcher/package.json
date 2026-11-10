@@ -1,6 +1,6 @@
 {
   "name": "freedomridge",
-  "version": "2.7.0",
+  "version": "2.8.0",
   "description": "Run Freedom Ridge, the self-hosted tool for exploring and curating computer vision datasets, on this machine with Docker: npx freedomridge",
   "license": "MIT",
   "homepage": "https://github.com/freedomridge/freedomridge",

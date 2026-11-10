@@ -4,6 +4,80 @@ Freedom Ridge has one version for the server, the web app and the Python SDK (th
 file), following [Semantic Versioning](https://semver.org). A release lists **upgrade notes** when
 it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
 
+## 2.8.0 (2026-11-10)
+
+2.8.0 lets a follower resume into its copy after its primary is restored from a backup, instead of copying every
+dataset again. It also fixes what a review found: similarity searches that came back short under a narrow filter,
+the sidebar scanning a large dataset for an overlay type on every load, a big Select All's chip, a lasso after a
+reload, unanswered launches of on-demand workers, array fields named after a samples column, object parents when
+copying between instances, and SDK filters that ignored `and`, `or` and arguments that aren't conditions. One
+migration.
+
+### Upgrade notes
+
+- One database migration, `0020_mirror_restores.sql`, applied with `scripts/apply_migrations.sh` (step 4 of
+  [Upgrading](docs/UPGRADING.md)).
+- A follower asks before resuming only when the restored primary runs this release too (it answers `match-keys`).
+  A primary on an older release gets a new copy on its followers, as before.
+- A large dataset whose statistics last ran before an upgrade added an overlay type (class probabilities, 2.4.0)
+  gets a full statistics refresh in the background the first time its sidebar opens: about 20 minutes for 3.7
+  million samples. Meanwhile the sidebar shows no fields of that type.
+
+### Added
+
+- **After a primary is restored from a backup, a follower asks before resuming into its copy**
+  ([FOLLOWERS.md](docs/FOLLOWERS.md#when-it-stops)). Until now each copy stopped and a new dataset was copied, so
+  what the follower had added (patch vectors computed on its own GPU, indexes, concepts, views, access grants) had to
+  be made again. Now the copy of each dataset the primary still shares is held, and the primary's other datasets keep
+  syncing. The follower matches the primary's samples to the copy's by file path, and by image hash where both have
+  one, without changing anything. The copy's row on Settings → Primaries then shows the counts and asks: **Resume
+  into this copy** keeps what this follower added on the matched samples, deletes the ones the primary no longer
+  has (after a second confirmation), and copies the rest fresh. **Make a new copy** does what happened before.
+
+### Fixed
+
+- **A big Select All's chip no longer offers Exclude.** Above 50,000 samples a Select All is applied as one
+  chip. Clicking it relabelled it "Exclude: …" while the grid, the count and the export stayed on the selected
+  samples. The chip has no toggle now; chips of picked samples and of searches still switch between include and
+  exclude.
+- **On-demand compute workers: a launch AWS never answered keeps its machine.** When the request to start a
+  machine timed out, the launch was recorded as refused, so a machine AWS had in fact started ran on with no record
+  and no one to end it. The launch now stays open: the next minute finds the machine by its tag, or ends the launch
+  after 15 minutes if there is none.
+- **An array field can't take the name of a column samples already has.** `lon`, `lat`, `created_by_user_id` and
+  `modified_by_user_id` were missing from the reserved names. Creating an array field by one of them (or following
+  a primary that has one) changed no column and registered the name as an array field anyway. It is refused now.
+- **A similarity search no longer comes back short when more samples match.** A search of up to 1,000 results
+  walks the vector index within a budget of 200,000 vectors. Under a narrow filter it could reach the budget with
+  matches left and answer with fewer results than asked, which looked the same as "nothing else matches". A short
+  answer is now checked: the matches are counted, and when more match than came back they are ranked exactly,
+  without the vector index. The check gets 5 seconds: under a narrow filter on a field with no index it would read
+  the whole dataset (over a minute on 3.7 million samples). Past that the search answers with what the index found
+  and its chip says "more may match". Patch searches still have the budget.
+- **A lasso on a large embeddings map comes back whole after a reload or Back.** On a map shown as a sample of
+  its points, a lasso selects every point inside it, on screen or not. After a reload, or Back and Forward, only
+  the points that had been on screen were still selected, so Apply, Tag and Export acted on a part of the
+  selection with nothing saying so. The lasso's outline is now kept with them.
+- **SDK: `Dataset.filter()` refuses an argument that isn't a condition.** It skipped one without a word, so
+  `ds.filter(s.reviewed)` or a dict filter selected the whole dataset. It raises `TypeError` now.
+- **SDK: `and`, `or`, `not` and chained comparisons on filter conditions raise.** `ds.match((s.a > 1) and (s.b < 2))`
+  kept only the second condition, and `0 < s.a < 1` only `s.a < 1`, because Python asks a condition for its truth
+  value and every object is true. A bulk tag or delete then hit more samples than the filter said. A condition now
+  raises `TypeError` there, and the message names `&`, `|` and `~`. Scripts that relied on the old behaviour were
+  filtering on one clause.
+- **Copying a dataset to another instance gives objects their image's new id**
+  ([BACKUP_AND_MIGRATION.md](docs/BACKUP_AND_MIGRATION.md#option-2-dataset-sync-via-sdk-selective-works-across-different-instances)).
+  `python -m fridge.sync_between_instances` copied an object sample's `metadata.parent_id` unchanged, so on the target
+  it named whichever sample had the source image's id, or none, and parent and object filters selected the wrong
+  samples. Each object now gets its parent's id on the target, also when the parent is copied after it or the object
+  was copied by an earlier run. An object whose image isn't in the dataset gets no parent, and the run says how many
+  there were. Datasets copied with an earlier release can be put right by running the copy again.
+- **The sidebar no longer scans a large dataset for an overlay type on every load.** A dataset last measured
+  before an upgrade added an overlay type (class probabilities, 2.4.0) had no cache for it, and the sidebar's scan
+  gave up after 10 s every time ("Failed to discover `__probability_fields__` … statement timeout"). A scan that
+  runs out of time now queues one full statistics refresh, which measures the dataset in the background and publishes
+  every overlay cache. Until it finishes, the sidebar shows no fields of that type and doesn't scan for them.
+
 ## 2.7.0 (2026-11-10)
 
 2.7.0 completes followers. A primary can run patch searches on the patch vectors a follower computed itself, a new

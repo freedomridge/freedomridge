@@ -5,7 +5,7 @@ it's over its time, or when its worker never came or went quiet, and its token g
 import os
 
 import pytest
-from botocore.exceptions import ClientError
+from botocore.exceptions import ClientError, ParamValidationError
 from fastapi import HTTPException
 
 from backend import compute_launcher, job_queue
@@ -26,12 +26,14 @@ ARCHITECTURES = {'r7g.2xlarge': ['arm64'], 'r7i.2xlarge': ['i386', 'x86_64']}
 
 
 class FakeEC2:
-    def __init__(self, spot_capacity=True, refuse=None):
-        self.spot_capacity, self.refuse = spot_capacity, refuse
+    def __init__(self, spot_capacity=True, refuse=None, lose_answer=False, unsent=False):
+        self.spot_capacity, self.refuse, self.lose_answer, self.unsent = spot_capacity, refuse, lose_answer, unsent
         self.requests, self.terminated, self.instances = [], [], {}
 
     def run_instances(self, **request):
         self.requests.append(request)
+        if self.unsent:  # botocore checks the parameters before it sends anything
+            raise ParamValidationError(report='bad subnet')
         if request.get('DryRun'):
             raise ClientError({'Error': {'Code': 'DryRunOperation', 'Message': 'would have succeeded'}}, 'RunInstances')
         if self.refuse:
@@ -41,6 +43,10 @@ class FakeEC2:
         instance_id = f'i-{len(self.instances) + 1:04d}'
         tags = {tag['Key']: tag['Value'] for spec in request['TagSpecifications'] for tag in spec['Tags']}
         self.instances[instance_id] = {'InstanceId': instance_id, 'State': {'Name': 'running'}, 'Tags': tags}
+        if 'InstanceMarketOptions' in request:  # as AWS: only a spot instance has a lifecycle
+            self.instances[instance_id]['InstanceLifecycle'] = 'spot'
+        if self.lose_answer:
+            raise TimeoutError('Read timeout on endpoint URL')
         return {'Instances': [{'InstanceId': instance_id}]}
 
     def describe_instance_types(self, InstanceTypes):
@@ -358,5 +364,53 @@ def test_one_job_runner_at_a_time_and_an_unrecorded_launch_is_found_by_its_tag(r
         await run(database, ec2)
         launched = next(row for row in await launches(database) if row['id'] != launch_id)
         assert ec2.instances[launched['instance_id']]['Tags']['fridge:launch'] == f"{identity}-{launched['id']}"
+
+    registry_database(scenario)
+
+
+def test_a_launch_aws_never_answered_keeps_its_machine(registry_database):
+    """A timeout isn't a refusal: AWS may have started the machine. The launch used to end there, and the machine ran
+    on with no record until someone found it in the AWS console."""
+
+    async def scenario(database):
+        await configure(database)
+        await waiting_fit(database)
+        ec2 = FakeEC2(lose_answer=True)
+        await run(database, ec2)
+        [launch] = await launches(database)
+        assert (launch['state'], launch['instance_id']) == ('starting', None)
+        assert await database.fetchval('SELECT is_active FROM api_tokens WHERE id = $1', launch['token_id'])
+        assert "didn't answer" in await database.fetchval('SELECT last_error FROM compute_launcher')
+
+        # A minute in which AWS doesn't list the machine yet: the launch stays open and covers the waiting job, so
+        # no second machine is started.
+        ec2.lose_answer = False
+        machine = ec2.instances.pop('i-0001')
+        await run(database, ec2)
+        [launch] = await launches(database)
+        assert (launch['state'], launch['instance_id'], len(ec2.requests)) == ('starting', None, 1)
+
+        # Then it's found by its tag, with the market AWS says it has.
+        ec2.instances['i-0001'] = machine
+        await run(database, ec2)
+        [launch] = await launches(database)
+        assert (launch['state'], launch['instance_id'], launch['market']) == ('starting', 'i-0001', 'spot')
+        assert len(ec2.requests) == 1
+
+        # No spot capacity, then the on-demand answer is lost: the adopted machine is on-demand, not the 'spot'
+        # the launch was recorded with.
+        await database.execute("UPDATE compute_launches SET state = 'ended'")
+        fallback = FakeEC2(spot_capacity=False, lose_answer=True)
+        fallback.instances = {'i-0001': {**machine, 'State': {'Name': 'terminated'}}}  # instance ids are unique
+        await run(database, fallback)
+        fallback.lose_answer = False
+        await run(database, fallback)
+        adopted = (await launches(database))[-1]
+        assert (adopted['instance_id'], adopted['market'], len(fallback.requests)) == ('i-0002', 'on-demand', 2)
+
+        # An error raised before anything was sent is a refusal, not a lost answer.
+        await database.execute("UPDATE compute_launches SET state = 'ended'")
+        await run(database, FakeEC2(unsent=True))
+        assert (await launches(database))[-1]['end_reason'].startswith('AWS refused the launch')
 
     registry_database(scenario)

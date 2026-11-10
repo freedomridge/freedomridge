@@ -1284,8 +1284,13 @@ class Dataset:
 
         # Add any Condition objects passed directly
         for cond in conditions:
-            if isinstance(cond, Condition):
-                all_conditions.append(cond.to_dict())
+            if not isinstance(cond, Condition):
+                # Skipping it made `ds.filter(s.reviewed)` or a dict no filter at all: the whole dataset.
+                raise TypeError(
+                    f"filter() takes conditions such as s.brightness > 0.5, got {cond!r}. "
+                    "Pass a comparison, keyword arguments (brightness__gt=0.5), or filter-language text to query().",
+                )
+            all_conditions.append(cond.to_dict())
 
         # Parse kwargs into conditions
         for key, value in kwargs.items():

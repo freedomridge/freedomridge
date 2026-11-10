@@ -1702,6 +1702,205 @@ def test_removed_on_the_primary_then_followed_again_the_copy_resumes(monkeypatch
     registry_database(scenario)
 
 
+async def restore_primary(database):
+    """As a restore of the primary into a new database: its samples come back with ids handed out again, soy is gone
+    and rice is new, and the follower's link knows the primary by another database identity."""
+    await database.execute('DELETE FROM samples WHERE dataset_id = 1')
+    await ingest([{'crop': 'corn'}], dataset_id=1, prefix='s3://images/r')  # corn's path, a new id
+    await ingest([{'crop': 'rice'}], dataset_id=1, prefix='s3://images/n')
+    await database.execute("UPDATE primary_links SET identity = '1:1'")
+    await database.execute("UPDATE mirrors SET primary_identity = '1:1'")
+
+
+def test_after_a_primary_restore_the_copy_is_held_asks_and_resumes_into_itself(monkeypatch, registry_database):
+    async def scenario(database):
+        _, link_id, _, mirror = await mirror_with_own_field(monkeypatch, database)
+        monkeypatch.setattr(primaries, 'db', database)
+        monkeypatch.setattr(follower_sync, 'queue_sync', AsyncMock())
+        await restore_primary(database)
+        await sync(database, link_id)
+        # Held, compared, and asking: nothing changed on the copy, and no new copy was made.
+        held = dict(await database.fetchrow('SELECT * FROM mirror_restores'))
+        assert (held['total'], held['matched'], held['only_here'], held['phase']) == (2, 1, 1, 'ask')
+        assert await database.fetchval('SELECT count(*) FROM mirrors') == 1
+        stopped = await mirror_of(database)
+        assert stopped['state'] == 'stopped' and 'Primaries page' in stopped['last_error']
+        assert await crops_with_own_field(database, mirror['dataset_id']) == ['corn', 'soy']
+        listed = await primaries.list_primaries(user=USER)
+        [entry] = listed['primaries'][0]['mirrors']
+        assert entry['restore']['compared'] and entry['restore']['matched'] == 1 and not entry['resumable']
+
+        # Its admin resumes into it: the matched sample keeps what was added here, soy goes, rice is copied.
+        await primaries.decide_restore(mirror['dataset_id'], primaries.RestoreDecision(decision='resume'), user=USER)
+        with pytest.raises(HTTPException) as again:
+            await primaries.decide_restore(mirror['dataset_id'], primaries.RestoreDecision(decision='new'), user=USER)
+        assert again.value.status_code == 409
+        await sync(database, link_id)
+        resumed = await mirror_of(database)
+        assert (resumed['dataset_id'], resumed['state']) == (mirror['dataset_id'], 'following')
+        assert await database.fetchval('SELECT count(*) FROM mirror_restores') == 0
+        assert await database.fetchval('SELECT count(*) FROM mirror_restore_map') == 0
+        assert sorted(r['metadata']['crop'] for r in (await copied(database, resumed)).values()) == ['corn', 'rice']
+        assert await crops_with_own_field(database, mirror['dataset_id']) == ['corn']
+
+    registry_database(scenario)
+
+
+def test_after_a_primary_restore_a_new_copy_leaves_the_held_one_as_it_is(monkeypatch, registry_database):
+    async def scenario(database):
+        _, link_id, _, mirror = await mirror_with_own_field(monkeypatch, database)
+        monkeypatch.setattr(primaries, 'db', database)
+        monkeypatch.setattr(follower_sync, 'queue_sync', AsyncMock())
+        await restore_primary(database)
+        await sync(database, link_id)
+        await primaries.decide_restore(mirror['dataset_id'], primaries.RestoreDecision(decision='new'), user=USER)
+        await sync(database, link_id)
+        await sync(database, link_id)
+        states = dict(await database.fetch('SELECT dataset_id, state FROM mirrors'))
+        assert states[mirror['dataset_id']] == 'stopped' and len(states) == 2
+        assert await database.fetchval('SELECT keep_separate FROM mirrors WHERE dataset_id = $1', mirror['dataset_id'])
+        fresh = await mirror_of(database)
+        assert fresh['state'] == 'following'
+        assert sorted(r['metadata']['crop'] for r in (await copied(database, fresh)).values()) == ['corn', 'rice']
+        assert await crops_with_own_field(database, mirror['dataset_id']) == ['corn', 'soy']  # the old copy as it was
+
+    registry_database(scenario)
+
+
+async def sync_until(database, link_id, reached):
+    """A sync job stepped until `reached(database)` holds after a step, then left there, as a runner that stopped."""
+    step = follower_sync.handler(database.pool)
+    checkpoint: dict = {}
+    for _ in range(200):
+        result = await step({'args': {'link_id': link_id}, 'checkpoint': checkpoint})
+        if result.publish is not None:
+            async with database.pool.acquire() as connection, connection.transaction():
+                await result.publish(connection)
+        if result.checkpoint is not None:
+            checkpoint = result.checkpoint
+        if await reached(database):
+            return
+        if result.finished:
+            break
+    raise AssertionError('The sync never got there')
+
+
+def refusing_match_keys(monkeypatch, status, detail):
+    real_call = follower_sync.call
+
+    async def call(client, method, path, **kwargs):
+        if path.endswith('/match-keys'):
+            raise follower_sync.PrimaryRefused(status, detail, None)
+        return await real_call(client, method, path, **kwargs)
+
+    monkeypatch.setattr(follower_sync, 'call', call)
+
+
+def test_a_held_copy_that_fails_does_not_hold_up_the_primary_s_other_mirrors(monkeypatch, registry_database):
+    async def scenario(database):
+        _, link_id, follower, _ = await mirror_with_own_field(monkeypatch, database)
+        await restore_primary(database)
+        await ingest([{'crop': 'oats'}], dataset_id=2, prefix='s3://images/o')
+        await followers.follow_dataset(follower, 2, followers.FollowOptions(), user=USER)
+        refusing_match_keys(monkeypatch, 400, 'the primary choked')
+        await sync(database, link_id)
+        # The held copy's error is its own, tried again later; the primary's other dataset is copied meanwhile.
+        held = dict(await database.fetchrow('SELECT * FROM mirror_restores'))
+        assert 'the primary choked' in held['last_error'] and held['retry_after'] is not None
+        assert held['phase'] == 'compare' and held['failures'] == 1
+        other = await database.fetchrow('SELECT * FROM mirrors WHERE origin_dataset_id = 2')
+        assert other['state'] == 'following'
+        assert await database.fetchval('SELECT last_error FROM primary_links') is None
+
+    registry_database(scenario)
+
+
+def test_a_primary_restored_onto_an_older_release_gets_a_new_copy(monkeypatch, registry_database):
+    async def scenario(database):
+        _, link_id, _, mirror = await mirror_with_own_field(monkeypatch, database)
+        await restore_primary(database)
+        refusing_match_keys(monkeypatch, 404, 'Not Found')  # a release without /match-keys
+        await sync(database, link_id)
+        await sync(database, link_id)
+        old = await database.fetchrow('SELECT * FROM mirrors WHERE dataset_id = $1', mirror['dataset_id'])
+        assert (
+            old['state'] == 'stopped'
+            and old['keep_separate']
+            and old['last_error'] == follower_sync.OLDER_PRIMARY_REASON
+        )
+        assert await database.fetchval('SELECT count(*) FROM mirror_restores') == 0
+        fresh = await mirror_of(database)
+        assert fresh['dataset_id'] != mirror['dataset_id'] and fresh['state'] == 'following'
+
+    registry_database(scenario)
+
+
+def test_a_404_for_a_dataset_unshared_meanwhile_is_not_an_older_primary(monkeypatch, registry_database):
+    async def scenario(database):
+        _, link_id, _, mirror = await mirror_with_own_field(monkeypatch, database)
+        await restore_primary(database)
+        refusing_match_keys(monkeypatch, 404, 'This follower does not follow that dataset')
+        await sync(database, link_id)
+        held = dict(await database.fetchrow('SELECT * FROM mirror_restores'))
+        assert 'does not follow' in held['last_error'] and held['decision'] is None
+        assert not await database.fetchval(
+            'SELECT keep_separate FROM mirrors WHERE dataset_id = $1',
+            mirror['dataset_id'],
+        )
+
+    registry_database(scenario)
+
+
+def test_a_held_copy_s_writes_that_fail_are_isolated(monkeypatch, registry_database):
+    async def scenario(database):
+        _, link_id, _, mirror = await mirror_with_own_field(monkeypatch, database)
+        monkeypatch.setattr(primaries, 'db', database)
+        monkeypatch.setattr(follower_sync, 'queue_sync', AsyncMock())
+        await restore_primary(database)
+        await sync(database, link_id)
+        await primaries.decide_restore(mirror['dataset_id'], primaries.RestoreDecision(decision='resume'), user=USER)
+        real = follower_sync.begin_mirror_write
+
+        async def refusing(connection, dataset_id):
+            if dataset_id == mirror['dataset_id']:
+                raise ValueError('a guard refused it')
+            await real(connection, dataset_id)
+
+        monkeypatch.setattr(follower_sync, 'begin_mirror_write', refusing)
+        await sync(database, link_id)  # finishes: the held copy's failure is its own
+        held = dict(await database.fetchrow('SELECT * FROM mirror_restores'))
+        assert 'a guard refused it' in held['last_error'] and held['phase'] == 'unmatched' and held['retry_after']
+        assert await crops_with_own_field(database, mirror['dataset_id']) == ['corn', 'soy']  # nothing deleted
+
+    registry_database(scenario)
+
+
+def test_an_unshare_during_a_resume_leaves_the_copy_s_ids_whole(monkeypatch, registry_database):
+    async def scenario(database):
+        _, link_id, follower, mirror = await mirror_with_own_field(monkeypatch, database)
+        monkeypatch.setattr(primaries, 'db', database)
+        monkeypatch.setattr(follower_sync, 'queue_sync', AsyncMock())
+        monkeypatch.setattr(follower_sync, 'RESTORE_ROWS', 1)
+        await restore_primary(database)
+        await sync(database, link_id)
+        await primaries.decide_restore(mirror['dataset_id'], primaries.RestoreDecision(decision='resume'), user=USER)
+
+        async def half_moved(db):
+            return await db.fetchval('SELECT phase FROM mirror_restores') == 'negate' and bool(
+                await db.fetchval('SELECT count(*) FROM mirror_samples WHERE origin_id < 0'),
+            )
+
+        await sync_until(database, link_id, half_moved)
+        # The primary stops sharing the dataset meanwhile: the move finishes first, then the question goes.
+        await followers.unfollow_dataset(follower, 1, user=USER)
+        await sync(database, link_id)
+        assert await database.fetchval('SELECT count(*) FROM mirror_restores') == 0
+        assert await database.fetchval('SELECT count(*) FROM mirror_samples WHERE origin_id < 0') == 0
+        assert (await mirror_of(database))['state'] == 'stopped'
+
+    registry_database(scenario)
+
+
 def test_a_cursor_too_old_copies_again_into_the_same_mirror(monkeypatch, registry_database):
     async def scenario(database):
         _, link_id, follower, mirror = await mirror_with_own_field(monkeypatch, database)

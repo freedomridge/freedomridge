@@ -27,6 +27,21 @@ interface Mirror {
     stopped_at: string | null;
     keep_separate: boolean;
     resumable: boolean;  // a new copy of its dataset from its primary resumes into it
+    restore: Restore | null;  // held after its primary was restored, until its admin chooses
+}
+// A copy held after its primary was restored into a new database: compared with it, then a question (docs/FOLLOWERS.md).
+interface Restore {
+    origin_name: string | null;
+    hash_field: string | null;
+    total: number;
+    matched: number;
+    matched_hash: number;
+    only_here: number | null;
+    phase: string;
+    decision: 'resume' | 'new' | 'drop' | 'redo' | null;
+    compared: boolean;
+    last_error: string | null;  // a step failed: tried again later, as a mirror is
+    retry_after: string | null;
 }
 interface Primary {
     id: number;
@@ -58,21 +73,123 @@ async function send(method: string, path: string, body?: unknown) {
     return res.json();
 }
 
+function RestoreQuestion({ mirror, restore }: { mirror: Mirror; restore: Restore }) {
+    const queryClient = useQueryClient();
+    const decide = useMutation({
+        mutationFn: (decision: 'resume' | 'new') =>
+            send('POST', `/primaries/mirrors/${mirror.dataset_id}/restore-decision`, { decision }),
+        onSuccess: () => queryClient.invalidateQueries({ queryKey: ['primaries'] }),
+    });
+    const [confirming, setConfirming] = useState(false);
+    const fresh = restore.total - restore.matched;
+    const failed = restore.last_error && (
+        <p data-testid="mirror-restore-error" className="text-xs text-red-300">
+            {restore.last_error}
+            {restore.retry_after && new Date(restore.retry_after) > new Date() &&
+                ` (next try at ${new Date(restore.retry_after).toLocaleTimeString()})`}
+        </p>
+    );
+    if (restore.decision === 'redo' || !restore.compared) {
+        return (
+            <div data-testid="mirror-restore" className="text-xs text-amber-200 space-y-1">
+                <p>
+                    The primary was restored from a backup. Comparing this copy with it
+                    {restore.total > 0 ? ` (${restore.total.toLocaleString()} samples so far)` : ''}…
+                </p>
+                {failed}
+            </div>
+        );
+    }
+    if (restore.decision === 'resume') {
+        return <p data-testid="mirror-restore" className="text-xs text-amber-200">Resuming into this copy…</p>;
+    }
+    if (restore.decision === 'new') {
+        return (
+            <p data-testid="mirror-restore" className="text-xs text-zinc-400">
+                Making a new copy: this one stays as it is.
+            </p>
+        );
+    }
+    if (restore.decision === 'drop') return null;
+    return (
+        <div data-testid="mirror-restore" className="text-xs text-amber-100 space-y-2 border border-amber-500/30 rounded p-2">
+            <p>
+                The primary was restored from a backup, so this copy can&apos;t simply carry on.{' '}
+                <span data-testid="mirror-restore-counts">
+                    {restore.matched.toLocaleString()} of {restore.total.toLocaleString()} samples
+                    {restore.origin_name ? ` in “${restore.origin_name}”` : ''} match it by file path
+                    {restore.hash_field ? ` (${restore.matched_hash.toLocaleString()} also by image hash)` : ''}.
+                </span>{' '}
+                Resuming keeps this instance&apos;s own data on the matched ones: its own vector fields, views and
+                concepts.
+                {fresh > 0 ? ` ${fresh.toLocaleString()} don't match: they're copied fresh.` : ''}
+                {restore.only_here ? ` ${restore.only_here.toLocaleString()} here that the primary no longer has go.` : ''}
+            </p>
+            {failed}
+            {confirming && restore.only_here ? (
+                <div data-testid="mirror-restore-confirm" className="flex flex-wrap items-center gap-2">
+                    <span>
+                        Resuming deletes {restore.only_here.toLocaleString()} samples here that the primary doesn&apos;t have,
+                        with what this instance added to them.
+                    </span>
+                    <button
+                        data-testid="mirror-restore-confirm-resume"
+                        onClick={() => decide.mutate('resume')}
+                        disabled={decide.isPending}
+                        className="px-3 py-1 rounded bg-red-600 hover:bg-red-500 text-white disabled:opacity-50"
+                    >
+                        Resume, and delete {restore.only_here.toLocaleString()} samples here
+                    </button>
+                    <button onClick={() => setConfirming(false)} className="text-zinc-300 hover:text-white underline">
+                        Cancel
+                    </button>
+                </div>
+            ) : null}
+            <div className="flex flex-wrap gap-2">
+                <button
+                    data-testid="mirror-restore-resume"
+                    onClick={() => (restore.only_here ? setConfirming(true) : decide.mutate('resume'))}
+                    disabled={decide.isPending || restore.matched === 0 || confirming}
+                    title={restore.matched === 0 ? 'Nothing in this copy matches the restored primary: make a new copy' : undefined}
+                    className="px-3 py-1 rounded bg-cyan-600 hover:bg-cyan-500 text-white disabled:opacity-50"
+                >
+                    Resume into this copy
+                </button>
+                <button
+                    data-testid="mirror-restore-new"
+                    onClick={() => decide.mutate('new')}
+                    disabled={decide.isPending}
+                    className="px-3 py-1 rounded border border-zinc-600 text-zinc-200 hover:bg-zinc-800 disabled:opacity-50"
+                >
+                    Make a new copy
+                </button>
+                {decide.error && <span className="text-red-300">{(decide.error as Error).message}</span>}
+            </div>
+        </div>
+    );
+}
+
 function MirrorRow({ mirror }: { mirror: Mirror }) {
     const queryClient = useQueryClient();
     const keep = useMutation({
         mutationFn: () => send('POST', `/primaries/mirrors/${mirror.dataset_id}/keep-separate`),
         onSuccess: () => queryClient.invalidateQueries({ queryKey: ['primaries'] }),
     });
+    const held = mirror.restore !== null && mirror.restore.decision !== 'drop';
     const copied = mirror.copy_total - mirror.copy_left;
     return (
         <div data-testid="mirror-row" className="text-sm space-y-1">
             <div className="flex flex-wrap items-center gap-3">
                 <Link href={`/datasets/${mirror.dataset_id}`} className="text-cyan-400 hover:underline">{mirror.name}</Link>
-                <span data-testid="mirror-state" className={`px-2 py-0.5 text-xs font-semibold rounded border ${STATE_STYLES[mirror.state]}`}>
-                    {mirror.state === 'copying'
-                        ? `Copying ${copied.toLocaleString()} of ${mirror.copy_total.toLocaleString()} blocks`
-                        : mirror.state === 'following' ? 'Following' : 'No longer following'}
+                <span
+                    data-testid="mirror-state"
+                    className={`px-2 py-0.5 text-xs font-semibold rounded border ${held ? STATE_STYLES.copying : STATE_STYLES[mirror.state]}`}
+                >
+                    {held
+                        ? 'On hold'
+                        : mirror.state === 'copying'
+                            ? `Copying ${copied.toLocaleString()} of ${mirror.copy_total.toLocaleString()} blocks`
+                            : mirror.state === 'following' ? 'Following' : 'No longer following'}
                 </span>
                 <span className="text-zinc-500">{mirror.samples.toLocaleString()} samples</span>
                 <span className="text-zinc-500">
@@ -90,7 +207,8 @@ function MirrorRow({ mirror }: { mirror: Mirror }) {
                     differently here): {mirror.concept_views.join(', ')}
                 </p>
             )}
-            {mirror.state === 'stopped' && (
+            {held && mirror.restore && <RestoreQuestion mirror={mirror} restore={mirror.restore} />}
+            {mirror.state === 'stopped' && !held && (
                 <p data-testid="mirror-resume" className="text-xs text-zinc-400 flex flex-wrap items-center gap-2">
                     {mirror.resumable ? (
                         <>
@@ -113,7 +231,7 @@ function MirrorRow({ mirror }: { mirror: Mirror }) {
                     {keep.error && <span className="text-red-300">{(keep.error as Error).message}</span>}
                 </p>
             )}
-            {mirror.last_error && (
+            {mirror.last_error && !held && (
                 <p data-testid="mirror-error" className="text-xs text-red-300">
                     {mirror.last_error}
                     {mirror.retry_after && new Date(mirror.retry_after) > new Date() &&

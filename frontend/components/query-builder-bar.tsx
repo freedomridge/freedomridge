@@ -31,7 +31,7 @@ interface QueryBuilderBarProps {
 
 // A selection or search chip includes or excludes its ids. A search keeps them in the one rule of an AND group (the
 // grid ranks by it), and the server ignores an operator set on a group, so the toggle flips that rule. Any other
-// group (a Select All's token, with its deselections) keeps the operator on the group, as before.
+// group (a Select All's token, with its deselections) has no rule to flip, so its chip offers no toggle.
 function idRule(filter: ComplexFilter | undefined): ComplexFilter | undefined {
     if (!filter?.logic) return filter;
     const only = filter.logic === 'AND' && filter.filters?.length === 1 ? filter.filters[0] : undefined;
@@ -41,6 +41,11 @@ function idRule(filter: ComplexFilter | undefined): ComplexFilter | undefined {
 function withIdOperator(filter: ComplexFilter, operator: 'in' | 'not in'): ComplexFilter {
     const rule = idRule(filter);
     return filter.logic && rule !== filter ? { ...filter, filters: [{ ...rule, operator }] } : { ...filter, operator };
+}
+
+function canExcludeIds(filter: ComplexFilter | undefined): boolean {
+    const rule = idRule(filter);
+    return !!rule && !rule.logic;
 }
 
 export function QueryBuilderBar({
@@ -87,7 +92,7 @@ export function QueryBuilderBar({
     // The chip's words. The page's latest search shows how many of the closest images it asked for, which can
     // be changed there; a lasso says which map it was drawn on.
     const chipLabel = (stage: ViewStage) => {
-        const search = stage.metadata?.search as { id: string; label: string; found: number; limit: number } | undefined;
+        const search = stage.metadata?.search as { id: string; label: string; found: number; limit: number; incomplete?: boolean } | undefined;
         if (search && search.id === activeSearchId && onSearchLimit && idRule(stage.filter)?.operator === 'in') {
             return (
                 <>
@@ -105,7 +110,16 @@ export function QueryBuilderBar({
                             <option key={n} value={n}>top {n.toLocaleString()}</option>
                         ))}
                     </select>
-                    {search.found < search.limit && <span className="ml-1 text-zinc-500">({search.found.toLocaleString()} found)</span>}
+                    {search.found < search.limit && (
+                        <span
+                            className={`ml-1 ${search.incomplete ? 'text-amber-300' : 'text-zinc-500'}`}
+                            title={search.incomplete
+                                ? 'The search stopped checking for more matches after a few seconds, so more samples may match. An index on the filtered field, or a narrower filter, makes it complete.'
+                                : undefined}
+                        >
+                            ({search.found.toLocaleString()} found{search.incomplete ? ', more may match' : ''})
+                        </span>
+                    )}
                 </>
             );
         }
@@ -302,6 +316,10 @@ export function QueryBuilderBar({
                                 {ChipContent}
                             </div>
                         );
+                    }
+
+                    if ((stage.type === 'selection' || stage.type === 'similarity') && !canExcludeIds(stage.filter)) {
+                        return <div key={index}>{ChipContent}</div>;
                     }
 
                     if (stage.type === 'selection' || stage.type === 'similarity') {
