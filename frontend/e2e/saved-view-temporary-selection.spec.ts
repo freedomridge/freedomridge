@@ -56,6 +56,19 @@ test('a view with a big Select All is saved with its filters only, and says why'
     }
 });
 
+// A big Select All's chip holds a token, not ids, and the server has no "all but this token". Clicking the chip
+// used to relabel it "Exclude: …" and leave the grid, the count and the export on the selected set.
+test('a big Select All chip offers no exclude toggle', async ({ page }) => {
+    await gotoDataset(page);
+    await bigSelectAll(page);
+    await page.getByTestId('apply-filters').click();
+    const chip = page.getByTestId('query-stage-chip').first();
+    await expect(chip).toContainText('Selected');
+    await chip.click({ position: { x: 12, y: 10 } });
+    await expect(chip).not.toContainText('Exclude');
+    await expect(page.locator('[title="Click to toggle include/exclude"]')).toHaveCount(0);
+});
+
 test('the API refuses a view holding a selection token', async ({ page }) => {
     const { datasetId } = readState();
     const res = await page.request.post(`/api/datasets/${datasetId}/views`, {

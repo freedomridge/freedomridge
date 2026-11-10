@@ -31,7 +31,7 @@ interface QueryBuilderBarProps {
 
 // A selection or search chip includes or excludes its ids. A search keeps them in the one rule of an AND group (the
 // grid ranks by it), and the server ignores an operator set on a group, so the toggle flips that rule. Any other
-// group (a Select All's token, with its deselections) keeps the operator on the group, as before.
+// group (a Select All's token, with its deselections) has no rule to flip, so its chip offers no toggle.
 function idRule(filter: ComplexFilter | undefined): ComplexFilter | undefined {
     if (!filter?.logic) return filter;
     const only = filter.logic === 'AND' && filter.filters?.length === 1 ? filter.filters[0] : undefined;
@@ -41,6 +41,11 @@ function idRule(filter: ComplexFilter | undefined): ComplexFilter | undefined {
 function withIdOperator(filter: ComplexFilter, operator: 'in' | 'not in'): ComplexFilter {
     const rule = idRule(filter);
     return filter.logic && rule !== filter ? { ...filter, filters: [{ ...rule, operator }] } : { ...filter, operator };
+}
+
+function canExcludeIds(filter: ComplexFilter | undefined): boolean {
+    const rule = idRule(filter);
+    return !!rule && !rule.logic;
 }
 
 export function QueryBuilderBar({
@@ -302,6 +307,10 @@ export function QueryBuilderBar({
                                 {ChipContent}
                             </div>
                         );
+                    }
+
+                    if ((stage.type === 'selection' || stage.type === 'similarity') && !canExcludeIds(stage.filter)) {
+                        return <div key={index}>{ChipContent}</div>;
                     }
 
                     if (stage.type === 'selection' || stage.type === 'similarity') {
