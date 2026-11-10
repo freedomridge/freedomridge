@@ -53,6 +53,13 @@ it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
   value and every object is true. A bulk tag or delete then hit more samples than the filter said. A condition now
   raises `TypeError` there, and the message names `&`, `|` and `~`. Scripts that relied on the old behaviour were
   filtering on one clause.
+- **Copying a dataset to another instance gives objects their image's new id**
+  ([BACKUP_AND_MIGRATION.md](docs/BACKUP_AND_MIGRATION.md#option-2-dataset-sync-via-sdk-selective-works-across-different-instances)).
+  `python -m fridge.sync_between_instances` copied an object sample's `metadata.parent_id` unchanged, so on the target
+  it named whichever sample had the source image's id, or none, and parent and object filters selected the wrong
+  samples. Each object now gets its parent's id on the target, also when the parent is copied after it or the object
+  was copied by an earlier run. An object whose image isn't in the dataset gets no parent, and the run says how many
+  there were. Datasets copied with an earlier release can be put right by running the copy again.
 
 ## 2.7.0 (2026-11-10)
 
