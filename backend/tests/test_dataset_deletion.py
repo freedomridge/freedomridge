@@ -176,6 +176,62 @@ def test_bounded_fanout_delete_keeps_other_dataset_and_retained_job(registry_dat
     registry_database(scenario)
 
 
+def test_a_followed_dataset_s_change_log_is_removed_in_bounded_units(registry_database, monkeypatch):
+    from backend import dataset_deletion
+
+    log_tables = ('sample_block_changes', 'vector_changes', 'dataset_changes', 'map_block_changes')
+
+    async def held(database, dataset_id):
+        return sum(
+            [
+                await database.fetchval(f'SELECT count(*) FROM {table} WHERE dataset_id=$1', dataset_id)
+                for table in log_tables
+            ],
+        )
+
+    async def scenario(database):
+        monkeypatch.setattr(dataset_deletion, 'BATCH_SIZE', 7)
+        await seed(database)
+        # What a follower that has been away leaves behind: change-log rows nobody has acknowledged.
+        for dataset_id in (1, 2):
+            await database.execute(
+                """INSERT INTO sample_block_changes(dataset_id,transaction_id,block_id)
+                       SELECT $1,n,0 FROM generate_series(1,20) n;
+                   """,
+                dataset_id,
+            )
+            await database.execute(
+                """INSERT INTO vector_changes(dataset_id,sample_id,kind,field_name,transaction_id)
+                   SELECT $1,1,'vector','clip',n FROM generate_series(1,20) n""",
+                dataset_id,
+            )
+            await database.execute(
+                "INSERT INTO dataset_changes(dataset_id,kind,transaction_id) SELECT $1,'fields',n "
+                'FROM generate_series(1,20) n',
+                dataset_id,
+            )
+            await database.execute(
+                """INSERT INTO map_block_changes(dataset_id,transaction_id,field_name,block_id)
+                   SELECT $1,n,'clip',0 FROM generate_series(1,20) n""",
+                dataset_id,
+            )
+        # Followed, so deleting its samples and vectors would log again if the job didn't switch the log off.
+        await database.execute('UPDATE datasets SET followed=TRUE WHERE id=1')
+        await datasets.delete_dataset(1, USER)
+        current = await claim(database)
+        before = await held(database, 1)
+        assert before == 80
+        while current['state'] != 'succeeded':
+            current = await step(database, current)
+            after = await held(database, 1)
+            assert 0 <= before - after <= 7  # never the whole log in one publication, and nothing logged anew
+            before = after
+        assert before == 0
+        assert await held(database, 2) == 80
+
+    registry_database(scenario)
+
+
 def test_cancel_resume_retains_checkpoint_and_same_job(registry_database, monkeypatch):
     from backend import dataset_deletion
 

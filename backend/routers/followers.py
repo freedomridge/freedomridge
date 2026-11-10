@@ -19,17 +19,20 @@ copy it reads the feed from start_txid - 1.
 
 import base64
 import secrets
+import uuid
 from typing import Annotated, List, Literal, Optional
 
 import numpy as np
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
+from .. import follower_search
 from ..api_errors import CodedHTTPException
 from ..crypto import hash_token
 from ..database import db
 from ..models import ViewCreate
+from ..sample_ids import ranges_on_ids
 from . import datasets as datasets_router
 from . import views as views_router
 from .auth import get_follower_user, require_role
@@ -42,7 +45,11 @@ FEED_TRANSACTIONS = 1000  # whole transactions per feed page
 FEED_VECTOR_ROWS = 20000  # vector changes per page a follower asks for (vector_limit), in whole transactions
 SAMPLE_BLOCKS = 16  # blocks per samples request
 VECTOR_SAMPLES = 2000  # samples per vectors request
+VECTOR_FIELDS = 64  # fields per vectors request
 TAG_SAMPLES = 50000  # samples per tags request from a follower
+# The follower API's version, in /follower/config. 2 adds the follower's reports of its own patch scales.
+PROTOCOL = 2
+REPORTED_SCALES = 100  # patch scales per report (base fields × scales)
 # The change log's tables, each with dataset_id and transaction_id.
 LOG_TABLES = ('sample_block_changes', 'vector_changes', 'dataset_changes', 'map_block_changes')
 
@@ -65,14 +72,35 @@ class BlockRequest(BaseModel):
 
 class VectorRequest(BaseModel):
     sample_ids: List[int] = Field(min_length=1, max_length=VECTOR_SAMPLES)
-    fields: List[str] = Field(default_factory=list, max_length=64)
+    fields: List[str] = Field(default_factory=list, max_length=VECTOR_FIELDS)
 
 
 class Ack(BaseModel):
     cursor: int
 
 
-class TagRequest(BaseModel):
+def clean_made_by(value: Optional[str]) -> Optional[str]:
+    """Who made an edit on the follower: shown with it here, never used for access. Printable (no control or format
+    characters, so no bidi overrides) and at most 100 characters; blank is none."""
+    if value is None or not value.strip():
+        return None
+    value = value.strip()
+    if len(value) > 100 or not value.isprintable():
+        raise ValueError('made_by must be at most 100 printable characters')
+    return value
+
+
+class MadeBy(BaseModel):
+    # The username of whoever made the edit on the follower (an older follower sends none).
+    made_by: Optional[str] = None
+
+    @field_validator('made_by')
+    @classmethod
+    def printable(cls, value: Optional[str]) -> Optional[str]:
+        return clean_made_by(value)
+
+
+class TagRequest(MadeBy):
     sample_ids: List[int] = Field(min_length=1, max_length=TAG_SAMPLES)
     # The tags option covers tags only: no other array field of the primary's.
     field_name: Literal['tags'] = 'tags'
@@ -80,9 +108,31 @@ class TagRequest(BaseModel):
     remove_tags: List[str] = Field(default_factory=list)
 
 
-class ViewRequest(BaseModel):
+class ViewRequest(MadeBy):
     name: str = Field(min_length=1, max_length=200)
     content: dict
+
+
+class ReportedScale(BaseModel):
+    base_field: str = Field(pattern=r'^[a-zA-Z0-9_]{1,100}$')
+    scale: str = Field(pattern=r'^[1-9][0-9]?x[1-9][0-9]?$')
+    dims: int = Field(ge=1, le=16000)
+    indexed: bool
+
+
+class FieldReport(BaseModel):
+    scales: List[ReportedScale] = Field(max_length=REPORTED_SCALES)
+
+
+class RelayedResult(BaseModel):
+    origin_id: int
+    field: str = Field(pattern=r'^[a-zA-Z0-9_]{1,200}$')
+    distance: float
+
+
+class SearchAnswer(BaseModel):
+    results: Optional[List[RelayedResult]] = Field(None, max_length=10000)
+    error: Optional[str] = Field(None, max_length=1000)
 
 
 async def identity(source=None) -> str:
@@ -180,7 +230,7 @@ async def list_followers(user: dict = Depends(require_role('admin'))):
     """Every follower with its datasets and options, when it last checked in (stale after STALE_DAYS) and the log
     rows the primary keeps for it."""
     followers = await db.fetch(
-        f"""SELECT id, name, created_at, last_seen_at, instance IS NOT NULL AS bound,
+        f"""SELECT id, name, created_at, last_seen_at, instance IS NOT NULL AS bound, left_at,
                    last_seen_at IS NULL OR last_seen_at < now() - interval '{STALE_DAYS} days' AS stale
             FROM followers ORDER BY name""",
     )
@@ -195,12 +245,33 @@ async def list_followers(user: dict = Depends(require_role('admin'))):
                    {held} AS held_rows
             FROM follower_datasets f JOIN datasets d ON d.id = f.dataset_id ORDER BY d.name""",
     )
+    reported = await db.fetch(
+        """SELECT follower_id, dataset_id, base_field, scale, dims, indexed, reported_at
+           FROM follower_fields ORDER BY base_field, scale""",
+    )
+    departures = await db.fetch(
+        """SELECT p.follower_id, p.dataset_id, d.name, p.tags, p.views, p.images, p.left_at
+           FROM follower_departures p JOIN datasets d ON d.id = p.dataset_id ORDER BY d.name""",
+    )
     result = []
     for follower in followers:
         entry = dict(follower)
         entry['datasets'] = [
-            {key: row[key] for key in row.keys() if key != 'follower_id'}
+            {
+                **{key: row[key] for key in row.keys() if key != 'follower_id'},
+                'own_scales': [
+                    {key: own[key] for key in ('base_field', 'scale', 'dims', 'indexed', 'reported_at')}
+                    for own in reported
+                    if own['follower_id'] == follower['id'] and own['dataset_id'] == row['dataset_id']
+                ],
+            }
             for row in datasets
+            if row['follower_id'] == follower['id']
+        ]
+        # A follower that stopped following: what it will get back if it returns.
+        entry['departures'] = [
+            {key: row[key] for key in row.keys() if key != 'follower_id'}
+            for row in departures
             if row['follower_id'] == follower['id']
         ]
         result.append(entry)
@@ -215,10 +286,13 @@ async def follow_dataset(
     user: dict = Depends(require_role('admin')),
 ):
     """Follow a dataset, or change its options. A new subscription gets its start transaction just after it commits:
-    from then on the dataset is followed, and only writes that started before may have missed the flag."""
+    from then on the dataset is followed, and only writes that started before may have missed the flag. For a
+    follower that stopped following, the dataset waits with its others, for if it returns."""
     async with db.pool.acquire() as connection:
         async with connection.transaction():
-            if not await connection.fetchval('SELECT 1 FROM followers WHERE id = $1', follower_id):
+            # Shared with leaving and returning, which lock the follower to move its subscriptions.
+            follower = await connection.fetchrow('SELECT left_at FROM followers WHERE id = $1 FOR SHARE', follower_id)
+            if follower is None:
                 raise HTTPException(status_code=404, detail='No such follower')
             # Serializes with unfollowing and removal, which recompute datasets.followed from the subscriptions.
             if not await connection.fetchval(
@@ -232,6 +306,19 @@ async def follow_dataset(
                     status_code=409,
                     detail="A mirror can't be followed: follow the dataset on its primary instead",
                 )
+            if follower['left_at'] is not None:
+                await connection.execute(
+                    """INSERT INTO follower_departures (follower_id, dataset_id, tags, views, images)
+                       VALUES ($1, $2, $3, $4, $5)
+                       ON CONFLICT (follower_id, dataset_id)
+                       DO UPDATE SET tags = EXCLUDED.tags, views = EXCLUDED.views, images = EXCLUDED.images""",
+                    follower_id,
+                    dataset_id,
+                    options.tags,
+                    options.views,
+                    options.images,
+                )
+                return {'follower_id': follower_id, 'dataset_id': dataset_id, **options.model_dump(), 'departed': True}
             await connection.execute(
                 """INSERT INTO follower_datasets (follower_id, dataset_id, tags, views, images)
                    VALUES ($1, $2, $3, $4, $5)
@@ -254,6 +341,9 @@ async def follow_dataset(
             dataset_id,
             await identity(connection),
         )
+    if row is None:
+        # Unfollowed, or the follower left, between the two statements.
+        raise HTTPException(status_code=409, detail='The subscription changed meanwhile: reload and try again')
     return dict(row)
 
 
@@ -266,6 +356,22 @@ async def unfollow_dataset(follower_id: int, dataset_id: int, user: dict = Depen
             follower_id,
             dataset_id,
         )
+        if deleted:
+            # Its searches of this dataset end with the subscription: the primary's wait hands each to another
+            # follower holding the scale, or answers 503.
+            await connection.execute(
+                """UPDATE follower_searches SET state = 'cancelled'
+                   WHERE follower_id = $1 AND dataset_id = $2 AND state IN ('pending', 'claimed')""",
+                follower_id,
+                dataset_id,
+            )
+        else:
+            # A follower that stopped following: the dataset won't come back if it returns.
+            deleted = await connection.fetchval(
+                'DELETE FROM follower_departures WHERE follower_id = $1 AND dataset_id = $2 RETURNING 1',
+                follower_id,
+                dataset_id,
+            )
         if not deleted:
             raise HTTPException(status_code=404, detail='The follower does not follow that dataset')
         await prune(connection, dataset_id)
@@ -318,19 +424,20 @@ async def remove_follower(follower_id: int, user: dict = Depends(require_role('a
 
 async def current_follower(request: Request, account: dict = Depends(get_follower_user)) -> dict:
     """The follower behind the token, stamped as seen now. Its token belongs to the first follower instance that used
-    it, by the installation id it sends (X-Fridge-Instance; a follower before 2.6.1 sends none and isn't checked)."""
+    it, by the installation id it sends (X-Fridge-Instance). A follower before 2.6.1 sends none and so never binds its
+    token; once a token is bound, a call without the header is another installation's too."""
     instance = request.headers.get('X-Fridge-Instance') or None
     row = await db.fetchrow(
         'UPDATE followers SET last_seen_at = now(), instance = COALESCE(instance, $2) WHERE user_id = $1 RETURNING *',
         account['id'],
         instance,
     )
-    if row is not None and instance and row['instance'] != instance:
+    if row is not None and row['instance'] is not None and row['instance'] != instance:
         raise CodedHTTPException(
             409,
             "This follower's token is in use by another Freedom Ridge instance: each instance needs a follower of its "
-            'own. If this instance was reinstalled, an admin on the primary can reset the follower on its Followers '
-            'page',
+            'own. If this instance was reinstalled, or went back to a release before 2.6.1, an admin on the primary '
+            'can reset the follower on its Followers page',
             'follower_instance_mismatch',
         )
     if row is None:
@@ -364,20 +471,107 @@ async def follower_config(follower: dict = Depends(current_follower)):
     )
     return {
         'name': follower['name'],
+        'protocol': PROTOCOL,
         # A follower before 2.6.1 compares `identity` exactly and copies everything again when it changes: it
         # keeps the cluster's identifier alone. Newer followers read the database's.
         'identity': current.split(':')[0],
         'database_identity': current,
+        # Stopped following (POST /follower/leave). A follower that still has this primary returns: the leave came
+        # from a link it has removed since, and arrived after the primary was added again.
+        'left': follower['left_at'] is not None,
         'datasets': [
             {**dict(row), 'ready': row['start_txid'] is not None and xmin >= row['start_txid']} for row in rows
         ],
     }
 
 
+@router.post('/follower/leave')
+async def follower_leave(follower: dict = Depends(current_follower)):
+    """The follower stopped following this primary (docs/FOLLOWERS.md). Its subscriptions move to
+    follower_departures with their options, so a dataset nobody else follows stops logging and each one's log is
+    pruned without it. Its reported patch scales go with them, and searches waiting for it are cancelled. It keeps
+    its token: they come back if it returns."""
+    async with db.pool.acquire() as connection, connection.transaction():
+        # Taken first, as remove_follower does: a dataset shared meanwhile waits for this, then joins the departures.
+        await connection.execute('SELECT 1 FROM followers WHERE id = $1 FOR UPDATE', follower['id'])
+        await connection.execute(
+            """SELECT 1 FROM datasets WHERE id IN (SELECT dataset_id FROM follower_datasets WHERE follower_id = $1)
+               ORDER BY id FOR NO KEY UPDATE""",
+            follower['id'],
+        )
+        # One statement, so no change to a subscription's options falls between the copy and the delete.
+        moved = await connection.fetch(
+            """WITH moved AS (
+                   DELETE FROM follower_datasets WHERE follower_id = $1 RETURNING dataset_id, tags, views, images
+               )
+               INSERT INTO follower_departures (follower_id, dataset_id, tags, views, images)
+               SELECT $1, dataset_id, tags, views, images FROM moved
+               ON CONFLICT (follower_id, dataset_id) DO UPDATE
+               SET tags = EXCLUDED.tags, views = EXCLUDED.views, images = EXCLUDED.images, left_at = now()
+               RETURNING dataset_id""",
+            follower['id'],
+        )
+        left = sorted(row['dataset_id'] for row in moved)
+        for dataset_id in left:
+            await prune(connection, dataset_id)
+        await connection.execute(
+            """UPDATE follower_searches SET state = 'cancelled'
+               WHERE follower_id = $1 AND state IN ('pending', 'claimed')""",
+            follower['id'],
+        )
+        await connection.execute('UPDATE followers SET left_at = now() WHERE id = $1', follower['id'])
+    return {'left': left}
+
+
+@router.post('/follower/return')
+async def follower_return(follower: dict = Depends(current_follower)):
+    """The follower added this primary again: the subscriptions it had when it left come back with their options,
+    each with a new start, so it copies them again (into the mirrors it kept: docs/FOLLOWERS.md). A dataset that is
+    being deleted, or has become a mirror, doesn't come back. The follower calls it when it adds this primary, and
+    when a sync finds the config saying it left while it still has the primary (a late leave from a link it removed).
+    The config itself never restores."""
+    async with db.pool.acquire() as connection:
+        async with connection.transaction():
+            row = await connection.fetchrow('SELECT left_at FROM followers WHERE id = $1 FOR UPDATE', follower['id'])
+            if row is None or row['left_at'] is None:  # removed meanwhile, or never left
+                return {'restored': []}
+            # follow_dataset's checks and lock, for each dataset.
+            followable = [
+                row['id']
+                for row in await connection.fetch(
+                    """SELECT d.id FROM datasets d
+                       WHERE d.id IN (SELECT dataset_id FROM follower_departures WHERE follower_id = $1)
+                         AND NOT d.deleting AND NOT EXISTS (SELECT 1 FROM mirrors m WHERE m.dataset_id = d.id)
+                       ORDER BY d.id FOR NO KEY UPDATE OF d""",
+                    follower['id'],
+                )
+            ]
+            restored = await connection.fetch(
+                """INSERT INTO follower_datasets (follower_id, dataset_id, tags, views, images)
+                   SELECT follower_id, dataset_id, tags, views, images FROM follower_departures
+                   WHERE follower_id = $1 AND dataset_id = ANY($2::int[])
+                   RETURNING dataset_id""",
+                follower['id'],
+                followable,
+            )
+            await connection.execute('DELETE FROM follower_departures WHERE follower_id = $1', follower['id'])
+            await connection.execute('UPDATE followers SET left_at = NULL WHERE id = $1', follower['id'])
+        # Their starts, after they're visible (as follow_dataset's second statement).
+        await stamp_starts(connection, follower['id'], await identity(connection))
+    return {'restored': sorted(row['dataset_id'] for row in restored)}
+
+
 @router.get('/follower/datasets/{dataset_id}/blocks')
 async def follower_blocks(dataset_id: int, follower: dict = Depends(current_follower)):
-    """Every block of the dataset with its sample count: the plan of a full copy."""
+    """Every block of the dataset with its sample count: the plan of a full copy. Asking for it starts a copy, whose
+    feed is read from start_txid - 1 again, so what an earlier copy acknowledged no longer bounds this follower's
+    cursor (follower_changes). Nothing pruned comes back, and nothing needs to: the copy holds it."""
     await subscription(db, follower, dataset_id)
+    await db.execute(
+        'UPDATE follower_datasets SET acked_txid = NULL WHERE follower_id = $1 AND dataset_id = $2',
+        follower['id'],
+        dataset_id,
+    )
     rows = await db.fetch(
         f'SELECT id / {BLOCK} AS block, count(*) AS samples FROM samples WHERE dataset_id = $1 GROUP BY 1 ORDER BY 1',
         dataset_id,
@@ -405,6 +599,13 @@ async def follower_changes(
             raise HTTPException(
                 status_code=409,
                 detail='Copy the dataset first, then read the feed from start_txid - 1',
+            )
+        if sub['acked_txid'] is not None and after < sub['acked_txid']:
+            # The log up to the acknowledged cursor is pruned: an answer from below it would silently miss changes.
+            raise HTTPException(
+                status_code=409,
+                detail='This cursor is behind what this follower has acknowledged (a follower restored from an older '
+                'backup): the changes between them are no longer kept, so copy the dataset again',
             )
         xmin = await connection.fetchval('SELECT txid_snapshot_xmin(txid_current_snapshot())')
         logged = ' UNION '.join(
@@ -608,6 +809,62 @@ async def follower_ack(dataset_id: int, ack: Ack, follower: dict = Depends(curre
 # --- Images, for a dataset whose images option is on ----------------------------------------------------------------
 
 
+@router.post('/follower/datasets/{dataset_id}/fields')
+async def follower_fields_report(dataset_id: int, report: FieldReport, follower: dict = Depends(current_follower)):
+    """The patch scales this follower holds of a dataset it follows, computed there and not sent by the primary: they
+    replace its previous report. A patch search on such a scale can then go to it (docs/FOLLOWERS.md)."""
+    unique = {(scale.base_field, scale.scale): scale for scale in report.scales}
+    async with db.pool.acquire() as connection, connection.transaction():
+        await subscription(connection, follower, dataset_id)
+        # A scale reported again keeps its first_reported_at: providers are taken in that order, so the same search
+        # keeps going to the same follower.
+        await connection.execute(
+            """DELETE FROM follower_fields WHERE follower_id = $1 AND dataset_id = $2
+                 AND (base_field, scale) NOT IN (SELECT * FROM unnest($3::text[], $4::text[]))""",
+            follower['id'],
+            dataset_id,
+            [base for base, _ in unique],
+            [scale for _, scale in unique],
+        )
+        await connection.executemany(
+            """INSERT INTO follower_fields (follower_id, dataset_id, base_field, scale, dims, indexed)
+               VALUES ($1, $2, $3, $4, $5, $6)
+               ON CONFLICT (follower_id, dataset_id, base_field, scale)
+               DO UPDATE SET dims = EXCLUDED.dims, indexed = EXCLUDED.indexed, reported_at = now()""",
+            [
+                (follower['id'], dataset_id, scale.base_field, scale.scale, scale.dims, scale.indexed)
+                for scale in unique.values()
+            ],
+        )
+    return {'scales': len(unique)}
+
+
+@router.get('/follower/searches')
+async def follower_claim_search(
+    wait: float = Query(0, ge=0, le=follower_search.CLAIM_WAIT_SECONDS),
+    follower: dict = Depends(current_follower),
+):
+    """The oldest patch search relayed to this follower (docs/FOLLOWERS.md), now claimed by it, waiting up to `wait`
+    seconds for one: {id, dataset_id, kind, request}, or {} when none came. Each poll counts as checking in."""
+    return await follower_search.claim(follower, wait) or {}
+
+
+@router.post('/follower/searches/{search_id}')
+async def follower_answer_search(
+    search_id: uuid.UUID,
+    answer: SearchAnswer,
+    follower: dict = Depends(current_follower),
+):
+    """This follower's answer to a search it claimed: its results in the primary's sample ids, or why it couldn't
+    run it. 409 when the search isn't its any more (cancelled, or answered)."""
+    results = [entry.model_dump() for entry in answer.results] if answer.results is not None else None
+    if results is None and answer.error is None:
+        raise HTTPException(status_code=400, detail='Send results or an error')
+    if not await follower_search.answer(follower, str(search_id), results, answer.error):
+        raise HTTPException(status_code=409, detail="This search isn't this follower's to answer any more")
+    return {'answered': str(search_id)}
+
+
 @router.get('/follower/datasets/{dataset_id}/samples/{sample_id}/media')
 async def follower_media(
     dataset_id: int,
@@ -681,7 +938,7 @@ async def follower_tags(dataset_id: int, request: TagRequest, follower: dict = D
     skipped = len(set(request.sample_ids)) - len(present)
     if not present:
         return {'updated_count': 0, 'skipped': skipped}
-    result = await datasets_router.bulk_tag_samples(
+    result = await datasets_router.tag_samples(
         dataset_id,
         datasets_router.BulkTagRequest(
             sample_ids=present,
@@ -689,7 +946,8 @@ async def follower_tags(dataset_id: int, request: TagRequest, follower: dict = D
             add_tags=request.add_tags,
             remove_tags=request.remove_tags,
         ),
-        user=account,
+        account,
+        made_by=request.made_by,
     )
     if isinstance(result, JSONResponse):
         return result
@@ -698,7 +956,8 @@ async def follower_tags(dataset_id: int, request: TagRequest, follower: dict = D
 
 @router.post('/follower/datasets/{dataset_id}/views', status_code=201)
 async def follower_create_view(dataset_id: int, request: ViewRequest, follower: dict = Depends(current_follower)):
-    """A shared view made on the follower, created here as its account and marked with where it was made."""
+    """A shared view made on the follower, created here as its account and marked with where it was made and by
+    whom there (made_on, made_by: set only here; create_view drops them from anyone else's content)."""
     account = await both_ways(follower, dataset_id, 'views')
     from ..follower_sync import uses_concept  # the follower side's check: the same on both
 
@@ -707,7 +966,16 @@ async def follower_create_view(dataset_id: int, request: ViewRequest, follower: 
             status_code=400,
             detail='A view that uses a concept stays on the instance that made it: concepts belong to each instance',
         )
-    content = {**request.content, 'made_on': follower['name']}
+    if ranges_on_ids(request.content):
+        raise HTTPException(
+            status_code=400,
+            detail='A view with a range on sample ids stays on the instance that made it: each instance numbers its '
+            'samples in its own order',
+        )
+    content = {key: value for key, value in request.content.items() if key not in views_router.FOLLOWER_MARKS}
+    content['made_on'] = follower['name']
+    if request.made_by:
+        content['made_by'] = request.made_by
     return await views_router.create_view(
         dataset_id,
         ViewCreate(name=request.name, content=content, is_public=True),

@@ -37,6 +37,12 @@ DATASET_TABLES = (
     ('views', ('id',)),
     ('dataset_access', ('dataset_id', 'user_id')),
     ('dataset_stats_state', ('dataset_id',)),
+    # A followed dataset's change log, which a follower that has been away leaves large. The keys follow each
+    # table's index on the dataset. The datasets trigger's own delete then finds nothing left.
+    ('sample_block_changes', ('dataset_id', 'transaction_id', 'block_id')),
+    ('vector_changes', ('dataset_id', 'transaction_id', 'id')),
+    ('dataset_changes', ('dataset_id', 'transaction_id', 'id')),
+    ('map_block_changes', ('dataset_id', 'transaction_id', 'field_name', 'block_id')),
 )
 CONCEPT_TABLES = (
     ('embedding_concept_scores', ('concept_id', 'sample_id')),

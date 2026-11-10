@@ -66,6 +66,11 @@ test('an instance follows a primary and mirrors the dataset it shares', async ({
         await row.getByRole('button', { name: 'Stop following…' }).click();
         await row.getByRole('button', { name: 'Stop following', exact: true }).click();
         await expect(page.getByTestId('primary-row').filter({ hasText: API })).toHaveCount(0);
+        // The primary (this instance) was told, so it no longer keeps changes for the follower.
+        await expect(page.getByTestId('stopped-notice')).toContainText('The primary knows');
+        const left = (await apiFetch(cookie, '/followers')).find((entry: { id: number }) => entry.id === follower.id);
+        expect(left.left_at).not.toBeNull();
+        expect(left.departures.map((entry: { dataset_id: number }) => entry.dataset_id)).toEqual([source.id]);
         await expect(page.getByText('Copies no longer following')).toBeVisible();
         await expect(page.getByTestId('mirror-row').filter({ hasText: source.name }).getByTestId('mirror-state'))
             .toHaveText('No longer following');

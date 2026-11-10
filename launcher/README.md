@@ -41,5 +41,7 @@ Options: `--dir DIR` (another folder), `--port N` and `--api-port N` (other port
 
 It's for one machine: the credentials are the development ones, and the ports listen on 127.0.0.1 only. A
 server needs `docker-compose.prod.yml` ([Docker deployment](https://github.com/freedomridge/freedomridge/blob/main/docs/DOCKER_DEPLOYMENT.md)).
+To let followers on other machines reach it, read [Reaching the primary](https://github.com/freedomridge/freedomridge/blob/main/docs/FOLLOWERS.md#reaching-the-primary)
+first: it says what to do before you serve these development settings.
 
 To delete everything, data included: `docker compose -f ~/freedomridge/docker-compose.try.yml down -v`.

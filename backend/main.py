@@ -760,8 +760,9 @@ async def _media_from_primary(source, path: str, params: dict) -> Response:
     for cached_path in await asyncio.to_thread(glob.glob, glob.escape(base) + ".*"):
         body = await asyncio.to_thread(read_cache, cached_path)
         if body is not None:
-            media_type = mimetypes.guess_type(cached_path)[0] or "application/octet-stream"
-            return Response(content=body, media_type=media_type, headers={**headers, "X-Cache": "HIT"})
+            declared = mimetypes.guess_type(cached_path)[0]
+            kwargs = _media_response_kwargs(declared, body[:_MEDIA_HEAD_BYTES], path, **headers, **{"X-Cache": "HIT"})
+            return Response(content=body, **kwargs)
     url = f"/follower/datasets/{source['origin_dataset_id']}/samples/{source['origin_id']}/media"
     try:
         answer = await (await _primary_client(source)).get(url, params=params)
@@ -779,9 +780,16 @@ async def _media_from_primary(source, path: str, params: dict) -> Response:
                 detail=f"From the primary: {detail or answer.text[:200]}",
             )
         raise HTTPException(status_code=502, detail=f"The primary answered {answer.status_code}: {detail or ''}")
-    media_type = answer.headers.get("content-type", "application/octet-stream").split(";")[0]
-    _queue_media_cache(base + (mimetypes.guess_extension(media_type) or ".bin"), answer.content)
-    return Response(content=answer.content, media_type=media_type, headers=headers)
+    # As for this instance's own media: only an image or a video is shown, sandboxed and never sniffed, and anything
+    # else is a download. The primary's Content-Type doesn't decide what runs on this origin.
+    kwargs = _media_response_kwargs(
+        answer.headers.get("content-type"),
+        answer.content[:_MEDIA_HEAD_BYTES],
+        path,
+        **headers,
+    )
+    _queue_media_cache(base + (mimetypes.guess_extension(kwargs["media_type"]) or ".bin"), answer.content)
+    return Response(content=answer.content, **kwargs)
 
 
 _HIGH_BIT_DEPTH_SUFFIXES = (".png", ".tif", ".tiff")

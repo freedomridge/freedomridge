@@ -85,7 +85,7 @@ def test_add_tags_stamps_the_rows_and_registers_the_tags(monkeypatch):
     assert upd[2] == ([1, 2, 3], 7, ["dated", "other"], [], 42)
     (reg,) = _executes(db, "INSERT INTO dataset_tags")
     assert "ON CONFLICT (dataset_id, field_name, tag) DO UPDATE SET last_used_at" in reg[1]
-    assert reg[2] == (7, "tags", ["dated", "other"], 42)
+    assert reg[2] == (7, "tags", ["dated", "other"], 42, None)  # no maker's name: not a follower's edit
 
 
 def test_remove_tags_stamps_the_rows_too(monkeypatch):

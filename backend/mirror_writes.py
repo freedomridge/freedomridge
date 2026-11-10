@@ -8,7 +8,7 @@ from urllib.parse import urlparse
 import asyncpg
 from fastapi import HTTPException
 
-from . import follower_sync
+from . import follower_sync, sample_ids
 from .routers import datasets as datasets_router
 from .routers import followers
 
@@ -41,6 +41,16 @@ def require_both_ways(mirror: dict, option: str, what: str) -> None:
         )
 
 
+def made_by(user: dict) -> dict:
+    """Who made the edit here, for the primary to show: left out when the username isn't one the primary accepts
+    (over 100 characters, or not printable), so a display-only name never blocks the edit."""
+    try:
+        name = followers.clean_made_by(user.get('username'))
+    except ValueError:
+        return {}
+    return {'made_by': name} if name else {}
+
+
 async def send(client, mirror: dict, method: str, path: str, body=None):
     """A call to the primary, its refusals passed on to the user."""
     try:
@@ -52,8 +62,9 @@ async def send(client, mirror: dict, method: str, path: str, body=None):
         raise HTTPException(status_code=502, detail=str(error)) from None
 
 
-async def forward_tags(source, dataset_id: int, request) -> dict:
-    """A bulk tag edit on a mirror, by ids, a selection or filters: sent to the primary for the same samples there."""
+async def forward_tags(source, dataset_id: int, request, user: dict) -> dict:
+    """A bulk tag edit on a mirror, by ids, a selection or filters: sent to the primary for the same samples there,
+    saying who made it here (made_by: shown there, never used for access)."""
     mirror = await mirror_of(source, dataset_id)
     assert mirror is not None
     require_both_ways(mirror, 'tags', 'tags')
@@ -94,6 +105,7 @@ async def forward_tags(source, dataset_id: int, request) -> dict:
                         'field_name': request.field_name,
                         'add_tags': request.add_tags,
                         'remove_tags': request.remove_tags,
+                        **made_by(user),
                     },
                 )
             except HTTPException as error:
@@ -125,7 +137,7 @@ async def forward_view(source, dataset_id: int, view, user: dict):
     mirror = await mirror_of(source, dataset_id)
     assert mirror is not None
     require_both_ways(mirror, 'views', 'shared views')
-    named = sorted(follower_sync.sample_ids_in(view.content, set()))
+    named = sorted(sample_ids.sample_ids_in(view.content, set()))
     to_primary = {
         row['sample_id']: row['origin_id']
         for row in await source.fetch(
@@ -140,9 +152,14 @@ async def forward_view(source, dataset_id: int, view, user: dict):
             mirror,
             'POST',
             f"/follower/datasets/{mirror['origin_dataset_id']}/views",
-            body={'name': view.name, 'content': follower_sync.translate_ids(view.content, to_primary)},
+            body={
+                'name': view.name,
+                'content': sample_ids.translate_ids(view.content, to_primary),
+                **made_by(user),
+            },
         )
-    content = {**view.content, 'made_on': created['content'].get('made_on')}
+    marks = {key: created['content'][key] for key in ('made_on', 'made_by') if key in created['content']}
+    content = {**view.content, **marks}
     async with source.pool.acquire() as connection, connection.transaction():
         await connection.execute("SELECT set_config('fridge.mirror_sync', $1, TRUE)", str(dataset_id))
         existing = await connection.fetchval(

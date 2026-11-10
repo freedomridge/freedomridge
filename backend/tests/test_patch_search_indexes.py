@@ -12,9 +12,8 @@ from typing import Any
 
 import pytest
 
-from backend import index_jobs
-from backend.routers import search
-from backend.routers.search import _indexed_grid
+from backend import index_jobs, patch_search
+from backend.patch_search import indexed_grid as _indexed_grid
 from backend.tests import test_field_registry_postgres as registry_helpers
 
 registry_database = registry_helpers.registry_database
@@ -110,22 +109,21 @@ def test_each_position_query_can_use_its_index_and_matches_the_exact_scan(regist
             "SELECT sample_id, vector FROM embeddings WHERE field_name = $1 ORDER BY sample_id LIMIT 1",
             'clip_patch_2x2_r0c0',
         )
-        args = [seed, 10, 1, seed_id, 'clip_patch_2x2_r0c0']
         common: dict[str, Any] = dict(
+            dataset_id=1,
             like_pattern='clip_patch_2x2_%',
-            dim=3,
-            where_clause='s.dataset_id = $3 AND NOT (e.sample_id = $4 AND e.field_name = $5)',
-            args=args,
+            seed_vector=seed,
+            dims=3,
             limit=10,
-            limit_param='$2',
             per_image=1,
+            exclude=(seed_id, 'clip_patch_2x2_r0c0'),
         )
         async with database.pool.acquire() as connection:
             fields = _indexed_grid('clip', '2x2', await index_jobs.cosine_hnsw_fields(connection, 3))
             assert fields == GRID
             recording = _Recording(connection)
-            indexed = await search._nearest_patches(recording, fields=fields, **common)
-            exact = await search._nearest_patches(connection, fields=None, **common)
+            indexed = await patch_search.nearest_patches(recording, fields=fields, **common)
+            exact = await patch_search.nearest_patches(connection, fields=None, **common)
             assert [(r['sample_id'], r['field_name']) for r in indexed] == [
                 (r['sample_id'], r['field_name']) for r in exact
             ]

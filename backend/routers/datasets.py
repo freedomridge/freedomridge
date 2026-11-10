@@ -108,12 +108,13 @@ def _validate_field_name(name) -> str:
     return name
 
 
-async def get_array_columns() -> set:
-    """Get the set of TEXT[] array columns on the samples table (cached)."""
+async def get_array_columns(source=None) -> set:
+    """Get the set of TEXT[] array columns on the samples table (cached). `source` is a connection or pool (the
+    API's db by default: the job runner, which has no db, passes its own)."""
     global _array_columns_cache, _array_columns_cache_time
     now = _time.time()
     if _array_columns_cache is None or now - _array_columns_cache_time > 60:
-        rows = await db.fetch("SELECT column_name FROM sample_array_columns")
+        rows = await (source or db).fetch("SELECT column_name FROM sample_array_columns")
         _array_columns_cache = {r['column_name'] for r in rows}
         _array_columns_cache_time = now
     return _array_columns_cache
@@ -140,7 +141,7 @@ _LABEL_EQ_OPS = ('=', '==', 'in') + _LABEL_NEG_OPS
 _LABEL_LIST_OPS = ('in', 'not in', 'not_in', 'nin')
 
 
-async def get_dataset_array_columns(dataset_id: int) -> DatasetArrayColumns:
+async def get_dataset_array_columns(dataset_id: int, source=None) -> DatasetArrayColumns:
     """Array columns that belong to THIS dataset (per-dataset isolation).
 
     The physical array columns are global (sample_array_columns), but a
@@ -148,16 +149,17 @@ async def get_dataset_array_columns(dataset_id: int) -> DatasetArrayColumns:
     Without this scoping, one dataset's dynamic array fields show up in every
     other dataset's schema / array-field list. Built-ins stay universal.
     """
-    cols = await get_array_columns()
+    cols = await (get_array_columns(source) if source is not None else get_array_columns())
+    source = source or db
     result = set(cols & _BUILTIN_ARRAY_COLUMNS)
     if not cols - _BUILTIN_ARRAY_COLUMNS:
-        return await label_context(db, dataset_id, result)
-    rows = await db.fetch(
+        return await label_context(source, dataset_id, result)
+    rows = await source.fetch(
         "SELECT field_name FROM dataset_fields WHERE dataset_id = $1 AND origin = 'native_array'",
         dataset_id,
     )
     result.update(r['field_name'] for r in rows if r['field_name'] in cols)
-    return await label_context(db, dataset_id, result)
+    return await label_context(source, dataset_id, result)
 
 
 class DatasetCreate(BaseModel):
@@ -3727,14 +3729,14 @@ def _grid_order_by(sort_by: str, direction: str, field_type_row) -> str:
     return "ORDER BY id"  # unsupported type (array, object, ...): fall back to the default order
 
 
-async def get_promoted_numeric_fields(dataset_id: int) -> set:
+async def get_promoted_numeric_fields(dataset_id: int, source=None) -> set:
     """Promoted metadata fields that have a numeric float index for this dataset.
 
     Range filters on these can use the bare `(metadata->>'f')::float` cast — it
     matches the promote_field index (so the planner can avoid a sequential scan)
     and is cast-safe because the index only builds when every value is numeric.
     """
-    rows = await db.fetch(
+    rows = await (source or db).fetch(
         "SELECT field_name FROM dataset_fields "
         "WHERE dataset_id = $1 AND is_promoted = TRUE "
         "AND field_type IN ('number', 'float', 'int', 'integer')",
@@ -6913,6 +6915,13 @@ async def _require_live_selection(token: Optional[str], source=None) -> None:
 @router.post("/datasets/{id}/samples/bulk-tag", dependencies=[Depends(require_dataset_access)])
 async def bulk_tag_samples(id: int, request: BulkTagRequest, user: dict = Depends(require_role("power_user"))):
     """Bulk add/remove values from any array field (tags, inferred_tags, etc.)."""
+    return await tag_samples(id, request, user)
+
+
+async def tag_samples(id: int, request: BulkTagRequest, user: dict, made_by: str | None = None):
+    """bulk_tag_samples, and a follower's tag edit (routers/followers.py), which says who made it there: `made_by` is
+    recorded with a tag this edit adds to the registry (display only). It isn't a request field, so only a follower's
+    edit sets it."""
     if not request.sample_ids and not request.selection_token and request.filters is None:
         raise HTTPException(status_code=400, detail="Provide sample_ids, selection_token or filters")
     await _require_live_selection(request.selection_token)
@@ -6951,7 +6960,7 @@ async def bulk_tag_samples(id: int, request: BulkTagRequest, user: dict = Depend
                 detail=f"{request.field_name} of a mirror is its primary's: only tags go back to the primary",
             )
 
-        return await mirror_writes.forward_tags(db, id, request)
+        return await mirror_writes.forward_tags(db, id, request, user)
 
     if (
         request.background
@@ -6966,7 +6975,8 @@ async def bulk_tag_samples(id: int, request: BulkTagRequest, user: dict = Depend
         or request.filters is not None
         or await _large_bulk_target(id, request.sample_ids)
     ):
-        return await _bulk_response(id, user, 'tag', request.model_dump())
+        payload = {**request.model_dump(), **({'made_by': made_by} if made_by else {})}
+        return await _bulk_response(id, user, 'tag', payload)
 
     where_sql, target_args = _bulk_target_predicate(request, id, start_index=1)
     add_arg = f'${len(target_args) + 1}::text[]'
@@ -7016,14 +7026,16 @@ async def bulk_tag_samples(id: int, request: BulkTagRequest, user: dict = Depend
                 # apply = last used. created_at is left alone for a tag the registry already knew.
                 await conn.execute(
                     """
-                    INSERT INTO dataset_tags (dataset_id, field_name, tag, created_at, created_by_user_id, last_used_at)
-                    SELECT $1, $2, unnest($3::text[]), NOW(), $4, NOW()
+                    INSERT INTO dataset_tags
+                        (dataset_id, field_name, tag, created_at, created_by_user_id, created_by_name, last_used_at)
+                    SELECT $1, $2, unnest($3::text[]), NOW(), $4, $5, NOW()
                     ON CONFLICT (dataset_id, field_name, tag) DO UPDATE SET last_used_at = EXCLUDED.last_used_at
                     """,
                     id,
                     col,
                     request.add_tags,
                     user["id"],
+                    made_by,
                 )
 
             if request.add_tags:
@@ -7786,8 +7798,15 @@ async def _tag_registry_info(dataset_id: int, col: str, tags: list, user: dict) 
             tags,
         )
         rows = await db.fetch(
-            "SELECT t.tag, t.created_at, t.last_used_at, u.username AS created_by FROM dataset_tags t "
-            "LEFT JOIN users u ON u.id = t.created_by_user_id WHERE t.dataset_id = $1 AND t.field_name = $2",
+            # A tag a follower sent up shows who made it there and on which follower: the follower's name from the
+            # account that made it, never from the name it sent (docs/FOLLOWERS.md).
+            """SELECT t.tag, t.created_at, t.last_used_at,
+                      CASE WHEN f.name IS NOT NULL AND t.created_by_name IS NOT NULL
+                           THEN t.created_by_name || ' on ' || f.name ELSE u.username END AS created_by
+               FROM dataset_tags t
+               LEFT JOIN users u ON u.id = t.created_by_user_id
+               LEFT JOIN followers f ON f.user_id = t.created_by_user_id
+               WHERE t.dataset_id = $1 AND t.field_name = $2""",
             dataset_id,
             col,
         )

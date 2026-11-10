@@ -1,3 +1,4 @@
+import type { PatchScaleInfo } from './patch-scales';
 import type { ClassRule } from './class-rules';
 import type { DefaultView } from './default-view';
 
@@ -462,6 +463,7 @@ export interface View {
         sort?: string;
         order?: 'asc' | 'desc';
         made_on?: string; // The follower instance the view was made on (docs/FOLLOWERS.md)
+        made_by?: string; // Who made it there: shown only, set by the primary (docs/FOLLOWERS.md)
     };
     is_public: boolean;
     shared_with_user_ids: number[];
@@ -1813,7 +1815,7 @@ export async function searchObjectToPatches(params: {
 export async function getPatchScales(
     datasetId: number,
     fieldName: string = "clip",
-): Promise<{ scale: string }[]> {
+): Promise<PatchScaleInfo[]> {
     const res = await fetch(`${API_BASE}/datasets/${datasetId}/embeddings/patch-scales?field_name=${fieldName}`);
     if (!res.ok) return [];
     return res.json();

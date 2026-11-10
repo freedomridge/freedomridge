@@ -152,3 +152,41 @@ def test_dataset_state_and_deletion_are_logged(registry_database):
         assert await taken(database, 'dataset_changes') == []
 
     registry_database(scenario)
+
+
+def test_truncate_is_refused_while_anything_is_followed_or_mirrored(registry_database):
+    async def scenario(database):
+        import asyncpg
+
+        # Every table whose changes are logged for followers, or guarded on a mirror, refuses TRUNCATE too.
+        logged = {
+            row['relname']
+            for row in await database.fetch(
+                """SELECT DISTINCT c.relname FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid
+                   WHERE NOT t.tgisinternal AND (t.tgname LIKE '%\\_log\\_%' OR t.tgname LIKE '%mirror\\_guard')""",
+            )
+        } | {'samples', 'datasets'}  # samples log from their statistics trigger
+        guarded = {
+            row['relname']
+            for row in await database.fetch(
+                """SELECT c.relname FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid
+                   WHERE t.tgname = 'follower_truncate_guard'""",
+            )
+        }
+        assert logged <= guarded, f'no TRUNCATE guard on {sorted(logged - guarded)}'
+
+        await ingest([{'crop': 'corn'}], dataset_id=1, prefix='s3://images/a')
+        # Nothing followed and no mirror: TRUNCATE works as before.
+        await database.execute('TRUNCATE sample_hashes')
+        await database.execute('UPDATE datasets SET followed = TRUE WHERE id = 1')
+        for table in ('sample_hashes', 'embedding_coordinates', 'embeddings CASCADE', 'samples CASCADE'):
+            with pytest.raises(asyncpg.PostgresError, match='followed or is a mirror'):
+                await database.execute(f'TRUNCATE {table}')
+        assert await database.fetchval('SELECT count(*) FROM samples') == 1
+        # A mirror alone refuses it too.
+        await database.execute('UPDATE datasets SET followed = FALSE')
+        await database.execute('INSERT INTO mirrors (dataset_id, origin_dataset_id, feed_cursor) VALUES (2, 7, 0)')
+        with pytest.raises(asyncpg.PostgresError, match='followed or is a mirror'):
+            await database.execute('TRUNCATE embeddings CASCADE')
+
+    registry_database(scenario)

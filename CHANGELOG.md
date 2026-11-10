@@ -4,6 +4,92 @@ Freedom Ridge has one version for the server, the web app and the Python SDK (th
 file), following [Semantic Versioning](https://semver.org). A release lists **upgrade notes** when
 it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
 
+## 2.7.0 (2026-11-10)
+
+2.7.0 completes followers. A primary can run patch searches on the patch vectors a follower computed itself, a new
+copy of a dataset resumes into its stopped mirror and keeps what the follower added there, stopping tells the
+primary, and edits sent up say who made them. It also fixes what a review of followers found: restored followers,
+bound tokens, media from a primary, large change logs, `TRUNCATE`, mirrors of many-field samples and long copies
+holding up other mirrors. Five migrations.
+
+### Upgrade notes
+
+- Apply the migrations with the app stopped. `0019_follower_truncate_guard.sql` adds triggers to the sample and vector
+  tables under a 2 s lock timeout, so on a busy server it fails quickly and has to be run again.
+- Primaries and followers can be upgraded in either order ([Upgrading](docs/UPGRADING.md)): a 2.7.0 follower works
+  with a 2.6.x primary, and a 2.6.x follower with a 2.7.0 primary. After a primary is upgraded, a follower restored
+  from an older backup copies its datasets again (409), and a follower taken back to a release before 2.6.1 is refused
+  until **Reset instance** on the primary (both under Fixed).
+- Four database migrations, `0015_follower_fields.sql`, `0016_follower_searches.sql`, `0017_mirror_resume.sql` and
+  `0018_follower_leave.sql`, applied with `scripts/apply_migrations.sh` (step 4 of [Upgrading](docs/UPGRADING.md)).
+- One more database migration, `0019_follower_truncate_guard.sql`. From it, a `TRUNCATE` in SQL of the sample,
+  vector, hash, map coordinate, field or view tables is refused while any dataset is followed or is a mirror.
+  Nothing in Freedom Ridge truncates them; a script of your own that does should delete the rows instead.
+
+### Added
+
+- **Followers report the patch scales they hold themselves** ([FOLLOWERS.md](docs/FOLLOWERS.md#patch-scales-of-its-own)).
+  A follower with patch vectors the primary doesn't have (computed on its own GPU, say) tells the primary which
+  scales, at most every 10 minutes, and Settings → Followers shows them. The follower API is now `protocol: 2`. This
+  is the first step to patch searches on the primary that run on a follower's patch vectors.
+- **Patch searches on a follower's patch scales** ([FOLLOWERS.md](docs/FOLLOWERS.md#patch-scales-of-its-own)). On the
+  primary, the sample viewer offers the scales a follower holds, and a patch search on one runs on the follower,
+  which polls for them over its own connection: a small hosted primary can offer 8×8 patch search without holding
+  the vectors. The results are the primary's own samples, as a local search shows them.
+- **A follower's new copy of a dataset resumes into its stopped mirror** ([FOLLOWERS.md](docs/FOLLOWERS.md#when-it-stops)),
+  when the same primary database shares it again (re-shared, the primary added again, or after a 409), keeping
+  what the follower added there: patch vectors computed on its own GPU no longer have to be computed again.
+  Samples gone from the primary go. A stopped copy can be kept as a separate copy instead.
+- **Stopping tells the primary** ([FOLLOWERS.md](docs/FOLLOWERS.md#when-it-stops)). Stop following on a follower
+  tells its primary, which stops keeping its change log for it: before, a follower that stopped held back the
+  primary's log pruning until its admin removed it. Adding the primary again brings back what it followed, with the
+  same options, resumed into its mirrors. Settings → Followers shows a follower that stopped, and what comes back.
+- **Edits sent up say who made them** ([FOLLOWERS.md](docs/FOLLOWERS.md#edits-sent-to-the-primary)): a tag or view
+  from a follower shows its maker there ("alice on lab"), display only.
+
+### Fixed
+
+- **Followers: a shared view's parent ids are translated** ([FOLLOWERS.md](docs/FOLLOWERS.md#what-a-mirror-holds)).
+  Copying a shared view, either way, translated only `id`, so a filter on an object's parent (`parent_id`,
+  `metadata.parent_id`) kept the other instance's ids and selected nothing, or another image's objects. A view
+  with a range on sample ids (`id > 15`) now stays on the instance that made it, as a view with a concept does:
+  each instance numbers its samples in its own order.
+- **Followers: two adds of one primary at the same time make one link.** Adding the same primary at two addresses
+  at once (a LAN address and a DNS name, say) could make two links, which shared one subscription there:
+  one's acknowledgements pruned changes the other hadn't read. The second add now waits and is refused (409).
+- **A follower restored from an older backup copies again instead of missing changes.** The primary prunes its
+  change log up to what each follower has acknowledged, and a restored follower read the feed from its older
+  cursor without being told those rows were gone. The feed now refuses a cursor behind the acknowledged one (409):
+  the follower stops that copy and takes a new one, which resumes into the same mirror.
+- **A follower token bound to an installation is refused when a call names no installation.** Before, such a
+  call passed, so a second install could share the subscription. A follower before 2.6.1 never binds its token and
+  isn't affected; one taken back to such a release is refused until **Reset instance** on the primary.
+- **An image a follower fetches from its primary can't run as a page.** The follower passed on whatever content
+  type the primary answered with, from its own address and without the sandbox and download rules its other media
+  gets, so a primary could have served a page with script that ran as the person viewing it. Those answers, and
+  the cached copies, now follow the same rules: only an image or a video is shown, and anything else downloads.
+- **Deleting a followed dataset no longer stalls on its change log.** The log a follower hadn't caught up on was
+  removed in one statement at the end of the deletion, which could run out of time on every try once the log was
+  large. The deletion now removes it in batches, like the dataset's other rows.
+- **`TRUNCATE` can't bypass followers.** Run in SQL on the sample, vector, hash, map coordinate, field or view
+  tables, it skipped the change log followers read and the protection that keeps a mirror read-only. It is now
+  refused while any dataset is followed or is a mirror, with a message that says what to do instead.
+- **A mirror no longer stops when a sample gains more than 64 vector fields at once.** 4×4 and 8×8 patch tiles on
+  one image are 80 fields: the follower asked the primary for all of them in one request, which the primary
+  refused, on every retry. It now asks for them 64 fields at a time.
+- **Map coordinates of a vector added to an already mirrored sample arrive with it.** When the same sync also
+  re-read that sample's block, the coordinates were written before the vector was there and then dropped, so the
+  sample was missing from the mirror's map until that part of the primary's map changed again.
+- **Samples that swap filepaths on the primary keep their vectors on the mirror.** The mirror deleted the sample
+  that held the path and made a new one without its vectors, and without anything the follower had added to it.
+  It now keeps both samples and only changes their paths.
+- **A long copy no longer holds up a primary's other mirrors.** A follower synced one mirror at a time, lowest
+  first, until it had caught up, so a first copy of a large dataset (hours) kept every other dataset of that
+  primary from syncing. The mirrors now take turns, a step each.
+- **Changing a follower's options on Settings → Followers no longer undoes the change made just before it.** Each
+  change sends all three options; one made before the page had reloaded the list sent the previous option's old
+  value. The options now wait while a change is saved.
+
 ## 2.6.1 (2026-11-09)
 
 2.6.1 fixes followers, from a review of the feature: a restored primary is detected and its followers copy again,

@@ -1356,3 +1356,13 @@ BEGIN
     RETURN NULL;
 END;
 $$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION refuse_followed_truncate() RETURNS trigger AS $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM datasets WHERE followed) OR EXISTS (SELECT 1 FROM mirrors) THEN
+        RAISE EXCEPTION 'TRUNCATE % is refused while a dataset here is followed or is a mirror: it would skip the change log followers read and a mirror''s protection. Delete the rows instead (followers see each delete), or stop sharing the followed datasets and delete the mirrors first',
+            TG_TABLE_NAME USING ERRCODE = '55000';
+    END IF;
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;

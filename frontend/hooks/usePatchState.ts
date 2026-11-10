@@ -3,6 +3,7 @@
 import { useState, useMemo, useEffect, useCallback } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { getPatchScales, searchSimilarPatches, type PatchSearchResult } from '@/lib/api';
+import { patchScaleLabel, patchScaleSource } from '@/lib/patch-scales';
 
 export interface PatchInfo {
     row: number;
@@ -36,6 +37,11 @@ export function usePatchState({
 
     const availablePatchScales = useMemo(
         () => patchScales?.map(s => s.scale) || [],
+        [patchScales]
+    );
+    // How each scale reads in the pickers: a follower's scale names the follower (lib/patch-scales.ts).
+    const patchScaleLabels = useMemo(
+        () => Object.fromEntries((patchScales ?? []).map(s => [s.scale, patchScaleLabel(s)])) as Record<string, string>,
         [patchScales]
     );
 
@@ -91,7 +97,8 @@ export function usePatchState({
             setSelectedPatches(patchMap);
             setGridPatchMode(scale);
             const ids = results.map(r => r.sample_id);
-            onSearchResults?.(ids, `Patch Search (${scale} R${row}C${col})`);
+            const source = patchScaleSource(patchScales?.find(s => s.scale === scale));
+            onSearchResults?.(ids, `Patch Search (${scale} R${row}C${col})${source}`);
             onCloseModal?.();
         } catch (error) {
             const msg = error instanceof Error ? error.message : 'Unknown error';
@@ -99,7 +106,7 @@ export function usePatchState({
         } finally {
             onSearchEnd?.();
         }
-    }, [datasetId, onSearchStart, onSearchEnd, onSearchResults, onCloseModal]);
+    }, [datasetId, patchScales, onSearchStart, onSearchEnd, onSearchResults, onCloseModal]);
 
     // Grid patch click handler (toggle individual patches)
     const handlePatchGridSelect = useCallback((sampleId: number, row: number, col: number, scale: string) => {
@@ -157,8 +164,9 @@ export function usePatchState({
     }, [selectedPatches]);
 
     return {
-        // Available scales
+        // Available scales, and how each reads
         availablePatchScales,
+        patchScaleLabels,
 
         // UI state + setters
         modalPatchScale,

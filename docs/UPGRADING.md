@@ -53,6 +53,25 @@ garbage-collection limits (`docker buildx inspect` shows them). To free the disk
 `docker builder prune --filter until=24h` soon after an upgrade. It removes what only earlier
 builds used and keeps the new build's cache, so the next upgrade still builds quickly.
 
+## Primaries and followers
+
+A primary and its [followers](FOLLOWERS.md) are separate installations: each has its own database and runs
+its own migrations, and they talk only through the follower API. So:
+
+- **Upgrade them one at a time, in either order.** Any two releases from 2.6.0 on follow each other: a follower
+  on an older or newer release than its primary keeps its mirrors in sync. A feature that needs both sides (the changelog says so) starts working once both
+  have it.
+- **While a primary is being upgraded** its followers keep their mirrors, read-only as always, show the
+  primary's last error on Settings → Primaries, and catch up from its change log when it answers again.
+- **Going back on a primary** is a restored primary to its followers: each stops its copy and takes a new one,
+  as a new dataset. Restore into a new or empty database, as the backup from step 2 is restored. A restore over
+  the same database isn't detected, and followers would keep rows the primary no longer has
+  ([Followers](FOLLOWERS.md#the-followers-protocol)).
+- **Going back on a follower** (restoring its backup) leaves its mirrors behind what it had told the primary
+  it held. The primary refuses the older position, and the follower copies those datasets again into the same
+  mirrors, reading every block again: hours for a large dataset. A dataset it started following after the backup
+  is copied as a new one.
+
 ## Going back
 
 Stop the services and restore the backup from step 2 into an empty database
