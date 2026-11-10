@@ -2,6 +2,7 @@
 
 Writes only append to existing discovery caches. Statistics owns removals; a
 missing cache is discovered only by the sidebar, never by filter compilation or writes.
+A dataset too large for the sidebar's scan gets its caches from a full statistics refresh.
 """
 
 import asyncpg
@@ -139,9 +140,14 @@ async def discover_fields(pool, dataset_id, cache, cached=None):
     The transaction-scoped advisory lock covers the second cache check, scan and
     publication on one connection. Cancellation/errors release it and SET LOCAL.
     Writers do not take this lock: append-only publication preserves their entries.
+    A scan that runs out of time is handed to statistics (fill_by_statistics), and while
+    that full refresh is queued or running on a measured dataset, loads skip the scan.
     """
+    from . import statistics  # statistics imports field_registry, which imports this module
+
     if cached is not None and cached.get('unique_values') is not None:
         return cached['unique_values']
+    scanning = False
     try:
         async with pool.acquire() as connection, connection.transaction():
             await connection.execute(f"SET LOCAL statement_timeout='{DISCOVERY_TIMEOUT_MS}ms'")
@@ -156,11 +162,21 @@ async def discover_fields(pool, dataset_id, cache, cached=None):
             )
             if fresh is not None and fresh['unique_values'] is not None:
                 return fresh['unique_values']
+            # The full refresh publishes it. A new dataset's first refresh is full too, but still scanned for, so
+            # its overlay types show before that refresh ends.
+            if await connection.fetchval(
+                'SELECT COALESCE((SELECT initialized FROM dataset_stats_state WHERE dataset_id=$1),FALSE) '
+                f'AND EXISTS({statistics.FULL_REFRESH_ACTIVE})',
+                dataset_id,
+            ):
+                return []
+            scanning = True
             rows = await connection.fetch(
                 "SELECT DISTINCT key AS field FROM samples s, jsonb_each(s.metadata) AS je(key,value) "
                 f"WHERE s.dataset_id=$1 AND ({DISCOVERY_SQL[cache]}) ORDER BY key",
                 dataset_id,
             )
+            scanning = False
             fields = [row['field'] for row in rows]
             # A sealing dataset remains readable. Roll back just publication if sealing races us.
             try:
@@ -181,9 +197,52 @@ async def discover_fields(pool, dataset_id, cache, cached=None):
             except asyncpg.ObjectNotInPrerequisiteStateError:
                 pass
             return fields
+    except asyncpg.QueryCanceledError as error:
+        # Only the scan's own timeout: waiting for another load's scan, or a manual cancel, is no reason to refresh.
+        # Both are SQLSTATE 57014, told apart by the server's English message: with lc_messages in another language
+        # nothing is handed off, and the timeout logs as before.
+        if scanning and 'statement timeout' in str(error):
+            try:
+                await fill_by_statistics(pool, dataset_id, cache)
+            except Exception as refused:
+                print(
+                    f'[field-stats] Discovering {cache} for dataset {dataset_id} timed out, '
+                    f'and statistics refused it: {refused}',
+                )
+        else:
+            print(f'[field-stats] Failed to discover {cache} for dataset {dataset_id}: {error}')
+        return []
     except Exception as error:
         print(f'[field-stats] Failed to discover {cache} for dataset {dataset_id}: {error}')
         return []
+
+
+async def fill_by_statistics(pool, dataset_id, cache):
+    """The sidebar's scan ran out of time: a large dataset with no cache yet, as after an upgrade that adds a cache
+    type. A full statistics refresh measures the dataset block by block with today's shapes, with no limit on the
+    whole, and publishes every cache. One queued or running is enough, and one that ended in the last hour without
+    publishing the cache isn't repeated: it would end the same way, once per load."""
+    from . import statistics  # statistics imports field_registry, which imports this module
+
+    ended = await pool.fetchrow(
+        """SELECT id, state, finished_at FROM jobs WHERE kind=$1 AND dataset_id=$2 AND (barrier->>'full')::boolean
+             AND state IN ('succeeded','failed','cancelled') AND finished_at > clock_timestamp() - interval '1 hour'
+           ORDER BY finished_at DESC LIMIT 1""",
+        statistics.KIND,
+        dataset_id,
+    )
+    if ended is not None:
+        print(
+            f'[field-stats] Discovering {cache} for dataset {dataset_id} took over {DISCOVERY_TIMEOUT_MS} ms; '
+            f"full statistics job {ended['id']} ended {ended['state']} at {ended['finished_at']:%Y-%m-%d %H:%M:%S} "
+            'without publishing it, so none is queued again until an hour after that',
+        )
+        return
+    job = await statistics.request_refresh(pool, dataset_id, force=True, unless_full_active=True)
+    print(
+        f'[field-stats] Discovering {cache} for dataset {dataset_id} took over {DISCOVERY_TIMEOUT_MS} ms; '
+        f"statistics job {job['id']} publishes it",
+    )
 
 
 class DatasetArrayColumns(set):

@@ -60,6 +60,11 @@ it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
   samples. Each object now gets its parent's id on the target, also when the parent is copied after it or the object
   was copied by an earlier run. An object whose image isn't in the dataset gets no parent, and the run says how many
   there were. Datasets copied with an earlier release can be put right by running the copy again.
+- **The sidebar no longer scans a large dataset for an overlay type on every load.** A dataset last measured
+  before an upgrade added an overlay type (class probabilities, 2.4.0) had no cache for it, and the sidebar's scan
+  gave up after 10 s every time ("Failed to discover `__probability_fields__` … statement timeout"). A scan that
+  runs out of time now queues one full statistics refresh, which measures the dataset in the background and publishes
+  every overlay cache. Until it finishes, the sidebar shows no fields of that type and doesn't scan for them.
 
 ## 2.7.0 (2026-11-10)
 

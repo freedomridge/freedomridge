@@ -641,6 +641,159 @@ def test_sidebar_timeout_releases_discovery_lock(registry_database, monkeypatch)
     registry_database(scenario)
 
 
+async def _measured_long_ago_without_caches(database):
+    """A dataset whose statistics ran long before its caches went missing, as before an upgrade added a cache type."""
+    await ingest([{'vehicles': BOX}])
+    await run_refresh(database, 1)
+    await database.execute("UPDATE jobs SET finished_at = finished_at - interval '2 hours' WHERE dataset_id=1")
+    await database.execute("DELETE FROM dataset_field_stats WHERE field_name LIKE '\\_\\_%'")
+
+
+async def _full_refreshes(database):
+    from backend import statistics
+
+    return await database.fetch(
+        """SELECT id FROM jobs WHERE kind=$1 AND dataset_id=1 AND state IN ('queued','running')
+           AND (barrier->>'full')::boolean""",
+        statistics.KIND,
+    )
+
+
+def _scans_time_out(monkeypatch):
+    from backend import label_fields
+
+    original = asyncpg.Connection.fetch
+
+    async def slow_scan(connection, query, *args, **kwargs):
+        if 'jsonb_each(' in query:
+            await connection.execute('SELECT pg_sleep(0.5)')
+        return await original(connection, query, *args, **kwargs)
+
+    monkeypatch.setattr(label_fields, 'DISCOVERY_TIMEOUT_MS', 100)
+    monkeypatch.setattr(asyncpg.Connection, 'fetch', slow_scan)
+    return original
+
+
+def test_a_sidebar_scan_out_of_time_hands_the_caches_to_one_full_statistics_refresh(registry_database, monkeypatch):
+    from backend import label_fields
+
+    async def scenario(database):
+        await _measured_long_ago_without_caches(database)
+        assert await _full_refreshes(database) == []
+        original = _scans_time_out(monkeypatch)
+        # Every cache type runs out of time at once: one full refresh between them.
+        await datasets._get_dataset_field_stats_impl(1, None)
+        assert len(await _full_refreshes(database)) == 1
+        # While it's queued, a load doesn't scan for what it will publish.
+        scans = _watch_scans(monkeypatch, database)
+        await datasets._get_dataset_field_stats_impl(1, None)
+        assert [query for query in scans if 'jsonb_each(' in query] == []
+        assert len(await _full_refreshes(database)) == 1
+        monkeypatch.setattr(asyncpg.Connection, 'fetch', original)
+        monkeypatch.setattr(label_fields, 'DISCOVERY_TIMEOUT_MS', 10_000)
+        await run_refresh(database, 1)  # runs the queued refresh
+        assert await database.fetchval(
+            "SELECT count(*) FROM dataset_field_stats WHERE dataset_id=1 AND field_name LIKE '\\_\\_%'",
+        ) == len(DISCOVERY_TYPES)
+        # The sidebar reads the published caches instead of scanning again.
+        scans = _watch_scans(monkeypatch, database)
+        fields = {f['name']: f for f in await datasets._get_dataset_field_stats_impl(1, None)}
+        assert fields['vehicles']['type'] == 'detections'
+        assert [query for query in scans if 'jsonb_each(' in query] == []
+
+    registry_database(scenario)
+
+
+def test_hand_offs_together_or_after_the_runner_claims_make_one_full_refresh_requested_once(registry_database):
+    import asyncio
+
+    from backend import job_queue, label_fields, statistics
+
+    async def scenario(database):
+        await ingest([{'vehicles': BOX}])
+        requests = 'SELECT stats_full_requests FROM datasets WHERE id=1'
+        before = await database.fetchval(requests)
+        await asyncio.gather(*[label_fields.fill_by_statistics(database.pool, 1, cache) for cache in DISCOVERY_TYPES])
+        jobs = await _full_refreshes(database)
+        assert len(jobs) == 1
+        # The runner claims it, and a load whose scan timed out before the claim hands off after it.
+        claimed = await job_queue.claim_job(database.pool, 'local', kinds=[statistics.KIND])
+        assert claimed is not None and claimed['id'] == jobs[0]['id']
+        await label_fields.fill_by_statistics(database.pool, 1, '__probability_fields__')
+        assert await database.fetchval('SELECT count(*) FROM jobs WHERE kind=$1', statistics.KIND) == 1
+        assert await database.fetchval(requests) == before + 1
+
+    registry_database(scenario)
+
+
+def test_waiting_for_another_loads_scan_or_a_manual_cancel_queues_no_refresh(registry_database, monkeypatch):
+    from backend import label_fields
+
+    async def scenario(database):
+        await _measured_long_ago_without_caches(database)
+        monkeypatch.setattr(label_fields, 'DISCOVERY_TIMEOUT_MS', 100)
+        cache = '__probability_fields__'
+        holder = await database.pool.acquire()
+        try:
+            async with holder.transaction():
+                await holder.execute(
+                    'SELECT pg_advisory_xact_lock(hashtextextended($1,0))',
+                    f'overlay-discovery:1:{cache}',
+                )
+                assert await label_fields.discover_fields(database.pool, 1, cache) == []
+        finally:
+            await database.pool.release(holder)
+        original = asyncpg.Connection.fetch
+
+        async def cancelled(connection, query, *args, **kwargs):
+            if 'jsonb_each(' in query:
+                raise asyncpg.QueryCanceledError('canceling statement due to user request')
+            return await original(connection, query, *args, **kwargs)
+
+        monkeypatch.setattr(asyncpg.Connection, 'fetch', cancelled)
+        assert await label_fields.discover_fields(database.pool, 1, cache) == []
+        assert await _full_refreshes(database) == []
+
+    registry_database(scenario)
+
+
+def test_a_new_datasets_first_refresh_still_lets_the_sidebar_discover(registry_database, monkeypatch):
+    from backend import statistics
+
+    async def scenario(database):
+        await ingest([{'vehicles': BOX}])
+        await statistics.request_refresh(database.pool, 1)  # its first refresh is full: nothing measured yet
+        assert len(await _full_refreshes(database)) == 1
+        scans = _watch_scans(monkeypatch, database)
+        fields = {f['name']: f for f in await datasets._get_dataset_field_stats_impl(1, None)}
+        assert fields['vehicles']['type'] == 'detections'
+        assert len([query for query in scans if 'jsonb_each(' in query]) == len(DISCOVERY_TYPES)
+
+    registry_database(scenario)
+
+
+def test_a_full_refresh_that_ended_without_the_cache_is_not_queued_again_on_every_load(registry_database, monkeypatch):
+    from backend import job_queue
+
+    async def scenario(database):
+        await _measured_long_ago_without_caches(database)
+        _scans_time_out(monkeypatch)
+        await datasets._get_dataset_field_stats_impl(1, None)
+        [job] = await _full_refreshes(database)
+        await job_queue.cancel_job(database.pool, job['id'])
+        for _ in range(2):
+            await datasets._get_dataset_field_stats_impl(1, None)
+        assert await _full_refreshes(database) == []
+        assert (
+            await database.fetchval(
+                "SELECT count(*) FROM jobs WHERE dataset_id=1 AND finished_at > clock_timestamp() - interval '1 hour'",
+            )
+            == 1
+        )
+
+    registry_database(scenario)
+
+
 def test_uncached_list_field_still_filters_and_autocompletes(registry_database):
     """A box field that exists but isn't in a discovery cache yet (new dataset, deploy, restore)."""
 
