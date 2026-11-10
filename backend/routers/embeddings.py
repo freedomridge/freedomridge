@@ -1590,15 +1590,27 @@ async def get_embedding_fields(id: int):
 
 @router.get("/patch-scales")
 async def get_patch_scales(id: int, field_name: str = "clip"):
-    """Return available patch scales for a given embedding field.
+    """Return available patch scales for a given embedding field, this dataset's and its followers'.
 
     Patch embeddings use field_name convention: "{field_name}_patch_{scale}_r{row}c{col}"
     (patch_search.patch_scales).
     """
     async with db.pool.acquire() as conn:
         scales = await patch_search.patch_scales(conn, id, field_name)
-    # The scales this dataset holds. A follower's own scales aren't searchable from here yet.
-    return [{"scale": s} for s, source in scales.items() if source['local']]
+    # The scales this dataset holds, and those only a follower holds, whose patch searches go to it
+    # (docs/FOLLOWERS.md): `local` false, with its `provider` and whether it's `online`.
+    result = []
+    for scale, source in scales.items():
+        entry: dict = {"scale": scale, "local": source['local']}
+        if not source['local']:
+            first = source['providers'][0]
+            entry.update(
+                provider=first['name'],
+                online=any(provider['online'] for provider in source['providers']),
+                last_seen_at=first['last_seen_at'],
+            )
+        result.append(entry)
+    return result
 
 
 # --- Raw vectors (for SDK UMAP computation) ---

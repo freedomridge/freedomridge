@@ -19,6 +19,7 @@ copy it reads the feed from start_txid - 1.
 
 import base64
 import secrets
+import uuid
 from typing import Annotated, List, Literal, Optional
 
 import numpy as np
@@ -26,6 +27,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
+from .. import follower_search
 from ..api_errors import CodedHTTPException
 from ..crypto import hash_token
 from ..database import db
@@ -97,6 +99,17 @@ class ReportedScale(BaseModel):
 
 class FieldReport(BaseModel):
     scales: List[ReportedScale] = Field(max_length=REPORTED_SCALES)
+
+
+class RelayedResult(BaseModel):
+    origin_id: int
+    field: str = Field(pattern=r'^[a-zA-Z0-9_]{1,200}$')
+    distance: float
+
+
+class SearchAnswer(BaseModel):
+    results: Optional[List[RelayedResult]] = Field(None, max_length=10000)
+    error: Optional[str] = Field(None, max_length=1000)
 
 
 async def identity(source=None) -> str:
@@ -662,6 +675,32 @@ async def follower_fields_report(dataset_id: int, report: FieldReport, follower:
             ],
         )
     return {'scales': len(unique)}
+
+
+@router.get('/follower/searches')
+async def follower_claim_search(
+    wait: float = Query(0, ge=0, le=follower_search.CLAIM_WAIT_SECONDS),
+    follower: dict = Depends(current_follower),
+):
+    """The oldest patch search relayed to this follower (docs/FOLLOWERS.md), now claimed by it, waiting up to `wait`
+    seconds for one: {id, dataset_id, kind, request}, or {} when none came. Each poll counts as checking in."""
+    return await follower_search.claim(follower, wait) or {}
+
+
+@router.post('/follower/searches/{search_id}')
+async def follower_answer_search(
+    search_id: uuid.UUID,
+    answer: SearchAnswer,
+    follower: dict = Depends(current_follower),
+):
+    """This follower's answer to a search it claimed: its results in the primary's sample ids, or why it couldn't
+    run it. 409 when the search isn't its any more (cancelled, or answered)."""
+    results = [entry.model_dump() for entry in answer.results] if answer.results is not None else None
+    if results is None and answer.error is None:
+        raise HTTPException(status_code=400, detail='Send results or an error')
+    if not await follower_search.answer(follower, str(search_id), results, answer.error):
+        raise HTTPException(status_code=409, detail="This search isn't this follower's to answer any more")
+    return {'answered': str(search_id)}
 
 
 @router.get('/follower/datasets/{dataset_id}/samples/{sample_id}/media')

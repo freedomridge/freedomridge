@@ -108,12 +108,13 @@ def _validate_field_name(name) -> str:
     return name
 
 
-async def get_array_columns() -> set:
-    """Get the set of TEXT[] array columns on the samples table (cached)."""
+async def get_array_columns(source=None) -> set:
+    """Get the set of TEXT[] array columns on the samples table (cached). `source` is a connection or pool (the
+    API's db by default: the job runner, which has no db, passes its own)."""
     global _array_columns_cache, _array_columns_cache_time
     now = _time.time()
     if _array_columns_cache is None or now - _array_columns_cache_time > 60:
-        rows = await db.fetch("SELECT column_name FROM sample_array_columns")
+        rows = await (source or db).fetch("SELECT column_name FROM sample_array_columns")
         _array_columns_cache = {r['column_name'] for r in rows}
         _array_columns_cache_time = now
     return _array_columns_cache
@@ -140,7 +141,7 @@ _LABEL_EQ_OPS = ('=', '==', 'in') + _LABEL_NEG_OPS
 _LABEL_LIST_OPS = ('in', 'not in', 'not_in', 'nin')
 
 
-async def get_dataset_array_columns(dataset_id: int) -> DatasetArrayColumns:
+async def get_dataset_array_columns(dataset_id: int, source=None) -> DatasetArrayColumns:
     """Array columns that belong to THIS dataset (per-dataset isolation).
 
     The physical array columns are global (sample_array_columns), but a
@@ -148,16 +149,17 @@ async def get_dataset_array_columns(dataset_id: int) -> DatasetArrayColumns:
     Without this scoping, one dataset's dynamic array fields show up in every
     other dataset's schema / array-field list. Built-ins stay universal.
     """
-    cols = await get_array_columns()
+    cols = await (get_array_columns(source) if source is not None else get_array_columns())
+    source = source or db
     result = set(cols & _BUILTIN_ARRAY_COLUMNS)
     if not cols - _BUILTIN_ARRAY_COLUMNS:
-        return await label_context(db, dataset_id, result)
-    rows = await db.fetch(
+        return await label_context(source, dataset_id, result)
+    rows = await source.fetch(
         "SELECT field_name FROM dataset_fields WHERE dataset_id = $1 AND origin = 'native_array'",
         dataset_id,
     )
     result.update(r['field_name'] for r in rows if r['field_name'] in cols)
-    return await label_context(db, dataset_id, result)
+    return await label_context(source, dataset_id, result)
 
 
 class DatasetCreate(BaseModel):
@@ -3727,14 +3729,14 @@ def _grid_order_by(sort_by: str, direction: str, field_type_row) -> str:
     return "ORDER BY id"  # unsupported type (array, object, ...): fall back to the default order
 
 
-async def get_promoted_numeric_fields(dataset_id: int) -> set:
+async def get_promoted_numeric_fields(dataset_id: int, source=None) -> set:
     """Promoted metadata fields that have a numeric float index for this dataset.
 
     Range filters on these can use the bare `(metadata->>'f')::float` cast — it
     matches the promote_field index (so the planner can avoid a sequential scan)
     and is cast-safe because the index only builds when every value is numeric.
     """
-    rows = await db.fetch(
+    rows = await (source or db).fetch(
         "SELECT field_name FROM dataset_fields "
         "WHERE dataset_id = $1 AND is_promoted = TRUE "
         "AND field_type IN ('number', 'float', 'int', 'integer')",

@@ -12,7 +12,7 @@ from urllib.parse import urlparse
 import httpx
 from fastapi import APIRouter, HTTPException, Request
 
-from .. import index_jobs
+from .. import follower_search, index_jobs
 from .. import patch_search as patch_core
 from ..access import check_dataset_access
 from ..database import db
@@ -448,6 +448,28 @@ async def search_by_image(req: ImageSearchRequest, request: Request):
     return await vector_search(search_req, request)
 
 
+def _patch_results(rows) -> list[dict]:
+    """Search rows as the response's samples, each with its matching patch's row and column."""
+    results = []
+    for row in rows:
+        data = dict(row)
+        if data.get('metadata'):
+            data['metadata'] = json.loads(data['metadata']) if isinstance(data['metadata'], str) else data['metadata']
+        else:
+            data['metadata'] = {}
+        if data.get('location') and isinstance(data['location'], str):
+            data['location'] = json.loads(data['location'])
+
+        # filepath stays raw — see /api/samples/{id}/media for image fetching.
+
+        # Parse row/col from field_name like "clip_patch_4x4_r2c3"
+        m = _PATCH_RC_RE.search(data.pop('field_name', ''))
+        data['patch_row'] = int(m.group(1)) if m else 0
+        data['patch_col'] = int(m.group(2)) if m else 0
+        results.append(data)
+    return results
+
+
 @router.post("/search/patches")
 @guest_heavy
 async def patch_search(req: PatchSearchRequest, request: Request):
@@ -476,10 +498,38 @@ async def patch_search(req: PatchSearchRequest, request: Request):
         req.dataset_id,
     )
     if not vector_row:
-        raise HTTPException(
-            status_code=404,
-            detail=f"No patch embedding found: {query_field} for sample {req.sample_id}",
+        # Not held here: a follower may hold this scale and run the search (docs/FOLLOWERS.md). Only when this
+        # dataset doesn't hold the scale at all: a seed lacking its tile here isn't sent elsewhere.
+        if not (
+            await follower_search.relayable(db, req.dataset_id, req.field_name, req.patch_scale)
+            and await db.fetchval(
+                'SELECT 1 FROM samples WHERE id = $1 AND dataset_id = $2',
+                req.sample_id,
+                req.dataset_id,
+            )
+        ):
+            raise HTTPException(
+                status_code=404,
+                detail=f"No patch embedding found: {query_field} for sample {req.sample_id}",
+            )
+        rows = await follower_search.relay(
+            request,
+            req.dataset_id,
+            req.field_name,
+            req.patch_scale,
+            'patch',
+            {
+                'sample_id': req.sample_id,
+                'base_field': req.field_name,
+                'scale': req.patch_scale,
+                'row': req.patch_row,
+                'col': req.patch_col,
+                'limit': req.limit,
+                'per_image': 1,
+                'filters': req.filters,
+            },
         )
+        return _patch_results(rows)
     vector_str = vector_row['vector']
 
     # Best matching patch per image, among all patches at the same scale. Excluded: only the exact query patch
@@ -499,26 +549,7 @@ async def patch_search(req: PatchSearchRequest, request: Request):
             exclude=(req.sample_id, query_field),
         )
 
-    # Parse row/col from field_name like "clip_patch_4x4_r2c3"
-    results = []
-    for row in rows:
-        data = dict(row)
-        if data.get('metadata'):
-            data['metadata'] = json.loads(data['metadata']) if isinstance(data['metadata'], str) else data['metadata']
-        else:
-            data['metadata'] = {}
-        if data.get('location') and isinstance(data['location'], str):
-            data['location'] = json.loads(data['location'])
-
-        # filepath stays raw — see /api/samples/{id}/media for image fetching.
-
-        # Extract patch position from field_name
-        m = _PATCH_RC_RE.search(data.pop('field_name', ''))
-        data['patch_row'] = int(m.group(1)) if m else 0
-        data['patch_col'] = int(m.group(2)) if m else 0
-        results.append(data)
-
-    return results
+    return _patch_results(rows)
 
 
 @router.post("/search/object-to-patches")
@@ -563,36 +594,67 @@ async def object_to_patch_search(req: ObjectToPatchSearchRequest, request: Reque
     candidate_limit = max(req.limit * 4, 50)
 
     dim = seed['dim']
-    async with db.pool.acquire() as conn:
-        indexed = await index_jobs.cosine_hnsw_fields(conn, dim) if dim else set()
-        fields: list[str] | None = None
-        if req.patch_scale:
-            fields = await patch_core.indexed_patch_fields(conn, req.dataset_id, req.base_field, req.patch_scale, dim)
-        elif any(field.startswith(f"{req.base_field}_patch_") for field in indexed):
-            # All scales: the dataset's own tile fields decide, so a scale without indexes is
-            # never skipped (it sends the search to the exact scan instead).
-            present = [
-                r['field_name']
-                for r in await conn.fetch(
-                    "SELECT DISTINCT e.field_name FROM embeddings e JOIN samples s ON e.sample_id = s.id "
-                    "WHERE s.dataset_id = $1 AND e.field_name LIKE $2",
-                    req.dataset_id,
-                    patch_pattern,
-                )
-            ]
-            fields = present if present and all(field in indexed for field in present) else None
-        # The best 3 tiles per parent image, so a covered best tile still leaves candidates.
-        rows = await patch_core.nearest_patches(
-            conn,
-            dataset_id=req.dataset_id,
-            fields=fields,
-            like_pattern=patch_pattern,
-            seed_vector=vector_str,
-            dims=dim,
-            limit=candidate_limit,
-            per_image=3,
-            filters=req.filters,
+    remote = req.patch_scale is not None and await follower_search.relayable(
+        db,
+        req.dataset_id,
+        req.base_field,
+        req.patch_scale,
+    )
+    if remote and req.patch_scale is not None:
+        # A scale only a follower holds: it runs the tile search with this object's vector (docs/FOLLOWERS.md).
+        rows = await follower_search.relay(
+            request,
+            req.dataset_id,
+            req.base_field,
+            req.patch_scale,
+            'object_to_patch',
+            {
+                'seed_vector': vector_str,
+                'base_field': req.base_field,
+                'scale': req.patch_scale,
+                'limit': candidate_limit,
+                'per_image': 3,
+                'filters': req.filters,
+            },
         )
+    else:
+        async with db.pool.acquire() as conn:
+            fields: list[str] | None = None
+            if req.patch_scale:
+                fields = await patch_core.indexed_patch_fields(
+                    conn,
+                    req.dataset_id,
+                    req.base_field,
+                    req.patch_scale,
+                    dim,
+                )
+            elif dim:
+                indexed = await index_jobs.cosine_hnsw_fields(conn, dim)
+                if any(field.startswith(f"{req.base_field}_patch_") for field in indexed):
+                    # All scales: the dataset's own tile fields decide, so a scale without indexes is
+                    # never skipped (it sends the search to the exact scan instead).
+                    present = [
+                        r['field_name']
+                        for r in await conn.fetch(
+                            "SELECT DISTINCT e.field_name FROM embeddings e JOIN samples s ON e.sample_id = s.id "
+                            "WHERE s.dataset_id = $1 AND e.field_name LIKE $2",
+                            req.dataset_id,
+                            patch_pattern,
+                        )
+                    ]
+                    fields = present if present and all(field in indexed for field in present) else None
+            # The best 3 tiles per parent image, so a covered best tile still leaves candidates.
+            rows = await patch_core.nearest_patches(
+                conn,
+                dataset_id=req.dataset_id,
+                fields=fields,
+                like_pattern=patch_pattern,
+                seed_vector=vector_str,
+                dims=dim,
+                limit=candidate_limit,
+                per_image=3,
+                filters=req.filters,
+            )
 
     # Existing labeled boxes per candidate parent image, to exclude already-covered tiles.
     parent_ids = list({r['sample_id'] for r in rows})

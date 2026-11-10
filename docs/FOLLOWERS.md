@@ -155,6 +155,23 @@ the scale, the vectors' size and whether every tile has its index. It reports wi
 replaces the last one. The primary keeps them while the dataset stays followed and shows them on Settings →
 Followers ("Holds clip 8×8"). Patch scales that came from the primary aren't reported.
 
+**Patch searches on the primary then run on the follower.** On the primary, the sample viewer offers a follower's
+scales next to its own. A patch search (or a search for unlabelled look-alikes of an object) on a scale only a
+follower holds goes to that follower; the primary never connects to it:
+
+1. The primary queues the search (`follower_searches`) for the follower that reported the scale first, or for
+   the next one that is online if the first doesn't take it within 3 seconds.
+2. The follower, whose job runner polls `GET /api/follower/searches?wait=25` over its own connection, claims it.
+   It runs the same search the primary would, on its mirror, translating sample ids both ways, and answers with
+   `POST /api/follower/searches/{id}` in the primary's sample ids. It runs up to 4 at a time.
+3. The primary shows the samples from its own tables. Samples deleted there since the follower's copy drop out,
+   and samples the follower hasn't copied yet (about a minute behind) are missing.
+
+A follower checked in within the last minute counts as online. Without one online, the search answers 503 and
+names the follower; with 8 searches already queued or running on it, 429; without an answer within 30 seconds,
+504. Filters on a concept, or on a selection made on the primary, can't run on a follower: save the selection as a
+view, or search on the follower itself.
+
 ### Edits sent to the primary
 
 With a dataset's **tags** option both ways, tagging its mirror (the tag dialog, or `POST .../samples/bulk-tag` by ids,

@@ -8,8 +8,8 @@ it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
 
 ### Upgrade notes
 
-- One database migration, `0015_follower_fields.sql`, applied with `scripts/apply_migrations.sh` (step 4 of
-  [Upgrading](docs/UPGRADING.md)).
+- Two database migrations, `0015_follower_fields.sql` and `0016_follower_searches.sql`, applied with
+  `scripts/apply_migrations.sh` (step 4 of [Upgrading](docs/UPGRADING.md)).
 
 ### Added
 
@@ -17,6 +17,10 @@ it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
   A follower with patch vectors the primary doesn't have (computed on its own GPU, say) tells the primary which
   scales, at most every 10 minutes, and Settings → Followers shows them. The follower API is now `protocol: 2`. This
   is the first step to patch searches on the primary that run on a follower's patch vectors.
+- **Patch searches on a follower's patch scales** ([FOLLOWERS.md](docs/FOLLOWERS.md#patch-scales-of-its-own)). On the
+  primary, the sample viewer offers the scales a follower holds, and a patch search on one runs on the follower,
+  which polls for them over its own connection: a small hosted primary can offer 8×8 patch search without holding
+  the vectors. The results are the primary's own samples, as a local search shows them.
 
 ## 2.6.1 (2026-11-09)
 

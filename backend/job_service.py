@@ -16,6 +16,7 @@ from . import (
     dataset_deletion,
     dataset_schedules,
     duplicate_jobs,
+    follower_search,
     follower_sync,
     index_actions,
     index_advisor,
@@ -373,6 +374,8 @@ async def run_service(dsn=DATABASE_URL):
                     await asyncio.wait((stop_requested,), timeout=delay)
 
             recovery = asyncio.create_task(recover())
+            # On a follower: answer the patch searches its primaries relay here (follower_search.py).
+            searches = asyncio.create_task(follower_search.serve(pool, stopping))
             schedules = [
                 (lambda: auth_cleanup.scheduled_cleanup(pool), 300, 'Demo account and session cleanup', False),
                 (lambda: schedule_cleanup(pool, interval), min(interval, 5), 'Selection cleanup', False),
@@ -430,13 +433,14 @@ async def run_service(dsn=DATABASE_URL):
                 runner.stop()
                 stop_requested.cancel()
                 recovery.cancel()
+                searches.cancel()
                 try:
                     await asyncio.wait_for(asyncio.shield(execution), shutdown_seconds)
                 except (asyncio.TimeoutError, TimeoutError):
                     logger.warning('Shutdown grace expired; cancelling measurements, preserving committed checkpoints')
                     execution.cancel()
                 finally:
-                    await asyncio.gather(execution, stop_requested, recovery, return_exceptions=True)
+                    await asyncio.gather(execution, stop_requested, recovery, searches, return_exceptions=True)
     finally:
         for signum in (signal.SIGINT, signal.SIGTERM):
             loop.remove_signal_handler(signum)

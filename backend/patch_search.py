@@ -151,9 +151,9 @@ async def nearest_patches(
             args,
             len(args) + 1,
             field_mapping=SAMPLES_JOIN_FIELD_MAPPING,
-            numeric_indexed_fields=await get_promoted_numeric_fields(dataset_id),
+            numeric_indexed_fields=await get_promoted_numeric_fields(dataset_id, conn),
             dataset_id=dataset_id,
-            array_columns=await get_dataset_array_columns(dataset_id),
+            array_columns=await get_dataset_array_columns(dataset_id, conn),
         )
         if filter_sql and filter_sql != 'TRUE':
             conditions.append(filter_sql)

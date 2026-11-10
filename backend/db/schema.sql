@@ -2585,6 +2585,25 @@ CREATE TABLE IF NOT EXISTS follower_fields (
 );
 CREATE INDEX IF NOT EXISTS follower_fields_dataset ON follower_fields (dataset_id, base_field, scale);
 
+-- Patch searches relayed to a follower (0016): a search on a patch scale only a follower holds waits here until the
+-- follower, polling over its own connection, claims and answers it. Rows go after an hour.
+CREATE TABLE IF NOT EXISTS follower_searches (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    follower_id INTEGER NOT NULL REFERENCES followers(id) ON DELETE CASCADE,
+    dataset_id INTEGER NOT NULL REFERENCES datasets(id) ON DELETE CASCADE,
+    kind TEXT NOT NULL CHECK (kind IN ('patch', 'object_to_patch')),
+    request JSONB NOT NULL,
+    state TEXT NOT NULL DEFAULT 'pending' CHECK (state IN ('pending', 'claimed', 'answered', 'failed', 'cancelled')),
+    result JSONB,
+    error TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    claimed_at TIMESTAMPTZ,
+    answered_at TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS follower_searches_waiting ON follower_searches (follower_id, created_at)
+    WHERE state = 'pending';
+CREATE INDEX IF NOT EXISTS follower_searches_created ON follower_searches (created_at);
+
 CREATE OR REPLACE FUNCTION sync_dataset_followed() RETURNS trigger AS $$
 BEGIN
     UPDATE datasets d SET followed = EXISTS (SELECT 1 FROM follower_datasets f WHERE f.dataset_id = d.id)
@@ -2843,5 +2862,6 @@ INSERT INTO schema_migrations (filename) VALUES
     ('0012_follower_images.sql'),
     ('0013_follower_restarts.sql'),
     ('0014_follower_instance.sql'),
-    ('0015_follower_fields.sql')
+    ('0015_follower_fields.sql'),
+    ('0016_follower_searches.sql')
 ON CONFLICT (filename) DO NOTHING;

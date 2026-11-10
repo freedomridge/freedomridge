@@ -2,16 +2,18 @@
 the primary's; the sync copies it into a mirror beside it through the real follower endpoints (an in-process HTTP
 client bound to the app), then applies the primary's feed to it."""
 
+import asyncio
 import io
 import os
 import uuid
+from typing import cast
 from unittest.mock import AsyncMock, Mock
 
 import asyncpg
 import httpx
 import numpy as np
 import pytest
-from fastapi import HTTPException
+from fastapi import HTTPException, Request
 
 from backend import follower_sync
 from backend.crypto import decrypt_secret, encrypt_secret
@@ -1071,8 +1073,9 @@ def test_a_follower_reports_the_patch_scales_it_holds_itself(monkeypatch, regist
             scales = await patch_search.patch_scales(connection, 1, 'clip')
         assert scales['2x2']['local'] is False
         assert [(p['name'], p['online'], p['dims']) for p in scales['2x2']['providers']] == [('lab', True, 3)]
-        # Not offered as a scale of the primary's own until a search can go to the follower.
-        assert await embeddings_router.get_patch_scales(1, 'clip') == []
+        # Offered with the follower that holds it: a patch search on it goes there.
+        offered = await embeddings_router.get_patch_scales(1, 'clip')
+        assert [(s['scale'], s['local'], s['provider'], s['online']) for s in offered] == [('2x2', False, 'lab', True)]
 
         # Stopping the follow drops what it reported.
         await followers.unfollow_dataset(follower, 1, user=USER)
@@ -1118,3 +1121,303 @@ def test_a_report_is_checked_and_only_for_a_followed_dataset(monkeypatch, regist
         assert [r['scale'] for r in await database.fetch('SELECT scale FROM follower_fields')] == ['2x2']
 
     registry_database(scenario)
+
+
+async def mirror_with_own_patches(monkeypatch, database):
+    """Dataset 1 on the primary with three images, a mirror of it, and 2x2 patch vectors computed on the mirror only,
+    reported to the primary."""
+    from backend import follower_search
+
+    created, link_id = await setup(monkeypatch, database)
+    monkeypatch.setattr(follower_search, 'db', database)
+    await ingest([{'crop': 'corn'}, {'crop': 'soy'}, {'crop': 'oat'}], dataset_id=1, prefix='s3://images/p')
+    follower = await database.fetchval('SELECT id FROM followers')
+    await followers.follow_dataset(follower, 1, followers.FollowOptions(), user=USER)
+    await sync(database, link_id)
+    mirror = await mirror_of(database)
+    local = [
+        r['id']
+        for r in await database.fetch('SELECT id FROM samples WHERE dataset_id = $1 ORDER BY id', mirror['dataset_id'])
+    ]
+    for index, sample_id in enumerate(local):
+        for tile, (row, col) in enumerate(((0, 0), (0, 1), (1, 0), (1, 1))):
+            vector = f'[{1 + index},{tile + 1},{(index * 3 + tile) % 5 + 1}]'
+            await database.execute(
+                'INSERT INTO embeddings (sample_id, field_name, vector) VALUES ($1, $2, $3::text::vector)',
+                sample_id,
+                f'clip_patch_2x2_r{row}c{col}',
+                vector,
+            )
+    await database.execute('UPDATE mirrors SET fields_reported_at = NULL')
+    await sync(database, link_id)
+    assert await database.fetchval('SELECT count(*) FROM follower_fields') == 1
+    return created, link_id, mirror
+
+
+class _Request:
+    async def is_disconnected(self):
+        return False
+
+
+def fake_request() -> Request:
+    """A request that stays connected, for calling the relay directly."""
+    return cast('Request', _Request())
+
+
+async def serve_once(database, created, link_id):
+    """The follower's side, once: claim the relayed search through the endpoint, run it here, answer it."""
+    from backend import follower_search
+    from backend.main import app
+
+    headers = {'Authorization': f"Bearer {created['token']}"}
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://primary/api') as client:
+        item = (await client.get('/follower/searches', params={'wait': 10}, headers=headers)).json()
+        results = await follower_search.run_search(database.pool, link_id, item)
+        answered = await client.post(f"/follower/searches/{item['id']}", json={'results': results}, headers=headers)
+        assert answered.status_code == 200, answered.text
+        return item, results
+
+
+def test_a_patch_search_on_a_follower_s_scale_runs_there_and_matches_a_local_search(monkeypatch, registry_database):
+    async def scenario(database):
+        from backend import follower_search, patch_search
+
+        created, link_id, mirror = await mirror_with_own_patches(monkeypatch, database)
+        seed = await database.fetchval('SELECT min(id) FROM samples WHERE dataset_id = 1')
+        body = {
+            'sample_id': seed,
+            'base_field': 'clip',
+            'scale': '2x2',
+            'row': 0,
+            'col': 0,
+            'limit': 10,
+            'per_image': 1,
+        }
+        relayed, (item, _) = await asyncio.gather(
+            follower_search.relay(fake_request(), 1, 'clip', '2x2', 'patch', body),
+            serve_once(database, created, link_id),
+        )
+        assert item['kind'] == 'patch' and item['dataset_id'] == 1
+        # The same search run on the mirror directly, in the primary's ids.
+        local_seed = await database.fetchval(
+            'SELECT sample_id FROM mirror_samples WHERE dataset_id = $1 AND origin_id = $2',
+            mirror['dataset_id'],
+            seed,
+        )
+        async with database.pool.acquire() as connection:
+            vector = await connection.fetchval(
+                "SELECT vector FROM embeddings WHERE sample_id = $1 AND field_name = 'clip_patch_2x2_r0c0'",
+                local_seed,
+            )
+            direct = await patch_search.nearest_patches(
+                connection,
+                dataset_id=mirror['dataset_id'],
+                fields=None,
+                like_pattern='clip_patch_2x2_%',
+                seed_vector=vector,
+                dims=3,
+                limit=10,
+                per_image=1,
+                exclude=(local_seed, 'clip_patch_2x2_r0c0'),
+            )
+            to_origin = dict(await connection.fetch('SELECT sample_id, origin_id FROM mirror_samples'))
+        assert [(r['sample_id'], r['field_name']) for r in relayed] == [
+            (to_origin[r['sample_id']], r['field_name']) for r in direct
+        ]
+        assert all(r['filepath'].startswith('s3://images/p') for r in relayed)  # the primary's own samples
+        assert await database.fetchval('SELECT state FROM follower_searches') == 'answered'
+
+    registry_database(scenario)
+
+
+def test_a_relayed_search_is_refused_offline_busy_or_with_a_filter_the_follower_can_t_run(
+    monkeypatch,
+    registry_database,
+):
+    async def scenario(database):
+        from backend import follower_search
+
+        created, link_id, mirror = await mirror_with_own_patches(monkeypatch, database)
+        seed = await database.fetchval('SELECT min(id) FROM samples WHERE dataset_id = 1')
+        body = {'sample_id': seed, 'base_field': 'clip', 'scale': '2x2', 'row': 0, 'col': 0, 'limit': 5}
+        follower = await database.fetchval('SELECT id FROM followers')
+
+        # Busy: PENDING_PER_FOLLOWER searches already queued for it.
+        for _ in range(follower_search.PENDING_PER_FOLLOWER):
+            await database.execute(
+                "INSERT INTO follower_searches (follower_id, dataset_id, kind, request) VALUES ($1, 1, 'patch', '{}')",
+                follower,
+            )
+        with pytest.raises(HTTPException) as busy:
+            await follower_search.relay(fake_request(), 1, 'clip', '2x2', 'patch', body)
+        assert busy.value.status_code == 429
+        await database.execute('DELETE FROM follower_searches')
+
+        # Offline: not seen within ONLINE_SECONDS.
+        await database.execute("UPDATE followers SET last_seen_at = now() - interval '1 hour'")
+        with pytest.raises(HTTPException) as offline:
+            await follower_search.relay(fake_request(), 1, 'clip', '2x2', 'patch', body)
+        assert offline.value.status_code == 503 and "'lab'" in offline.value.detail
+
+        # Filters a mirror can't evaluate as the primary would: refused, never passed on.
+        item = {'dataset_id': 1, 'kind': 'patch', 'request': {**body, 'filters': CONCEPT_FILTER}}
+        with pytest.raises(follower_search.RelayRefused, match='concept'):
+            await follower_search.run_search(database.pool, link_id, item)
+        for node in (
+            {'field': 'id', 'operator': 'in_selection', 'value': 'token'},
+            {'field': 'crop', 'operator': 'sql', 'value': '1=1'},
+        ):
+            with pytest.raises(follower_search.RelayRefused):
+                follower_search.check_filters(node)
+        # Sample ids are translated to the mirror's.
+        follower_search.check_filters({'logic': 'AND', 'filters': [{'field': 'id', 'operator': 'in', 'value': [seed]}]})
+        translated = follower_search.translate_ids(
+            {'field': 'id', 'operator': 'in', 'value': [seed, 999999]},
+            {seed: 7},
+        )
+        assert translated['value'] == [7]
+
+    registry_database(scenario)
+
+
+def test_a_follower_s_answer_is_its_own_and_reads_only_the_searched_dataset(monkeypatch, registry_database):
+    async def scenario(database):
+        from backend import follower_search
+
+        created, link_id, mirror = await mirror_with_own_patches(monkeypatch, database)
+        await ingest([{'crop': 'secret'}], dataset_id=2, prefix='s3://images/other')
+        other = await database.fetchval('SELECT id FROM samples WHERE dataset_id = 2')
+        mine = await database.fetchval('SELECT min(id) FROM samples WHERE dataset_id = 1')
+        # A sample of another dataset in the answer is dropped: only the searched dataset's samples are shown.
+        rows = await follower_search.hydrate(
+            1,
+            [
+                {'origin_id': other, 'field': 'clip_patch_2x2_r0c0', 'distance': 0.1},
+                {'origin_id': mine, 'field': 'clip_patch_2x2_r0c1', 'distance': 0.2},
+            ],
+        )
+        assert [r['sample_id'] for r in rows] == [mine]
+        # Answers only for a search it claimed, and only once.
+        follower = dict(await database.fetchrow('SELECT * FROM followers'))
+        search_id = await database.fetchval(
+            "INSERT INTO follower_searches (follower_id, dataset_id, kind, request) "
+            "VALUES ($1, 1, 'patch', '{\"limit\": 5}') RETURNING id",
+            follower['id'],
+        )
+        assert await follower_search.answer(follower, str(search_id), [], None) is False  # not claimed yet
+        claimed = await follower_search.claim(follower, 0)
+        assert claimed is not None and claimed['id'] == str(search_id)
+        too_many = [{'origin_id': mine, 'field': 'f', 'distance': 0.0}] * 6
+        assert await follower_search.answer(follower, str(search_id), too_many, None) is True
+        assert await database.fetchval('SELECT state FROM follower_searches') == 'failed'  # over its limit
+        assert await follower_search.answer(follower, str(search_id), [], None) is False  # already answered
+
+    registry_database(scenario)
+
+
+def test_patch_search_relays_only_when_the_seed_s_scale_isn_t_held_here(monkeypatch, registry_database):
+    async def scenario(database):
+        from backend import follower_search
+        from backend.models import PatchSearchRequest
+        from backend.routers import search
+
+        created, link_id, mirror = await mirror_with_own_patches(monkeypatch, database)
+        monkeypatch.setattr(search, 'db', database)
+        monkeypatch.setattr(search, 'get_optional_user', AsyncMock(return_value=None))
+        monkeypatch.setattr(search, 'check_dataset_access', AsyncMock())
+        relayed = AsyncMock(return_value=[])
+        monkeypatch.setattr(follower_search, 'relay', relayed)
+        seed = await database.fetchval('SELECT min(id) FROM samples WHERE dataset_id = 1')
+        request = PatchSearchRequest(dataset_id=1, sample_id=seed, patch_scale='2x2', limit=5)
+        assert await search.patch_search(request, _Request()) == []
+        assert relayed.await_args is not None and relayed.await_args.args[1:5] == (1, 'clip', '2x2', 'patch')
+        # A scale nobody holds: 404, as before.
+        relayed.reset_mock()
+        with pytest.raises(HTTPException) as missing:
+            await search.patch_search(PatchSearchRequest(dataset_id=1, sample_id=seed, patch_scale='4x4'), _Request())
+        assert missing.value.status_code == 404 and not relayed.await_count
+        # A scale this dataset holds itself, on other samples: a seed lacking its tile isn't sent to the follower.
+        other = await database.fetchval('SELECT max(id) FROM samples WHERE dataset_id = 1')
+        await database.execute(
+            "INSERT INTO embeddings (sample_id, field_name, vector) VALUES ($1, 'clip_patch_2x2_r0c0', '[1,1,1]')",
+            other,
+        )
+        follower_search._held_here.clear()
+        with pytest.raises(HTTPException) as held:
+            await search.patch_search(request, _Request())
+        assert held.value.status_code == 404 and not relayed.await_count
+
+    registry_database(scenario)
+
+
+def test_relayed_filters_keep_element_conditions_and_requests_are_capped(monkeypatch, registry_database):
+    async def scenario(database):
+        from backend import follower_search
+
+        created, link_id, mirror = await mirror_with_own_patches(monkeypatch, database)
+        element = {
+            'field': 'detections',
+            'operator': 'elem_match',
+            'value': {'logic': 'AND', 'filters': [{'field': 'id', 'operator': '=', 'value': 5}]},
+        }
+        follower_search.check_filters({'logic': 'AND', 'filters': [element]})  # the grid's facets: allowed
+        # An element's own `id` is not a sample id: left as it is.
+        assert follower_search.translate_ids(element, {5: 99}) == element
+        assert follower_search.sample_ids_in(element, set()) == set()
+        seed = await database.fetchval('SELECT min(id) FROM samples WHERE dataset_id = 1')
+        request = {'sample_id': seed, 'base_field': 'clip', 'scale': '2x2', 'row': 0, 'col': 0}
+        for limit, per_image in ((follower_search.MAX_LIMIT + 1, 1), (5, follower_search.MAX_PER_IMAGE + 1), (0, 1)):
+            item = {'dataset_id': 1, 'kind': 'patch', 'request': {**request, 'limit': limit, 'per_image': per_image}}
+            with pytest.raises(follower_search.RelayRefused, match='more than a follower runs'):
+                await follower_search.run_search(database.pool, link_id, item)
+
+    registry_database(scenario)
+
+
+def test_a_follower_answers_running_searches_before_it_reconnects(monkeypatch):
+    """A failed poll (the primary restarting, say) closes the follower's client: the searches already running answer
+    through it first, instead of failing and leaving the primary's users to wait for a 504."""
+    from backend import follower_search
+
+    events = []
+    stopping = asyncio.Event()
+
+    class Pool:
+        async def fetchrow(self, query, *args):
+            return {'id': 1, 'url': 'http://primary/api', 'token_encrypted': 'x'}
+
+        async def fetchval(self, query, *args):
+            return 'installation-1'
+
+    class Client:
+        closed = False
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            self.closed = True
+            events.append('closed')
+
+    client = Client()
+    polls = iter([{'id': 'search-1', 'dataset_id': 1, 'kind': 'patch', 'request': {}}])
+
+    async def call(the_client, method, path, **kwargs):
+        if method == 'GET':
+            try:
+                return next(polls)
+            except StopIteration:
+                stopping.set()
+                raise follower_sync.PrimaryUnavailable('the primary is restarting')
+        events.append('answered on a closed client' if the_client.closed else 'answered')
+        return {}
+
+    async def run_search(pool, link_id, item):
+        await asyncio.sleep(0.2)  # still running when the next poll fails
+        return []
+
+    monkeypatch.setattr(follower_sync, 'connect', lambda link, instance=None: client)
+    monkeypatch.setattr(follower_sync, 'call', call)
+    monkeypatch.setattr(follower_search, 'run_search', run_search)
+    asyncio.run(asyncio.wait_for(follower_search.serve_link(Pool(), 1, stopping), 10))
+    assert events == ['answered', 'closed']
