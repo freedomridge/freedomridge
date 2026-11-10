@@ -13,7 +13,7 @@ import numpy as np
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from pydantic import BaseModel, Field, FiniteFloat, model_validator
 
-from .. import map_placement, patch_import
+from .. import map_placement, patch_import, patch_search
 from ..access import require_dataset_access
 from ..api_errors import CodedHTTPException
 from ..coordinates import (
@@ -1593,29 +1593,10 @@ async def get_patch_scales(id: int, field_name: str = "clip"):
     """Return available patch scales for a given embedding field.
 
     Patch embeddings use field_name convention: "{field_name}_patch_{scale}_r{row}c{col}"
-    This endpoint extracts distinct scales from the field_name pattern.
+    (patch_search.patch_scales).
     """
-    pattern = f"{field_name}_patch_%"
-    rows = await db.fetch(
-        """
-        SELECT DISTINCT e.field_name
-        FROM embeddings e
-        JOIN samples s ON e.sample_id = s.id
-        WHERE s.dataset_id = $1 AND e.field_name LIKE $2
-    """,
-        id,
-        pattern,
-    )
-
-    # Parse scales from field names like "clip_patch_4x4_r0c0"
-    scales = set()
-    prefix = f"{field_name}_patch_"
-    for r in rows:
-        fn = r['field_name']
-        rest = fn[len(prefix) :]  # "4x4_r0c0"
-        scale = rest.split('_')[0]  # "4x4"
-        scales.add(scale)
-
+    async with db.pool.acquire() as conn:
+        scales = await patch_search.patch_scales(conn, id, field_name)
     return [{"scale": s} for s in sorted(scales)]
 
 
