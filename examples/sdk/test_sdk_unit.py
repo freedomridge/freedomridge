@@ -177,6 +177,17 @@ def test_a_condition_has_no_truth_value():
         0.2 < a < 0.8
 
 
+def test_filter_refuses_what_is_not_a_condition():
+    """A bare field or a dict used to be skipped, which left no filter: the whole dataset."""
+    from fridge.core.dataset import Dataset
+    from fridge.core.view import FieldExpression
+
+    with pytest.raises(TypeError, match="conditions"):
+        Dataset.filter(Mock(), FieldExpression("reviewed"))
+    with pytest.raises(TypeError, match="conditions"):
+        Dataset.filter(Mock(), {"field": "split", "operator": "=", "value": "train"})
+
+
 def test_complex_nested():
     """Test complex nested conditions."""
     from fridge.core.view import FieldExpression
