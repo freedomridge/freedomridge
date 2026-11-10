@@ -12,6 +12,10 @@ it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
   chip. Clicking it relabelled it "Exclude: …" while the grid, the count and the export stayed on the selected
   samples. The chip has no toggle now; chips of picked samples and of searches still switch between include and
   exclude.
+- **On-demand compute workers: a launch AWS never answered keeps its machine.** When the request to start a
+  machine timed out, the launch was recorded as refused, so a machine AWS had in fact started ran on with no record
+  and no one to end it. The launch now stays open: the next minute finds the machine by its tag, or ends the launch
+  after 15 minutes if there is none.
 - **SDK: `and`, `or`, `not` and chained comparisons on filter conditions raise.** `ds.match((s.a > 1) and (s.b < 2))`
   kept only the second condition, and `0 < s.a < 1` only `s.a < 1`, because Python asks a condition for its truth
   value and every object is true. A bulk tag or delete then hit more samples than the filter said. A condition now
