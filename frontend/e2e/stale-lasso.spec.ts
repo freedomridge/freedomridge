@@ -17,6 +17,7 @@ const FIELD = 'e2e_lasso';
 const POLYGON = [[-0.5, -0.5], [4.5, -0.5], [4.5, 5.5], [-0.5, 5.5]];
 let cookie = '';
 let dsId = 0;
+let sampleIds: number[] = [];
 
 test.beforeAll(async () => {
     cookie = await adminLogin();
@@ -27,7 +28,8 @@ test.beforeAll(async () => {
         embeddings: { [FIELD]: Array.from({ length: 8 }, (_, d) => Math.sin(i * 0.37 + d) + (i % 3) * 2) },
     }));
     const { ids } = await apiFetch(cookie, `/datasets/${dsId}/samples`, { method: 'POST', body: JSON.stringify({ samples }) });
-    const coordinates = (ids as number[]).map((sampleId, i) => ({ sample_id: sampleId, x: i % 10, y: Math.floor(i / 10) }));
+    sampleIds = ids as number[];
+    const coordinates = sampleIds.map((sampleId, i) => ({ sample_id: sampleId, x: i % 10, y: Math.floor(i / 10) }));
     await apiFetch(cookie, `/datasets/${dsId}/embeddings/coordinates?field_name=${FIELD}`, {
         method: 'POST', body: JSON.stringify(coordinates),
     });
@@ -96,6 +98,28 @@ test('a lasso chip says which map it is on, opens no form, and a click excludes 
     await expect(chip).toContainText(`Exclude Embeddings region · ${FIELD} map`);
     await expectTotal(page, 48);
     await chip.click();
+    await expectTotal(page, 12);
+});
+
+// A lasso on a sampled scatter keeps its polygon as the selection and only its visible points as ids. The saved
+// state held the ids without the polygon, so after a reload (or Back) Apply, Tag and Export acted on the visible
+// points alone. This small map never samples, so the state is put in place as the app saves it.
+test('a lasso comes back after a reload as its whole region, not its visible points', async ({ page }) => {
+    await page.goto('/');
+    await page.evaluate(({ key, state }) => localStorage.setItem(key, JSON.stringify(state)), {
+        key: `fridge-filters-${dsId}`,
+        state: {
+            viewStages: [], filterMode: 'simple', simpleFilters: {}, advancedFilters: { logic: 'AND', filters: [] },
+            // Two of the region's points were on screen; x 0..1, y 0..5 holds 12.
+            brushedIds: sampleIds.slice(0, 2), selectedIds: [], currentPolygon: null, selectionSource: 'Embeddings',
+            currentEmbeddingRegion: {
+                field: FIELD, polygon: [[-0.5, -0.5], [1.5, -0.5], [1.5, 5.5], [-0.5, 5.5]], token: '', total: 12, modelId: null,
+            },
+        },
+    });
+    await page.goto(`/datasets/${dsId}`);
+    await page.getByTestId('apply-filters').click();
+    await expect(page.getByTestId('query-stage-chip')).toContainText(`Embeddings region · ${FIELD} map`);
     await expectTotal(page, 12);
 });
 

@@ -1169,6 +1169,8 @@ function DatasetPageContent() {
                             selectedIds={selectedIds}
                             onSelection={(ids) => {
                                 setSelectionSource('Duplicates');
+                                // A lasso still held would keep filtering and these ids would be ignored.
+                                setCurrentEmbeddingRegion(null);
                                 setBrushedIds(ids);
                             }}
                             onSampleClick={(s) => { setModalSourcePanelId(null); setSelectedSample(s); }}
@@ -1200,6 +1202,8 @@ function DatasetPageContent() {
                             filters={imageGrainFilters}
                             onSelection={(ids) => {
                                 setSelectionSource('Sparse Sample');
+                                // A lasso still held would keep filtering and these ids would be ignored.
+                                setCurrentEmbeddingRegion(null);
                                 setBrushedIds(ids);
                             }}
                         />
@@ -1566,6 +1570,7 @@ function DatasetPageContent() {
                             // Apply the version-diff selection as a server-side stage
                             // (in_selection token) — no id list materialized client-side.
                             setSelectionSource(`Version: ${label}`);
+                            setCurrentEmbeddingRegion(null);
                             setBrushedIds([]);
                             setViewStages([{
                                 type: 'filter',

@@ -19,12 +19,17 @@ type SimpleFilters = Record<string, any>;
 // --- Persistence helpers ---
 const STORAGE_PREFIX = 'fridge-filters-';
 
+// A lasso on a sampled scatter: the polygon is the selection, and brushedIds holds only its visible points.
+type EmbeddingRegion = { field: string; polygon: number[][]; token: string; total: number; modelId?: string | null };
+
 interface PersistedFilterState {
     viewStages: ViewStage[];
     filterMode: 'simple' | 'advanced';
     simpleFilters: SimpleFilters;
     advancedFilters: ComplexFilter;
     brushedIds: number[];
+    // Kept with brushedIds or not at all: the ids alone would come back as a selection of the visible points only.
+    currentEmbeddingRegion?: EmbeddingRegion | null;
     selectedIds: number[];
     currentPolygon: MapPolygon;
     selectionSource: string;
@@ -76,6 +81,7 @@ function saveFilterState(datasetId: number | undefined, state: PersistedFilterSt
             ...state,
             // Cap transient selections — large lasso/brush selections don't persist
             brushedIds: state.brushedIds.length <= MAX_PERSISTED_IDS ? state.brushedIds : [],
+            currentEmbeddingRegion: state.brushedIds.length <= MAX_PERSISTED_IDS ? state.currentEmbeddingRegion ?? null : null,
             selectedIds: state.selectedIds.length <= MAX_PERSISTED_IDS ? state.selectedIds : [],
             // Drop applied selection stages with too many IDs (rather than save a broken stub)
             viewStages: state.viewStages.filter(s => !isEphemeralSelectionStage(s)),
@@ -95,9 +101,9 @@ function saveFilterState(datasetId: number | undefined, state: PersistedFilterSt
 // restore triggers — which would otherwise pin Back on the latest filter).
 function historyStateSig(s: {
     viewStages: ViewStage[]; brushedIds: number[]; selectedIds: number[];
-    currentPolygon: MapPolygon; selectionSource: string;
+    currentPolygon: MapPolygon; selectionSource: string; currentEmbeddingRegion?: EmbeddingRegion | null;
 }): string {
-    return JSON.stringify([s.viewStages, s.brushedIds, s.selectedIds, s.currentPolygon, s.selectionSource]);
+    return JSON.stringify([s.viewStages, s.brushedIds, s.selectedIds, s.currentPolygon, s.selectionSource, s.currentEmbeddingRegion ?? null]);
 }
 
 interface FilterContextType {
@@ -168,8 +174,8 @@ interface FilterContextType {
 
     // Embeddings region (UMAP lasso) — applied as a SERVER-SIDE filter, never an
     // id list, so the full selection scopes the grid without capping/freezing.
-    currentEmbeddingRegion: { field: string; polygon: number[][]; token: string; total: number; modelId?: string | null } | null;
-    setCurrentEmbeddingRegion: (region: { field: string; polygon: number[][]; token: string; total: number; modelId?: string | null } | null) => void;
+    currentEmbeddingRegion: EmbeddingRegion | null;
+    setCurrentEmbeddingRegion: (region: EmbeddingRegion | null) => void;
 
     // Selection Source
     selectionSource: string;
@@ -341,8 +347,8 @@ export function FilterProvider({ children, datasetId }: { children: React.ReactN
     // Map Polygon Selection
     const [currentPolygon, setCurrentPolygon] = useState<MapPolygon>(savedState?.currentPolygon ?? null);
 
-    // Embeddings region (UMAP lasso). Transient (not persisted), like a large brush.
-    const [currentEmbeddingRegion, setCurrentEmbeddingRegion] = useState<{ field: string; polygon: number[][]; token: string; total: number; modelId?: string | null } | null>(null);
+    // Embeddings region (UMAP lasso). Persisted with its brushedIds, or, like a large brush, not at all.
+    const [currentEmbeddingRegion, setCurrentEmbeddingRegion] = useState<EmbeddingRegion | null>(savedState?.currentEmbeddingRegion ?? null);
 
     // Grid Selection (Checkboxes)
     const [selectedIds, setSelectedIds] = useState<number[]>(savedState?.selectedIds ?? []);
@@ -375,11 +381,11 @@ export function FilterProvider({ children, datasetId }: { children: React.ReactN
         saveTimerRef.current = setTimeout(() => {
             saveFilterState(datasetId, {
                 viewStages, filterMode, simpleFilters, advancedFilters,
-                brushedIds, selectedIds, currentPolygon, selectionSource, dismissedDefaultViewId,
+                brushedIds, currentEmbeddingRegion, selectedIds, currentPolygon, selectionSource, dismissedDefaultViewId,
             });
         }, 300);
         return () => { if (saveTimerRef.current) clearTimeout(saveTimerRef.current); };
-    }, [datasetId, viewStages, filterMode, simpleFilters, advancedFilters, brushedIds, selectedIds, currentPolygon, selectionSource, dismissedDefaultViewId]);
+    }, [datasetId, viewStages, filterMode, simpleFilters, advancedFilters, brushedIds, currentEmbeddingRegion, selectedIds, currentPolygon, selectionSource, dismissedDefaultViewId]);
 
     // --- Browser history (back/forward) for filter state ---
     // Each settled filter change pushes a history entry; Back/Forward restores that
@@ -400,10 +406,11 @@ export function FilterProvider({ children, datasetId }: { children: React.ReactN
         // browser history.state limit and makes pushState throw (mirrors persistence).
         viewStages: viewStages.filter(s => !isEphemeralSelectionStage(s)),
         brushedIds: brushedIds.length <= MAX_PERSISTED_IDS ? brushedIds : [],
+        currentEmbeddingRegion: brushedIds.length <= MAX_PERSISTED_IDS ? currentEmbeddingRegion : null,
         selectedIds: selectedIds.length <= MAX_PERSISTED_IDS ? selectedIds : [],
         currentPolygon,
         selectionSource,
-    }), [viewStages, brushedIds, selectedIds, currentPolygon, selectionSource]);
+    }), [viewStages, brushedIds, currentEmbeddingRegion, selectedIds, currentPolygon, selectionSource]);
 
     // Every entry we write KEEPS the app router's own keys (__NA + its tree). Next reloads the page
     // on Back/Forward to an entry without them, and ours never had them: the router stamps the entry
@@ -448,7 +455,7 @@ export function FilterProvider({ children, datasetId }: { children: React.ReactN
             }
         }, 400);
         return () => { if (historyTimerRef.current) clearTimeout(historyTimerRef.current); };
-    }, [viewStages, brushedIds, selectedIds, currentPolygon, selectionSource, buildHistorySnapshot]);
+    }, [viewStages, brushedIds, currentEmbeddingRegion, selectedIds, currentPolygon, selectionSource, buildHistorySnapshot]);
 
     // Listen for popstate (back/forward)
     useEffect(() => {
@@ -461,6 +468,7 @@ export function FilterProvider({ children, datasetId }: { children: React.ReactN
             suppressPushUntilRef.current = Date.now() + 600;
             setViewStages(state.viewStages ?? []);
             setBrushedIds(state.brushedIds ?? []);
+            setCurrentEmbeddingRegion(state.currentEmbeddingRegion ?? null);
             setSelectedIds(state.selectedIds ?? []);
             setCurrentPolygon(state.currentPolygon ?? null);
             setSelectionSource(state.selectionSource ?? 'Manual');

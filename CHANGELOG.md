@@ -16,6 +16,10 @@ it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
   machine timed out, the launch was recorded as refused, so a machine AWS had in fact started ran on with no record
   and no one to end it. The launch now stays open: the next minute finds the machine by its tag, or ends the launch
   after 15 minutes if there is none.
+- **A lasso on a large embeddings map comes back whole after a reload or Back.** On a map shown as a sample of
+  its points, a lasso selects every point inside it, on screen or not. After a reload, or Back and Forward, only
+  the points that had been on screen were still selected, so Apply, Tag and Export acted on a part of the
+  selection with nothing saying so. The lasso's outline is now kept with them.
 - **SDK: `Dataset.filter()` refuses an argument that isn't a condition.** It skipped one without a word, so
   `ds.filter(s.reviewed)` or a dict filter selected the whole dataset. It raises `TypeError` now.
 - **SDK: `and`, `or`, `not` and chained comparisons on filter conditions raise.** `ds.match((s.a > 1) and (s.b < 2))`
