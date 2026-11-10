@@ -1711,6 +1711,16 @@ export async function getSamples(
 }
 
 // --- Similarity Search ---
+// A search's results. `incomplete`: the index answered with fewer than asked and the server's check for matches it
+// left behind ran out of time (X-Search-Incomplete), so more samples may match than came back.
+export type SearchResults = Sample[] & { incomplete?: boolean };
+
+async function searchResults(res: Response): Promise<SearchResults> {
+    const results: SearchResults = await res.json();
+    if (res.headers.get('X-Search-Incomplete')) results.incomplete = true;
+    return results;
+}
+
 export async function searchSimilar(params: {
     datasetId: number;
     sampleId?: number;
@@ -1719,7 +1729,7 @@ export async function searchSimilar(params: {
     embeddingField: string;
     limit: number;
     filters?: ComplexFilter;
-}): Promise<Sample[]> {
+}): Promise<SearchResults> {
     const res = await fetch(`${API_BASE}/search`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -1734,7 +1744,7 @@ export async function searchSimilar(params: {
         })
     });
     await ensureOk(res, 'Failed to search similar samples');
-    return res.json();
+    return searchResults(res);
 }
 
 // Reverse image search: rank the dataset by similarity to an uploaded image (base64,
@@ -1747,7 +1757,7 @@ export async function searchByImage(params: {
     embeddingField: string;
     limit: number;
     filters?: ComplexFilter;
-}): Promise<Sample[]> {
+}): Promise<SearchResults> {
     const res = await fetch(`${API_BASE}/search/by-image`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -1761,7 +1771,7 @@ export async function searchByImage(params: {
         })
     });
     await ensureOk(res, 'Failed to search by image');
-    return res.json();
+    return searchResults(res);
 }
 
 // --- Patch Similarity Search ---

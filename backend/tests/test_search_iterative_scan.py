@@ -10,10 +10,13 @@ reproduce candidate exhaustion.
 """
 
 import asyncio
+import json
+from typing import Any
 
+import asyncpg
 import pytest
 
-from backend.models import SearchRequest
+from backend.models import Sample, SearchRequest
 from backend.routers import search as search_router
 
 
@@ -26,9 +29,10 @@ class _Ctx:
 
 
 class _Conn:
-    def __init__(self, found=0, matching=0):
+    def __init__(self, found=0, matching=0, slow=None):
         self.executed: list[str] = []
-        self.found, self.matching = found, matching
+        self.found, self.matching, self.slow = found, matching, slow
+        self.answer: Any = None
         self.fetched: list[str] = []
         self.counted = 0
 
@@ -37,10 +41,17 @@ class _Conn:
 
     async def fetch(self, query, *args):
         self.fetched.append(query)
-        return [{'id': i, 'metadata': None, 'location': None} for i in range(self.found)]
+        if self.slow == 'exact' and len(self.fetched) == 2:
+            raise asyncpg.QueryCanceledError('canceling statement due to statement timeout')
+        return [
+            {'id': i, 'filepath': f'{i}.jpg', 'media_type': 'image', 'metadata': None, 'location': None}
+            for i in range(self.found)
+        ]
 
     async def fetchval(self, query, *args):
         self.counted += 1
+        if self.slow == 'count':
+            raise asyncpg.QueryCanceledError('canceling statement due to statement timeout')
         return self.matching
 
     def transaction(self):
@@ -96,7 +107,7 @@ def _run(limit, monkeypatch, conn=None):
     monkeypatch.setattr(search_router, "get_optional_user", fake_user)
     monkeypatch.setattr(search_router, "check_dataset_access", fake_access)
     req = SearchRequest(dataset_id=1, vector=[0.1] * 8, field_name="clip", limit=limit)
-    asyncio.run(search_router.vector_search(req, _Req()))  # type: ignore[arg-type]
+    conn.answer = asyncio.run(search_router.vector_search(req, _Req()))  # type: ignore[arg-type]
     return conn.executed
 
 
@@ -142,3 +153,22 @@ def test_a_short_indexed_answer_is_ranked_again_only_when_matches_were_left_behi
     exact = _Conn(found=10)  # limit > 1000 is exact already
     _run(1001, monkeypatch, exact)
     assert exact.counted == 0 and len(exact.fetched) == 1
+
+
+@pytest.mark.parametrize('slow', ['count', 'exact'])
+def test_the_check_of_a_short_answer_has_a_time_budget(slow, monkeypatch):
+    """Under a narrow filter with no index the count and the exact pass each read the whole dataset (77 s measured
+    on 3.7M samples). They share a statement timeout; past it the index's rows are the answer, marked incomplete."""
+    conn = _Conn(found=3, matching=50, slow=slow)
+    executed = _run(50, monkeypatch, conn)
+    budget = f"SET LOCAL statement_timeout = '{int(search_router._SHORT_CHECK_SECONDS * 1000)}ms'"
+    assert executed.index(budget) > executed.index("SET LOCAL hnsw.iterative_scan = relaxed_order")
+    assert conn.answer.headers[search_router.SEARCH_INCOMPLETE_HEADER] == '1'
+    rows = json.loads(conn.answer.body)
+    assert [row['id'] for row in rows] == [0, 1, 2]
+    # The same keys as a complete answer, which goes through the route's response_model.
+    assert set(rows[0]) == set(Sample.model_fields)
+
+    checked = _Conn(found=3, matching=3)  # a check that finishes says nothing
+    _run(50, monkeypatch, checked)
+    assert isinstance(checked.answer, list)

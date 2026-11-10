@@ -92,7 +92,7 @@ export function QueryBuilderBar({
     // The chip's words. The page's latest search shows how many of the closest images it asked for, which can
     // be changed there; a lasso says which map it was drawn on.
     const chipLabel = (stage: ViewStage) => {
-        const search = stage.metadata?.search as { id: string; label: string; found: number; limit: number } | undefined;
+        const search = stage.metadata?.search as { id: string; label: string; found: number; limit: number; incomplete?: boolean } | undefined;
         if (search && search.id === activeSearchId && onSearchLimit && idRule(stage.filter)?.operator === 'in') {
             return (
                 <>
@@ -110,7 +110,16 @@ export function QueryBuilderBar({
                             <option key={n} value={n}>top {n.toLocaleString()}</option>
                         ))}
                     </select>
-                    {search.found < search.limit && <span className="ml-1 text-zinc-500">({search.found.toLocaleString()} found)</span>}
+                    {search.found < search.limit && (
+                        <span
+                            className={`ml-1 ${search.incomplete ? 'text-amber-300' : 'text-zinc-500'}`}
+                            title={search.incomplete
+                                ? 'The search stopped checking for more matches after a few seconds, so more samples may match. An index on the filtered field, or a narrower filter, makes it complete.'
+                                : undefined}
+                        >
+                            ({search.found.toLocaleString()} found{search.incomplete ? ', more may match' : ''})
+                        </span>
+                    )}
                 </>
             );
         }

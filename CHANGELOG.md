@@ -41,7 +41,9 @@ it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
   walks the vector index within a budget of 200,000 vectors. Under a narrow filter it could reach the budget with
   matches left and answer with fewer results than asked, which looked the same as "nothing else matches". A short
   answer is now checked: the matches are counted, and when more match than came back they are ranked exactly,
-  without the vector index (slower on a large dataset). Patch searches still have the budget.
+  without the vector index. The check gets 5 seconds: under a narrow filter on a field with no index it would read
+  the whole dataset (over a minute on 3.7 million samples). Past that the search answers with what the index found
+  and its chip says "more may match". Patch searches still have the budget.
 - **A lasso on a large embeddings map comes back whole after a reload or Back.** On a map shown as a sample of
   its points, a lasso selects every point inside it, on screen or not. After a reload, or Back and Forward, only
   the points that had been on screen were still selected, so Apply, Tag and Export acted on a part of the
