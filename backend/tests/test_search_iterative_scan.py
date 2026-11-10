@@ -26,14 +26,22 @@ class _Ctx:
 
 
 class _Conn:
-    def __init__(self):
+    def __init__(self, found=0, matching=0):
         self.executed: list[str] = []
+        self.found, self.matching = found, matching
+        self.fetched: list[str] = []
+        self.counted = 0
 
     async def execute(self, query, *args):
         self.executed.append(query)
 
     async def fetch(self, query, *args):
-        return []
+        self.fetched.append(query)
+        return [{'id': i, 'metadata': None, 'location': None} for i in range(self.found)]
+
+    async def fetchval(self, query, *args):
+        self.counted += 1
+        return self.matching
 
     def transaction(self):
         return _Ctx()
@@ -71,8 +79,8 @@ class _DB:
         return None
 
 
-def _run(limit, monkeypatch):
-    conn = _Conn()
+def _run(limit, monkeypatch, conn=None):
+    conn = conn or _Conn()
     monkeypatch.setattr(search_router, "db", _DB(conn))
 
     class _Req:
@@ -112,3 +120,25 @@ def test_exact_branch_disables_the_index_and_leaves_hnsw_gucs_alone(monkeypatch)
 def test_scan_budget_is_well_above_pgvectors_default():
     # 20,000 is pgvector's default and is exhausted by a 1% filter at ~200 survivors.
     assert search_router._HNSW_MAX_SCAN_TUPLES >= 100_000
+
+
+def test_a_short_indexed_answer_is_ranked_again_only_when_matches_were_left_behind(monkeypatch):
+    """Past its tuple budget the index scan stops with matches left, and the short answer looked like "no more
+    match". A short answer is checked with a count that stops at the limit, and ranked again off the vector index
+    only when more match than came back."""
+    left_behind = _Conn(found=49, matching=50)
+    _run(50, monkeypatch, left_behind)
+    assert left_behind.counted == 1 and len(left_behind.fetched) == 2
+    assert "+ 0 ASC" in left_behind.fetched[1] and "+ 0 ASC" not in left_behind.fetched[0]
+
+    all_there = _Conn(found=49, matching=49)
+    _run(50, monkeypatch, all_there)
+    assert all_there.counted == 1 and len(all_there.fetched) == 1
+
+    full = _Conn(found=50)
+    _run(50, monkeypatch, full)
+    assert full.counted == 0 and len(full.fetched) == 1
+
+    exact = _Conn(found=10)  # limit > 1000 is exact already
+    _run(1001, monkeypatch, exact)
+    assert exact.counted == 0 and len(exact.fetched) == 1

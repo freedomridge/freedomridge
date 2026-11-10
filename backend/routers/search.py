@@ -6,6 +6,7 @@ import json
 import logging
 import re
 import socket
+import time
 from typing import Any
 from urllib.parse import urlparse
 
@@ -170,6 +171,8 @@ async def vector_search(req: SearchRequest, request: Request):
     args.append(req.field_name)
     conditions.append(f"e.field_name = ${arg_idx}")
     arg_idx += 1
+    # A row without a vector has no distance: the index never returns it, so neither do the count and exact pass.
+    conditions.append("e.vector IS NOT NULL")
 
     # Add optional filters
     if req.filters:
@@ -225,7 +228,8 @@ async def vector_search(req: SearchRequest, request: Request):
     else:
         dist_expr = f"(e.vector <=> {vector_param})"
 
-    query = f"""
+    def ranked(order_by: str) -> str:
+        return f"""
         SELECT s.id, s.filepath, s.metadata, s.media_type, s.tags,
                ST_AsGeoJSON(s.location)::json as location,
                s.created_at, s.last_modified_at,
@@ -233,9 +237,11 @@ async def vector_search(req: SearchRequest, request: Request):
         FROM embeddings e
         JOIN samples s ON e.sample_id = s.id
         WHERE {where_clause}
-        ORDER BY {dist_expr} ASC
+        ORDER BY {order_by} ASC
         LIMIT {limit_param}
     """
+
+    query = ranked(dist_expr)
 
     # HNSW returns at most hnsw.ef_search candidates, and pgvector caps ef_search at 1000.
     # So there's no single fast path for an arbitrary top-K:
@@ -261,6 +267,30 @@ async def vector_search(req: SearchRequest, request: Request):
                 await conn.execute("SET LOCAL enable_indexscan = off")
                 await conn.execute("SET LOCAL enable_indexonlyscan = off")
             rows = await conn.fetch(query, *args)
+            if req.limit <= 1000 and len(rows) < req.limit:
+                # Fewer rows than asked from the index means either that no more match or that the scan reached
+                # its tuple budget with matches left, and nothing in the answer tells them apart. Count the
+                # matches, stopping at the limit (no distances; the vector is named only to keep the arguments).
+                matching = await conn.fetchval(
+                    f"""SELECT count(*) FROM (
+                            SELECT 1 FROM embeddings e JOIN samples s ON e.sample_id = s.id
+                            WHERE {where_clause} AND {vector_param}::text IS NOT NULL
+                            LIMIT {limit_param}
+                        ) matches""",
+                    *args,
+                )
+                if matching > len(rows):
+                    # Matches were left behind: rank them all. "+ 0" keeps the ORDER BY off the vector index and
+                    # leaves the other indexes usable, so the filters still narrow the scan.
+                    started, indexed = time.monotonic(), len(rows)
+                    rows = await conn.fetch(ranked(f"{dist_expr} + 0"), *args)
+                    log.info(
+                        "vector_search: %d of %d from the index of %s, ranked exactly in %.1fs",
+                        indexed,
+                        req.limit,
+                        req.field_name,
+                        time.monotonic() - started,
+                    )
 
     results = []
     for row in rows:

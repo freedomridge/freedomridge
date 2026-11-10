@@ -16,6 +16,11 @@ it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
   machine timed out, the launch was recorded as refused, so a machine AWS had in fact started ran on with no record
   and no one to end it. The launch now stays open: the next minute finds the machine by its tag, or ends the launch
   after 15 minutes if there is none.
+- **A similarity search no longer comes back short when more samples match.** A search of up to 1,000 results
+  walks the vector index within a budget of 200,000 vectors. Under a narrow filter it could reach the budget with
+  matches left and answer with fewer results than asked, which looked the same as "nothing else matches". A short
+  answer is now checked: the matches are counted, and when more match than came back they are ranked exactly,
+  without the vector index (slower on a large dataset). Patch searches still have the budget.
 - **A lasso on a large embeddings map comes back whole after a reload or Back.** On a map shown as a sample of
   its points, a lasso selects every point inside it, on screen or not. After a reload, or Back and Forward, only
   the points that had been on screen were still selected, so Apply, Tag and Export acted on a part of the
