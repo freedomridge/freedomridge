@@ -4,7 +4,14 @@ Freedom Ridge has one version for the server, the web app and the Python SDK (th
 file), following [Semantic Versioning](https://semver.org). A release lists **upgrade notes** when
 it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
 
-## Unreleased
+## 2.8.0 (2026-11-10)
+
+2.8.0 lets a follower resume into its copy after its primary is restored from a backup, instead of copying every
+dataset again. It also fixes what a review found: similarity searches that came back short under a narrow filter,
+the sidebar scanning a large dataset for an overlay type on every load, a big Select All's chip, a lasso after a
+reload, unanswered launches of on-demand workers, array fields named after a samples column, object parents when
+copying between instances, and SDK filters that ignored `and`, `or` and arguments that aren't conditions. One
+migration.
 
 ### Upgrade notes
 
@@ -12,6 +19,9 @@ it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
   [Upgrading](docs/UPGRADING.md)).
 - A follower asks before resuming only when the restored primary runs this release too (it answers `match-keys`).
   A primary on an older release gets a new copy on its followers, as before.
+- A large dataset whose statistics last ran before an upgrade added an overlay type (class probabilities, 2.4.0)
+  gets a full statistics refresh in the background the first time its sidebar opens: about 20 minutes for 3.7
+  million samples. Meanwhile the sidebar shows no fields of that type.
 
 ### Added
 
