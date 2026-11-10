@@ -29,6 +29,15 @@ interface OwnScale {
     indexed: boolean;
     reported_at: string;
 }
+// A dataset a follower followed when it stopped following: it comes back, with these options, if it returns.
+interface Departure {
+    dataset_id: number;
+    name: string;
+    tags: Sync;
+    views: Sync;
+    images: boolean;
+    left_at: string;
+}
 interface Follower {
     id: number;
     name: string;
@@ -36,7 +45,9 @@ interface Follower {
     last_seen_at: string | null;
     stale: boolean;
     bound: boolean;  // its token belongs to the installation that first used it
+    left_at: string | null;  // it stopped following (its Stop following told this server)
     datasets: FollowedDataset[];
+    departures: Departure[];
 }
 
 const SYNC_LABELS: Record<Sync, string> = { primary: 'Primary only', both: 'Both ways' };
@@ -55,13 +66,14 @@ async function send(method: string, path: string, body?: unknown) {
     return res.json();
 }
 
-function SyncSelect({ value, onChange, label }: { value: Sync; onChange: (value: Sync) => void; label: string }) {
+function SyncSelect({ value, onChange, label, disabled }: { value: Sync; onChange: (value: Sync) => void; label: string; disabled: boolean }) {
     return (
         <label className="flex items-center gap-2 text-sm text-zinc-300">
             {label}
             <select
                 aria-label={label}
                 value={value}
+                disabled={disabled}
                 onChange={event => onChange(event.target.value as Sync)}
                 className="bg-zinc-950 border border-zinc-700 rounded px-2 py-1 text-zinc-100"
             >
@@ -79,7 +91,9 @@ function FollowerCard({ follower, datasets }: { follower: Follower; datasets: { 
     const [confirmRemove, setConfirmRemove] = useState(false);
     const refresh = () => queryClient.invalidateQueries({ queryKey: ['followers'] });
     const follow = useMutation({
-        // The options replace each other's: every change sends all three.
+        // The options replace each other's: every change sends all three, read from the list. So the controls wait
+        // until a change is saved and the list has it (onSuccess returns the refetch, which the mutation waits for):
+        // a second change sent sooner carried the first one's old value and undid it.
         mutationFn: ({ datasetId, tags, views, images }: { datasetId: number; tags: Sync; views: Sync; images: boolean }) =>
             send('PUT', `/followers/${follower.id}/datasets/${datasetId}`, { tags, views, images }),
         onSuccess: refresh,
@@ -91,24 +105,48 @@ function FollowerCard({ follower, datasets }: { follower: Follower; datasets: { 
     const remove = useMutation({ mutationFn: () => send('DELETE', `/followers/${follower.id}`), onSuccess: refresh });
     const reset = useMutation({ mutationFn: () => send('POST', `/followers/${follower.id}/reset-instance`), onSuccess: refresh });
     const error = follow.error || unfollow.error || remove.error || reset.error;
-    const followed = new Set(follower.datasets.map(dataset => dataset.dataset_id));
+    const followed = new Set([...follower.datasets, ...follower.departures].map(dataset => dataset.dataset_id));
 
     return (
         <div data-testid="follower-row" className="p-4 border border-zinc-800 rounded-xl bg-zinc-900 space-y-3">
             <div className="flex items-center justify-between gap-4">
                 <h3 className="font-semibold text-white">{follower.name}</h3>
-                <span
-                    data-testid="follower-seen"
-                    className={`px-2 py-0.5 text-xs font-semibold rounded border ${follower.stale
-                        ? 'bg-amber-500/10 text-amber-300 border-amber-500/30'
-                        : 'bg-green-500/10 text-green-400 border-green-500/30'}`}
-                >
-                    {follower.last_seen_at
-                        ? `Last checked in ${new Date(follower.last_seen_at).toLocaleString()}`
-                        : 'Never checked in'}
-                </span>
+                {follower.left_at ? (
+                    <span
+                        data-testid="follower-left"
+                        className="px-2 py-0.5 text-xs font-semibold rounded border bg-zinc-500/10 text-zinc-300 border-zinc-500/30"
+                        title="It stopped following on its side; this server no longer keeps changes for it"
+                    >
+                        Stopped following on {new Date(follower.left_at).toLocaleString()}
+                    </span>
+                ) : (
+                    <span
+                        data-testid="follower-seen"
+                        className={`px-2 py-0.5 text-xs font-semibold rounded border ${follower.stale
+                            ? 'bg-amber-500/10 text-amber-300 border-amber-500/30'
+                            : 'bg-green-500/10 text-green-400 border-green-500/30'}`}
+                    >
+                        {follower.last_seen_at
+                            ? `Last checked in ${new Date(follower.last_seen_at).toLocaleString()}`
+                            : 'Never checked in'}
+                    </span>
+                )}
             </div>
-            {follower.datasets.length === 0 ? (
+            {follower.departures.length > 0 && (
+                <div data-testid="follower-departures" className="space-y-1 text-sm">
+                    <p className="text-zinc-400">Comes back with these if it follows this server again:</p>
+                    {follower.departures.map(dataset => (
+                        <div key={dataset.dataset_id} className="flex flex-wrap items-center gap-4">
+                            <span className="text-zinc-100 min-w-40">{dataset.name}</span>
+                            <span className="text-zinc-500">Tags {SYNC_LABELS[dataset.tags].toLowerCase()}, views {SYNC_LABELS[dataset.views].toLowerCase()}{dataset.images ? ', images served' : ''}</span>
+                            <button onClick={() => unfollow.mutate(dataset.dataset_id)} className="text-zinc-400 hover:text-red-300">
+                                Don&apos;t bring back
+                            </button>
+                        </div>
+                    ))}
+                </div>
+            )}
+            {follower.left_at ? null : follower.datasets.length === 0 ? (
                 <p className="text-sm text-zinc-500">Follows no datasets yet.</p>
             ) : (
                 <div className="space-y-2">
@@ -118,11 +156,13 @@ function FollowerCard({ follower, datasets }: { follower: Follower; datasets: { 
                             <SyncSelect
                                 label="Tags"
                                 value={dataset.tags}
+                                disabled={follow.isPending}
                                 onChange={tags => follow.mutate({ datasetId: dataset.dataset_id, tags, views: dataset.views, images: dataset.images })}
                             />
                             <SyncSelect
                                 label="Views"
                                 value={dataset.views}
+                                disabled={follow.isPending}
                                 onChange={views => follow.mutate({ datasetId: dataset.dataset_id, tags: dataset.tags, views, images: dataset.images })}
                             />
                             <label
@@ -133,6 +173,7 @@ function FollowerCard({ follower, datasets }: { follower: Follower; datasets: { 
                                     type="checkbox"
                                     aria-label="Serve images"
                                     checked={dataset.images}
+                                    disabled={follow.isPending}
                                     onChange={event => follow.mutate({
                                         datasetId: dataset.dataset_id, tags: dataset.tags, views: dataset.views, images: event.target.checked,
                                     })}
@@ -263,7 +304,7 @@ export default function FollowersPage() {
                                     aria-label="Follower name"
                                     value={name}
                                     onChange={event => setName(event.target.value)}
-                                    placeholder="e.g. tailscale-local"
+                                    placeholder="e.g. laptop"
                                     pattern="[a-z0-9][a-z0-9-]{0,62}"
                                     title="Lowercase letters, digits and hyphens"
                                     className="bg-zinc-950 border border-zinc-700 rounded px-3 py-1.5 text-sm text-zinc-100"

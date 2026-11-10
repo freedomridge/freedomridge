@@ -221,7 +221,15 @@ To change the schema:
    queues, and keep that job kind working for the rest of the major version, since a database from
    that release can upgrade straight to any later one. Migrations only go forward; going back is
    restoring the backup taken before the upgrade.
-4. Run sections 4 and 5.
+4. Think about followers ([docs/FOLLOWERS.md](docs/FOLLOWERS.md)) when a migration changes rows, not only the
+   schema. Statements on the tables followers read (`samples`, `embeddings`, `sample_hashes`,
+   `embedding_coordinates`, `dataset_fields`, `views`, `embedding_viz_meta` and `datasets`: the ones with the
+   `follower_truncate_guard` trigger) run those tables' triggers like any other write. On a primary, each changed row of a followed dataset
+   is logged, and every follower fetches it again. On a follower, a mirror's read-only guard refuses the
+   statement and the migration fails. When the rows mean the same afterwards (a column filled in, a table
+   rebuilt), keep the triggers from firing, for example with `ALTER TABLE ... DISABLE TRIGGER USER` around the
+   statement or by creating the triggers after the rows are copied, and say in the file that it is on purpose.
+5. Run sections 4 and 5.
 
 To apply pending migrations to an existing database, run `scripts/apply_migrations.sh` from the
 repository root. It records each file in the `schema_migrations` table in the same transaction as

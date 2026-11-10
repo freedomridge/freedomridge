@@ -218,6 +218,7 @@ the variable.
 | `/api/follower/datasets/{id}/tags`, `.../views`, `.../views/{view_id}` | POST, DELETE | follower token | Edits sent up, when the dataset's tags or views option is both ways |
 | `/api/follower/datasets/{id}/fields` | POST | follower token | Report the patch scales the follower holds of a dataset, computed there |
 | `/api/follower/searches`, `/api/follower/searches/{id}` | GET, POST | follower token | Claim a patch search the primary relays to the follower (long poll); answer it |
+| `/api/follower/leave`, `/api/follower/return` | POST | follower token | The follower stopped following: its subscriptions move aside and the primary stops logging for it; it added the primary again: they come back ([Followers](FOLLOWERS.md#when-it-stops)) |
 | `/api/primaries` | POST, GET | admin | On a follower: follow a primary (its follower token is checked first); list primaries and their mirrors |
 | `/api/primaries/{id}` | DELETE | admin | Stop following a primary; its mirrors stay as read-only copies |
 | `/api/primaries/mirrors/{id}/keep-separate` | POST | admin | Keep a stopped copy as it is: a new copy of its dataset makes a new dataset instead of resuming into it |

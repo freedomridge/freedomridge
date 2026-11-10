@@ -34,6 +34,11 @@ test('an admin adds a follower, chooses what it follows, and removes it', async 
         await row.getByRole('button', { name: 'Follow', exact: true }).click();
         const followed = row.getByTestId('followed-dataset').filter({ hasText: dataset.name });
         await expect(followed).toBeVisible();
+        // The list is slow to come back, as under load: a change made before it has the last one must not undo it.
+        await page.route('**/api/followers', async route => {
+            if (route.request().method() === 'GET') await new Promise(resolve => setTimeout(resolve, 1500));
+            await route.continue();
+        });
         await followed.getByLabel('Tags').selectOption('both');
         await expect.poll(async () => {
             const listed = await apiFetch(cookie, '/followers');
@@ -49,6 +54,7 @@ test('an admin adds a follower, chooses what it follows, and removes it', async 
             const entry = listed.find((item: { name: string }) => item.name === name)?.datasets[0];
             return entry && [entry.tags, entry.images];
         }).toEqual(['both', true]);
+        await page.unrouteAll({ behavior: 'wait' }); // a delayed GET still running finishes first
         const config = await (await asFollower('/follower/config')).json();
         expect(config.datasets.map((entry: { dataset_id: number; tags: string; images: boolean }) =>
             [entry.dataset_id, entry.tags, entry.images])).toEqual([[dataset.id, 'both', true]]);

@@ -42,6 +42,10 @@ class ViewRoute(APIRoute):
 
 router = APIRouter(route_class=ViewRoute)
 
+# A view's marks of the follower it came from and who made it there (docs/FOLLOWERS.md). Only the primary sets them,
+# when a follower sends a view up (followers.follower_create_view), so no one can make a view look like a follower's.
+FOLLOWER_MARKS = ('made_on', 'made_by')
+
 
 def generate_slug():
     return secrets.token_urlsafe(8)
@@ -80,17 +84,24 @@ async def create_view(id: int, view: ViewCreate, user: dict = Depends(get_curren
         view.shared_with_user_ids = []
     if _has_temporary_selection(view.content):
         raise HTTPException(status_code=422, detail=TEMPORARY_SELECTION_DETAIL)
+    # A follower's token reaches this only through follower_create_view, which sets the marks itself.
+    if any(key in view.content for key in FOLLOWER_MARKS) and not await db.fetchval(
+        'SELECT 1 FROM followers WHERE user_id = $1',
+        user['id'],
+    ):
+        view.content = {key: value for key, value in view.content.items() if key not in FOLLOWER_MARKS}
     # Verify dataset exists
     dataset = await db.fetchrow("SELECT id FROM datasets WHERE id = $1", id)
     if not dataset:
         raise HTTPException(status_code=404, detail="Dataset not found")
     # A shared view on a mirror whose views sync both ways is made on its primary (docs/FOLLOWERS.md), unless it uses
-    # a concept: concepts belong to each instance, so that view stays here, shared on this instance.
+    # a concept or a range on sample ids, which mean something else there: that view stays here, shared on this
+    # instance (follower_sync.instance_bound).
     from .. import follower_sync  # here: it imports the routers
 
     if (
         view.is_public
-        and not follower_sync.uses_concept(view.content)
+        and not follower_sync.instance_bound(view.content)
         and await db.fetchval("SELECT 1 FROM mirrors WHERE dataset_id = $1 AND views = 'both'", id)
     ):
         from .. import mirror_writes
@@ -285,13 +296,13 @@ async def share_view(id: int, view_id: int, share: ViewShare, user: dict = Depen
         raise HTTPException(status_code=403, detail="Not authorized to share this view")
     await _require_known_users(share.shared_with_user_ids)
     # Made public on a mirror whose views sync both ways: it's made on the primary, and this private one is replaced
-    # by its copy (docs/FOLLOWERS.md). Not a view that uses a concept: concepts belong to each instance.
+    # by its copy (docs/FOLLOWERS.md). Not a view bound to this instance (a concept, or a range on sample ids).
     from .. import follower_sync  # here: it imports the routers
 
     content = _decode_content(await db.fetchval("SELECT content FROM views WHERE id = $1", view_id))
     if (
         share.is_public
-        and not follower_sync.uses_concept(content)
+        and not follower_sync.instance_bound(content)
         and await db.fetchval(
             """SELECT 1 FROM mirrors m WHERE m.dataset_id = $1 AND m.views = 'both'
            AND NOT EXISTS (SELECT 1 FROM mirror_views v WHERE v.view_id = $2)""",

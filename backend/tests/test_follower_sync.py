@@ -15,7 +15,7 @@ import numpy as np
 import pytest
 from fastapi import HTTPException, Request
 
-from backend import follower_sync
+from backend import follower_sync, sample_ids
 from backend.crypto import decrypt_secret, encrypt_secret
 from backend.models import ViewCreate
 from backend.routers import auth, datasets, followers, primaries, schedules, views
@@ -72,6 +72,14 @@ async def sync(database, link_id):
         if result.finished:
             return result
     raise AssertionError('The sync did not finish')
+
+
+async def follower_headers(created) -> dict:
+    """What a follower's instance sends its primary: its token and its installation id (the token is bound to it)."""
+    return {
+        'Authorization': f"Bearer {created['token']}",
+        'X-Fridge-Instance': await follower_sync.installation_id(vars(followers)['db']),  # the test's database
+    }
 
 
 async def mirror_of(database):
@@ -809,6 +817,55 @@ def test_the_tags_option_covers_tags_only_and_a_concept_view_stays_where_it_was_
     registry_database(scenario)
 
 
+def test_shared_views_translate_parent_ids_and_a_range_on_ids_stays_where_it_was_made(
+    monkeypatch,
+    registry_database,
+):
+    import json
+
+    def leaf(content):
+        content = json.loads(content) if isinstance(content, str) else content
+        return content['filters']['filters'][0]
+
+    async def scenario(database):
+        _, link_id = await setup(monkeypatch, database)
+        monkeypatch.setattr(views, 'db', database)
+        await ingest([{'crop': 'corn'}, {'crop': 'soy'}], dataset_id=1, prefix='s3://images/p')
+        follower = await database.fetchval('SELECT id FROM followers')
+        await followers.follow_dataset(follower, 1, followers.FollowOptions(views='both'), user=USER)
+        await sync(database, link_id)
+        mirror = (await mirror_of(database))['dataset_id']
+        local = {row['origin_id']: row['id'] for row in (await copied(database, {'dataset_id': mirror})).values()}
+        image = min(local)
+        sub = dict(await database.fetchrow('SELECT * FROM followers WHERE id = $1', follower))
+
+        # The primary's view of one image's objects: its parent id becomes this instance's.
+        objects = {
+            'filters': {
+                'logic': 'AND',
+                'filters': [{'field': 'metadata.parent_id', 'operator': '=', 'value': image}],
+            },
+        }
+        await views.create_view(1, ViewCreate(name='Objects', content=objects, is_public=True), user=USER)
+        await sync(database, link_id)
+        here = await database.fetchval("SELECT content FROM views WHERE dataset_id = $1 AND name = 'Objects'", mirror)
+        assert leaf(here)['value'] == local[image]
+
+        # A range on ids can't be translated: refused by the primary, kept on the mirror, the primary's not copied.
+        ranged = {'filters': {'logic': 'AND', 'filters': [{'field': 'id', 'operator': '>', 'value': image}]}}
+        with pytest.raises(HTTPException) as refused:
+            await followers.follower_create_view(1, followers.ViewRequest(name='Later', content=ranged), follower=sub)
+        assert refused.value.status_code == 400 and 'sample ids' in refused.value.detail
+        view = await views.create_view(mirror, ViewCreate(name='Later', content=ranged, is_public=True), user=USER)
+        assert not view.get('from_primary') and view['is_public']
+        await views.create_view(1, ViewCreate(name='Range', content=ranged, is_public=True), user=USER)
+        await sync(database, link_id)
+        assert not await database.fetchval("SELECT 1 FROM views WHERE dataset_id = $1 AND name = 'Range'", mirror)
+        assert (await mirror_of(database))['concept_views'] == ['Range']
+
+    registry_database(scenario)
+
+
 async def test_a_vector_field_clash_says_which_field_and_why(monkeypatch):
     class Connection:  # a vector index of this name at another size refuses the primary's vectors
         async def execute(self, sql, *args):
@@ -909,6 +966,38 @@ def test_a_mirror_s_own_vectors_can_be_deleted_and_the_primary_s_cannot(monkeypa
     registry_database(scenario)
 
 
+def test_two_adds_of_one_primary_at_once_make_one_link(monkeypatch, registry_database):
+    async def scenario(database):
+        created, _ = await setup(monkeypatch, database)
+        monkeypatch.setattr(primaries, 'db', database)
+        await database.execute('DELETE FROM primary_links')
+        # Both read the primary's config before either checks for a link to it: at two addresses, both passed.
+        real_call, both_read = follower_sync.call, asyncio.Barrier(2)
+
+        async def call(client, method, path, **kwargs):
+            answer = await real_call(client, method, path, **kwargs)
+            if path == '/follower/config':
+                await both_read.wait()
+            return answer
+
+        monkeypatch.setattr(follower_sync, 'call', call)
+        added = await asyncio.wait_for(
+            asyncio.gather(
+                *(
+                    primaries.add_primary(primaries.PrimaryCreate(url=url, token=created['token']), user=USER)
+                    for url in ('http://primary/api', 'http://primary.example.org/api')
+                ),
+                return_exceptions=True,
+            ),
+            20,
+        )
+        refused = [answer for answer in added if isinstance(answer, HTTPException)]
+        assert len(refused) == 1 and refused[0].status_code == 409, added
+        assert await database.fetchval('SELECT count(*) FROM primary_links') == 1
+
+    registry_database(scenario)
+
+
 def test_one_link_per_primary_and_one_instance_per_follower_token(monkeypatch, registry_database):
     async def scenario(database):
         created, link_id = await setup(monkeypatch, database)
@@ -928,7 +1017,11 @@ def test_one_link_per_primary_and_one_instance_per_follower_token(monkeypatch, r
         assert await database.fetchval('SELECT instance FROM followers') == this
         account = {'id': await database.fetchval('SELECT user_id FROM followers')}
         await followers.current_follower(Mock(headers={'X-Fridge-Instance': this}), account=account)
-        await followers.current_follower(Mock(headers={}), account=account)  # an older follower: not checked
+        # Bound, so this follower sends its installation id: a call without one is from somewhere else.
+        with pytest.raises(HTTPException) as headerless:
+            await followers.current_follower(Mock(headers={}), account=account)
+        assert headerless.value.status_code == 409
+        assert getattr(headerless.value, 'code', None) == 'follower_instance_mismatch'
         reinstalled = str(uuid.uuid4())
         with pytest.raises(HTTPException) as other:
             await followers.current_follower(Mock(headers={'X-Fridge-Instance': reinstalled}), account=account)
@@ -1093,7 +1186,7 @@ def test_a_report_is_checked_and_only_for_a_followed_dataset(monkeypatch, regist
             followers.ReportedScale(base_field='clip', scale='0x2', dims=3, indexed=False)
         with pytest.raises(ValueError):
             followers.ReportedScale(base_field='clip; DROP', scale='2x2', dims=3, indexed=False)
-        headers = {'Authorization': f"Bearer {created['token']}"}
+        headers = await follower_headers(created)
         body = {'scales': [{'base_field': 'clip', 'scale': '2x2', 'dims': 3, 'indexed': True}]}
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://primary/api') as client:
             refused = await client.post('/follower/datasets/1/fields', json=body, headers=headers)
@@ -1169,7 +1262,7 @@ async def serve_once(database, created, link_id):
     from backend import follower_search
     from backend.main import app
 
-    headers = {'Authorization': f"Bearer {created['token']}"}
+    headers = await follower_headers(created)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://primary/api') as client:
         item = (await client.get('/follower/searches', params={'wait': 10}, headers=headers)).json()
         results = await follower_search.run_search(database.pool, link_id, item)
@@ -1271,13 +1364,45 @@ def test_a_relayed_search_is_refused_offline_busy_or_with_a_filter_the_follower_
                 follower_search.check_filters(node)
         # Sample ids are translated to the mirror's.
         follower_search.check_filters({'logic': 'AND', 'filters': [{'field': 'id', 'operator': 'in', 'value': [seed]}]})
-        translated = follower_search.translate_ids(
+        translated = sample_ids.translate_ids(
             {'field': 'id', 'operator': 'in', 'value': [seed, 999999]},
             {seed: 7},
         )
         assert translated['value'] == [7]
 
     registry_database(scenario)
+
+
+def test_a_relayed_range_on_sample_ids_is_refused():
+    from backend import follower_search
+
+    # A mirror numbers its samples in another order, so a range on ids can't be translated, only refused.
+    refused: tuple[dict, ...] = (
+        {'field': 'id', 'operator': '>', 'value': 15},
+        {'field': 'parent_id', 'operator': '<=', 'value': 3},
+        {'field': 'metadata.parent_id', 'operator': 'contains', 'value': 1},
+        {'field': 'tags', 'operator': 'parent_matches', 'value': {'field': 'id', 'operator': '>=', 'value': 2}},
+        {
+            'logic': 'OR',
+            'filters': [
+                {'field': 'crop', 'operator': '=', 'value': 'corn'},
+                {'field': 'id', 'operator': '<', 'value': 9},
+            ],
+        },
+    )
+    for node in refused:
+        with pytest.raises(follower_search.RelayRefused, match='sample ids'):
+            follower_search.check_filters(node)
+    # Membership is translated, whether a parent is set doesn't depend on ids, and a label element's id is its own.
+    allowed: tuple[dict, ...] = (
+        {'field': 'id', 'operator': 'not in', 'value': [1, 2]},
+        {'field': 'parent_id', 'operator': 'is_null'},
+        {'field': 'parent_id', 'operator': 'exists'},
+        {'field': 'detections', 'operator': 'elem_match', 'value': {'field': 'id', 'operator': '>', 'value': 3}},
+        {'field': 'score', 'operator': '>', 'value': 0.5},
+    )
+    for node in allowed:
+        follower_search.check_filters(node)
 
 
 def test_a_follower_s_answer_is_its_own_and_reads_only_the_searched_dataset(monkeypatch, registry_database):
@@ -1311,6 +1436,43 @@ def test_a_follower_s_answer_is_its_own_and_reads_only_the_searched_dataset(monk
         assert await follower_search.answer(follower, str(search_id), too_many, None) is True
         assert await database.fetchval('SELECT state FROM follower_searches') == 'failed'  # over its limit
         assert await follower_search.answer(follower, str(search_id), [], None) is False  # already answered
+
+    registry_database(scenario)
+
+
+def test_unfollowing_a_dataset_ends_its_relayed_searches(monkeypatch, registry_database):
+    async def scenario(database):
+        from backend import follower_search
+
+        await mirror_with_own_patches(monkeypatch, database)
+        follower = dict(await database.fetchrow('SELECT * FROM followers'))
+        seed = await database.fetchval('SELECT min(id) FROM samples WHERE dataset_id = 1')
+        body = {'sample_id': seed, 'base_field': 'clip', 'scale': '2x2', 'row': 0, 'col': 0, 'limit': 10}
+
+        async def queued(state='pending'):
+            return await database.fetchval(
+                "INSERT INTO follower_searches (follower_id, dataset_id, kind, request, state) "
+                "VALUES ($1, 1, 'patch', '{\"limit\": 5}', $2) RETURNING id",
+                follower['id'],
+                state,
+            )
+
+        # A search the primary is waiting on ends at once, saying why.
+        relayed = asyncio.create_task(follower_search.relay(fake_request(), 1, 'clip', '2x2', 'patch', body))
+        for _ in range(100):
+            if await database.fetchval("SELECT count(*) FROM follower_searches WHERE state = 'pending'"):
+                break
+            await asyncio.sleep(0.05)
+        running = await queued('claimed')
+        await followers.unfollow_dataset(follower['id'], 1, user=USER)
+        with pytest.raises(HTTPException) as ended:
+            await asyncio.wait_for(relayed, 10)
+        assert ended.value.status_code == 503 and 'no longer follows this dataset' in ended.value.detail
+        assert await database.fetchval("SELECT count(*) FROM follower_searches WHERE state <> 'cancelled'") == 0
+        assert await follower_search.answer(follower, str(running), [], None) is False
+        # One queued as the subscription went (the relay had just checked its providers) isn't claimed.
+        await queued()
+        assert await follower_search.claim(follower, 0) is None
 
     registry_database(scenario)
 
@@ -1362,8 +1524,8 @@ def test_relayed_filters_keep_element_conditions_and_requests_are_capped(monkeyp
         }
         follower_search.check_filters({'logic': 'AND', 'filters': [element]})  # the grid's facets: allowed
         # An element's own `id` is not a sample id: left as it is.
-        assert follower_search.translate_ids(element, {5: 99}) == element
-        assert follower_search.sample_ids_in(element, set()) == set()
+        assert sample_ids.translate_ids(element, {5: 99}) == element
+        assert sample_ids.sample_ids_in(element, set()) == set()
         seed = await database.fetchval('SELECT min(id) FROM samples WHERE dataset_id = 1')
         request = {'sample_id': seed, 'base_field': 'clip', 'scale': '2x2', 'row': 0, 'col': 0}
         for limit, per_image in ((follower_search.MAX_LIMIT + 1, 1), (5, follower_search.MAX_PER_IMAGE + 1), (0, 1)):
@@ -1484,11 +1646,13 @@ def test_the_primary_added_again_resumes_its_copies(monkeypatch, registry_databa
         monkeypatch.setattr(primaries, 'db', database)
         await primaries.remove_primary(link_id, user=USER)
         assert (await mirror_of(database))['link_id'] is None
-        again = await database.fetchval(
-            "INSERT INTO primary_links (url, token_encrypted, created_by) VALUES ('http://primary/api', $1, 1) "
-            'RETURNING id',
-            encrypt_secret(created['token']),
-        )
+        # Added again as an admin does: the primary gets back what this instance followed (POST /follower/return).
+        again = (
+            await primaries.add_primary(
+                primaries.PrimaryCreate(url='http://primary/api', token=created['token']),
+                user=USER,
+            )
+        )['id']
         await sync(database, again)
         resumed = await mirror_of(database)
         assert await database.fetchval('SELECT count(*) FROM mirrors') == 1
@@ -1607,6 +1771,293 @@ def test_a_copy_of_another_primary_database_is_not_resumed(monkeypatch, registry
     registry_database(scenario)
 
 
+async def as_follower(created, method, path, body=None):
+    """A call to the primary's follower API with the follower's token, as its instance makes it."""
+    from backend.main import app
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://primary/api') as client:
+        response = await client.request(
+            method,
+            path,
+            json=body,
+            headers=await follower_headers(created),
+        )
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+async def log_rows(database, dataset_id):
+    return sum(
+        [
+            await database.fetchval(f'SELECT count(*) FROM {table} WHERE dataset_id = $1', dataset_id)
+            for table in followers.LOG_TABLES
+        ],
+    )
+
+
+def test_stopping_tells_the_primary_and_adding_it_again_brings_the_datasets_back(monkeypatch, registry_database):
+    async def scenario(database):
+        created, link_id, follower, mirror = await mirror_with_own_field(monkeypatch, database)
+        monkeypatch.setattr(primaries, 'db', database)
+        await followers.follow_dataset(follower, 1, followers.FollowOptions(tags='both', images=True), user=USER)
+        await database.execute(
+            "INSERT INTO follower_fields (follower_id, dataset_id, base_field, scale, dims, indexed) "
+            "VALUES ($1, 1, 'clip', '2x2', 3, FALSE)",
+            follower,
+        )
+        waiting = await database.fetchval(
+            "INSERT INTO follower_searches (follower_id, dataset_id, kind, request) VALUES ($1, 1, 'patch', '{}') "
+            'RETURNING id',
+            follower,
+        )
+        await database.execute("UPDATE samples SET tags = '{late}' WHERE dataset_id = 1")
+        assert await log_rows(database, 1) > 0
+
+        assert await primaries.remove_primary(link_id, user=USER) == {'removed': link_id, 'told_primary': True}
+        # The primary keeps nothing for it: no subscription, log, reported scales or waiting search.
+        assert await database.fetchval('SELECT count(*) FROM follower_datasets') == 0
+        assert not await database.fetchval('SELECT followed FROM datasets WHERE id = 1')
+        assert await log_rows(database, 1) == 0
+        assert await database.fetchval('SELECT count(*) FROM follower_fields') == 0
+        assert await database.fetchval('SELECT state FROM follower_searches WHERE id = $1', waiting) == 'cancelled'
+        listed = (await followers.list_followers(user=USER))[0]
+        assert listed['left_at'] is not None and listed['datasets'] == []
+        assert [(d['dataset_id'], d['tags'], d['views'], d['images']) for d in listed['departures']] == [
+            (1, 'both', 'primary', True),
+        ]
+        # Not logged while it's away, and a sync still running on the follower (its config call) restores nothing.
+        await database.execute("UPDATE samples SET tags = '{away}' WHERE dataset_id = 1")
+        assert await log_rows(database, 1) == 0
+        assert (await as_follower(created, 'GET', '/follower/config'))['datasets'] == []
+        assert await database.fetchval('SELECT count(*) FROM follower_datasets') == 0
+
+        again = await primaries.add_primary(
+            primaries.PrimaryCreate(url='http://primary/api', token=created['token']),
+            user=USER,
+        )
+        assert again['datasets'] == 1
+        back = await database.fetchrow('SELECT * FROM follower_datasets')
+        assert (back['dataset_id'], back['tags'], back['images']) == (1, 'both', True)
+        assert back['start_txid'] is not None
+        assert await database.fetchval('SELECT count(*) FROM follower_departures') == 0
+        assert await database.fetchval('SELECT left_at FROM followers') is None
+        assert await as_follower(created, 'POST', '/follower/return') == {'restored': []}  # nothing more to restore
+        await sync(database, again['id'])
+        resumed = await mirror_of(database)
+        assert (resumed['dataset_id'], resumed['state']) == (mirror['dataset_id'], 'following')
+        assert await crops_with_own_field(database, mirror['dataset_id']) == ['corn', 'soy']
+
+    registry_database(scenario)
+
+
+def test_stopping_stops_here_when_the_primary_can_t_be_told(monkeypatch, registry_database):
+    async def scenario(database):
+        _, link_id, follower, _ = await mirror_with_own_field(monkeypatch, database)
+        monkeypatch.setattr(primaries, 'db', database)
+        for answer, detail in (
+            (None, 'The primary could not be reached'),
+            (404, "The primary runs an older release, which can't be told"),
+        ):
+
+            def handler(request, answer=answer):
+                if answer is None:
+                    raise httpx.ConnectError('unreachable', request=request)
+                return httpx.Response(answer, json={'detail': 'Not Found'})
+
+            monkeypatch.setattr(
+                follower_sync,
+                'connect',
+                lambda link, instance=None, handler=handler: httpx.AsyncClient(
+                    transport=httpx.MockTransport(handler),
+                    base_url=link['url'],
+                ),
+            )
+            result = await primaries.remove_primary(link_id, user=USER)
+            assert (result['removed'], result['told_primary']) == (link_id, False)
+            assert result['detail'].startswith(detail)
+            assert await database.fetchval('SELECT count(*) FROM primary_links') == 0
+            assert (await mirror_of(database))['state'] == 'stopped'
+            link_id = await database.fetchval(
+                "INSERT INTO primary_links (url, token_encrypted, created_by) VALUES ('http://primary/api', 'x', 1) "
+                'RETURNING id',
+            )
+        # The primary didn't hear: it still keeps the subscription, until its admin removes the follower.
+        assert await database.fetchval('SELECT count(*) FROM follower_datasets WHERE follower_id = $1', follower) == 1
+
+    registry_database(scenario)
+
+
+def test_while_a_follower_is_away_shares_wait_and_only_followable_datasets_come_back(monkeypatch, registry_database):
+    async def scenario(database):
+        created, _ = await setup(monkeypatch, database)
+        follower = await database.fetchval('SELECT id FROM followers')
+        await followers.follow_dataset(follower, 1, followers.FollowOptions(), user=USER)
+        assert await as_follower(created, 'POST', '/follower/leave') == {'left': [1]}
+
+        # Shared while it's away: the dataset waits with the others instead of logging for no one.
+        shared = await followers.follow_dataset(follower, 2, followers.FollowOptions(tags='both'), user=USER)
+        assert shared['departed'] is True
+        assert await database.fetchval('SELECT count(*) FROM follower_datasets') == 0
+        assert not await database.fetchval('SELECT followed FROM datasets WHERE id = 2')
+        # An admin can keep one from coming back; unfollowing it again finds nothing.
+        await followers.unfollow_dataset(follower, 2, user=USER)
+        with pytest.raises(HTTPException) as gone:
+            await followers.unfollow_dataset(follower, 2, user=USER)
+        assert gone.value.status_code == 404
+        await followers.follow_dataset(follower, 2, followers.FollowOptions(tags='both'), user=USER)
+        assert await database.fetchval('SELECT count(*) FROM follower_departures') == 2
+
+        # Dataset 1 is being deleted: it doesn't come back (its deletion would remove the subscription anyway).
+        await database.execute('UPDATE datasets SET deleting = TRUE WHERE id = 1')
+        assert await as_follower(created, 'POST', '/follower/return') == {'restored': [2]}
+        back = await database.fetchrow('SELECT dataset_id, tags, start_txid FROM follower_datasets')
+        assert (back['dataset_id'], back['tags']) == (2, 'both') and back['start_txid'] is not None
+        assert await database.fetchval('SELECT count(*) FROM follower_departures') == 0
+        assert await database.fetchval('SELECT followed FROM datasets WHERE id = 2')
+
+    registry_database(scenario)
+
+
+def test_a_leave_that_arrives_after_the_primary_was_added_again_is_undone_on_the_next_sync(
+    monkeypatch,
+    registry_database,
+):
+    async def scenario(database):
+        created, link_id, _, mirror = await mirror_with_own_field(monkeypatch, database)
+        monkeypatch.setattr(primaries, 'db', database)
+        # An earlier link's Stop following reaches the primary late, after this link was added: the primary has the
+        # follower as left, though this instance still follows it.
+        await as_follower(created, 'POST', '/follower/leave')
+        assert await database.fetchval('SELECT count(*) FROM follower_datasets') == 0
+        await sync(database, link_id)
+        await sync(database, link_id)
+        assert await database.fetchval('SELECT left_at FROM followers') is None
+        assert await database.fetchval('SELECT count(*) FROM follower_datasets') == 1
+        resumed = await mirror_of(database)
+        assert await database.fetchval('SELECT count(*) FROM mirrors') == 1
+        assert (resumed['dataset_id'], resumed['state']) == (mirror['dataset_id'], 'following')
+        # Stop following here, for real: the link goes first, so a sync still running can't return.
+        async with follower_sync.connect(
+            await database.fetchrow('SELECT * FROM primary_links WHERE id = $1', link_id),
+            await follower_sync.installation_id(database),
+        ) as client:
+            link = dict(await database.fetchrow('SELECT * FROM primary_links WHERE id = $1', link_id))
+            await primaries.remove_primary(link_id, user=USER)
+            assert await follower_sync.return_if_linked(database.pool, link, client) is False
+        assert await database.fetchval('SELECT left_at FROM followers') is not None
+
+    registry_database(scenario)
+
+
+def test_a_late_sync_step_leaves_a_stopped_mirror_stopped(monkeypatch, registry_database):
+    async def scenario(database):
+        _, link_id = await setup(monkeypatch, database)
+        monkeypatch.setattr(primaries, 'db', database)
+        await ingest([{'crop': 'corn'}], dataset_id=1, prefix='s3://images/l')
+        follower = await database.fetchval('SELECT id FROM followers')
+        await followers.follow_dataset(follower, 1, followers.FollowOptions(), user=USER)
+        step = follower_sync.handler(database.pool)
+        checkpoint: dict = {}
+        for _ in range(50):
+            result = await step({'args': {'link_id': link_id}, 'checkpoint': checkpoint})
+            if result.message == 'Copy complete; following the feed':
+                break
+            if result.publish is not None:
+                async with database.pool.acquire() as connection, connection.transaction():
+                    await result.publish(connection)
+            checkpoint = result.checkpoint if result.checkpoint is not None else checkpoint
+        else:
+            raise AssertionError('The copy did not complete')
+        # The primary is removed here while that step runs; then the step publishes.
+        await primaries.remove_primary(link_id, user=USER)
+        async with database.pool.acquire() as connection, connection.transaction():
+            await result.publish(connection)
+            mirror = await mirror_of(database)
+            await follower_sync.advance_cursor(connection, mirror['dataset_id'], 5)
+            await follower_sync.note_failure(connection, mirror['dataset_id'], 'The primary answered 404')
+        stopped = await mirror_of(database)
+        assert stopped['state'] == 'stopped'
+        assert stopped['last_error'] == 'No longer following: the primary was removed on this instance'
+        assert stopped['feed_cursor'] == mirror['feed_cursor'] and stopped['failures'] == mirror['failures']
+
+    registry_database(scenario)
+
+
+def test_edits_sent_up_say_who_made_them_and_no_one_else_can(monkeypatch, registry_database):
+    async def scenario(database):
+        monkeypatch.setattr(views, 'db', database)
+        monkeypatch.setattr(datasets, 'db', database)
+        _, link_id = await setup(monkeypatch, database)
+        await ingest([{'crop': 'corn'}, {'crop': 'soy'}], dataset_id=1, prefix='s3://images/m')
+        follower = await database.fetchval('SELECT id FROM followers')
+        both = followers.FollowOptions(tags='both', views='both')
+        await followers.follow_dataset(follower, 1, both, user=USER)
+        await sync(database, link_id)
+        mirror = await mirror_of(database)
+        alice = {**USER, 'username': 'alice'}
+        local = sorted((await copied(database, mirror)).values(), key=lambda row: row['id'])
+
+        await datasets.bulk_tag_samples(
+            mirror['dataset_id'],
+            datasets.BulkTagRequest(sample_ids=[local[0]['id']], add_tags=['weedy']),
+            alice,
+        )
+        registry = await datasets._tag_registry_info(1, 'tags', ['weedy'], USER)
+        assert registry['weedy']['created_by'] == 'alice on lab'
+        # The person's name is display only: the follower's name comes from its account, not from what it sent.
+        assert await database.fetchval("SELECT created_by_name FROM dataset_tags WHERE tag = 'weedy'") == 'alice'
+
+        made = await views.create_view(
+            mirror['dataset_id'],
+            ViewCreate(name='Corn here', content={'filters': {}, 'made_on': 'elsewhere'}, is_public=True),
+            user=alice,
+        )
+        assert (made['content']['made_on'], made['content']['made_by']) == ('lab', 'alice')
+        on_primary = await database.fetchval("SELECT content FROM views WHERE dataset_id = 1 AND name = 'Corn here'")
+        assert (on_primary['made_on'], on_primary['made_by']) == ('lab', 'alice')
+        # Anyone else's view can't claim to come from a follower.
+        own = await views.create_view(
+            1,
+            ViewCreate(name='Fake', content={'filters': {}, 'made_on': 'lab', 'made_by': 'bob'}, is_public=True),
+            user=USER,
+        )
+        assert 'made_on' not in own['content'] and 'made_by' not in own['content']
+
+        # A username the primary wouldn't accept (too long, say) is left out: the edit itself still goes through.
+        long_name = {**USER, 'username': 'x' * 101}
+        await datasets.bulk_tag_samples(
+            mirror['dataset_id'],
+            datasets.BulkTagRequest(sample_ids=[local[1]['id']], add_tags=['unnamed']),
+            long_name,
+        )
+        assert await database.fetchval("SELECT created_by_name FROM dataset_tags WHERE tag = 'unnamed'") is None
+        plain = await views.create_view(
+            mirror['dataset_id'],
+            ViewCreate(name='Soy here', content={'filters': {}}, is_public=True),
+            user=long_name,
+        )
+        assert plain['content']['made_on'] == 'lab' and 'made_by' not in plain['content']
+
+        # A large edit goes to a bulk job, which records the name too.
+        response = await datasets.tag_samples(
+            1,
+            datasets.BulkTagRequest(sample_ids=[local[0]['origin_id']], add_tags=['queued'], background=True),
+            USER,
+            made_by='carol',
+        )
+        test_bulk_jobs.submitted(response)
+        await test_bulk_jobs.finish(database)
+        assert await database.fetchval("SELECT created_by_name FROM dataset_tags WHERE tag = 'queued'") == 'carol'
+
+        assert followers.TagRequest(sample_ids=[1], made_by='  dee  ').made_by == 'dee'
+        assert followers.TagRequest(sample_ids=[1], made_by='   ').made_by is None
+        for bad in ('a\u202eb', 'x' * 101, 'tab\there'):
+            with pytest.raises(ValueError):
+                followers.TagRequest(sample_ids=[1], made_by=bad)
+
+    registry_database(scenario)
+
+
 def test_the_0017_backfill_gives_no_identity_to_a_stopped_copy_which_is_then_never_resumed(
     monkeypatch,
     registry_database,
@@ -1632,5 +2083,222 @@ def test_the_0017_backfill_gives_no_identity_to_a_stopped_copy_which_is_then_nev
         await sync(database, link_id)
         assert await database.fetchval('SELECT count(*) FROM mirrors') == 2
         assert (await mirror_of(database))['dataset_id'] != mirror['dataset_id']
+
+    registry_database(scenario)
+
+
+def test_a_cursor_behind_the_acknowledged_one_is_refused_and_the_mirror_copies_again(monkeypatch, registry_database):
+    async def scenario(database):
+        _, link_id = await setup(monkeypatch, database)
+        await ingest([{'crop': 'corn'}], dataset_id=1, prefix='s3://images/a')
+        follower = await database.fetchval('SELECT id FROM followers')
+        await followers.follow_dataset(follower, 1, followers.FollowOptions(), user=USER)
+        await sync(database, link_id)
+        mirror = await mirror_of(database)
+        backed_up = mirror['feed_cursor']  # the cursor in a backup of this follower, taken now
+
+        # The primary changes; the follower applies it and acknowledges, so the primary prunes its log.
+        await ingest([{'crop': 'soy'}], dataset_id=1, prefix='s3://images/b')
+        await sync(database, link_id)
+        await sync(database, link_id)
+        acked = await database.fetchval('SELECT acked_txid FROM follower_datasets WHERE follower_id = $1', follower)
+        assert acked > backed_up
+        assert await database.fetchval('SELECT count(*) FROM sample_block_changes WHERE dataset_id = 1') == 0
+
+        # The follower is restored from that backup: its cursor and its samples are the old ones, without soy.
+        [soy] = [row['id'] for row in (await copied(database, mirror)).values() if row['metadata']['crop'] == 'soy']
+        async with database.pool.acquire() as connection, connection.transaction():
+            await connection.execute("SELECT set_config('fridge.mirror_sync', $1, TRUE)", str(mirror['dataset_id']))
+            await connection.execute('DELETE FROM samples WHERE id = $1', soy)
+            await connection.execute(
+                'UPDATE mirrors SET feed_cursor = $2 WHERE dataset_id = $1',
+                mirror['dataset_id'],
+                backed_up,
+            )
+        # Its old cursor can't be answered: the rows between are gone. The cursor it acknowledged still reads.
+        sub = dict(await database.fetchrow('SELECT * FROM followers WHERE id = $1', follower))
+        identity = await followers.identity(database)
+        with pytest.raises(HTTPException) as behind:
+            await followers.follower_changes(1, backed_up, identity, 1000, follower=sub)
+        assert behind.value.status_code == 409 and 'copy the dataset again' in behind.value.detail
+        assert (await followers.follower_changes(1, acked, identity, 1000, follower=sub))['blocks'] == []
+
+        # So its sync stops that copy rather than carrying on without soy, and a new copy resumes into the same
+        # mirror: the new copy reads the feed from the subscription's start, which the primary takes once it has been
+        # asked for the copy's plan.
+        await sync(database, link_id)
+        again = await mirror_of(database)
+        assert again['dataset_id'] == mirror['dataset_id'] and again['state'] == 'following'
+        assert sorted(row['metadata']['crop'] for row in (await copied(database, again)).values()) == ['corn', 'soy']
+
+    registry_database(scenario)
+
+
+async def test_a_primary_s_answer_is_never_served_as_a_page(monkeypatch, tmp_path):
+    from backend import main
+
+    page = b'<!doctype html><script>fetch("/api/users")</script>'
+    answer = Mock(status_code=200, headers={'content-type': 'text/html; charset=utf-8'}, content=page)
+    monkeypatch.setattr(main, 'S3_LOCAL_PATH', str(tmp_path))
+    monkeypatch.setattr(main, '_queue_media_cache', main._write_media_cache)  # written at once
+    monkeypatch.setattr(main, '_primary_client', AsyncMock(return_value=Mock(get=AsyncMock(return_value=answer))))
+    source = {'dataset_id': 5, 'origin_id': 7, 'origin_dataset_id': 1, 'url': 'http://primary/api'}
+
+    first = await main._media_from_primary(source, 's3://images/a-0.jpg', {})
+    again = await main._media_from_primary(source, 's3://images/a-0.jpg', {})  # from the cache
+    assert 'X-Cache' not in first.headers and again.headers['X-Cache'] == 'HIT'
+    for response in (first, again):
+        assert response.body == page and response.media_type == 'application/octet-stream'
+        assert response.headers['Content-Security-Policy'] == 'sandbox'
+        assert response.headers['X-Content-Type-Options'] == 'nosniff'
+        assert response.headers['Content-Disposition'].startswith('attachment')
+
+
+def test_a_sample_changed_in_more_fields_than_one_request_takes_still_syncs(monkeypatch, registry_database):
+    async def scenario(database):
+        _, link_id = await setup(monkeypatch, database)
+        await ingest([{'crop': 'corn'}], dataset_id=1, prefix='s3://images/a')
+        corn = await database.fetchval('SELECT id FROM samples WHERE dataset_id = 1')
+        follower = await database.fetchval('SELECT id FROM followers')
+        await followers.follow_dataset(follower, 1, followers.FollowOptions(), user=USER)
+        await sync(database, link_id)
+
+        # 4x4 and 8x8 patch tiles are 80 fields on one sample: more than a vectors request takes.
+        fields = [f'tile_{index:02d}' for index in range(followers.VECTOR_FIELDS + 6)]
+        await database.execute(
+            "INSERT INTO embeddings (sample_id, field_name, vector) "
+            "SELECT $1, name, '[1,0]' FROM unnest($2::text[]) name",
+            corn,
+            fields,
+        )
+        result = await sync(database, link_id)
+        mirror = await mirror_of(database)
+        assert mirror['last_error'] is None and not result.result['failed']
+        [local] = (await copied(database, mirror)).values()
+        held = await database.fetch('SELECT field_name FROM embeddings WHERE sample_id = $1 ORDER BY 1', local['id'])
+        assert [row['field_name'] for row in held] == fields
+
+    registry_database(scenario)
+
+
+def test_coordinates_of_a_vector_added_to_a_mirrored_sample_arrive_with_it(monkeypatch, registry_database):
+    async def scenario(database):
+        _, link_id = await setup(monkeypatch, database)
+        await ingest([{'crop': 'corn'}], dataset_id=1, prefix='s3://images/a')
+        corn = await database.fetchval('SELECT id FROM samples WHERE dataset_id = 1')
+        follower = await database.fetchval('SELECT id FROM followers')
+        await followers.follow_dataset(follower, 1, followers.FollowOptions(), user=USER)
+        await sync(database, link_id)
+
+        # One page of the feed: the sample's block (a tag), a vector it didn't have, and that vector's place on the
+        # map. The block is applied before the vector is here, so its coordinates must be applied after.
+        await database.execute("UPDATE samples SET tags = '{reviewed}' WHERE id = $1", corn)
+        await database.execute(
+            "INSERT INTO embeddings (sample_id, field_name, vector) VALUES ($1, 'clip', '[1,0]')",
+            corn,
+        )
+        await database.execute(
+            "INSERT INTO embedding_coordinates (sample_id, field_name, x, y) VALUES ($1, 'clip', 3, 4)",
+            corn,
+        )
+        await sync(database, link_id)
+        mirror = await mirror_of(database)
+        assert await coordinates_of(database, mirror['dataset_id']) == {corn: (3.0, 4.0)}
+
+    registry_database(scenario)
+
+
+def test_samples_that_swap_filepaths_keep_their_vectors_and_what_was_added_here(monkeypatch, registry_database):
+    async def scenario(database):
+        _, link_id = await setup(monkeypatch, database)
+        await ingest([{'crop': 'corn'}, {'crop': 'soy'}], dataset_id=1, prefix='s3://images/a')
+        corn, soy = [
+            row['id'] for row in await database.fetch('SELECT id FROM samples WHERE dataset_id = 1 ORDER BY id')
+        ]
+        await database.execute(
+            "INSERT INTO embeddings (sample_id, field_name, vector) "
+            "VALUES ($1, 'clip', '[1,0]'), ($2, 'clip', '[0,1]')",
+            corn,
+            soy,
+        )
+        follower = await database.fetchval('SELECT id FROM followers')
+        await followers.follow_dataset(follower, 1, followers.FollowOptions(), user=USER)
+        await sync(database, link_id)
+        mirror = await mirror_of(database)
+        before = await copied(database, mirror)
+        # A vector field of this instance's own, on the mirror's copy of corn.
+        await database.execute(
+            "INSERT INTO embeddings (sample_id, field_name, vector) VALUES ($1, 'mine', '[5,5]')",
+            before[corn]['id'],
+        )
+
+        # There, the two samples swap filepaths; their vectors don't change, so the feed names only their block.
+        async with database.pool.acquire() as connection, connection.transaction():
+            await connection.execute("UPDATE samples SET filepath = 's3://images/swap' WHERE id = $1", corn)
+            await connection.execute("UPDATE samples SET filepath = 's3://images/a-0.jpg' WHERE id = $1", soy)
+            await connection.execute("UPDATE samples SET filepath = 's3://images/a-1.jpg' WHERE id = $1", corn)
+        await sync(database, link_id)
+        after = await copied(database, mirror)
+        assert {origin: row['filepath'] for origin, row in after.items()} == {
+            corn: 's3://images/a-1.jpg',
+            soy: 's3://images/a-0.jpg',
+        }
+        assert {origin: row['id'] for origin, row in after.items()} == {
+            origin: row['id'] for origin, row in before.items()
+        }  # the same samples here, not new ones
+        vectors = await database.fetch(
+            'SELECT sample_id, field_name, vector::text FROM embeddings WHERE sample_id = ANY($1::int[]) ORDER BY 1, 2',
+            [after[corn]['id'], after[soy]['id']],
+        )
+        assert [tuple(row) for row in vectors] == [
+            (after[corn]['id'], 'clip', '[1,0]'),
+            (after[corn]['id'], 'mine', '[5,5]'),
+            (after[soy]['id'], 'clip', '[0,1]'),
+        ]
+
+    registry_database(scenario)
+
+
+def test_a_long_copy_does_not_hold_up_the_other_mirrors_of_its_primary(monkeypatch, registry_database):
+    async def scenario(database):
+        _, link_id = await setup(monkeypatch, database)
+        monkeypatch.setattr(follower_sync, 'COPY_BLOCKS', 1)  # each block in a step of its own
+        # Two datasets of four blocks each on the primary.
+        for dataset_id in (1, 2):
+            for block in range(4):
+                await database.execute(
+                    "INSERT INTO samples (id, dataset_id, filepath, media_type) VALUES ($1, $2, $3, 'image')",
+                    dataset_id * 100000 + block * follower_sync.BLOCK,
+                    dataset_id,
+                    f's3://images/{dataset_id}-{block}.jpg',
+                )
+        follower = await database.fetchval('SELECT id FROM followers')
+        for dataset_id in (1, 2):
+            await followers.follow_dataset(follower, dataset_id, followers.FollowOptions(), user=USER)
+
+        # The sync job, step by step: when the later mirror has its first samples, the earlier one is still copying.
+        step = follower_sync.handler(database.pool)
+        checkpoint: dict = {}
+        seen = None
+        for _ in range(200):
+            result = await step({'args': {'link_id': link_id}, 'checkpoint': checkpoint})
+            if result.publish is not None:
+                async with database.pool.acquire() as connection, connection.transaction():
+                    await result.publish(connection)
+            if result.checkpoint is not None:
+                checkpoint = result.checkpoint
+            mirrors = await database.fetch('SELECT dataset_id, state FROM mirrors ORDER BY dataset_id')
+            if seen is None and len(mirrors) == 2:
+                later = await database.fetchval(
+                    'SELECT count(*) FROM mirror_samples WHERE dataset_id = $1',
+                    mirrors[1]['dataset_id'],
+                )
+                if later:
+                    seen = mirrors[0]['state']
+            if result.finished:
+                break
+        assert seen == 'copying'
+        assert [row['state'] for row in mirrors] == ['following', 'following']
+        assert await database.fetchval('SELECT count(*) FROM mirror_samples') == 8
 
     registry_database(scenario)

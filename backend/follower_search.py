@@ -17,6 +17,7 @@ from fastapi import HTTPException, Request
 
 from . import patch_search
 from .database import db
+from .sample_ids import ELEMENT_OPERATORS, SAMPLE_ID_FIELDS, SAMPLE_ID_OPERATORS, sample_ids_in, translate_ids
 
 logger = logging.getLogger('fridge.follower_search')
 
@@ -65,11 +66,7 @@ RELAYED_OPERATORS = frozenset(
         'has_matching_object',
     },
 )
-# Leaf fields whose values are sample ids, the primary's: a mirror has its own.
-SAMPLE_ID_FIELDS = frozenset({'id', 'parent_id', 'metadata.parent_id'})
 LOGIC = frozenset({'AND', 'OR', 'NOT'})
-# Operators whose value is a condition on each label element (its own keys, an `id` among them), not on samples.
-ELEMENT_OPERATORS = ('elem_match', 'match_elements')
 
 
 class RelayRefused(ValueError):
@@ -176,8 +173,11 @@ async def relay(request: Request, dataset_id: int, base_field: str, scale: str, 
                 'SELECT follower_id, state, result, error FROM follower_searches WHERE id = $1',
                 search_id,
             )
-            if row is None:
-                break
+            if row is None:  # its follower was removed
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"The follower '{provider['name']}' no longer follows this dataset",
+                )
             if row['state'] == 'answered':
                 return await hydrate(dataset_id, row['result'] or [])
             if row['state'] == 'failed':
@@ -185,6 +185,27 @@ async def relay(request: Request, dataset_id: int, base_field: str, scale: str, 
                     status_code=502,
                     detail=f"The follower '{provider['name']}' couldn't run this search: {row['error']}",
                 )
+            if row['state'] == 'cancelled':
+                # Its follower stopped following the dataset (unfollowed, or POST /follower/leave): the fallback takes
+                # it, or it ends now.
+                moved = None
+                if fallback is not None:
+                    moved = await db.fetchval(
+                        f"""UPDATE follower_searches SET follower_id = $2, state = 'pending' WHERE id = $1
+                             AND state = 'cancelled'
+                             AND (SELECT count(*) FROM follower_searches
+                                  WHERE follower_id = $2 AND state IN ('pending', 'claimed')) < {PENDING_PER_FOLLOWER}
+                           RETURNING follower_id""",
+                        search_id,
+                        fallback['id'],
+                    )
+                if moved is None or fallback is None:
+                    raise HTTPException(
+                        status_code=503,
+                        detail=f"The follower '{provider['name']}' no longer follows this dataset",
+                    )
+                provider, fallback = fallback, None
+                continue
             waited = time.monotonic() - started
             if row['state'] == 'pending' and fallback is not None and waited > FALLBACK_SECONDS:
                 # The fallback takes it only within its own cap (a soft cap, as above).
@@ -246,9 +267,13 @@ async def claim(follower: dict, wait: float) -> dict | None:
     deadline = time.monotonic() + wait
     while True:
         row = await db.fetchrow(
+            # Only of a dataset it still follows: one queued just as its subscription went isn't its to run.
             """UPDATE follower_searches SET state = 'claimed', claimed_at = now()
-               WHERE id = (SELECT id FROM follower_searches WHERE follower_id = $1 AND state = 'pending'
-                           ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT 1)
+               WHERE id = (SELECT s.id FROM follower_searches s
+                           WHERE s.follower_id = $1 AND s.state = 'pending'
+                             AND EXISTS (SELECT 1 FROM follower_datasets f
+                                         WHERE f.follower_id = s.follower_id AND f.dataset_id = s.dataset_id)
+                           ORDER BY s.created_at FOR UPDATE OF s SKIP LOCKED LIMIT 1)
                RETURNING id, dataset_id, kind, request""",
             follower['id'],
         )
@@ -310,46 +335,16 @@ def check_filters(node: Any) -> None:
         raise RelayRefused('a selection made on the primary: save it as a view first')
     if operator not in RELAYED_OPERATORS:
         raise RelayRefused(f'the filter operator {operator!r} is not one a follower runs')
+    if node.get('field') in SAMPLE_ID_FIELDS and operator not in SAMPLE_ID_OPERATORS:
+        raise RelayRefused(
+            f"{node['field']} {operator} on sample ids: a follower numbers its samples differently, so only =, !=, in "
+            'and not in on them are passed on',
+        )
     # Nested sample filters (parent_matches, has_matching_object) are checked like the rest. An element match's value
     # is a condition on each label element's own values, the same on a mirror: nothing in it to translate or refuse.
     value = node.get('value')
     if operator not in ELEMENT_OPERATORS and isinstance(value, dict) and ('filters' in value or 'operator' in value):
         check_filters(value)
-
-
-def sample_ids_in(node: Any, found: set) -> set:
-    """The primary's sample ids a filter names."""
-    if isinstance(node, dict):
-        if node.get('operator') in ELEMENT_OPERATORS:
-            return found
-        if node.get('field') in SAMPLE_ID_FIELDS and node.get('operator') in ('in', 'not in', '=', '!='):
-            value = node.get('value')
-            found.update(v for v in (value if isinstance(value, list) else [value]) if isinstance(v, int))
-        for value in node.values():
-            sample_ids_in(value, found)
-    elif isinstance(node, list):
-        for value in node:
-            sample_ids_in(value, found)
-    return found
-
-
-def translate_ids(node: Any, mapping: dict) -> Any:
-    """A filter with the primary's sample ids replaced by this instance's. A sample that isn't here matches nothing:
-    it leaves a list, and a single id becomes 0, which no sample has."""
-    if isinstance(node, dict):
-        if node.get('operator') in ELEMENT_OPERATORS:
-            return node
-        node = {key: translate_ids(value, mapping) for key, value in node.items()}
-        if node.get('field') in SAMPLE_ID_FIELDS and node.get('operator') in ('in', 'not in', '=', '!='):
-            value = node.get('value')
-            if isinstance(value, list):
-                node['value'] = [mapping[v] for v in value if v in mapping]
-            elif isinstance(value, int):
-                node['value'] = mapping.get(value, 0)
-        return node
-    if isinstance(node, list):
-        return [translate_ids(value, mapping) for value in node]
-    return node
 
 
 async def run_search(pool, link_id: int, item: dict) -> list[dict]:

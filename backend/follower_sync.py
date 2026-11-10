@@ -27,6 +27,7 @@ from .field_registry import lock_field_lifecycle
 from .job_runner import StepResult
 from .routers import datasets as datasets_router
 from .routers import followers
+from .sample_ids import ranges_on_ids, sample_ids_in, translate_ids
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +38,7 @@ RANK_SECONDS = 1800
 BLOCK = followers.BLOCK
 COPY_BLOCKS = 2  # blocks per step: up to 8192 samples and their vectors
 REQUEST_SECONDS = 120
+RETURN_SECONDS = 10  # a sync's own /follower/return holds the link row meanwhile (return_if_linked)
 LOCK_SECONDS = 5
 RETRY_SECONDS = 60  # a failed mirror's wait before its next try, doubling after each failure in a row
 RETRY_MAX_SECONDS = 3600
@@ -151,35 +153,10 @@ def uses_concept(node) -> bool:
     return False
 
 
-def sample_ids_in(node, found: set) -> set:
-    """The sample ids a view's filters name (`id in [...]` from a brushed selection, `id = n`)."""
-    if isinstance(node, dict):
-        if node.get('field') == 'id' and node.get('operator') in ('in', 'not in', '=', '!='):
-            value = node.get('value')
-            found.update(v for v in (value if isinstance(value, list) else [value]) if isinstance(v, int))
-        for value in node.values():
-            sample_ids_in(value, found)
-    elif isinstance(node, list):
-        for value in node:
-            sample_ids_in(value, found)
-    return found
-
-
-def translate_ids(node, mapping: dict):
-    """A view's filters with the primary's sample ids replaced by this instance's. A sample that isn't here matches
-    nothing either way: it leaves a list, and a single id becomes 0, which no sample has."""
-    if isinstance(node, dict):
-        node = {key: translate_ids(value, mapping) for key, value in node.items()}
-        if node.get('field') == 'id' and node.get('operator') in ('in', 'not in', '=', '!='):
-            value = node.get('value')
-            if isinstance(value, list):
-                node['value'] = [mapping[v] for v in value if v in mapping]
-            elif isinstance(value, int):
-                node['value'] = mapping.get(value, 0)
-        return node
-    if isinstance(node, list):
-        return [translate_ids(value, mapping) for value in node]
-    return node
+def instance_bound(node) -> bool:
+    """A view that stays on the instance that made it: it uses a concept (each instance has its own), or a range on
+    sample ids (each numbers its samples in its own order)."""
+    return uses_concept(node) or ranges_on_ids(node)
 
 
 def vector_payload(rows: list) -> bytes:
@@ -270,6 +247,18 @@ async def fetch_vectors(client, origin: int, sample_ids: list, fields=None) -> l
     return found
 
 
+async def fetch_vector_pairs(client, origin: int, pairs: list) -> list:
+    """The vectors of these (sample, field) pairs, asked for a request's worth of fields at a time: one sample can
+    change in more fields than a request takes (4x4 and 8x8 patch tiles are 80)."""
+    fields = sorted({field for _, field in pairs})
+    found: list = []
+    for start in range(0, len(fields), followers.VECTOR_FIELDS):
+        asked = set(fields[start : start + followers.VECTOR_FIELDS])
+        sample_ids = sorted({sample_id for sample_id, field in pairs if field in asked})
+        found += await fetch_vectors(client, origin, sample_ids, sorted(asked))
+    return found
+
+
 async def ensure_array_columns(pool, dataset_id: int, names: list) -> None:
     """The primary's array fields need their physical column here before samples carrying them are written."""
     if not names:
@@ -321,10 +310,13 @@ async def write_samples(connection, dataset_id: int, blocks: list, data: dict) -
     )
     if not samples:
         return present
-    # A filepath the primary moved here from another sample (a version restore recreating a deleted sample, say):
-    # that sample's own block, which changed too, brings it back. Until then it would break UNIQUE (dataset, filepath).
+    # A filepath the primary moved here from another sample (two samples swapping paths, or a version restore
+    # recreating a deleted one): the sample holding it here steps aside under a name of its own, so it keeps its
+    # vectors and what this instance added to it. Its own row in this batch, or its own block, which changed too,
+    # then gives it its path or removes it. Until then it would break UNIQUE (dataset, filepath).
     await connection.execute(
-        """DELETE FROM samples s USING mirror_samples m, unnest($2::int[], $3::text[]) AS r(origin_id, filepath)
+        """UPDATE samples s SET filepath = 'mirror-moved://' || m.dataset_id || '/' || m.origin_id
+           FROM mirror_samples m, unnest($2::int[], $3::text[]) AS r(origin_id, filepath)
            WHERE m.dataset_id = $1 AND s.id = m.sample_id AND s.filepath = r.filepath AND m.origin_id <> r.origin_id""",
         dataset_id,
         present,
@@ -634,10 +626,10 @@ async def write_fields(connection, dataset_id: int, fields: list) -> None:
 
 
 async def write_views(connection, dataset_id: int, views: list) -> list:
-    """The primary's shared views, with their sample ids translated. A view that uses a concept stays on the primary
-    (concepts are per instance): its name is returned."""
-    concept = sorted(view['name'] for view in views if uses_concept(view['content']))
-    copied = [view for view in views if not uses_concept(view['content'])]
+    """The primary's shared views, with their sample ids translated. A view bound to the primary (a concept, or a
+    range on sample ids: instance_bound) stays there: its name is returned."""
+    concept = sorted(view['name'] for view in views if instance_bound(view['content']))
+    copied = [view for view in views if not instance_bound(view['content'])]
     named = sorted(set().union(*(sample_ids_in(view['content'], set()) for view in copied)))
     mapping = {
         row['origin_id']: row['sample_id']
@@ -771,6 +763,28 @@ def primary_identity(config: dict) -> str:
     return config.get('database_identity') or config['identity']
 
 
+async def return_if_linked(pool, link, client) -> bool:
+    """The primary has this instance as having stopped following it, but the link is still here: a Stop following
+    from a link removed since reached the primary after this one was added (its return found nothing to restore).
+    Return again (POST /follower/return). The link stays locked meanwhile: a Stop following now deletes it before
+    telling the primary, so it can't come between, and a sync still running after one never returns."""
+    async with pool.acquire() as connection, connection.transaction():
+        if await connection.fetchval('SELECT 1 FROM primary_links WHERE id = $1 FOR SHARE', link['id']) is None:
+            return False
+        # Briefly: a Stop following in the UI waits on this row. A timeout is PrimaryUnavailable, and the next sync
+        # tries again.
+        previous, client.timeout = client.timeout, httpx.Timeout(RETURN_SECONDS)
+        try:
+            await call(client, 'POST', '/follower/return')
+        except PrimaryRefused as error:
+            if error.status == 404:  # a primary before 2.7.0 says nothing of leaving
+                return False
+            raise
+        finally:
+            client.timeout = previous
+    return True
+
+
 async def configure(pool, link, client, checkpoint: dict) -> StepResult:
     """Read what the primary assigns this follower: start a copy of each newly ready dataset, update the options,
     and stop the mirrors of datasets it no longer shares."""
@@ -787,6 +801,8 @@ async def configure(pool, link, client, checkpoint: dict) -> StepResult:
 
         return StepResult(finished=True, result={'stopped': reason}, message=reason, publish=removed)
 
+    if config.get('left') and await return_if_linked(pool, link, client):
+        config = await call(client, 'GET', '/follower/config')
     current = primary_identity(config)
     restored = link['identity'] is not None and not followers.same_identity(link['identity'], current)
     live = {
@@ -985,9 +1001,10 @@ async def copy_step(pool, link, client, mirror, checkpoint: dict) -> StepResult:
     if not remaining:
         # Every block is here: copy the views, whose sample ids can now be translated, and follow the feed.
         async def following(connection):
+            # Not a mirror stopped meanwhile (its primary removed here while this step ran): it stays stopped.
             await connection.execute(
                 "UPDATE mirrors SET state = 'following', last_synced_at = now(), last_error = NULL, failures = 0, "
-                'retry_after = NULL WHERE dataset_id = $1',
+                "retry_after = NULL WHERE dataset_id = $1 AND state <> 'stopped'",
                 dataset_id,
             )
 
@@ -999,7 +1016,7 @@ async def copy_step(pool, link, client, mirror, checkpoint: dict) -> StepResult:
     async def progress(connection):
         await connection.execute(
             'UPDATE mirrors SET copy_blocks = $2, last_synced_at = now(), last_error = NULL, failures = 0, '
-            'retry_after = NULL WHERE dataset_id = $1',
+            "retry_after = NULL WHERE dataset_id = $1 AND state <> 'stopped'",
             dataset_id,
             rest,
         )
@@ -1054,9 +1071,10 @@ async def rank_step(pool, mirror, checkpoint: dict):
 
 
 async def advance_cursor(connection, dataset_id: int, cursor: int) -> None:
+    # A mirror stopped while this step ran keeps its reason (a resume recomputes its copy anyway).
     await connection.execute(
         'UPDATE mirrors SET feed_cursor = $2, last_synced_at = now(), last_error = NULL, failures = 0, '
-        'retry_after = NULL WHERE dataset_id = $1',
+        "retry_after = NULL WHERE dataset_id = $1 AND state <> 'stopped'",
         dataset_id,
         cursor,
     )
@@ -1110,8 +1128,9 @@ async def feed_step(pool, link, client, mirror, checkpoint: dict) -> StepResult:
             'more': changes['more'],
             'blocks': blocks,
             'vectors': loose,
-            # Coordinates alone (a placement or a re-fit there): no samples or vectors to re-read.
-            'maps': sorted({entry['block'] for entry in changes['maps']} - reread),
+            # Coordinates are applied last, re-read blocks included: a block's step writes its coordinates before the
+            # page's vectors are here, and a coordinate of a vector that isn't here yet can't be written.
+            'maps': sorted({entry['block'] for entry in changes['maps']}),
             'state': bool(set(changes['dataset']) & {'fields', 'settings', 'views', 'maps'}),
         }
         if not (blocks or loose or page['maps'] or page['state']):
@@ -1135,9 +1154,7 @@ async def feed_step(pool, link, client, mirror, checkpoint: dict) -> StepResult:
         return StepResult(checkpoint=checkpoint, message=f'Applied {count:,} changed samples', publish=publish)
     if page['vectors']:
         part, page['vectors'] = page['vectors'][: followers.VECTOR_SAMPLES], page['vectors'][followers.VECTOR_SAMPLES :]
-        sample_ids = sorted({sample_id for sample_id, _ in part})
-        fields = sorted({field for _, field in part})
-        vectors = decode_vectors(await fetch_vectors(client, origin, sample_ids, fields))
+        vectors = decode_vectors(await fetch_vector_pairs(client, origin, part))
 
         async def publish(connection):
             await begin_mirror_write(connection, dataset_id)
@@ -1209,11 +1226,11 @@ def isolated(mirror, before: dict, result: StepResult) -> StepResult:
 
 async def note_failure(connection, dataset_id: int, reason: str) -> None:
     """Put the error on the mirror, and wait before trying it again: a mirror that fails until someone fixes it
-    shouldn't download its next page again every minute."""
+    shouldn't download its next page again every minute. A stopped mirror keeps the reason it stopped."""
     await connection.execute(
         """UPDATE mirrors SET last_error = $2, failures = failures + 1,
                   retry_after = now() + make_interval(secs => least($3 * power(2, failures), $4))
-           WHERE dataset_id = $1""",
+           WHERE dataset_id = $1 AND state <> 'stopped'""",
         dataset_id,
         reason,
         RETRY_SECONDS,
@@ -1281,14 +1298,22 @@ def handler(pool):
             try:
                 if not checkpoint.get('configured'):
                     return await configure(pool, link, client, checkpoint)
+                # The mirrors take turns, so a long first copy or a busy feed doesn't hold up the others of this
+                # primary: the mirror whose page of the feed is half applied carries on with it (the page is in the
+                # checkpoint), and otherwise the next one after the mirror served last.
+                page = checkpoint.get('page')
                 mirror = await pool.fetchrow(
                     """SELECT m.* FROM mirrors m JOIN datasets d ON d.id = m.dataset_id
                        WHERE m.link_id = $1 AND m.state <> 'stopped' AND NOT d.deleting
                          AND NOT (m.dataset_id = ANY($2::int[])) AND (m.retry_after IS NULL OR m.retry_after <= now())
-                       ORDER BY m.dataset_id LIMIT 1""",
+                       ORDER BY (m.dataset_id = $3) DESC, (m.dataset_id <= $4), m.dataset_id LIMIT 1""",
                     link['id'],
                     checkpoint.get('caught_up', []),
+                    page['dataset_id'] if page else 0,
+                    checkpoint.get('turn', 0),
                 )
+                if mirror is not None:
+                    checkpoint['turn'] = mirror['dataset_id']
                 if mirror is None and checkpoint.get('protocol', 1) >= 2:
                     due = await pool.fetchrow(
                         f"""SELECT m.* FROM mirrors m JOIN datasets d ON d.id = m.dataset_id

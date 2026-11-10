@@ -86,7 +86,8 @@ function MirrorRow({ mirror }: { mirror: Mirror }) {
             </div>
             {mirror.concept_views.length > 0 && (
                 <p className="text-xs text-zinc-400">
-                    Not copied, because they use a concept and concepts belong to each instance: {mirror.concept_views.join(', ')}
+                    Not copied, because they use a concept (each instance has its own) or a range of sample ids (numbered
+                    differently here): {mirror.concept_views.join(', ')}
                 </p>
             )}
             {mirror.state === 'stopped' && (
@@ -123,12 +124,22 @@ function MirrorRow({ mirror }: { mirror: Mirror }) {
     );
 }
 
-function PrimaryCard({ primary }: { primary: Primary }) {
+// What Stop following answers: whether the primary heard, so it stops keeping changes for this instance.
+interface Removed {
+    removed: number;
+    told_primary: boolean;
+    detail?: string;
+}
+
+function PrimaryCard({ primary, onRemoved }: { primary: Primary; onRemoved: (url: string, result: Removed) => void }) {
     const queryClient = useQueryClient();
     const [confirmRemove, setConfirmRemove] = useState(false);
     const remove = useMutation({
-        mutationFn: () => send('DELETE', `/primaries/${primary.id}`),
-        onSuccess: () => queryClient.invalidateQueries({ queryKey: ['primaries'] }),
+        mutationFn: (): Promise<Removed> => send('DELETE', `/primaries/${primary.id}`),
+        onSuccess: result => {
+            onRemoved(primary.url, result);
+            queryClient.invalidateQueries({ queryKey: ['primaries'] });
+        },
     });
     return (
         <div data-testid="primary-row" className="p-4 border border-zinc-800 rounded-xl bg-zinc-900 space-y-3">
@@ -181,6 +192,8 @@ export default function PrimariesPage() {
         },
         refetchInterval: 15_000,
     });
+    // The card goes with its primary, so what Stop following answered shows here.
+    const [stopped, setStopped] = useState<{ url: string; result: Removed } | null>(null);
     const add = useMutation({
         mutationFn: () => send('POST', '/primaries', { url: url.trim(), token: token.trim() }),
         onSuccess: () => {
@@ -248,10 +261,23 @@ export default function PrimariesPage() {
                             <p className="text-red-300">Could not load the primaries.</p>
                         ) : (
                             <div className="space-y-3">
+                                {stopped && (
+                                    <p
+                                        data-testid="stopped-notice"
+                                        className={`text-sm ${stopped.result.told_primary ? 'text-zinc-400' : 'text-amber-300'}`}
+                                    >
+                                        {stopped.result.told_primary
+                                            ? `Stopped following ${stopped.url}. The primary knows, and no longer keeps changes for this instance.`
+                                            : `Stopped following ${stopped.url}, but the primary wasn't told: ${stopped.result.detail}. `
+                                              + 'Its admin can remove this follower under Settings → Followers there.'}
+                                    </p>
+                                )}
                                 {(data?.primaries ?? []).length === 0 && (
                                     <p data-testid="no-primaries" className="text-zinc-500">This instance follows no primary.</p>
                                 )}
-                                {(data?.primaries ?? []).map(primary => <PrimaryCard key={primary.id} primary={primary} />)}
+                                {(data?.primaries ?? []).map(primary => (
+                                    <PrimaryCard key={primary.id} primary={primary} onRemoved={(url, result) => setStopped({ url, result })} />
+                                ))}
                                 {(data?.unlinked_mirrors ?? []).length > 0 && (
                                     <div className="p-4 border border-zinc-800 rounded-xl bg-zinc-900/50 space-y-2">
                                         <h3 className="font-semibold text-white">Copies no longer following</h3>

@@ -1434,6 +1434,7 @@ CREATE TABLE IF NOT EXISTS dataset_tags (
     created_at TIMESTAMP WITH TIME ZONE,
     created_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
     last_used_at TIMESTAMP WITH TIME ZONE,
+    created_by_name TEXT,  -- who made it on the follower that sent it (display only; 0018)
     PRIMARY KEY (dataset_id, field_name, tag)
 );
 
@@ -2549,7 +2550,8 @@ CREATE TABLE IF NOT EXISTS followers (
     created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     last_seen_at TIMESTAMPTZ,
-    instance TEXT  -- the installation id of the instance its token belongs to: the first that used it (0014)
+    instance TEXT,  -- the installation id of the instance its token belongs to: the first that used it (0014)
+    left_at TIMESTAMP WITH TIME ZONE  -- it stopped following; its subscriptions are in follower_departures (0018)
 );
 
 CREATE TABLE IF NOT EXISTS follower_datasets (
@@ -2568,6 +2570,18 @@ CREATE TABLE IF NOT EXISTS follower_datasets (
     PRIMARY KEY (follower_id, dataset_id)
 );
 CREATE INDEX IF NOT EXISTS follower_datasets_dataset ON follower_datasets (dataset_id);
+
+-- The subscriptions of a follower that stopped following, with their options: they come back if it returns (0018).
+CREATE TABLE IF NOT EXISTS follower_departures (
+    follower_id INTEGER NOT NULL REFERENCES followers(id) ON DELETE CASCADE,
+    dataset_id INTEGER NOT NULL REFERENCES datasets(id) ON DELETE CASCADE,
+    tags TEXT NOT NULL CHECK (tags IN ('primary', 'both')),
+    views TEXT NOT NULL CHECK (views IN ('primary', 'both')),
+    images BOOLEAN NOT NULL,
+    left_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now(),
+    PRIMARY KEY (follower_id, dataset_id)
+);
+CREATE INDEX IF NOT EXISTS follower_departures_dataset ON follower_departures (dataset_id);
 
 -- Patch scales a follower holds of a dataset it follows, computed there and not sent by the primary (0015): it
 -- reports them, so a patch search on such a scale can go to it.
@@ -2841,6 +2855,38 @@ CREATE TABLE IF NOT EXISTS compute_launches (
 );
 CREATE INDEX IF NOT EXISTS compute_launches_live ON compute_launches (launched_at) WHERE state <> 'ended';
 
+-- (0019) TRUNCATE fires none of the triggers that log a followed dataset's changes for its followers, or that keep a
+-- mirror read-only: a follower would keep rows the primary no longer has, and a mirror could be emptied. Nothing
+-- in the application truncates these tables, so the statement is refused while any dataset here is followed or is
+-- a mirror. Every table with a follower-log trigger or a mirror guard has it
+-- (backend/tests/test_follower_change_log.py checks the catalog).
+CREATE OR REPLACE FUNCTION refuse_followed_truncate() RETURNS trigger AS $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM datasets WHERE followed) OR EXISTS (SELECT 1 FROM mirrors) THEN
+        RAISE EXCEPTION 'TRUNCATE % is refused while a dataset here is followed or is a mirror: it would skip the change log followers read and a mirror''s protection. Delete the rows instead (followers see each delete), or stop sharing the followed datasets and delete the mirrors first',
+            TG_TABLE_NAME USING ERRCODE = '55000';
+    END IF;
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER follower_truncate_guard BEFORE TRUNCATE ON samples
+    FOR EACH STATEMENT EXECUTE FUNCTION refuse_followed_truncate();
+CREATE TRIGGER follower_truncate_guard BEFORE TRUNCATE ON embeddings
+    FOR EACH STATEMENT EXECUTE FUNCTION refuse_followed_truncate();
+CREATE TRIGGER follower_truncate_guard BEFORE TRUNCATE ON sample_hashes
+    FOR EACH STATEMENT EXECUTE FUNCTION refuse_followed_truncate();
+CREATE TRIGGER follower_truncate_guard BEFORE TRUNCATE ON embedding_coordinates
+    FOR EACH STATEMENT EXECUTE FUNCTION refuse_followed_truncate();
+CREATE TRIGGER follower_truncate_guard BEFORE TRUNCATE ON dataset_fields
+    FOR EACH STATEMENT EXECUTE FUNCTION refuse_followed_truncate();
+CREATE TRIGGER follower_truncate_guard BEFORE TRUNCATE ON views
+    FOR EACH STATEMENT EXECUTE FUNCTION refuse_followed_truncate();
+CREATE TRIGGER follower_truncate_guard BEFORE TRUNCATE ON embedding_viz_meta
+    FOR EACH STATEMENT EXECUTE FUNCTION refuse_followed_truncate();
+CREATE TRIGGER follower_truncate_guard BEFORE TRUNCATE ON datasets
+    FOR EACH STATEMENT EXECUTE FUNCTION refuse_followed_truncate();
+
 -- Ledger of applied migrations: the 1.0.0 baseline, then the files in backend/db/migrations/
 -- (0001_..., 0002_...) that scripts/apply_migrations.sh applies to existing databases. A fresh install
 -- from this file IS current: when you add a migration, make the same change here and ADD ITS
@@ -2867,5 +2913,7 @@ INSERT INTO schema_migrations (filename) VALUES
     ('0014_follower_instance.sql'),
     ('0015_follower_fields.sql'),
     ('0016_follower_searches.sql'),
-    ('0017_mirror_resume.sql')
+    ('0017_mirror_resume.sql'),
+    ('0018_follower_leave.sql'),
+    ('0019_follower_truncate_guard.sql')
 ON CONFLICT (filename) DO NOTHING;

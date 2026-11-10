@@ -378,13 +378,14 @@ async def _mutate(connection, job, ids, removed_fields):
         )
         if request['add_tags']:
             await connection.execute(
-                """INSERT INTO dataset_tags(dataset_id,field_name,tag,created_by_user_id,last_used_at)
-                   SELECT $1,$2,unnest($3::text[]),$4,NOW()
+                """INSERT INTO dataset_tags(dataset_id,field_name,tag,created_by_user_id,created_by_name,last_used_at)
+                   SELECT $1,$2,unnest($3::text[]),$4,$5,NOW()
                    ON CONFLICT(dataset_id,field_name,tag) DO UPDATE SET last_used_at=EXCLUDED.last_used_at""",
                 dataset_id,
                 request['field_name'],
                 request['add_tags'],
                 job['created_by'],
+                request.get('made_by'),  # a follower's edit: who made it there (routers/datasets.py tag_samples)
             )
         await invalidate_values(connection, dataset_id, [request['field_name']])
         return int(status.split()[-1])

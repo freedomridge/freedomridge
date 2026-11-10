@@ -463,6 +463,7 @@ export interface View {
         sort?: string;
         order?: 'asc' | 'desc';
         made_on?: string; // The follower instance the view was made on (docs/FOLLOWERS.md)
+        made_by?: string; // Who made it there: shown only, set by the primary (docs/FOLLOWERS.md)
     };
     is_public: boolean;
     shared_with_user_ids: number[];

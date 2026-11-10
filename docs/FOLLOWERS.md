@@ -11,7 +11,7 @@ reads, and the follower's sync, which keeps a read-only mirror of each dataset s
 
 An admin manages followers under **Settings → Followers** (or the endpoints below):
 
-1. **Add a follower**, giving it a name such as `tailscale-local`. The primary creates an account for it,
+1. **Add a follower**, giving it a name such as `laptop`. The primary creates an account for it,
    `follower:<name>`, which has no password and so can't log in. It also creates a **follower token**, shown
    once: give it to the follower with the primary's URL. Only the follower endpoints accept that token (any
    other endpoint answers 403), and they accept no other credential.
@@ -28,7 +28,8 @@ An admin manages followers under **Settings → Followers** (or the endpoints be
    A mirror (a dataset this instance follows from another) can't be chosen: follows don't chain, so an instance
    that wants it follows its primary.
 3. **Watch** when each follower last checked in, and how many log rows the primary keeps for it until it
-   catches up. Nothing is removed automatically.
+   catches up. A follower that stopped following on its side shows **Stopped following** with the datasets it
+   gets back if it follows again (see "Stopping tells the primary" below). **Don't bring back** drops one.
 4. **Remove a follower** to delete everything the primary keeps for it:
    - its token stops working;
    - its log rows are deleted;
@@ -102,9 +103,10 @@ creates the database, which followers detect.
 An admin adds the primary under **Settings → Primaries**, with its API address (`https://primary.example.com/api`)
 and the follower token. The token is checked against the primary before it's saved, and stored encrypted with
 `STORAGE_ENCRYPTION_KEY`. An instance follows a primary once: a second address for the same primary (its LAN
-address and a Tailscale name, say) is refused, since both would share one subscription there. The primary, for its
+address and a DNS name, say) is refused, since both would share one subscription there. The primary, for its
 part, binds a follower's token to the first instance that uses it, by that instance's installation id (made once,
-in its database), and refuses the token from another (409). A follower restored from a dump or moved to another
+in its database), and refuses the token from another (409). Once the token is bound, a call that sends no
+installation id is refused the same way. A follower restored from a dump or moved to another
 server keeps its installation id. One reinstalled from scratch gets a new one: **Reset instance** on the primary's
 Followers page lets the next installation that calls take the token over.
 
@@ -120,6 +122,25 @@ primary that resumes where it stopped:
 
 The Primaries page shows each mirror's state (copying, following, or no longer following), the copy's progress,
 its last sync, and any error. The job's successful runs are pruned from the job history like other automatic jobs.
+
+### Reaching the primary
+
+The follower starts every connection: it reads the config and the feed, fetches images the primary serves, and
+polls for relayed patch searches. The primary never connects to a follower. So a follower needs no open port,
+public address or certificate; only the primary has to be reachable by its followers, at an address they can open.
+
+A launcher install (`npx freedomridge`) listens on 127.0.0.1 only, so as a primary for other machines it has to be
+put behind an address they can reach, such as a VPN or a tunnel. It is made for one machine: it runs with
+development settings, which use the default storage key and put internal detail in error messages. Before others
+can reach one:
+
+- Log in and replace the admin password (`admin123`). The first login asks for a new one, but until someone has
+  logged in, whoever reaches the instance first gets that login.
+- Share it only with people you'd trust with the instance itself.
+- For a wider audience, run the primary with `docker-compose.prod.yml` instead ([Docker deployment](DOCKER_DEPLOYMENT.md)).
+
+While a primary's machine is asleep or offline, its followers keep their mirrors, read-only as always, and catch
+up from the change log when it's back. Images the primary serves (**Serve images**) don't load meanwhile.
 
 ### What a mirror holds
 
@@ -138,8 +159,9 @@ its last sync, and any error. The job's successful runs are pruned from the job 
 - **Maps:** the primary places new samples on its maps and re-fits them; the mirror takes its coordinates, so a
   view with a polygon drawn on a map selects the same samples on both. The mirror ranks a map when the primary
   has re-ranked it. Map placement here leaves the primary's fields alone.
-- **Views that use a concept** stay on the primary, because concepts belong to each instance; the views panel
-  lists them.
+- **Views that use a concept, or a range on sample ids** (`id > 15`, a `parent_id` range), stay on the primary:
+  concepts belong to each instance, and each numbers its samples in its own order. The views panel lists them.
+  Sample ids named outright (`id in [...]`, an object's `parent_id`) are translated.
 - **Images:** the mirror reads the same media paths. When this instance can read them (the same disk path, or a
   storage configuration with read access to the bucket), it serves them itself. When it can't, and the primary
   has the dataset's `images` option on, it asks the primary for the image, thumbnail, crop or overlay and keeps
@@ -171,7 +193,12 @@ follower holds goes to that follower; the primary never connects to it:
 A follower checked in within the last minute counts as online. Without one online, the search answers 503 and
 names the follower; with 8 searches already queued or running on it, 429; without an answer within 30 seconds,
 504. Filters on a concept, or on a selection made on the primary, can't run on a follower: save the selection as a
-view, or search on the follower itself.
+view, or search on the follower itself. Neither can a range on sample ids (`id > 15`, a `parent_id` range): a
+follower numbers its samples in another order, so only `=`, `!=`, `in` and `not in` on them are passed on, translated.
+
+A search belongs to a follower only while it follows the dataset. When the primary's admin stops sharing the
+dataset with it, or it stops following the primary, its queued and running searches of that dataset are cancelled:
+each goes to the next follower holding the scale, or ends with 503 ("no longer follows this dataset").
 
 ### Edits sent to the primary
 
@@ -181,11 +208,18 @@ is queued at once, and the tags show on the mirror when it has run, within a min
 only, tagging a mirror is refused. The option covers `tags` only: the primary's other array fields stay read-only
 on a mirror, and the primary refuses them from a follower.
 
+**Who made it.** The follower sends the username of whoever made the edit (`made_by`), shown on the primary: a tag
+it adds to the tag registry reads "created by alice on lab", and a view "made on lab by alice". It's display only:
+the edit is still made as the follower's account. The follower's name comes from that account, never from what it
+sent, and a user on the primary can't mark a view as made on a follower (`made_on` and `made_by` are dropped from
+anyone else's view).
+
 With the **views** option both ways:
 
 - a view shared with everyone on the mirror (saved public, or shared later) is created on the primary as the
-  follower's account, marked `made_on` with the follower's name, and copied back at once. Not one that uses a
-  concept: concepts belong to each instance, so it stays on the mirror, shared there;
+  follower's account, marked `made_on` with the follower's name and `made_by` with its maker, and copied back at
+  once. Not one that uses a concept or a range on sample ids (instance_bound): each instance has its own concepts
+  and numbers its own samples, so it stays on the mirror, shared there;
 - deleting a copied view deletes it on the primary, which allows it only for views the follower made;
 - private views, and views shared with some users only, stay on the mirror.
 
@@ -201,7 +235,7 @@ both. Every other edit of a mirror (bulk set, rename, clear or delete) is refuse
 - The primary stops sharing a dataset: its mirror stops.
 - The primary was restored into a new database (410), or a mirror's cursor is too old (409): that mirror stops,
   and a new copy starts if the dataset is still shared.
-- Removing the primary here (Stop following) stops all its mirrors.
+- Removing the primary here (Stop following) stops all its mirrors, and tells the primary (below).
 
 A mirror whose sync fails, a vector field clash say, doesn't hold up the other mirrors of its primary: its error
 shows on the Primaries page, and it's tried again after a minute, waiting twice as long after each failure in a
@@ -224,6 +258,26 @@ doesn't record its primary database, so it's never resumed either.
 On the Primaries page, the stopped copy a new copy would resume into says so: only the latest one of its primary
 database, and none while a copy of that database still follows the dataset. **Keep as a separate copy** freezes
 it: a new copy of its dataset then makes a new dataset (`POST /api/primaries/mirrors/{id}/keep-separate`).
+
+**Stopping tells the primary.** Stop following stops the mirrors here first, then calls the primary
+(`POST /api/follower/leave`, waiting up to 5 seconds), so it stops keeping its change log for this instance:
+
+- its subscriptions move aside with their options, so a dataset nobody else follows stops logging, and each
+  dataset's log is pruned without this instance;
+- the patch scales it reported go, and relayed searches waiting for it are cancelled (a second follower holding
+  the scale takes them);
+- its token keeps working.
+
+If the primary can't be told (offline, or a release before this one), the follower stops anyway and the Primaries
+page says so: the primary's admin can remove the follower on its Followers page.
+
+**Coming back.** Adding the same primary again (with the same follower token) brings back what this instance
+followed when it stopped, with the same options (`POST /api/follower/return`), and each copy resumes into its
+stopped mirror. A dataset shared with it meanwhile comes too. A dataset deleted meanwhile, being deleted, or one the
+primary's admin chose not to bring back, doesn't. Adding the primary does this. So does a sync of a primary this
+instance still has, when the primary says it stopped following: a Stop following from a link removed since that
+reached the primary late, after the primary was added again. A sync still running here when it stopped doesn't
+bring anything back, because Stop following removes the link before it tells the primary.
 
 ## Endpoints
 

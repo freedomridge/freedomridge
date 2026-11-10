@@ -163,9 +163,9 @@ export default function ViewManager({
                     {mirror && mirror.concept_views.length > 0 && (
                         <p data-testid="concept-views-note" className="text-xs text-zinc-400 bg-zinc-800/50 rounded border border-zinc-800 p-2">
                             {mirror.concept_views.length === 1 ? '1 shared view' : `${mirror.concept_views.length} shared views`} on{' '}
-                            {primaryHost(mirror)} ({mirror.concept_views.join(', ')}) use a concept, so{' '}
-                            {mirror.concept_views.length === 1 ? 'it stays' : 'they stay'} there: concepts belong to each
-                            instance, and this one doesn&apos;t have the primary&apos;s.
+                            {primaryHost(mirror)} ({mirror.concept_views.join(', ')}) use a concept or a range of sample
+                            ids, so {mirror.concept_views.length === 1 ? 'it stays' : 'they stay'} there: each instance
+                            has its own concepts and numbers its own samples.
                         </p>
                     )}
 
@@ -271,8 +271,8 @@ export default function ViewManager({
                                             )}
                                             {view.content.made_on && (
                                                 <span data-testid="view-made-on" className="text-[10px] text-zinc-400 truncate"
-                                                    title={`Made on the follower instance ${view.content.made_on}. Saved searches keep their results, so it shows the same samples here.`}>
-                                                    made on {view.content.made_on}
+                                                    title={`Made on the follower instance ${view.content.made_on}${view.content.made_by ? ` by ${view.content.made_by}` : ''}. Saved searches keep their results, so it shows the same samples here.`}>
+                                                    made on {view.content.made_on}{view.content.made_by ? ` by ${view.content.made_by}` : ''}
                                                 </span>
                                             )}
                                             {!isMine && !view.from_primary && (
