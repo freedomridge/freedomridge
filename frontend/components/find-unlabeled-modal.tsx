@@ -5,6 +5,7 @@ import { useState } from 'react';
 
 interface Props {
     availablePatchScales: string[];  // e.g. ["4x4", "8x8"]
+    patchScaleLabels?: Record<string, string>;  // how each scale reads, e.g. "8x8 · on desktop" for a follower's
     onSearch: (patchScale: string | undefined, limit: number) => void;
     onClose: () => void;
 }
@@ -12,7 +13,7 @@ interface Props {
 // Dialog for "Find Unlabeled": from a selected object, surface similar UNlabeled patch
 // regions across the dataset. Lets the user pick the patch size (one scale, or all) and how
 // many look-alikes to surface, then runs the object->patch cross-search.
-export function FindUnlabeledModal({ availablePatchScales, onSearch, onClose }: Props) {
+export function FindUnlabeledModal({ availablePatchScales, patchScaleLabels, onSearch, onClose }: Props) {
     // '' = all scales (recall across sizes); a specific scale narrows to that tile size.
     const [patchScale, setPatchScale] = useState<string>('');
     const [limit, setLimit] = useState(60);
@@ -49,7 +50,7 @@ export function FindUnlabeledModal({ availablePatchScales, onSearch, onClose }: 
                             >
                                 <option value="">All sizes (best recall)</option>
                                 {availablePatchScales.map(s => (
-                                    <option key={s} value={s}>{s}</option>
+                                    <option key={s} value={s}>{patchScaleLabels?.[s] ?? s}</option>
                                 ))}
                             </select>
                             <p className="text-xs text-zinc-500 mt-1">

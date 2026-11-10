@@ -155,8 +155,9 @@ the scale, the vectors' size and whether every tile has its index. It reports wi
 replaces the last one. The primary keeps them while the dataset stays followed and shows them on Settings →
 Followers ("Holds clip 8×8"). Patch scales that came from the primary aren't reported.
 
-**Patch searches on the primary then run on the follower.** On the primary, the sample viewer offers a follower's
-scales next to its own. A patch search (or a search for unlabelled look-alikes of an object) on a scale only a
+**Patch searches on the primary then run on the follower.** On the primary, the sample viewer, the grid and Find
+unlabeled offer a follower's scales next to its own, named for it ("8x8 · on desktop", with "(offline)" when no
+follower holding it has checked in within the last minute), and a search's filter chip says where it ran. A patch search (or a search for unlabelled look-alikes of an object) on a scale only a
 follower holds goes to that follower; the primary never connects to it:
 
 1. The primary queues the search (`follower_searches`) for the follower that reported the scale first, or for

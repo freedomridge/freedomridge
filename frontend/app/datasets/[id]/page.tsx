@@ -1034,6 +1034,7 @@ function DatasetPageContent() {
                         selectedPatches={g.grain === 'object' ? undefined : patchState.selectedPatches}
                         onPatchSelect={g.grain === 'object' ? undefined : patchState.handlePatchGridSelect}
                         availablePatchScales={g.grain === 'object' ? [] : patchState.availablePatchScales}
+                        patchScaleLabels={patchState.patchScaleLabels}
                         gridPatchMode={g.grain === 'object' ? null : patchState.gridPatchMode}
                         onGridPatchModeChange={patchState.setGridPatchMode}
                         onClearPatches={patchState.clearSelectedPatches}
@@ -1542,6 +1543,7 @@ function DatasetPageContent() {
                                 />
                             ) : undefined}
                             availablePatchScales={patchState.availablePatchScales}
+                            patchScaleLabels={patchState.patchScaleLabels}
                             onPatchSearch={patchState.handlePatchSearch}
                             patchScale={patchState.gridPatchMode}
                             onPatchScaleChange={patchState.setGridPatchMode}
@@ -1595,6 +1597,7 @@ function DatasetPageContent() {
                 findUnlabeled && (
                     <FindUnlabeledModal
                         availablePatchScales={patchState.availablePatchScales}
+                        patchScaleLabels={patchState.patchScaleLabels}
                         onSearch={(patchScale, limit) =>
                             handleFindUnlabeled(findUnlabeled.objectId, findUnlabeled.panelId, patchScale, limit)}
                         onClose={() => setFindUnlabeled(null)}

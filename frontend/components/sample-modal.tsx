@@ -21,6 +21,7 @@ interface Props {
     onMediaFieldChange?: (field: string) => void;
     onClose: () => void;
     availablePatchScales?: string[];
+    patchScaleLabels?: Record<string, string>;  // how each scale reads, e.g. "8x8 · on desktop" for a follower's
     patchFieldName?: string;
     onPatchSearch?: (sampleId: number, fieldName: string, scale: string, row: number, col: number, limit: number) => void;
     patchScale?: string | null;
@@ -47,7 +48,7 @@ interface Props {
     highlightBox?: [number, number, number, number] | null;
 }
 
-export function SampleModal({ sample, activeMediaField = 'filepath', availableMediaFields = ['filepath'], activeOverlayFields: initialOverlayFields = [], overlayConfigs, segmentationConfig, onMediaFieldChange, onClose, availablePatchScales = [], patchFieldName = 'clip', onPatchSearch, patchScale: externalPatchScale, onPatchScaleChange, onNext, onPrevious, hasNext = false, hasPrevious = false, isSelected = false, onToggleSelection, onFindSimilar, onTag, overlay, onCloseOverlay, highlightBox, highlightCuboidId, highlightCuboidField, onSaveClassRule }: Props) {
+export function SampleModal({ sample, activeMediaField = 'filepath', availableMediaFields = ['filepath'], activeOverlayFields: initialOverlayFields = [], overlayConfigs, segmentationConfig, onMediaFieldChange, onClose, availablePatchScales = [], patchScaleLabels, patchFieldName = 'clip', onPatchSearch, patchScale: externalPatchScale, onPatchScaleChange, onNext, onPrevious, hasNext = false, hasPrevious = false, isSelected = false, onToggleSelection, onFindSimilar, onTag, overlay, onCloseOverlay, highlightBox, highlightCuboidId, highlightCuboidField, onSaveClassRule }: Props) {
     // How each class-probability field is shown while the modal is open: edited rules redraw at once, write nothing,
     // and stay while stepping through samples.
     const [probabilityViews, setProbabilityViews] = useState<Record<string, ProbabilityView>>({});
@@ -439,7 +440,7 @@ export function SampleModal({ sample, activeMediaField = 'filepath', availableMe
                                     >
                                         <option value="">Off</option>
                                         {availablePatchScales.map(s => (
-                                            <option key={s} value={s}>{s}</option>
+                                            <option key={s} value={s}>{patchScaleLabels?.[s] ?? s}</option>
                                         ))}
                                     </select>
                                     {selectedPatch && onPatchSearch && (

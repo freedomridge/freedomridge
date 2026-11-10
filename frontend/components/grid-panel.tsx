@@ -67,6 +67,7 @@ interface GridPanelProps {
     selectedPatches?: Map<number, Array<{ row: number; col: number; scale: string }>>;
     onPatchSelect?: (sampleId: number, row: number, col: number, scale: string) => void;
     availablePatchScales?: string[];
+    patchScaleLabels?: Record<string, string>;  // how each scale reads, e.g. "8x8 · on desktop" for a follower's
     gridPatchMode?: string | null;
     onGridPatchModeChange?: (mode: string | null) => void;
     onClearPatches?: () => void;
@@ -113,6 +114,7 @@ export function GridPanel({
     selectedPatches,
     onPatchSelect,
     availablePatchScales = [],
+    patchScaleLabels,
     gridPatchMode,
     onGridPatchModeChange,
     onClearPatches,
@@ -443,7 +445,7 @@ export function GridPanel({
                             >
                                 <option value="">Off</option>
                                 {availablePatchScales.map(s => (
-                                    <option key={s} value={s}>{s}</option>
+                                    <option key={s} value={s}>{patchScaleLabels?.[s] ?? s}</option>
                                 ))}
                             </select>
                         </div>
