@@ -23,6 +23,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field, TypeAdapter, ValidationError, field_validator
 
 from backend.field_registry import (
+    LOCAL_PREFIX,
     REQUEST_FULL_REFRESH,
     cached_distinct_values,
     field_stats,
@@ -43,6 +44,7 @@ from backend.label_fields import (
     label_context,
     label_path,
 )
+from backend.local_fields import LOCAL_TAGS, local_field
 from backend.sample_ingest import insert_samples
 
 from .. import class_rules, dataset_deletion, field_usage, job_queue, job_wait, statistics
@@ -98,6 +100,24 @@ _SAFE_FIELD_NAME_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_.]{0,127}$')
 def _is_safe_field_name(name) -> bool:
     """True if `name` is safe to interpolate into SQL as a field / JSON key."""
     return isinstance(name, str) and _SAFE_FIELD_NAME_RE.match(name) is not None
+
+
+def _queryable_field(name) -> bool:
+    """A field name a query can use: a safe metadata name or column, or a mirror's own `@local.` field."""
+    try:
+        return _is_safe_field_name(name) or local_field(name) is not None
+    except ValueError:
+        return False
+
+
+def _field_text_sql(name: str) -> str:
+    """A scalar field's value as text: metadata->>'x', or local_metadata->>'x' for a mirror's own field (0022).
+    Raises HTTP 400 for a name no query can use."""
+    try:
+        local = local_field(name)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from None
+    return local.text if local is not None else f"metadata->>'{_validate_field_name(name)}'"
 
 
 def _validate_field_name(name) -> str:
@@ -2157,11 +2177,12 @@ async def _get_dataset_field_stats_impl(
         return (field_name, 'enum', state, result, stat)
 
     async def filter_datetime_field(field_name, stat):
-        if not _is_safe_field_name(field_name):
+        if not _queryable_field(field_name):
             return (field_name, 'datetime', 'cached', None, stat)
+        text = _field_text_sql(field_name)
         args = [id]
         arg_idx = 2
-        conditions = ["dataset_id = $1", f"metadata->>'{field_name}' IS NOT NULL"]
+        conditions = ["dataset_id = $1", f"{text} IS NOT NULL"]
         if filter_obj:
             sql, arg_idx = parse_filter_node(
                 filter_obj,
@@ -2178,7 +2199,7 @@ async def _get_dataset_field_stats_impl(
             state, row = await _facet_query(
                 db.fetchrow(
                     f"""
-                SELECT MIN(metadata->>'{field_name}') as min_val, MAX(metadata->>'{field_name}') as max_val
+                SELECT MIN({text}) as min_val, MAX({text}) as max_val
                 FROM samples WHERE {where}
             """,
                     *args,
@@ -2225,7 +2246,7 @@ async def _get_dataset_field_stats_impl(
         """A facet request's metadata field. A promoted MIN/MAX is recomputed whatever the breadth, so
         it never waits for the probe; the rest decide with the request's one probe."""
         name = stat['field_name']
-        if not _is_safe_field_name(name):
+        if not _queryable_field(name):
             # A name no query can use: its dataset values, for good (labelled `filterable: false`).
             await fill_cached(field_schema, stat, kind)
             return
@@ -2310,7 +2331,7 @@ async def _get_dataset_field_stats_impl(
             "values_complete": stat.get("values_complete", False),
         }
 
-        if not _is_safe_field_name(stat['field_name']):
+        if not _queryable_field(stat['field_name']):
             field_schema['filterable'] = False  # no query can name it: never pending, never asked for
 
         # null_count: samples with no value for this field — drives the "(no value)"
@@ -2345,7 +2366,7 @@ async def _get_dataset_field_stats_impl(
                 else (False, False)
             )
             should_filter = should_filter_distinct if kind == 'enum' else should_filter_minmax
-            if should_filter and not _is_safe_field_name(stat['field_name']):
+            if should_filter and not _queryable_field(stat['field_name']):
                 # A name the queries cannot use keeps its cached values; it never fails the request
                 # (on a small dataset the whole sidebar answered 400).
                 should_filter = False
@@ -2456,7 +2477,7 @@ async def compute_filtered_minmax(
     Compute min/max for a specific field given filter constraints.
     Uses the B-Tree index on the promoted field for performance.
     """
-    _validate_field_name(field_name)
+    text = _field_text_sql(field_name)  # metadata->>'x', or a mirror's own local_metadata->>'x'
     # Build filter SQL
     args = [dataset_id]
     arg_idx = 2
@@ -2474,11 +2495,11 @@ async def compute_filtered_minmax(
     # The index on (metadata->>'field_name')::float makes this fast
     query = f"""
         SELECT
-            MIN((metadata->>'{field_name}')::float) as min_val,
-            MAX((metadata->>'{field_name}')::float) as max_val
+            MIN(({text})::float) as min_val,
+            MAX(({text})::float) as max_val
         FROM samples
         WHERE dataset_id = $1 AND {filter_sql}
-          AND metadata->>'{field_name}' IS NOT NULL
+          AND {text} IS NOT NULL
     """
     result = await db.fetchrow(query, *args)
     bounds = (result['min_val'], result['max_val']) if result and result['min_val'] is not None else ()
@@ -2487,8 +2508,8 @@ async def compute_filtered_minmax(
         # sorts NaN above Infinity): JSON has no such numbers, so the bounds are the finite values'.
         # Only then: the guards read the field from every row twice more.
         query += f"""
-          AND (metadata->>'{field_name}')::float > '-Infinity'::float
-          AND (metadata->>'{field_name}')::float < 'Infinity'::float
+          AND ({text})::float > '-Infinity'::float
+          AND ({text})::float < 'Infinity'::float
         """
         result = await db.fetchrow(query, *args)
 
@@ -2502,7 +2523,7 @@ async def compute_filtered_values(dataset_id: int, field_name: str, filters: Dic
     Compute unique values for a specific field given filter constraints.
     Uses the B-Tree index on the promoted field for performance.
     """
-    _validate_field_name(field_name)
+    text = _field_text_sql(field_name)  # metadata->>'x', or a mirror's own local_metadata->>'x'
     # Build filter SQL
     args = [dataset_id]
     arg_idx = 2
@@ -2519,10 +2540,10 @@ async def compute_filtered_values(dataset_id: int, field_name: str, filters: Dic
     # Query for distinct values with filters
     # The index on metadata->>'field_name' makes this fast
     query = f"""
-        SELECT DISTINCT metadata->>'{field_name}' as value
+        SELECT DISTINCT {text} as value
         FROM samples
         WHERE dataset_id = $1 AND {filter_sql}
-          AND metadata->>'{field_name}' IS NOT NULL
+          AND {text} IS NOT NULL
         ORDER BY value LIMIT 101
     """
 
@@ -2960,7 +2981,13 @@ async def autocomplete_field(id: int, field_name: str, q: str = "", limit: int =
 
 
 async def _autocomplete_impl(id: int, field_name: str, q: str, limit: int, filter_obj=None):
-    if not (_is_safe_field_name(field_name) or field_name.replace('_', '').replace('-', '').isalnum()):
+    try:
+        local = local_field(field_name)  # a mirror's own field: local_metadata, or the local_tags array
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from None
+    if local is None and not (
+        _is_safe_field_name(field_name) or field_name.replace('_', '').replace('-', '').isalnum()
+    ):
         raise HTTPException(status_code=400, detail="Invalid field name")
 
     # Build base WHERE clause
@@ -2997,7 +3024,8 @@ async def _autocomplete_impl(id: int, field_name: str, q: str, limit: int, filte
     # preview, never a cap.
     array_cols = await get_dataset_array_columns(id)
     scalar_meta = False
-    path = label_path(field_name, array_cols)
+    path = None if local is not None else label_path(field_name, array_cols)
+    scalar_text = local.text if local is not None else f"metadata->>'{field_name}'"
     if path and path[1] == 'label':
         arr = _validate_field_name(path[0])
         val_source = (
@@ -3009,14 +3037,13 @@ async def _autocomplete_impl(id: int, field_name: str, q: str, limit: int, filte
             f"SELECT jsonb_array_elements_text(metadata->'segmentation'->'labels') AS val "
             f"FROM samples WHERE {where} AND jsonb_typeof(metadata->'segmentation'->'labels') = 'array'"
         )
-    elif field_name in array_cols:
+    elif local is not None and local.array:
+        val_source = f"SELECT unnest({local.column}) AS val FROM samples WHERE {where}"
+    elif local is None and field_name in array_cols:
         val_source = f"SELECT unnest({field_name}) AS val FROM samples WHERE {where}"
     else:
         scalar_meta = True
-        val_source = (
-            f"SELECT metadata->>'{field_name}' AS val "
-            f"FROM samples WHERE {where} AND metadata->>'{field_name}' IS NOT NULL"
-        )
+        val_source = f"SELECT {scalar_text} AS val FROM samples WHERE {where} AND {scalar_text} IS NOT NULL"
 
     # Indexed exact-match probe, promoted scalar fields only. A pasted full identifier on a
     # high-cardinality field (every value unique) is never in the cached preview, and the
@@ -3033,7 +3060,7 @@ async def _autocomplete_impl(id: int, field_name: str, q: str, limit: int, filte
         if promoted:
             cnt = await _safe_filter_query(
                 db.fetchval(
-                    f"SELECT COUNT(*) FROM samples WHERE {where} AND metadata->>'{field_name}' = ${arg_idx}",
+                    f"SELECT COUNT(*) FROM samples WHERE {where} AND {scalar_text} = ${arg_idx}",
                     *args,
                     q,
                 ),
@@ -3600,21 +3627,22 @@ def _text_value(val) -> str:
     return str(val)
 
 
-def _numeric_metadata_sql(field: str) -> str:
+def _numeric_metadata_sql(field: str, source: str = 'metadata') -> str:
     """SQL for a metadata field's numeric value, NULL for non-numeric/missing rows.
 
     Guards the ::float cast so a text/mixed field doesn't 500 the whole query on a
     non-numeric row. Accepts both JSON numbers and numeric strings — some
     fields store numbers as strings (e.g. "0", "103000002"). `field` must already
     be validated. Used for UNpromoted fields; promoted numeric fields use the bare
-    cast so the query matches their float index (see parse_filter_node).
+    cast so the query matches their float index (see parse_filter_node). `source` is the JSON column: a mirror's own
+    fields are in local_metadata.
     """
     return (
-        f"CASE WHEN jsonb_typeof(metadata->'{field}') = 'number' "
-        f"THEN (metadata->>'{field}')::float "
-        f"WHEN jsonb_typeof(metadata->'{field}') = 'string' "
-        f"AND metadata->>'{field}' ~ '^-?[0-9]+(\\.[0-9]+)?([eE][-+]?[0-9]+)?$' "
-        f"THEN (metadata->>'{field}')::float END"
+        f"CASE WHEN jsonb_typeof({source}->'{field}') = 'number' "
+        f"THEN ({source}->>'{field}')::float "
+        f"WHEN jsonb_typeof({source}->'{field}') = 'string' "
+        f"AND {source}->>'{field}' ~ '^-?[0-9]+(\\.[0-9]+)?([eE][-+]?[0-9]+)?$' "
+        f"THEN ({source}->>'{field}')::float END"
     )
 
 
@@ -3707,7 +3735,7 @@ def _escape_like(val) -> str:
     return str(val).replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
-def _numeric_sort_order_by(field: str, promoted: bool, direction: str) -> str:
+def _numeric_sort_order_by(field: str, promoted: bool, direction: str, source: str = 'metadata') -> str:
     """ORDER BY clause for sorting the grid by a numeric metadata field.
 
     A promoted numeric field uses the bare `(metadata->>'f')::float` cast (matching
@@ -3723,8 +3751,8 @@ def _numeric_sort_order_by(field: str, promoted: bool, direction: str) -> str:
     """
     if promoted:
         nulls = "NULLS LAST" if direction == "ASC" else "NULLS FIRST"
-        return f"ORDER BY (metadata->>'{field}')::float {direction} {nulls}"
-    return f"ORDER BY {_numeric_metadata_sql(field)} {direction} NULLS LAST"
+        return f"ORDER BY ({source}->>'{field}')::float {direction} {nulls}"
+    return f"ORDER BY {_numeric_metadata_sql(field, source)} {direction} NULLS LAST"
 
 
 _NATIVE_SORT_COLUMNS = ('id', 'created_at', 'last_modified_at', 'filepath')
@@ -3752,11 +3780,15 @@ def _grid_order_by(sort_by: str, direction: str, field_type_row) -> str:
     if not field_type_row:
         return "ORDER BY id"  # not a known field: fall back to the default order
     field_type = field_type_row['field_type']
+    local = local_field(sort_by)  # a mirror's own field: its key in local_metadata
+    source, key = ('local_metadata', local.name) if local is not None else ('metadata', sort_by)
+    if local is not None and local.array:
+        return "ORDER BY id"  # `@local.tags` is an array, as unsortable as tags
     if field_type in ('number', 'float', 'int', 'integer'):
         # Cast to float for numeric sorting; promoted fields ride their index.
-        return _numeric_sort_order_by(sort_by, bool(field_type_row['is_promoted']), direction) + ", id"
+        return _numeric_sort_order_by(key, bool(field_type_row['is_promoted']), direction, source) + ", id"
     if field_type in ('string', 'enum', 'datetime'):
-        return f"ORDER BY metadata->>'{sort_by}' {direction} NULLS LAST, id"
+        return f"ORDER BY {source}->>'{key}' {direction} NULLS LAST, id"
     return "ORDER BY id"  # unsupported type (array, object, ...): fall back to the default order
 
 
@@ -3803,6 +3835,11 @@ _CROSSGRAIN_NATIVE_FIELDS = {'id', 'filepath', 'created_at', 'last_modified_at',
 _STRICT_NEG_OPS = {'!=', '<>', 'not in', 'not_in', 'nin'}
 
 
+def _top_field(field: str) -> str:
+    """The field a filter leaf's presence depends on: a dotted metadata path's top key, or a whole `@local.` name."""
+    return field if field.startswith(LOCAL_PREFIX) else field.split('.', 1)[0]
+
+
 def _collect_top_meta_fields(node: Dict[str, Any], array_columns: Optional[set] = None) -> set:
     """Distinct top-level METADATA field names `node` references (excluding native columns and
     virtual ops). Used to attach a field-presence check to a NOT group."""
@@ -3820,8 +3857,13 @@ def _collect_top_meta_fields(node: Dict[str, Any], array_columns: Optional[set] 
             return
         f = n.get('field')
         if isinstance(f, str):
-            top = f.split('.', 1)[0]
-            if top not in _CROSSGRAIN_NATIVE_FIELDS and top not in arrays and _is_safe_field_name(top):
+            top = _top_field(f)
+            if (
+                top not in _CROSSGRAIN_NATIVE_FIELDS
+                and top not in arrays
+                and top != LOCAL_TAGS
+                and _queryable_field(top)
+            ):
                 fields.add(top)
 
     walk(node)
@@ -3874,10 +3916,10 @@ def _strictify_negations(node: Any, partner: bool = False, array_columns: Option
     op = str(node.get('operator', '=')).lower()
     f = node.get('field')
     if op in _STRICT_NEG_OPS and isinstance(f, str):
-        top = f.split('.', 1)[0]
-        if top in _CROSSGRAIN_NATIVE_FIELDS or top in arrays:
+        top = _top_field(f)
+        if top in _CROSSGRAIN_NATIVE_FIELDS or top in arrays or top == LOCAL_TAGS:
             return None if partner else node
-        if _is_safe_field_name(top):
+        if _queryable_field(top):
             return {'logic': 'AND', 'filters': [node, {'field': top, 'operator': 'exists'}]}
     # Absence ops (is_null / not_exists) are NULL-tolerant the same way: rendered against the
     # cross-grain PARTNER — the other grain, which lacks the field — they are vacuously TRUE and
@@ -3889,7 +3931,7 @@ def _strictify_negations(node: Any, partner: bool = False, array_columns: Option
     # symmetric self case — an image-only field's absence on the OBJECT grid still matching every
     # object — is a known limitation that needs per-grain field-presence to resolve.
     if partner and op in ('is_null', 'not_exists') and isinstance(f, str):
-        top = f.split('.', 1)[0]
+        top = _top_field(f)
         if top not in _CROSSGRAIN_NATIVE_FIELDS:
             return None
     # concept_exclude is a NULL-tolerant negation too (NOT EXISTS a passing score row): on a row
@@ -4256,7 +4298,16 @@ def _compile_filter_node(
         # `field` is the only user-controlled token interpolated into SQL below
         # (as a column name or JSON key); every value is parameterized. Validate
         # it up front so no branch can build SQL from an injectable name.
-        _validate_field_name(field)
+        # A mirror's own field (`@local.<name>`, 0022) is stored in local_metadata, or local_tags for
+        # `@local.tags`, never in metadata; local_field checks the name after the prefix.
+        try:
+            local = local_field(field)
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from None
+        if local is None:
+            _validate_field_name(field)
+        # The JSON column and key a metadata-like field is read from.
+        json_source, json_key = ('local_metadata', local.name) if local is not None else ('metadata', field)
 
         # Derived fields: an embedding or hash (rows in their own tables, not metadata keys) or the
         # location, named `embeddings.<field>` / `hashes.<field>` / `location`. They answer presence
@@ -4301,13 +4352,15 @@ def _compile_filter_node(
             # (JSON null/scalar), which would 500 the whole query for one bad row.
             return (
                 f"EXISTS (SELECT 1 FROM jsonb_array_elements("
-                f"CASE WHEN jsonb_typeof(metadata->'{field}') = 'array' "
-                f"THEN metadata->'{field}' ELSE '[]'::jsonb END) AS elem WHERE {inner})",
+                f"CASE WHEN jsonb_typeof({json_source}->'{json_key}') = 'array' "
+                f"THEN {json_source}->'{json_key}' ELSE '[]'::jsonb END) AS elem WHERE {inner})",
                 arg_idx,
             )
 
+        if local is not None:
+            col = local.text
         # Handle mapped fields first
-        if field_mapping and field in field_mapping:
+        elif field_mapping and field in field_mapping:
             col = field_mapping[field]
         # Handle special fields
         elif field == 'media_type':
@@ -4393,10 +4446,13 @@ def _compile_filter_node(
 
         # Generate SQL based on operator
         array_cols = array_columns if array_columns is not None else _get_array_columns_sync()
+        # A native array, and its column: `@local.tags` is local_tags.
+        is_array = local.array if local is not None else field in array_cols
+        arr = local.column if local is not None else field
         # A metadata field's numeric value, for the number comparisons below: a promoted numeric
         # field's bare ::float cast matches its index; any other field guards the cast.
         promoted_numeric = bool(numeric_indexed_fields and field in numeric_indexed_fields)
-        numeric_col = f"({col})::float" if promoted_numeric else _numeric_metadata_sql(field)
+        numeric_col = f"({col})::float" if promoted_numeric else _numeric_metadata_sql(json_key, json_source)
         # Whether `=`/`in` take a numeric string as a number (_equality_number): on a promoted numeric field. The
         # dataset's array context knows those fields too, so a caller that passes no numeric_indexed_fields (hash
         # duplicates, sampling, bulk jobs, mirror tag forwarding, version queries) matches what the grid matches;
@@ -4406,7 +4462,7 @@ def _compile_filter_node(
         # A date / datetime given to day, minute or second precision means that whole unit
         #: `=` is the unit, `!=` its complement, `<=` ends where the next unit
         # starts and `>` starts there. (`>=` and `<` are already right at the unit's start.)
-        if op in ('=', '!=', '<=', '>') and field not in array_cols and field not in ('id', 'media_type', 'filepath'):
+        if op in ('=', '!=', '<=', '>') and not is_array and field not in ('id', 'media_type', 'filepath'):
             window = _iso_unit_window(val)
             if window is not None:
                 lo, hi = window
@@ -4441,9 +4497,9 @@ def _compile_filter_node(
             val = [_to_ts(v) for v in val] if isinstance(val, list) else _to_ts(val)
 
         if op == '=':
-            if field in array_cols:
+            if is_array:
                 args.append(val)
-                return f"${arg_idx} = ANY({field})", arg_idx + 1
+                return f"${arg_idx} = ANY({arr})", arg_idx + 1
             elif field in ['media_type', 'filepath', 'id', 'created_at']:
                 # id (int) and created_at (datetime, coerced above) bind natively; only
                 # the text columns are stringified. Use the RESOLVED col (e.g. s.id) — a bare
@@ -4464,10 +4520,10 @@ def _compile_filter_node(
                 return f"{col} = ${arg_idx}", arg_idx + 1
 
         elif op == '!=':
-            if field in array_cols:
+            if is_array:
                 args.append(val)
                 # Include rows with no/empty array value in the complement.
-                return f"(NOT (${arg_idx} = ANY({field})) OR {field} IS NULL)", arg_idx + 1
+                return f"(NOT (${arg_idx} = ANY({arr})) OR {arr} IS NULL)", arg_idx + 1
             elif field in ['id', 'created_at']:
                 # Native typed columns — bind as-is (int / coerced datetime). _text_value
                 # would stringify and break `integer/timestamp IS DISTINCT FROM text`.
@@ -4493,7 +4549,7 @@ def _compile_filter_node(
             # unfinished filter never 500s the whole query.
             if val is None or (isinstance(val, str) and val.strip() == ''):
                 return "TRUE", arg_idx
-            if field not in ['id', 'created_at', 'media_type', 'filepath'] and field not in array_cols:
+            if field not in ['id', 'created_at', 'media_type', 'filepath'] and not is_array:
                 # Use the NUMERIC (::float) path only when the value is actually a number.
                 # Anything else — an ISO date ('2025-01-01') or datetime ('2025-01-01T00:00'),
                 # or arbitrary text — compares as TEXT: correct for datetime (ISO-8601 sorts
@@ -4519,7 +4575,7 @@ def _compile_filter_node(
                     else:
                         # Unpromoted/mixed field: guard the cast so a non-numeric row doesn't
                         # 500 the whole query.
-                        col = _numeric_metadata_sql(field)
+                        col = _numeric_metadata_sql(json_key, json_source)
                     if isinstance(val, str):
                         # float() above only CHOSE the numeric path; bind the number itself.
                         # A str bound to a ::float parameter is the asyncpg DataError ("must
@@ -4532,9 +4588,9 @@ def _compile_filter_node(
             return f"{col} {op} ${arg_idx}", arg_idx + 1
 
         elif op == 'contains':
-            if field in array_cols:
+            if is_array:
                 args.append(val)
-                return f"${arg_idx} = ANY({field})", arg_idx + 1
+                return f"${arg_idx} = ANY({arr})", arg_idx + 1
             else:
                 args.append(f"%{_escape_like(val)}%")
                 return f"{col} ILIKE ${arg_idx} ESCAPE '\\'", arg_idx + 1
@@ -4543,9 +4599,9 @@ def _compile_filter_node(
             if not isinstance(val, list):
                 val = [val]
 
-            if field in array_cols:
+            if is_array:
                 args.append(val)
-                return f"{field} && ${arg_idx}::text[]", arg_idx + 1
+                return f"{arr} && ${arg_idx}::text[]", arg_idx + 1
             elif field in ['media_type', 'filepath', 'id', 'created_at']:
                 args.append(val)
                 return f"{col} = ANY(${arg_idx})", arg_idx + 1
@@ -4565,10 +4621,10 @@ def _compile_filter_node(
         elif op == 'not in':
             if not isinstance(val, list):
                 val = [val]
-            if field in array_cols:
+            if is_array:
                 args.append(val)
                 # Include rows with no/empty array value in the complement.
-                return f"(NOT ({field} && ${arg_idx}::text[]) OR {field} IS NULL)", arg_idx + 1
+                return f"(NOT ({arr} && ${arg_idx}::text[]) OR {arr} IS NULL)", arg_idx + 1
             elif field in ['media_type', 'filepath', 'id', 'created_at']:
                 # Native columns — compare WITHOUT the ::text[] cast, mirroring `in`
                 # above. id is integer / created_at is timestamp; a text[] cast here
@@ -4587,26 +4643,26 @@ def _compile_filter_node(
             return f"({col} IS NULL OR NOT ({col} = ANY(${arg_idx}::text[])))", arg_idx + 1
 
         elif op == 'is_null':
-            if field in array_cols:
+            if is_array:
                 # Empty tags are stored as '{}', not NULL: `tags IS NULL` matched nothing, so the
                 # "(no value)" filter on an array field was always empty. Same as not_exists.
-                return f"array_length({field}, 1) IS NULL", arg_idx
+                return f"array_length({arr}, 1) IS NULL", arg_idx
             # `col` resolves to the native column (id/created_at/filepath/media_type),
             # an array column, or metadata->>'field' — checking the right thing instead
             # of always probing metadata (which made id/created_at is_null match every row).
             return f"{col} IS NULL", arg_idx
 
         elif op == 'is_not_null':
-            if field in array_cols:
-                return f"array_length({field}, 1) IS NOT NULL", arg_idx
+            if is_array:
+                return f"array_length({arr}, 1) IS NOT NULL", arg_idx
             return f"{col} IS NOT NULL", arg_idx
 
         elif op == 'exists':
-            if field in array_cols:
+            if is_array:
                 # Native TEXT[] column (tags, ...): "exists" = has >= 1 element. A row with
                 # tags=[] has the column but no tags; NULL/empty -> not exists. (metadata ? field
                 # was wrong here — tags isn't a metadata key, so `exists` matched zero rows.)
-                return f"({field} IS NOT NULL AND array_length({field}, 1) > 0)", arg_idx
+                return f"({arr} IS NOT NULL AND array_length({arr}, 1) > 0)", arg_idx
             if (field_mapping and field in field_mapping) or field in ('media_type', 'filepath', 'id', 'created_at'):
                 # Native scalar column: existence = the column is set.
                 return f"{col} IS NOT NULL", arg_idx
@@ -4614,17 +4670,17 @@ def _compile_filter_node(
             # regardless of value type. Unlike `is_not_null` (via metadata->>'field', which
             # coerces to text and returns NULL for dict/array values), this detects complex
             # values like heatmap overlays `{"type": "heatmap", ...}`.
-            args.append(field)
-            return f"(metadata ? ${arg_idx})", arg_idx + 1
+            args.append(json_key)
+            return f"({json_source} ? ${arg_idx})", arg_idx + 1
 
         elif op == 'not_exists':
-            if field in array_cols:
+            if is_array:
                 # Inverse of exists: no elements (NULL column or empty array).
-                return f"array_length({field}, 1) IS NULL", arg_idx
+                return f"array_length({arr}, 1) IS NULL", arg_idx
             if (field_mapping and field in field_mapping) or field in ('media_type', 'filepath', 'id', 'created_at'):
                 return f"{col} IS NULL", arg_idx
-            args.append(field)
-            return f"NOT (metadata ? ${arg_idx})", arg_idx + 1
+            args.append(json_key)
+            return f"NOT ({json_source} ? ${arg_idx})", arg_idx + 1
 
         elif op in ('geo_polygon', 'geo_polygon_exclude'):
             # val is list of [lon, lat] points
@@ -5320,9 +5376,9 @@ async def _list_samples_post(id: int, request: SamplesRequest):
     # Build ORDER BY clause
     order_by = "ORDER BY id"  # Default sort
     if request.sort_by:
-        # Sanitize field name
-        if not request.sort_by.replace("_", "").replace("-", "").isalnum():
-            raise HTTPException(status_code=400, detail="Invalid sort field name")
+        # Sanitize field name (a mirror's own `@local.` field is checked by local_field)
+        if not (_queryable_field(request.sort_by) or request.sort_by.replace("_", "").replace("-", "").isalnum()):
+            raise HTTPException(status_code=400, detail=f"Invalid sort field name: {request.sort_by!r}")
 
         # Determine sort direction
         direction = "DESC" if request.sort_order and request.sort_order.lower() == "desc" else "ASC"
@@ -5619,9 +5675,9 @@ async def _list_samples(
     order_by = "ORDER BY id"  # Default sort
     if sort_by:
         print(f"DEBUG: sort_by={sort_by}, sort_order={sort_order}")
-        # Sanitize field name
-        if not sort_by.replace("_", "").replace("-", "").isalnum():
-            raise HTTPException(status_code=400, detail="Invalid sort field name")
+        # Sanitize field name (a mirror's own `@local.` field is checked by local_field)
+        if not (_queryable_field(sort_by) or sort_by.replace("_", "").replace("-", "").isalnum()):
+            raise HTTPException(status_code=400, detail=f"Invalid sort field name: {sort_by!r}")
 
         # Determine sort direction
         direction = "DESC" if sort_order and sort_order.lower() == "desc" else "ASC"
@@ -5815,8 +5871,16 @@ async def _histogram(
     sample_ids: Optional[List[int]] = None,
 ):
     """The histogram of the filtered set, or only of the rows in `sample_ids` (the preview)."""
-    # `field` is interpolated into the value expression below; reject unsafe names.
-    _validate_field_name(field)
+    # `field` is interpolated into the value expression below; reject unsafe names. A mirror's own field
+    # (`@local.<name>`) is read from local_metadata (or the local_tags array), never metadata.
+    try:
+        local = local_field(field)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from None
+    if local is None:
+        _validate_field_name(field)
+    json_source, json_key = ('local_metadata', local.name) if local is not None else ('metadata', field)
+    meta_text, meta_json = f"{json_source}->>'{json_key}'", f"{json_source}->'{json_key}'"
 
     # Detect datetime metadata fields the way the rest of the app does — from the
     # field_type the stats refresh assigns in dataset_field_stats — so `datetime` /
@@ -5838,10 +5902,10 @@ async def _histogram(
         # sample through the metadata index decides, not a scan of the field.
         iso, present = await db.fetchrow(
             "SELECT count(*) FILTER (WHERE v ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}'), count(*) FROM ("
-            "  SELECT metadata->>$2 AS v FROM samples WHERE dataset_id = $1 AND metadata ? $2"
-            "  AND metadata->>$2 <> '' LIMIT 1000) sampled",
+            f"  SELECT {json_source}->>$2 AS v FROM samples WHERE dataset_id = $1 AND {json_source} ? $2"
+            f"  AND {json_source}->>$2 <> '' LIMIT 1000) sampled",
             id,
-            field,
+            json_key,
         )
         if present and iso * 2 >= present:
             declared_text = False
@@ -5867,7 +5931,10 @@ async def _histogram(
     if field == 'media_type':
         value_expr = "media_type"
         field_kind = "categorical"
-    elif field in await get_dataset_array_columns(id):
+    elif local is not None and local.array:
+        value_expr = f"unnest({local.column})"
+        field_kind = "categorical"
+    elif local is None and field in await get_dataset_array_columns(id):
         value_expr = f"unnest({field})"
         field_kind = "categorical"
     elif field == 'filepath':
@@ -5877,14 +5944,14 @@ async def _histogram(
         value_expr = "id"
         field_kind = "numeric"
     elif declared_text and field != 'created_at':
-        value_expr = f"metadata->>'{field}'"
+        value_expr = meta_text
         field_kind = "categorical"
     elif field == 'created_at' or field.endswith('_at') or field.endswith('_date') or field_is_datetime:
-        value_expr = "created_at" if field == 'created_at' else f"metadata->>'{field}'"
+        value_expr = "created_at" if field == 'created_at' else meta_text
         field_kind = "timestamp"
     else:
         # Default to metadata field (string)
-        value_expr = f"metadata->>'{field}'"
+        value_expr = meta_text
         field_kind = "numeric_or_categorical"
 
     # Timestamp-aware binning: convert to epoch seconds so width_bucket works
@@ -5898,8 +5965,8 @@ async def _histogram(
         # subquery). `_value` cannot collide with a samples column. Both passes stream, so no
         # extracted value is spooled to memory or temp files.
         source = f"samples {where_clause}"
-        text_expr, json_expr = value_expr, f"metadata->'{field}'"
-        if value_expr == f"metadata->>'{field}'":
+        text_expr, json_expr = value_expr, meta_json
+        if value_expr == meta_text:
             extract, text_expr = value_expr, "_value"
             if numbers_only and field_kind == "numeric_or_categorical":
                 # Keep the JSON value for the number-type guard.
@@ -6158,7 +6225,8 @@ async def _histogram_preview(
     top: int,
     as_number: bool,
 ) -> Dict[str, Any]:
-    _validate_field_name(field)
+    if not _queryable_field(field):  # a safe name, or a mirror's own `@local.` field (_histogram reads either)
+        _validate_field_name(field)
 
     def unavailable(status: str, **detail: Any) -> Dict[str, Any]:
         return {"field": field, "approximate": True, "preview": {"status": status, **detail}}

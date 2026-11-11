@@ -158,10 +158,21 @@ def uses_concept(node) -> bool:
     return False
 
 
+def uses_local_fields(node) -> bool:
+    """A filter on a mirror's own fields (`@local.<name>`), which only this instance has."""
+    if isinstance(node, dict):
+        field = node.get('field')
+        own = isinstance(field, str) and field.startswith(LOCAL_PREFIX)
+        return own or any(uses_local_fields(value) for value in node.values())
+    if isinstance(node, list):
+        return any(uses_local_fields(value) for value in node)
+    return False
+
+
 def instance_bound(node) -> bool:
-    """A view that stays on the instance that made it: it uses a concept (each instance has its own), or a range on
-    sample ids (each numbers its samples in its own order)."""
-    return uses_concept(node) or ranges_on_ids(node)
+    """A view that stays on the instance that made it: it uses a concept (each instance has its own), a range on
+    sample ids (each numbers its samples in its own order), or a mirror's own `@local.` field."""
+    return uses_concept(node) or ranges_on_ids(node) or uses_local_fields(node)
 
 
 def vector_payload(rows: list) -> bytes:

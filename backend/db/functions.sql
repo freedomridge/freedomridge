@@ -417,7 +417,10 @@ BEGIN
                 covered := (COALESCE(OLD.metadata,'{}'::jsonb)-recorded)
                         IS NOT DISTINCT FROM (COALESCE(NEW.metadata,'{}'::jsonb)-recorded)
                     AND (OLD.tags IS NOT DISTINCT FROM NEW.tags OR 'tags'=ANY(recorded))
-                    AND (OLD.media_type IS NOT DISTINCT FROM NEW.media_type OR 'media_type'=ANY(recorded));
+                    AND (OLD.media_type IS NOT DISTINCT FROM NEW.media_type OR 'media_type'=ANY(recorded))
+                    -- A mirror's own fields (0022): a change to them is recorded below, never assumed covered.
+                    AND OLD.local_metadata IS NOT DISTINCT FROM NEW.local_metadata
+                    AND OLD.local_tags IS NOT DISTINCT FROM NEW.local_tags;
             END IF;
             IF covered AND (TG_OP = 'INSERT' OR (OLD.dataset_id,OLD.id::bigint/4096)
                 IS NOT DISTINCT FROM (NEW.dataset_id,NEW.id::bigint/4096)) THEN
@@ -435,6 +438,12 @@ BEGIN
                         COALESCE(OLD.metadata,'{}'::jsonb) || COALESCE(NEW.metadata,'{}'::jsonb)) key
                     WHERE OLD.metadata->key IS DISTINCT FROM NEW.metadata->key);
             END IF;
+            IF OLD.local_metadata IS DISTINCT FROM NEW.local_metadata THEN
+                affected := affected || ARRAY(
+                    SELECT '@local.' || key FROM jsonb_object_keys(OLD.local_metadata || NEW.local_metadata) key
+                    WHERE OLD.local_metadata->key IS DISTINCT FROM NEW.local_metadata->key);
+            END IF;
+            IF OLD.local_tags IS DISTINCT FROM NEW.local_tags THEN affected := affected || ARRAY['@local.tags']; END IF;
             IF OLD.tags IS DISTINCT FROM NEW.tags THEN affected := affected || ARRAY['tags']; END IF;
             IF OLD.media_type IS DISTINCT FROM NEW.media_type THEN affected := affected || ARRAY['media_type']; END IF;
         END IF;

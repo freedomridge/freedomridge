@@ -14,7 +14,7 @@ from pydantic import BaseModel
 from ..access import require_dataset_access
 from ..database import db
 from ..diskspace import estimate_snapshot_bytes, require_free_space
-from ..field_registry import REQUEST_FULL_REFRESH, _value_names, lock_field_lifecycle
+from ..field_registry import LOCAL_PREFIX, REQUEST_FULL_REFRESH, _value_names, lock_field_lifecycle
 from ..label_fields import DISCOVERY_TYPES, LEGACY_LABEL_FIELDS, DatasetArrayColumns, label_context
 from ..request_limits import guest_heavy
 from ..validation import clean_name
@@ -760,6 +760,12 @@ def _reject_live_only_filters(node: Any) -> None:
         return
     operator = str(node.get('operator', '=')).lower()
     field = node['field']
+    if isinstance(field, str) and field.startswith(LOCAL_PREFIX):
+        # A version keeps no history of a mirror's own fields, by decision (docs/FOLLOWERS.md).
+        raise HTTPException(
+            status_code=400,
+            detail=f"Filter on {field!r}: a version keeps no history of this server's own (@local.) fields",
+        )
     derived = isinstance(field, str) and field != 'location' and _derived_field(field) is not None
     if operator in _LIVE_ONLY_FILTER_OPS or derived:
         raise HTTPException(

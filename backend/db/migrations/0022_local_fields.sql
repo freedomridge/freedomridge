@@ -114,3 +114,76 @@ $$ LANGUAGE plpgsql;
 CREATE TRIGGER samples_mirror_local_guard AFTER INSERT OR UPDATE OR DELETE ON samples
     FOR EACH ROW WHEN (NULLIF(current_setting('fridge.mirror_local', TRUE), '') IS NOT NULL)
     EXECUTE FUNCTION guard_mirror_local();
+
+-- Statistics for a mirror's own fields: a write to them records its `@local.` names as the block's affected fields.
+CREATE OR REPLACE FUNCTION mark_dataset_stats_stale()
+RETURNS TRIGGER AS $$
+DECLARE
+    affected TEXT[];
+    recorded TEXT[];
+    covered BOOLEAN;
+BEGIN
+    IF TG_OP = 'DELETE' AND current_setting('fridge.deletion_dataset', TRUE) = OLD.dataset_id::text THEN
+        RETURN NULL;
+    END IF;
+    IF TG_OP = 'TRUNCATE' THEN
+        INSERT INTO dataset_stats_pending(dataset_id, block_id)
+        SELECT id, -1 FROM datasets ON CONFLICT DO NOTHING;
+        RETURN NULL;
+    END IF;
+    IF TG_OP <> 'DELETE' THEN
+        SELECT field_names INTO recorded FROM dataset_stats_pending
+        WHERE dataset_id=NEW.dataset_id AND block_id=NEW.id::bigint/4096 AND transaction_id=txid_current();
+        IF FOUND THEN
+            IF recorded IS NULL THEN
+                covered := TRUE;
+            ELSIF TG_OP = 'INSERT' THEN
+                covered := COALESCE(NEW.metadata,'{}'::jsonb)-recorded = '{}'::jsonb
+                    AND ARRAY['tags','media_type'] <@ recorded;
+            ELSE
+                covered := (COALESCE(OLD.metadata,'{}'::jsonb)-recorded)
+                        IS NOT DISTINCT FROM (COALESCE(NEW.metadata,'{}'::jsonb)-recorded)
+                    AND (OLD.tags IS NOT DISTINCT FROM NEW.tags OR 'tags'=ANY(recorded))
+                    AND (OLD.media_type IS NOT DISTINCT FROM NEW.media_type OR 'media_type'=ANY(recorded))
+                    -- A mirror's own fields (0022): a change to them is recorded below, never assumed covered.
+                    AND OLD.local_metadata IS NOT DISTINCT FROM NEW.local_metadata
+                    AND OLD.local_tags IS NOT DISTINCT FROM NEW.local_tags;
+            END IF;
+            IF covered AND (TG_OP = 'INSERT' OR (OLD.dataset_id,OLD.id::bigint/4096)
+                IS NOT DISTINCT FROM (NEW.dataset_id,NEW.id::bigint/4096)) THEN
+                RETURN NULL;
+            END IF;
+        END IF;
+        affected := ARRAY(SELECT field_name FROM dataset_fields
+                          WHERE dataset_id = NEW.dataset_id AND origin = 'native_array');
+        IF TG_OP = 'INSERT' THEN
+            affected := affected || ARRAY(SELECT jsonb_object_keys(NEW.metadata)) || ARRAY['tags', 'media_type'];
+        ELSE
+            IF OLD.metadata IS DISTINCT FROM NEW.metadata THEN
+                affected := affected || ARRAY(
+                    SELECT key FROM jsonb_object_keys(
+                        COALESCE(OLD.metadata,'{}'::jsonb) || COALESCE(NEW.metadata,'{}'::jsonb)) key
+                    WHERE OLD.metadata->key IS DISTINCT FROM NEW.metadata->key);
+            END IF;
+            IF OLD.local_metadata IS DISTINCT FROM NEW.local_metadata THEN
+                affected := affected || ARRAY(
+                    SELECT '@local.' || key FROM jsonb_object_keys(OLD.local_metadata || NEW.local_metadata) key
+                    WHERE OLD.local_metadata->key IS DISTINCT FROM NEW.local_metadata->key);
+            END IF;
+            IF OLD.local_tags IS DISTINCT FROM NEW.local_tags THEN affected := affected || ARRAY['@local.tags']; END IF;
+            IF OLD.tags IS DISTINCT FROM NEW.tags THEN affected := affected || ARRAY['tags']; END IF;
+            IF OLD.media_type IS DISTINCT FROM NEW.media_type THEN affected := affected || ARRAY['media_type']; END IF;
+        END IF;
+        PERFORM sample_block_changed(NEW.dataset_id, NEW.id::bigint / 4096);
+        PERFORM record_stats_work(NEW.dataset_id, NEW.id::bigint / 4096, affected);
+    END IF;
+    IF TG_OP = 'DELETE' OR (TG_OP = 'UPDATE' AND
+        (OLD.dataset_id, OLD.id::bigint / 4096) IS DISTINCT FROM (NEW.dataset_id, NEW.id::bigint / 4096)) THEN
+        IF EXISTS (SELECT 1 FROM datasets WHERE id = OLD.dataset_id) THEN
+            PERFORM sample_block_changed(OLD.dataset_id, OLD.id::bigint / 4096);
+            PERFORM record_stats_work(OLD.dataset_id, OLD.id::bigint / 4096, NULL);
+        END IF;
+    END IF;
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;

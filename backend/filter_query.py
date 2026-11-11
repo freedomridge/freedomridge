@@ -59,7 +59,8 @@ _FROM_FILTER = {
 _VALUELESS = set(_PRESENCE)
 _KEYWORDS = {'and', 'or', 'not', 'in', 'contains', 'exists', 'is', 'null', 'between', 'like'}
 _NUMBER = re.compile(r'[+-]?(\d+(\.\d*)?|\.\d+)([eE][+-]?\d+)?\Z')
-_PLAIN_FIELD = re.compile(r'[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*\Z')
+# A mirror's own fields (`@local.weeds`) are written as they are too: no field path can start with `@`.
+_PLAIN_FIELD = re.compile(r'(@local\.[A-Za-z_][A-Za-z0-9_]*|[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*)\Z')
 _WORD_END = set(' \t\r\n()[],=!<>"\'`#')
 _CLOSE = {'(': ')', '[': ']'}
 _ESCAPES = {'n': '\n', 't': '\t', 'r': '\r', 'b': '\b', 'f': '\f'}  # and every escape json.dumps writes

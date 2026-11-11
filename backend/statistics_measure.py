@@ -9,6 +9,7 @@ import asyncpg
 from .job_queue import _terminate_connection
 from .job_tasks import run_isolated
 from .label_fields import LABEL_CACHES, LEGACY_GEOMETRY_FIELDS, label_context
+from .local_fields import LOCAL_TAGS
 
 BLOCK_SIZE = 4096
 VALUE_LIMIT = 100
@@ -158,7 +159,9 @@ async def aggregate_field(pool, dataset_id, name, partial=None, limit=128):
                 'cache_token': cache_token,
                 'defined': definition is not None or name in INDEX_TYPES or name in ('tags', 'media_type'),
                 'field_type': (
-                    'enum' if name != parent or definition['origin'] == 'native_array' else definition['field_type']
+                    'enum'
+                    if name != parent or definition['origin'] == 'native_array' or name == LOCAL_TAGS
+                    else definition['field_type']
                 )
                 if definition
                 else INDEX_TYPES.get(name),
