@@ -221,6 +221,12 @@ async def reset_password(
             await conn.execute("DELETE FROM sessions WHERE user_id = $1", id)
             # And end their API tokens: a token copied by whoever had the account would
             # otherwise work again as soon as the user chose a new password.
-            await conn.execute("UPDATE api_tokens SET is_active = FALSE WHERE user_id = $1 AND is_active", id)
+            revoked = await conn.fetch(
+                "UPDATE api_tokens SET is_active = FALSE WHERE user_id = $1 AND is_active RETURNING scope",
+                id,
+            )
 
-    return {"message": "Password reset successfully"}
+    # By scope, so the page can say what stops working: a follower that connects with one of these stops syncing
+    # until it is given a new token, and on-demand machines started under a worker token end.
+    counts = {scope: sum(1 for row in revoked if row['scope'] == scope) for scope in ('full', 'follower', 'worker')}
+    return {"message": "Password reset successfully", "revoked_tokens": counts}

@@ -46,12 +46,16 @@ def test_an_admin_reset_revokes_the_users_tokens(auth_database):
         target = await account(database, 'reset-target', role='power_user')
         other = await account(database, 'reset-bystander', role='power_user')
         stolen = await token_for(database, target)
+        for scope in ('follower', 'follower', 'worker'):
+            await token_for(database, target, scope)
         kept = await token_for(database, other)
         assert await bearer_status(client, stolen) == 200
 
         login_as(client, 'reset-admin')
         response = await client.post(f'/api/users/{target}/reset-password', json={'password': 'temporary-credential'})
         assert response.status_code == 200, response.text
+        # The page says what stopped working from these counts.
+        assert response.json()['revoked_tokens'] == {'full': 1, 'follower': 2, 'worker': 1}
         # The user sets their own password (what lifted the must-change gate for the old token).
         await database.execute('UPDATE users SET must_change_password = FALSE WHERE id = $1', target)
 

@@ -4,6 +4,7 @@ import React, { useState, useEffect } from 'react';
 import * as Dialog from '@radix-ui/react-dialog';
 import { Cross2Icon } from '@radix-ui/react-icons';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
+import { passwordResetMessage, RESET_PASSWORD_HINT, type RevokedTokens } from '@/lib/password-reset';
 
 interface User {
     id: number;
@@ -73,9 +74,10 @@ export function EditUserModal({ user, onClose }: EditUserModalProps) {
                 const data = await res.json();
                 throw new Error(data.detail || 'Failed to reset password');
             }
+            return (await res.json()) as { revoked_tokens?: RevokedTokens };
         },
-        onSuccess: () => {
-            setSuccessMessage('Password reset successfully');
+        onSuccess: (answer) => {
+            setSuccessMessage(passwordResetMessage(answer?.revoked_tokens));
             setResetPassword('');
         },
         onError: (err: Error) => {
@@ -144,7 +146,8 @@ export function EditUserModal({ user, onClose }: EditUserModalProps) {
                         </div>
 
                         <div className="border-t border-zinc-800 pt-4">
-                            <h3 className="text-sm font-medium text-zinc-400 mb-3">Reset Password</h3>
+                            <h3 className="text-sm font-medium text-zinc-400 mb-1">Reset Password</h3>
+                            <p data-testid="reset-password-hint" className="text-xs text-zinc-500 mb-3">{RESET_PASSWORD_HINT}</p>
                             <div className="flex gap-2">
                                 <input
                                     type="password"

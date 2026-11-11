@@ -4,7 +4,14 @@ Freedom Ridge has one version for the server, the web app and the Python SDK (th
 file), following [Semantic Versioning](https://semver.org). A release lists **upgrade notes** when
 it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
 
-## Unreleased
+## 2.9.0 (2026-11-10)
+
+2.9.0 gives each dataset its own partition of the vector table, with its own vector indexes, so a search plans and
+locks that dataset's vectors only, and near-duplicates and uniqueness stay in their dataset. Its migration copies
+every vector with the app stopped (about a minute per million). It also adds links to a filter, a view or a
+sample, with Copy link; a follower's fields of its own on a mirror; and fixes from a review: datasets with a default
+view can be deleted, media and thumbnails check access and buckets first, on-demand workers, the launcher, password
+resets ending API tokens, versions, and number filters. Two migrations.
 
 ### Upgrade notes
 
@@ -127,8 +134,9 @@ it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
   once. Both now revoke the account's tokens with its sessions, and an admin can revoke all of another user's
   tokens with `DELETE /api/users/{id}/tokens`. That includes the follower and worker tokens the account issued:
   followers that connect with one stop syncing until they are given a new token (Settings → Followers), and
-  on-demand machines started under it end. Deactivating an account and changing your own password work as
-  before.
+  on-demand machines started under it end. The Edit User dialog says so under **Reset Password**, and after a
+  reset it says how many tokens were revoked and how many of them were follower or worker tokens. Deactivating an
+  account and changing your own password work as before.
 - **A version's answers no longer change with the live dataset.** Filtering or aggregating a version on a label
   path such as `animals.label` read which fields are lists from the dataset as it is now. Once `animals` was
   cleared in the dataset, the same query on the unchanged version matched nothing; for a box field such as
@@ -143,6 +151,10 @@ it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
   groups, sparse sampling, bulk tag, delete and set by filter, a follower's tag edits and version queries compared
   the text `"1"` and missed it. They now match what the grid matches. A field without an index still compares
   such a value as text.
+- **Thumbnails and overlays stop when a dataset loses a storage bucket.** After an admin restricted a storage
+  configuration to other datasets, the original images of a dataset that lost it were refused, but thumbnails,
+  crops and heatmap overlays already made from them were still served from the cache to anyone with access to
+  that dataset. The bucket is now checked before the cache is read. Nothing else changes.
 
 ### Removed
 
@@ -151,11 +163,6 @@ it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
   partway through the schema, so the data was gone and the
   database unusable. Nothing in Freedom Ridge called it: a new database is created from `backend/db/schema.sql`
   when its container first starts, and an existing one is upgraded with `scripts/apply_migrations.sh`.
-- **Thumbnails and overlays stop when a dataset loses a storage bucket.** After an admin restricted a storage
-  configuration to other datasets, the original images of a dataset that lost it were refused, but thumbnails,
-  crops and heatmap overlays already made from them were still served from the cache to anyone with access to
-  that dataset. The bucket is now checked before the cache is read. Nothing else changes.
-
 
 ## 2.8.0 (2026-11-10)
 
