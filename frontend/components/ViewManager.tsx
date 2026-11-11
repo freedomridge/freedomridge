@@ -2,9 +2,11 @@ import React, { useState, useEffect, useRef } from 'react';
 import { View, ViewStage, ComplexFilter, DatasetMirror, getDatasetViews, createView, deleteView, updateDataset } from '../lib/api';
 import { primaryHost } from './mirror-badge';
 import { useUser } from '@/contexts/UserContext';
-import { filterHasInSelection } from '@/contexts/FilterContext';
+import { useToast } from '@/contexts/ToastContext';
+import { filterHasInSelection } from '@/lib/filter-query';
+import { copyLink, viewLink } from '@/lib/links';
 import { ShareViewModal } from './ShareViewModal';
-import { Share1Icon, TrashIcon, EyeOpenIcon, LockClosedIcon, GlobeIcon, PersonIcon, StarIcon, StarFilledIcon } from '@radix-ui/react-icons';
+import { Share1Icon, TrashIcon, EyeOpenIcon, LockClosedIcon, GlobeIcon, PersonIcon, StarIcon, StarFilledIcon, Link2Icon } from '@radix-ui/react-icons';
 
 interface ViewManagerProps {
     datasetId: number;
@@ -22,6 +24,7 @@ export default function ViewManager({
     datasetId, currentFilters, currentViewStages, onLoadView, defaultViewId = null, onDefaultViewChanged, mirror = null,
 }: ViewManagerProps) {
     const { user } = useUser();
+    const { addToast } = useToast();
     const [views, setViews] = useState<View[]>([]);
     const [loadError, setLoadError] = useState<string | null>(null);
     const [newViewName, setNewViewName] = useState('');
@@ -284,6 +287,18 @@ export default function ViewManager({
                                     </button>
 
                                     <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                                        <button
+                                            data-testid="view-copy-link"
+                                            onClick={(e) => {
+                                                e.stopPropagation();
+                                                const link = viewLink(window.location.origin, datasetId, view.slug);
+                                                void copyLink(Promise.resolve(link), `Link to the view “${view.name}” copied`, addToast);
+                                            }}
+                                            className="p-1.5 text-zinc-400 hover:text-cyan-400 hover:bg-cyan-400/10 rounded transition-colors"
+                                            title="Copy a link to this view. It opens only for people who can see the view."
+                                        >
+                                            <Link2Icon className="w-3.5 h-3.5" />
+                                        </button>
                                         {user?.role === 'admin' && !mirror && (
                                             <button
                                                 data-testid="view-default-toggle"

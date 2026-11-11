@@ -3,6 +3,7 @@
 import asyncio
 import time
 
+import asyncpg
 from fastapi import HTTPException
 
 from . import job_queue
@@ -114,8 +115,13 @@ async def _submit(pool, dataset_id, user_id, *, resume):
         if resume:
             raise HTTPException(409, 'Dataset deletion has not started')
         job = await job_queue.enqueue_job(connection, KIND, dataset_id=dataset_id, lane='user', created_by=user_id)
+        # The default view goes with the seal: once sealed, the dataset row refuses the update its foreign key
+        # makes when the view's row is removed, and the deletion failed there at every resume. A mirror's settings
+        # are its primary's, so clearing its default view is allowed as its sync's changes are, for this
+        # transaction and this dataset only.
+        await connection.execute("SELECT set_config('fridge.mirror_sync', $1, TRUE)", str(dataset_id))
         await connection.execute(
-            'UPDATE datasets SET deleting=TRUE,deletion_job_id=$2 WHERE id=$1',
+            'UPDATE datasets SET deleting=TRUE,deletion_job_id=$2,default_view_id=NULL WHERE id=$1',
             dataset_id,
             job['id'],
         )
@@ -202,6 +208,7 @@ async def _drop_index(pool, job):
     async with pool.acquire(timeout=1) as connection:
 
         async def drop():
+            from .index_actions import _wait_for_backup
             from .index_jobs import TABLE_LOCK, try_lock, unlock
 
             if not await connection.fetchval('SELECT pg_try_advisory_lock(20261017,$1)', job['dataset_id']):
@@ -227,9 +234,19 @@ async def _drop_index(pool, job):
                 )
                 if index is None:
                     return False
+                # A backup holds every table for the whole dump, which the drop would wait behind: as index removal
+                # does (index_actions), wait for it without spending the failure budget.
+                await _wait_for_backup(pool)
                 await connection.execute("SET lock_timeout='100ms'; SET statement_timeout='5s'")
                 quoted = index.replace('"', '""')
-                await connection.execute(f'DROP INDEX CONCURRENTLY IF EXISTS "{quoted}"', timeout=5)
+                try:
+                    await connection.execute(f'DROP INDEX CONCURRENTLY IF EXISTS "{quoted}"', timeout=5)
+                except asyncpg.LockNotAvailableError as error:
+                    # The drop waits for every transaction holding samples (a long read, a map re-fit's export):
+                    # contention, retried with backoff until they end, not a failure.
+                    raise job_queue.QueueContended(
+                        'Waiting for transactions on samples to end before removing the dataset index',
+                    ) from error
                 return True
             finally:
                 if not connection.is_closed():

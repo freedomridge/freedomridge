@@ -69,6 +69,19 @@ async def set_launcher(settings: LauncherSettings, user: dict = Depends(require_
         raise HTTPException(status_code=400, detail='Give the AWS region and the server URL to turn it on')
     if settings.access_key_id and settings.secret_access_key == '':
         raise HTTPException(status_code=400, detail='An access key needs its secret')
+    # A machine is looked at and ended with these: with another region or account, AWS wouldn't know it.
+    stored = await db.fetchrow('SELECT region, access_key_id FROM compute_launcher')
+    changes_aws = (
+        settings.region != stored['region']
+        or settings.access_key_id != stored['access_key_id']
+        or settings.secret_access_key is not None
+    )
+    if changes_aws and await db.fetchval("SELECT EXISTS (SELECT 1 FROM compute_launches WHERE state <> 'ended')"):
+        raise HTTPException(
+            status_code=409,
+            detail='Machines are still running: change the region or the AWS keys once they have ended. Turn it off '
+            'to start no more; each ends when its worker is done.',
+        )
     secret = settings.secret_access_key
     await db.execute(
         """UPDATE compute_launcher SET enabled = $1, region = $2, instance_type = $3, subnet_id = $4,

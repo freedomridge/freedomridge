@@ -4,6 +4,7 @@
 // docker-compose.try.yml (bundled in this package with the files it mounts) from a folder, ~/freedomridge by
 // default, and brings that folder's database up to this release first, so the same command also upgrades.
 const { spawn, spawnSync } = require('node:child_process');
+const crypto = require('node:crypto');
 const fs = require('node:fs');
 const net = require('node:net');
 const os = require('node:os');
@@ -15,6 +16,8 @@ const RELEASE = path.join(__dirname, '..', 'release');
 const FILES = ['docker-compose.try.yml', 'backend/db/schema.sql', 'backend/db/postgresql.conf'];
 const SERVICES = ['db', 'backend', 'job-runner', 'frontend'];
 const APP_SERVICES = ['backend', 'job-runner', 'frontend'];
+// docker-compose.try.yml's `name:`: the Compose project of ~/freedomridge.
+const PROJECT = 'freedomridge-try';
 const DEFAULT_PORT = 3000;
 const DEFAULT_API_PORT = 8000;
 
@@ -144,10 +147,13 @@ function parsePs(text) {
 
 function compose(dir, args, stdio = 'inherit') {
     // The compose file mounts ./data at the same path in the containers, by ${PWD}: Node doesn't set PWD for a
-    // child started in another folder, so it's set here.
+    // child started in another folder, so it's set here. The folder's .env names its project (folderProject), which
+    // a COMPOSE_PROJECT_NAME in the shell would override.
+    const env = { ...process.env, PWD: dir };
+    delete env.COMPOSE_PROJECT_NAME;
     const result = spawnSync('docker', ['compose', '-f', path.join(dir, 'docker-compose.try.yml'), ...args], {
         cwd: dir,
-        env: { ...process.env, PWD: dir },
+        env,
         stdio,
         encoding: 'utf8',
     });
@@ -176,6 +182,47 @@ function installed(dir) {
     if (!fs.existsSync(path.join(dir, 'docker-compose.try.yml'))) {
         fail(`No Freedom Ridge in ${dir}: start it first with npx freedomridge${dir === parseArgs([]).dir ? '' : ` --dir ${dir}`}`);
     }
+}
+
+// The Docker Compose project a folder runs as, kept in its .env, where Compose reads it. ~/freedomridge keeps the
+// compose file's, and so does a folder an earlier launcher already started (its containers and database are under
+// it). Any other folder gets its own, from its path, so two folders never share containers or a database.
+function folderProject(dir) {
+    const named = readEnv(dir).COMPOSE_PROJECT_NAME;
+    if (named) return named;
+    if (dir === parseArgs([]).dir || fs.existsSync(path.join(dir, 'docker-compose.try.yml'))) return PROJECT;
+    const project = `${PROJECT}-${crypto.createHash('sha256').update(dir).digest('hex').slice(0, 12)}`;
+    writeEnv(dir, { COMPOSE_PROJECT_NAME: project });
+    return project;
+}
+
+function sameFolder(a, b) {
+    const real = folder => {
+        try {
+            return fs.realpathSync(folder);
+        } catch {
+            return path.resolve(folder);
+        }
+    };
+    return real(a) === real(b);
+}
+
+// Refuse to start when the folder's Compose project has containers of another folder (Compose labels each with its
+// folder): starting would replace them, on the same database.
+function checkProjectFolder(dir) {
+    const project = folderProject(dir);
+    const listed = spawnSync('docker', ['ps', '--all', '--filter', `label=com.docker.compose.project=${project}`,
+        '--format', '{{.Label "com.docker.compose.project.working_dir"}}'], { encoding: 'utf8' });
+    if (listed.error || listed.status !== 0) {
+        fail(`Couldn't list Docker's containers: ${listed.error ? listed.error.message : (listed.stderr || '').trim()}`);
+    }
+    const other = listed.stdout.split('\n').map(line => line.trim()).find(folder => folder && !sameFolder(folder, dir));
+    if (other) {
+        fail(`The containers of Docker Compose project ${project} belong to ${other}; starting them from ${dir} would `
+            + `replace them. Run it from that folder (npx freedomridge --dir ${other}), or remove its containers first: `
+            + `docker compose -f ${path.join(other, 'docker-compose.try.yml')} down`);
+    }
+    return project;
 }
 
 function running(dir) {
@@ -257,6 +304,7 @@ async function start(options) {
     checkDocker();
     const { dir } = options;
     fs.mkdirSync(dir, { recursive: true });
+    checkProjectFolder(dir);
 
     // A folder running a newer release is left alone: its database has migrations this one doesn't know.
     const before = running(dir);
@@ -329,4 +377,7 @@ if (require.main === module) {
     });
 }
 
-module.exports = { parseArgs, readEnv, writeEnv, compareVersions, versionOfImage, parsePs, summary, FILES, VERSION };
+module.exports = {
+    parseArgs, readEnv, writeEnv, compareVersions, versionOfImage, parsePs, summary, folderProject, checkProjectFolder,
+    compose, FILES, VERSION, PROJECT,
+};

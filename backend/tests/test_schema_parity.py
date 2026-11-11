@@ -1,5 +1,5 @@
 """Guard against a deploy-bug class: a migration object missing from
-schema.sql. Fresh prod DBs init from schema.sql directly (init_db.py does NOT run migrations),
+schema.sql. Fresh prod DBs init from schema.sql directly (no migration runs on a new database),
 so anything a migration creates — a TABLE, an added COLUMN, a FUNCTION, a TRIGGER, or a
 (non-concurrent) INDEX — must also live in schema.sql, or the feature breaks on a fresh deploy.
 

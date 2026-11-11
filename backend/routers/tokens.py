@@ -103,3 +103,15 @@ async def revoke_token(token_id: int, user: dict = Depends(get_current_user)):
     await db.execute("UPDATE api_tokens SET is_active = FALSE WHERE id = $1", token_id)
 
     return {"message": "Token revoked successfully"}
+
+
+@router.delete("/users/{user_id}/tokens")
+async def revoke_user_tokens(user_id: int, admin: dict = Depends(require_role("admin"))):
+    """
+    Revoke every API token of a user: an admin's way to end the tokens of an account someone
+    else may have used. A user revokes their own tokens one at a time with DELETE /tokens/{id}.
+    """
+    if await db.fetchval("SELECT 1 FROM users WHERE id = $1", user_id) is None:
+        raise HTTPException(status_code=404, detail="User not found")
+    status = await db.execute("UPDATE api_tokens SET is_active = FALSE WHERE user_id = $1 AND is_active", user_id)
+    return {"revoked": int(status.split()[-1])}

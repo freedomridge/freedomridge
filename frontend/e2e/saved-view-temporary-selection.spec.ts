@@ -1,5 +1,5 @@
-import { test, expect, type Page } from '@playwright/test';
-import { AUTH_STATE, gotoDataset, expectTotal } from './helpers';
+import { test, expect } from '@playwright/test';
+import { AUTH_STATE, bigSelectAll, gotoDataset, expectTotal } from './helpers';
 import { readState } from './api';
 
 // Regression: a Select All over 50,000 samples is a server token that expires after
@@ -7,21 +7,6 @@ import { readState } from './api';
 // (Select All is exactly what they show), and the UI says why. The 12-row fixture never needs a
 // token, so the two responses a big Select All gets (its count, its token) are faked.
 test.use({ storageState: AUTH_STATE });
-
-async function bigSelectAll(page: Page) {
-    await page.route('**/samples/query', async route => {
-        if (route.request().postDataJSON()?.limit === 1) {
-            await route.fulfill({ json: { items: [], total: 60_000 } });  // Select All's count probe
-        } else {
-            await route.continue();
-        }
-    });
-    await page.route('**/selection_token', route => route.fulfill({ json: { token: 'e2e-expired-token', count: 60_000 } }));
-    await page.getByTestId('grid-select-all').click();
-    await expect(page.getByTestId('grid-selection-count')).toContainText('60,000', { timeout: 10_000 });
-    await page.unroute('**/samples/query');
-    await page.unroute('**/selection_token');
-}
 
 test('a view with a big Select All is saved with its filters only, and says why', async ({ page }) => {
     const { datasetId } = readState();

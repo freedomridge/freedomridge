@@ -34,12 +34,17 @@ From the checkout the server runs, with `docker-compose.prod.yml`:
    ```
    To build them from the checkout instead, as releases before 2.2.0 need, run
    `docker compose -f docker-compose.prod.yml build --pull`.
-4. Apply the migrations, then recreate the containers:
+4. Stop the app, apply the migrations with it stopped, then recreate the containers:
    ```bash
+   docker compose -f docker-compose.prod.yml stop backend job-runner backup frontend
    FRIDGE_DB_CONTAINER=$(docker compose -f docker-compose.prod.yml ps -q db) \
      bash scripts/apply_migrations.sh
    docker compose -f docker-compose.prod.yml up -d
    ```
+   Running, the old version would go on serving requests and running jobs against the changed schema until it is
+   replaced: its API checks the schema only in `/api/health`, and its job runner only when it starts. The `backup`
+   service is stopped too: a scheduled dump that ran during the migrations would make them wait behind it, or fail.
+   `up -d` starts all four again. The server is down from the `stop` until the new version answers in step 5.
 5. Check `https://YOUR_DOMAIN/api/health`. It answers `"status": "ok"` with the new `version`.
    While it answers 503 (and the backend container reports unhealthy), its lists say why:
    `pending_migrations` or `stale_functions` (run step 4 again), or `unknown_migrations` (the
@@ -85,9 +90,10 @@ Don't run an older version against the upgraded database: its migration runner a
 git pull --ff-only
 uv sync --extra cuda          # or --extra cpu
 cd frontend && npm ci && cd ..
-# When the pull brought new backend/db/migrations (the Quick Start's database container):
+# When the pull brought new backend/db/migrations (the Quick Start's database container), with the
+# backend, the job runner and the frontend stopped:
 FRIDGE_DB_CONTAINER=freedomridge-db ./scripts/apply_migrations.sh
 ```
 
-Then restart the backend and the frontend. How the dependency versions themselves are chosen and
-updated: [Updating dependencies](DEPENDENCIES.md).
+Then start the backend, the job runner and the frontend again. How the dependency versions themselves are
+chosen and updated: [Updating dependencies](DEPENDENCIES.md).

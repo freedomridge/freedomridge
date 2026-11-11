@@ -152,6 +152,11 @@ class JobFailure(JobLease):
 
 
 LEASE_LOST = {'code': 'lease_lost', 'message': 'This worker no longer holds the job: stop without reporting'}
+# The same for the worker (it drops this job and goes on claiming others), when its owner lost access to the dataset.
+ACCESS_LOST = {
+    'code': 'lease_lost',
+    'message': "This worker's owner can no longer access the job's dataset: stop without reporting",
+}
 
 
 async def _own_worker(worker_id: str, user: dict) -> Dict[str, Any]:
@@ -168,10 +173,28 @@ async def _own_worker(worker_id: str, user: dict) -> Dict[str, Any]:
 async def _worker_job(worker_id: str, job_id: uuid.UUID, user: dict) -> Dict[str, Any]:
     """The job this worker claimed; 409 when it is someone else's now (or never was)."""
     await _own_worker(worker_id, user)
-    job = await db.fetchrow('SELECT kind, worker_id FROM jobs WHERE id = $1', job_id)
+    job = await db.fetchrow('SELECT kind, worker_id, dataset_id FROM jobs WHERE id = $1', job_id)
     if job is None or job['worker_id'] != worker_id:
         raise HTTPException(status_code=409, detail=LEASE_LOST)
     return dict(job)
+
+
+async def _owner_may_access(dataset_id: Optional[int], user: dict) -> None:
+    """409 (ACCESS_LOST) unless the worker's owner may still access the job's dataset, as a claim requires. A lease
+    stands for the job, not for access the owner has lost since the claim: when an admin removes their access to a
+    private dataset, the worker can't download more of its data, upload a result for it or keep the lease. Giving
+    the job back (fail, release) stays open; otherwise the lease expires and the job goes back to the queue."""
+    if dataset_id is None:
+        allowed = user['role'] == 'admin'  # as for a claim: a job on no dataset is for an admin's worker
+    else:
+        where, args = await filter_datasets_for_user(user)
+        allowed = await db.fetchval(
+            f'SELECT EXISTS (SELECT 1 FROM datasets WHERE id = ${len(args) + 1} AND {where})',
+            *args,
+            dataset_id,
+        )
+    if not allowed:
+        raise HTTPException(status_code=409, detail=ACCESS_LOST)
 
 
 async def _queue(operation):
@@ -258,8 +281,10 @@ async def claim(worker_id: str, request: ClaimRequest, user: dict = Depends(get_
 @router.post('/workers/{worker_id}/jobs/{job_id}/heartbeat')
 async def job_heartbeat(worker_id: str, job_id: uuid.UUID, report: JobProgress, user: dict = Depends(get_worker_user)):
     """Renew the job's lease and report progress. With `cancel_requested`, stop and release the job. 409 when
-    the lease is gone (it expired, or the job ended): stop without reporting."""
-    await _worker_job(worker_id, job_id, user)
+    the lease is gone (it expired, or the job ended), or its owner can no longer access the job's dataset: stop
+    without reporting."""
+    claimed = await _worker_job(worker_id, job_id, user)
+    await _owner_may_access(claimed['dataset_id'], user)
     renewed = await _queue(job_queue.heartbeat_job(db.pool, job_id, report.lease_token, lease_seconds=LEASE_SECONDS))
     if renewed is None:
         raise HTTPException(status_code=409, detail=LEASE_LOST)
@@ -287,8 +312,9 @@ async def job_heartbeat(worker_id: str, job_id: uuid.UUID, report: JobProgress, 
 async def complete(worker_id: str, job_id: uuid.UUID, outcome: JobOutcome, user: dict = Depends(get_worker_user)):
     """Finish the worker's step with its result. A kind whose work goes on on the server (a map re-fit's swap)
     hands the job back with its uploads; any other ends with the result. It ends cancelled instead when a cancel
-    came in first. 400 when the uploads aren't complete."""
+    came in first. 400 when the uploads aren't complete; 409 when its owner can no longer access the job's dataset."""
     claimed = await _worker_job(worker_id, job_id, user)
+    await _owner_may_access(claimed['dataset_id'], user)
     remote = REMOTE_KINDS.get(claimed['kind'])
     if remote is not None and remote.finish is not None:
         job = await db.fetchrow('SELECT * FROM jobs WHERE id = $1', job_id)
@@ -340,11 +366,11 @@ async def release(worker_id: str, job_id: uuid.UUID, lease: JobLease, user: dict
 
 
 async def _live_lease(worker_id: str, job_id: uuid.UUID, lease_token: uuid.UUID, user: dict):
-    """(the job's RemoteKind, the job) while this worker holds its live lease; 409 otherwise. Every file transfer
-    checks it."""
+    """(the job's RemoteKind, the job) while this worker holds its live lease and its owner may still access the
+    job's dataset; 409 otherwise. Every file transfer checks it."""
     await _own_worker(worker_id, user)
     job = await db.fetchrow(
-        """SELECT kind, checkpoint FROM jobs WHERE id = $1 AND worker_id = $2 AND lease_token = $3
+        """SELECT kind, checkpoint, dataset_id FROM jobs WHERE id = $1 AND worker_id = $2 AND lease_token = $3
              AND state = 'running' AND lease_expires_at > clock_timestamp()""",
         job_id,
         worker_id,
@@ -352,6 +378,7 @@ async def _live_lease(worker_id: str, job_id: uuid.UUID, lease_token: uuid.UUID,
     )
     if job is None or job['kind'] not in REMOTE_KINDS:
         raise HTTPException(status_code=409, detail=LEASE_LOST)
+    await _owner_may_access(job['dataset_id'], user)
     return REMOTE_KINDS[job['kind']], dict(job)
 
 

@@ -35,6 +35,7 @@ interface Props {
     // Find Similar from the sample on screen (the modal had no actions).
     onFindSimilar?: () => void;
     onTag?: () => void;  // tag THIS sample (the one shown) without leaving the view
+    onCopyLink?: () => void;  // a link that opens this sample on the applied filters
     // A dialog layered over this view (the tag dialog). Rendered INSIDE the Radix content so it is
     // inside its focus trap and click-outside boundary; while it is open, Escape closes it (not the
     // view) and the view's arrow/Space shortcuts pause.
@@ -48,7 +49,7 @@ interface Props {
     highlightBox?: [number, number, number, number] | null;
 }
 
-export function SampleModal({ sample, activeMediaField = 'filepath', availableMediaFields = ['filepath'], activeOverlayFields: initialOverlayFields = [], overlayConfigs, segmentationConfig, onMediaFieldChange, onClose, availablePatchScales = [], patchScaleLabels, patchFieldName = 'clip', onPatchSearch, patchScale: externalPatchScale, onPatchScaleChange, onNext, onPrevious, hasNext = false, hasPrevious = false, isSelected = false, onToggleSelection, onFindSimilar, onTag, overlay, onCloseOverlay, highlightBox, highlightCuboidId, highlightCuboidField, onSaveClassRule }: Props) {
+export function SampleModal({ sample, activeMediaField = 'filepath', availableMediaFields = ['filepath'], activeOverlayFields: initialOverlayFields = [], overlayConfigs, segmentationConfig, onMediaFieldChange, onClose, availablePatchScales = [], patchScaleLabels, patchFieldName = 'clip', onPatchSearch, patchScale: externalPatchScale, onPatchScaleChange, onNext, onPrevious, hasNext = false, hasPrevious = false, isSelected = false, onToggleSelection, onFindSimilar, onTag, onCopyLink, overlay, onCloseOverlay, highlightBox, highlightCuboidId, highlightCuboidField, onSaveClassRule }: Props) {
     // How each class-probability field is shown while the modal is open: edited rules redraw at once, write nothing,
     // and stay while stepping through samples.
     const [probabilityViews, setProbabilityViews] = useState<Record<string, ProbabilityView>>({});
@@ -352,6 +353,16 @@ export function SampleModal({ sample, activeMediaField = 'filepath', availableMe
                                     data-testid="modal-copy-path"
                                 >
                                     Copy path
+                                </button>
+                            )}
+                            {onCopyLink && (
+                                <button
+                                    onClick={onCopyLink}
+                                    className="text-xs text-zinc-400 hover:text-white border border-zinc-700 rounded px-2 py-1"
+                                    title="Copy a link that opens this sample on the applied filters"
+                                    data-testid="modal-copy-link"
+                                >
+                                    Copy link
                                 </button>
                             )}
                             {onTag && (

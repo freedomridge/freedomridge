@@ -1025,9 +1025,12 @@ metrics are absent. The module does not add a 5xx alarm or demo-login dashboard.
 Review security updates monthly and after relevant advisories. OS unattended
 upgrades do not update containers. Back up first, check out the release that has
 the fixes, pull its images with `docker compose -f docker-compose.prod.yml pull`
-(between releases, rebuild from the checkout with `build --pull`), apply migrations using the explicit production DB container, and recreate with
-`up -d`. nginx re-resolves Docker service IPs every 10 seconds; allow startup
-health checks and that DNS window after recreation. A single-instance restart still
+(between releases, rebuild from the checkout with `build --pull`), stop the app
+(`docker compose -f docker-compose.prod.yml stop backend job-runner backup frontend`),
+apply migrations using the explicit production DB container, and recreate with
+`up -d` ([Upgrading](UPGRADING.md), step 4). nginx re-resolves Docker service IPs
+every 10 seconds; allow startup health checks and that DNS window after
+recreation. A single-instance restart still
 has downtime; this is not a rolling deployment. After changing the Mapbox token, recreate
 the frontend (`docker compose -f docker-compose.prod.yml up -d frontend`). Editing the top-level `nginx.conf` template needs
 `docker compose -f docker-compose.prod.yml up -d --no-deps --force-recreate nginx`

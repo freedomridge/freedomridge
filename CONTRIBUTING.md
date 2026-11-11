@@ -263,6 +263,11 @@ migrations the database records but the code doesn't have: the database is newer
   keep the full data reachable.
 - Before changing the map panel or the `map_points` endpoint, read
   [the map requirements](docs/MAP_REQUIREMENTS.md).
+- Copied links must keep opening. `frontend/tests/link-fixtures.json` holds frozen `q=` and `f=` links, and the
+  frontend, backend and e2e tests open them. A change to the stage or filter shape, an operator, or the query
+  language that breaks one either keeps reading the old shape (the fixtures stay), or gives `f=` a new version
+  (`LINK_VERSION` in `frontend/lib/links.ts`) on purpose: it removes the old version's fixtures and says in the
+  CHANGELOG's upgrade notes that links copied before the release no longer open.
 - Commit messages are one short sentence, optionally prefixed with the area (`Sidebar: ...`).
 
 ## Pull requests

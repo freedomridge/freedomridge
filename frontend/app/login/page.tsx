@@ -5,6 +5,7 @@ import { useUser } from '@/contexts/UserContext';
 import { useSearchParams } from 'next/navigation';
 import Image from 'next/image';
 import { Wordmark } from '@/components/wordmark';
+import { safeNext } from '@/lib/links';
 
 function LoginContent() {
     const [username, setUsername] = useState('');
@@ -16,6 +17,8 @@ function LoginContent() {
     const { login, checkAuth } = useUser();
     const searchParams = useSearchParams();
     const expired = searchParams ? searchParams.get('expired') : null;
+    // The page asked for before signing in (a link, or the page a session expired on), if it is a page of this app.
+    const next = () => safeNext(searchParams?.get('next'), window.location.origin);
 
     // Check if demo mode is enabled
     useEffect(() => {
@@ -30,7 +33,7 @@ function LoginContent() {
         setError('');
         setIsLoading(true);
         try {
-            await login(username, password);
+            await login(username, password, next());
         } catch (err: unknown) {
             setError(err instanceof Error ? err.message : String(err));
             setIsLoading(false);
@@ -49,10 +52,10 @@ function LoginContent() {
                 const data = await res.json();
                 throw new Error(data.detail || 'Failed to create demo account');
             }
-            // Refresh auth state and redirect to homepage
+            // Refresh auth state and go to the page asked for, else the homepage
             await checkAuth();
-            // eslint-disable-next-line @next/next/no-location-assign-relative-destination -- A new guest session must discard the previous user’s in-memory view state.
-            window.location.href = '/';
+            // A full load: a new guest session must discard the previous user’s in-memory view state.
+            window.location.href = next();
         } catch (err: unknown) {
             setError(err instanceof Error ? err.message : String(err));
             setIsDemoLoading(false);

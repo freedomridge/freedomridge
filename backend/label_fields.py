@@ -248,7 +248,15 @@ async def fill_by_statistics(pool, dataset_id, cache):
 class DatasetArrayColumns(set):
     """Native array names plus the schema context needed by synchronous SQL builders."""
 
-    def __init__(self, columns=(), *, label_fields=LEGACY_LABEL_FIELDS, registered=(), list_fields=()):
+    def __init__(
+        self,
+        columns=(),
+        *,
+        label_fields=LEGACY_LABEL_FIELDS,
+        registered=(),
+        list_fields=(),
+        promoted_numeric=(),
+    ):
         super().__init__(columns)
         self.label_fields = set(label_fields)
         self.registered = set(registered)
@@ -256,6 +264,9 @@ class DatasetArrayColumns(set):
         # has cached them (a new dataset, a deploy, a restore). Writes and statistics use
         # label_fields only, so plain lists still get no `.label` vocabulary.
         self.list_fields = set(list_fields)
+        # Promoted numeric fields (as datasets.get_promoted_numeric_fields): every value is a number, so the filter
+        # compiler compares a numeric string with them as a number, whether or not its caller passed that set.
+        self.promoted_numeric = set(promoted_numeric)
 
 
 def label_path(field, columns=None):
@@ -271,10 +282,12 @@ def label_path(field, columns=None):
 async def label_context(connection, dataset_id, columns=()):
     """Filter/write context is cache-only; discovery belongs exclusively to field-stats."""
     registered = await connection.fetch(
-        "SELECT field_name, field_type FROM dataset_fields WHERE dataset_id=$1 AND origin<>'system'",
+        "SELECT field_name, field_type, is_promoted FROM dataset_fields WHERE dataset_id=$1 AND origin<>'system'",
         dataset_id,
     )
     lists = {row['field_name'] for row in registered if row['field_type'] == 'list'}
+    numbers = ('number', 'float', 'int', 'integer')
+    promoted_numeric = {row['field_name'] for row in registered if row['is_promoted'] and row['field_type'] in numbers}
     rows = await connection.fetch(
         'SELECT field_name, unique_values FROM dataset_field_stats WHERE dataset_id=$1 AND field_name=ANY($2::text[])',
         dataset_id,
@@ -291,4 +304,5 @@ async def label_context(connection, dataset_id, columns=()):
         label_fields=labels,
         registered=[row['field_name'] for row in registered],
         list_fields=lists,
+        promoted_numeric=promoted_numeric,
     )

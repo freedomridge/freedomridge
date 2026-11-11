@@ -1,5 +1,12 @@
 // Helpers for the filter bar's chips and the query text in each filter's card (docs/FILTER_QUERY.md).
-import type { ViewStage } from './api';
+import type { ComplexFilter, ViewStage } from './api';
+
+/** Whether the filter holds a server selection token (a big Select All), which the server forgets after 2 hours. */
+export function filterHasInSelection(f: ComplexFilter | undefined): boolean {
+    if (!f) return false;
+    if (f.operator === 'in_selection') return true;
+    return (f.filters || []).some(filterHasInSelection);
+}
 
 /** An embeddings lasso, included or excluded: a polygon on one field's map, with no form to edit it in. */
 export function isLassoStage(stage: ViewStage): boolean {

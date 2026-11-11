@@ -5,8 +5,10 @@ import { toggleOverlayField } from '@/lib/labels';
 import { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import type { Feature, Polygon } from 'geojson';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { ApiError, isRescoringRefusal, getSamples, getDatasetSchema, getDataset, getEmbeddingFields, searchSimilar, searchByImage, searchObjectToPatches, updateDataset, setClassRule, sampleDuplicates, notifySamplesMutated, createSelectionToken, type Dataset, type Filters, type Sample, type SchemaField, type ComplexFilter, type ViewStage } from '@/lib/api';
+import { ApiError, isRescoringRefusal, getSamples, getDatasetSchema, getDataset, getEmbeddingFields, searchSimilar, searchByImage, searchObjectToPatches, updateDataset, setClassRule, sampleDuplicates, notifySamplesMutated, createSelectionToken, getView, parseFilterQuery, formatFilterQuery, FilterQueryProblem, type Dataset, type Filters, type Sample, type SchemaField, type ComplexFilter, type ViewStage } from '@/lib/api';
 import { describeFilter, convertSimpleFiltersToComplex } from '@/lib/filter-utils';
+import { copyLink, datasetLink, decodeStages, joinQueryParts, LinkError, mayBeText, type DatasetLink } from '@/lib/links';
+import { useToast } from '@/contexts/ToastContext';
 import { usePatchState } from '@/hooks/usePatchState';
 import { useSampleCount } from '@/hooks/useSampleCount';
 import Link from 'next/link';
@@ -20,7 +22,7 @@ import { SimilaritySearchModal } from '@/components/similarity-search-modal';
 import { FindUnlabeledModal } from '@/components/find-unlabeled-modal';
 import { TagManagementModal } from '@/components/TagManagementModal';
 import ViewManager from '@/components/ViewManager';
-import { GearIcon, CheckIcon, Cross2Icon } from '@radix-ui/react-icons';
+import { GearIcon, CheckIcon, Cross2Icon, Link2Icon } from '@radix-ui/react-icons';
 import { PanelLayout } from '@/components/panel-layout';
 import { QueryBuilderBar } from '@/components/query-builder-bar';
 import { FindSimilar, DEFAULT_SEARCH_LIMIT, searchLimitOf, type ImageSearchInput, type SearchScope } from '@/components/find-similar';
@@ -35,7 +37,7 @@ import { EmbeddingsPanel } from '@/components/embeddings-panel';
 import { DuplicatesPanel } from '@/components/duplicates-panel';
 import { ConceptsPanel } from '@/components/concepts-panel';
 import { HistogramPanel } from '@/components/histogram-panel';
-import { GridPanel } from '@/components/grid-panel';
+import { GridPanel, readGridSort, rememberGridSort } from '@/components/grid-panel';
 import type { GridMore } from '@/components/dataset-grid';
 import { SparseSamplePanel } from '@/components/sparse-sample-panel';
 import { ExportDialog } from '@/components/export-dialog';
@@ -63,6 +65,54 @@ async function retryDropped<T>(request: () => Promise<T>): Promise<T> {
             if (!(error instanceof TypeError) || attempt === 3) throw error;
             await new Promise(resolve => setTimeout(resolve, 500 * attempt));
         }
+    }
+}
+
+// The stages a link's filter opens on (its view, else its encoded stages, else its query: lib/links.ts), or null
+// when it sets no filter. A link that can't be opened here throws a LinkError saying why.
+async function linkStages(datasetId: number, link: DatasetLink): Promise<ViewStage[] | null> {
+    if (link.view !== undefined) {
+        const view = await getView(link.view).catch((error: unknown) => {
+            if (error instanceof ApiError && error.status === 404) return null;  // also a view the reader can't open
+            throw error;
+        });
+        if (!view || view.dataset_id !== datasetId) throw new LinkError("This view no longer exists or isn't shared with you.");
+        // Its stages, as choosing it in Saved Views applies them. A view saved before views kept their stages holds
+        // only its compiled filter: one stage named after the view, as the default view does.
+        if (view.content.viewStages) return view.content.viewStages;
+        const filter = view.content.filters;
+        return filter?.filters?.length || filter?.field ? [{ type: 'filter', description: view.name, filter }] : [];
+    }
+    if (link.f !== undefined) return decodeStages(link.f);
+    if (link.q !== undefined) {
+        if (!link.q.trim()) return [];  // "no filters", as Copy link writes it for a dataset with none applied
+        try {
+            // One chip per top-level AND part, named as Add Filter names it.
+            const { filters } = await parseFilterQuery(datasetId, link.q, []);
+            return filters.map((filter): ViewStage => ({ type: 'filter', description: describeFilter(filter), filter }));
+        } catch (error) {
+            if (!(error instanceof FilterQueryProblem)) throw error;
+            const hint = error.suggestions.length ? ` (did you mean ${error.suggestions.map(n => `'${n}'`).join(' or ')}?)` : '';
+            throw new LinkError(`This link's filter can't be used here. Line ${error.line}, column ${error.column}: ${error.message}${hint}`);
+        }
+    }
+    return null;
+}
+
+// Each applied filter as query text for a link (datasetLink), or null when the link takes them encoded: a chip that
+// isn't text, or text that doesn't read back as the same filters on this dataset (the language writes a field name
+// it doesn't read, such as the coverage warning's embeddings.<field>, so such a link wouldn't open).
+async function linkQueryParts(datasetId: number, stages: ViewStage[]): Promise<string[] | null> {
+    if (!mayBeText(stages)) return null;
+    const filters = stages.map(stage => stage.filter);
+    const { parts } = await formatFilterQuery(datasetId, filters);
+    if (!parts.every((part): part is string => !!part)) return null;
+    try {
+        const { reuse } = await parseFilterQuery(datasetId, joinQueryParts(parts), filters);
+        return reuse.length === filters.length && reuse.every((index, i) => index === i) ? parts : null;
+    } catch (error) {
+        if (error instanceof FilterQueryProblem) return null;
+        throw error;
     }
 }
 
@@ -217,7 +267,11 @@ function DatasetPageContent() {
         setCurrentEmbeddingRegion,
         selectionSource,
         setSelectionSource,
+        link,
+        settleLink,
+        linkPending,
     } = useFilters();
+    const { addToast } = useToast();
 
     const { data: dataset, error: datasetError, isFetchedAfterMount: datasetFetchedOnOpen } = useQuery({
         queryKey: ['dataset', datasetId],
@@ -297,7 +351,8 @@ function DatasetPageContent() {
     // Shared with any grid asking the same (useSampleCount): with nothing staged, one request answers both.
     // After a tag edit or a finished job it keeps the number while the same filters are counted again.
     const { data: appliedCount, failureReason: globalCountFailure } = useSampleCount(datasetId, imageGrainFilters, {
-        enabled: grainKnown || !globalFilters.filters?.length,
+        // Not for the saved filters a link is about to replace.
+        enabled: !linkPending && (grainKnown || !globalFilters.filters?.length),
         keepWhileRecounting: true,
     });
 
@@ -374,7 +429,7 @@ function DatasetPageContent() {
     const { data: schema, isLoading: schemaLoading, isPlaceholderData: schemaIsPrevious } = useQuery<SchemaField[]>({
         queryKey: ['schema', datasetId, schemaFilters, lightningMode],
         queryFn: ({ signal }) => getDatasetSchema(datasetId!, schemaFilters, lightningMode, signal),
-        enabled: !!datasetId,
+        enabled: !!datasetId && !linkPending,  // not for the saved filters a link is about to replace
         staleTime: 60_000,
         refetchOnWindowFocus: false,
         // Field-stats can take a long time on large filtered datasets. Stacking
@@ -529,6 +584,63 @@ function DatasetPageContent() {
         setHighlightCuboidField(null);
         setSelectedSample(sample);
     }, [datasetId]);
+
+    // A link to this dataset (lib/links.ts; FilterContext read it as the page opened). Its sort is the grids'
+    // before they open (they open on the next render).
+    const linkSortedRef = useRef(false);
+    useEffect(() => {
+        if (!link || datasetId == null || linkSortedRef.current) return;
+        linkSortedRef.current = true;
+        if (link.sort !== undefined) rememberGridSort(datasetId, link.sort || undefined, link.dir ?? 'asc');
+    }, [link, datasetId]);
+    // Once the dataset has answered (a dataset the reader can't open answers as it does without a link), the link's
+    // filter replaces the restored one, then its sample opens, with next/previous walking the grid as it loads.
+    const linkOpenedRef = useRef(false);
+    useEffect(() => {
+        if (!link || !dataset || datasetId == null || linkOpenedRef.current) return;
+        linkOpenedRef.current = true;
+        const notice = (message: string) => addToast(message, 'warning', 10000);
+        void (async () => {
+            let stages: ViewStage[] | null = null;
+            try {
+                stages = await linkStages(datasetId, link);
+            } catch (error) {
+                notice(error instanceof LinkError ? error.message : `Couldn't open the link: ${(error as Error).message}`);
+            }
+            settleLink(stages);
+            if (link.sample === undefined) return;
+            const id = Number(link.sample);
+            let sample: Sample | undefined;
+            try {
+                if (Number.isSafeInteger(id)) {
+                    const found = await getSamples(datasetId, 1, 0, { logic: 'AND', filters: [{ field: 'id', operator: 'in', value: [id] }] }, undefined, undefined, true);
+                    sample = found.items[0];
+                }
+            } catch (error) {
+                notice(`Couldn't open the linked sample: ${(error as Error).message}`);
+                return;
+            }
+            if (!sample) {
+                notice("The linked sample isn't in this dataset.");
+                return;
+            }
+            // The panels open once the link has settled (they wait for it): give a grid a moment to be there, so
+            // next and previous have rows to walk. Without one the sample still opens.
+            for (let waited = 0; waited < 40 && Object.keys(gridSamplesRefs.current).length === 0; waited += 1) {
+                await new Promise(resolve => setTimeout(resolve, 50));
+            }
+            // The grid holding it, else the grid panel rendered last (a saved layout replaces the default one).
+            const grids = Object.entries(gridSamplesRefs.current);
+            const grid = grids.find(([, rows]) => rows.current.some(row => row.id === id)) ?? grids[grids.length - 1];
+            void handleSampleClick(sample, grid?.[0] ?? 'center');
+        })();
+    }, [link, dataset, datasetId, settleLink, addToast, handleSampleClick]);
+    // A dataset that doesn't answer has nothing to open the link on: the page shows why, without the link.
+    useEffect(() => {
+        if (!link || !datasetError || linkOpenedRef.current) return;
+        linkOpenedRef.current = true;
+        settleLink(null);
+    }, [link, datasetError, settleLink]);
 
     // Image -> objects pivot (for the grid panel `panelId`): show every object whose
     // parent_id is one of the selected images. Switches THAT panel to object grain with the
@@ -1239,6 +1351,22 @@ function DatasetPageContent() {
         else if (lastSearch?.image) void handleImageSearch(lastSearch.image, limit, lastSearch.scope, lastSearch.id, true);
     };
     const hasDraft = hasUnappliedChanges || brushedIds.length > 0 || selectedIds.length > 0 || !!currentPolygon;
+    // Copy link (lib/links.ts): the applied filters and the grid's sort, and the sample shown when given. The draft
+    // isn't applied, so it isn't in the link.
+    const copyDatasetLink = (sampleId?: number) => {
+        if (datasetId == null) return;
+        const stages = viewStages;
+        const link = (async () => datasetLink({
+            origin: window.location.origin,
+            datasetId,
+            stages,
+            parts: await linkQueryParts(datasetId, stages),
+            sort: readGridSort(datasetId),
+            sample: sampleId,
+        }))();
+        const copied = sampleId !== undefined ? 'Link to this sample copied' : stages.length ? 'Link to these filters copied' : 'Link to this dataset copied';
+        void copyLink(link, hasDraft ? `${copied}. It holds the applied filters only, not the draft.` : copied, addToast);
+    };
 
     if (!isMounted) return null;
 
@@ -1253,6 +1381,19 @@ function DatasetPageContent() {
                         {datasetError.status === 403 ? "You don't have access to this dataset." : "This dataset doesn't exist."}
                     </p>
                     <Link href="/" className="text-sm text-cyan-400 hover:text-cyan-300">← Back to datasets</Link>
+                </div>
+            </div>
+        );
+    }
+
+    // A link's filters are on their way (a view fetched, a query parsed): no panel opens on the filters this
+    // browser had saved, which would be queried and shown only to be replaced.
+    if (linkPending) {
+        return (
+            <div className="h-screen flex flex-col bg-zinc-950">
+                <Header />
+                <div data-testid="link-opening" className="flex-1 flex items-center justify-center text-sm text-zinc-400">
+                    Opening the link…
                 </div>
             </div>
         );
@@ -1382,6 +1523,15 @@ function DatasetPageContent() {
                                 }}
                             />
                         )}
+                        <button
+                            onClick={() => copyDatasetLink()}
+                            data-testid="copy-link"
+                            className="px-3 py-1 border rounded text-sm transition-colors flex items-center gap-2 bg-zinc-800 text-zinc-300 border-zinc-700 hover:bg-zinc-700 hover:text-white"
+                            title="Copy a link that opens this dataset on the applied filters and the grid's sort. It opens only for people who can open the dataset."
+                        >
+                            <Link2Icon />
+                            Copy link
+                        </button>
                         <button
                             onClick={() => setIsJobHistoryOpen(true)}
                             data-testid="open-job-history"
@@ -1529,6 +1679,8 @@ function DatasetPageContent() {
                                 setSimilaritySearchSample(seed);
                             } : undefined}
                             onTag={() => setTagSampleId(selectedSample.id)}
+                            // The row opened (an object shows as its parent image): a link to it opens the same view.
+                            onCopyLink={() => copyDatasetLink(modalSourcePanelId != null && modalSourceId != null ? modalSourceId : selectedSample.id)}
                             onCloseOverlay={() => setTagSampleId(null)}
                             overlay={tagSampleId !== null && datasetId ? (
                                 <TagManagementModal

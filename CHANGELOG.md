@@ -4,6 +4,114 @@ Freedom Ridge has one version for the server, the web app and the Python SDK (th
 file), following [Semantic Versioning](https://semver.org). A release lists **upgrade notes** when
 it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
 
+## Unreleased
+
+### Added
+
+- **Links that open a dataset on a filter, a saved view or a sample.** `/datasets/<id>?q=split = train` opens the
+  dataset on that filter, written in the query language (docs/FILTER_QUERY.md), one chip per `AND` part.
+  `?view=<slug>` opens a saved view, `?sample=<id>` opens a sample, and `?sort=<field>&dir=desc` sets the grid's
+  sort. Filters the language can't write (map regions, lassos, picked samples, searches, concepts) go in `?f=`,
+  encoded with a version number: a link made by a version that reads it differently says so and opens nothing.
+  The link's filters replace the ones the browser kept for the dataset, which are one Back away, and the dataset's
+  default view isn't put on top. The address loses the link once it has opened, so a reload keeps later changes.
+  A view the reader can't open, a filter with a mistake or a sample of another dataset is reported, and the
+  dataset opens as it would without the link.
+- **Copy link.** A **Copy link** button beside **Saved Views** copies a link to the applied filters and the
+  grid's sort, each saved view has one for the view, and the sample view's adds the sample. The filters go in as
+  query text when every chip can be written so and reads back the same, else encoded. The unapplied draft isn't in
+  the link, and the message says so. A big Select All (the server keeps it for 2 hours) and a link over 6,000
+  characters (about a thousand picked samples) copy nothing and say to save a view and copy its link instead. A
+  link opens only for people who can open the dataset, or the view. Where the browser doesn't let the page copy,
+  the link is shown to copy by hand.
+- **Signing in goes back to the page asked for.** Opening a link while signed out, or a session expiring, goes to
+  the login page and then back to that page, filters included. Only a page of this server is followed; anything
+  else goes to the dataset list.
+
+### Fixed
+
+- **A dataset that has a default view can be deleted.** The deletion job failed when it reached the view, at
+  every resume, and the dataset stayed "being deleted". The default view is now cleared when the deletion starts.
+  A dataset already stuck that way isn't freed by this release (its row refuses every change while it is being
+  deleted); that needs a later one.
+- **Image requests no longer tell a signed-out caller which samples exist.** `/api/samples/<id>/media` answered
+  "not found" for a missing sample, "sign in" for an existing one, and another "not found" for an existing
+  sample whose asked-for field was empty, so sample ids and the presence of a field could be probed without an
+  account. No image or value was returned. It now asks who is calling first, and checks access to the dataset
+  before saying anything about the field.
+- **Deleting a dataset no longer fails while a backup runs.** The deletion's last step removes the dataset's field
+  indexes, which waits for every transaction reading the samples table. A backup holds that table for the whole
+  dump, so the wait ran out, and each time counted as a failure: after the fifth the deletion failed with every
+  sample already gone, and the dataset stayed "deleting" until an administrator resumed it. The step now waits for
+  a running backup first, and waits out other long reads (a map re-fit's export) without failing.
+- **On-demand compute workers: a power user's own worker no longer holds back a machine.** The job runner started a
+  machine only when no compute worker was free, and counted every idle worker as free. A power user's worker takes
+  only jobs on datasets its owner can access, so a re-fit of another dataset waited with no machine until it was
+  cancelled 12 hours later. A worker now counts only for the jobs it can take.
+- **On-demand compute workers: machines that can't work no longer start one after another.** When every machine
+  failed the same way (an image that doesn't start, a server it can't reach), each one powered off or was ended
+  and the next minute started another, until the job's 12 hours or the month's machine-hours ran out, while System
+  status showed no error. After two machines in a row never connect, no more start until an admin saves the
+  settings again, and the error says why. No machine starts either while the admin who saved the settings is
+  deactivated or no longer an admin: the machines' workers use that admin's token.
+- **On-demand compute workers: changing the region no longer loses track of a running machine.** The job runner
+  looked at every machine in the region saved last. AWS doesn't know a machine's id in another region, so a machine
+  started before the change looked gone: its record ended while it ran on, outside the time limits and the month's
+  machine-hours. Each machine is now looked at and ended in the region it started in, and the settings page refuses
+  to change the region or the AWS keys while a machine runs.
+- **`npx freedomridge` sizes PostgreSQL for a laptop.** `docker-compose.try.yml` loaded the database settings tuned
+  for a 32 GB server, among them 8 GB of shared buffers: more memory than a small Docker Desktop has to give, where
+  the database may not start at all. It now starts with 512 MB of shared buffers, 16 MB of work memory
+  and 256 MB of maintenance memory; `POSTGRES_SHARED_BUFFERS`, `POSTGRES_EFFECTIVE_CACHE_SIZE`, `POSTGRES_WORK_MEM`
+  and `POSTGRES_MAINTENANCE_WORK_MEM` in the folder's `.env` give it more. Docker needs at least 4 GB of memory for
+  it ([launcher/README.md](launcher/README.md)).
+- **`npx freedomridge --dir` starts a separate installation.** Every folder ran as the same Docker Compose project,
+  so starting a second folder replaced the first one's containers with its own, on the first one's database, and
+  `docker compose ... down -v` from either folder deleted that one database. A folder other than `~/freedomridge`
+  now gets its own project, named in its `.env`, with its own containers and database. `~/freedomridge`, and a
+  folder an earlier launcher already started, keep the project and database they have. The launcher refuses to
+  start a folder whose project's containers belong to another folder, and says which.
+- **Upgrading stops the app before the migrations.** [Upgrading](docs/UPGRADING.md) applied the migrations while the
+  old version still ran, and recreated its containers only afterwards. In between, the old API went on serving
+  requests and the old job runner went on running jobs against the changed schema: the API checks the schema only
+  in `/api/health`, the job runner only when it starts. Step 4 now stops the backend, the job runner, the scheduled
+  backup and the frontend first, as [Docker deployment](docs/DOCKER_DEPLOYMENT.md) and [Deploy to AWS](docs/DEPLOY_TO_AWS.md) now do too.
+  `npx freedomridge` already stopped the app before migrating.
+- **An admin's password reset ends the user's API tokens** ([AUTHENTICATION.md](docs/AUTHENTICATION.md#api-tokens)).
+  A reset signed the user out but kept their tokens, so a token copied by whoever had the account worked again as
+  soon as the user chose a new password. `reset_admin.py` with a password left an admin's old tokens working at
+  once. Both now revoke the account's tokens with its sessions, and an admin can revoke all of another user's
+  tokens with `DELETE /api/users/{id}/tokens`. That includes the follower and worker tokens the account issued:
+  followers that connect with one stop syncing until they are given a new token (Settings → Followers), and
+  on-demand machines started under it end. Deactivating an account and changing your own password work as
+  before.
+- **A version's answers no longer change with the live dataset.** Filtering or aggregating a version on a label
+  path such as `animals.label` read which fields are lists from the dataset as it is now. Once `animals` was
+  cleared in the dataset, the same query on the unchanged version matched nothing; for a box field such as
+  `vehicles` it happened after the next statistics refresh. A version is now read with the fields it stored.
+- **A compute worker stops working on a dataset its owner can no longer access.** When an admin removed a power
+  user's access to a private dataset while that user's worker was fitting one of its maps, the worker could still
+  download the job's data, upload a result and keep renewing its lease until the job ended. Those calls now check
+  the access again, as claiming a job does. The worker drops that job and goes on with others, and the job goes
+  back to the queue. Nothing else changes.
+- **A filter like `score = "1"` on an indexed number field matches the same samples everywhere.** On a number field
+  with an index, the grid compares a number written as text with the stored numbers, so it finds `1.0`. Duplicate
+  groups, sparse sampling, bulk tag, delete and set by filter, a follower's tag edits and version queries compared
+  the text `"1"` and missed it. They now match what the grid matches. A field without an index still compares
+  such a value as text.
+
+### Removed
+
+- **`backend/init_db.py`.** A leftover script from before migrations: run against an installation it dropped the
+  dataset, sample, vector and field tables (and, by CASCADE, everything that refers to them) and then failed
+  partway through the schema, so the data was gone and the
+  database unusable. Nothing in Freedom Ridge called it: a new database is created from `backend/db/schema.sql`
+  when its container first starts, and an existing one is upgraded with `scripts/apply_migrations.sh`.
+- **Thumbnails and overlays stop when a dataset loses a storage bucket.** After an admin restricted a storage
+  configuration to other datasets, the original images of a dataset that lost it were refused, but thumbnails,
+  crops and heatmap overlays already made from them were still served from the cache to anyone with access to
+  that dataset. The bucket is now checked before the cache is read. Nothing else changes.
+
 ## 2.8.0 (2026-11-10)
 
 2.8.0 lets a follower resume into its copy after its primary is restored from a backup, instead of copying every

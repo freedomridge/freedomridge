@@ -18,7 +18,7 @@ interface User {
 interface UserContextType {
     user: User | null;
     isLoading: boolean;
-    login: (username: string, password: string) => Promise<void>;
+    login: (username: string, password: string, next?: string) => Promise<void>;
     logout: () => Promise<void>;
     changePassword: (current: string, newPass: string) => Promise<void>;
     checkAuth: () => Promise<void>;
@@ -126,7 +126,8 @@ export function UserProvider({ children }: { children: React.ReactNode }) {
         };
     }, [isAuthenticated, checkAuth]);
 
-    async function login(username: string, password: string) {
+    // `next`: where to go once signed in, a page of this app (the login page checks it).
+    async function login(username: string, password: string, next = '/') {
         const res = await fetch('/api/auth/login', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -144,7 +145,7 @@ export function UserProvider({ children }: { children: React.ReactNode }) {
         // empty result that survived the client-side navigation. (A full refresh "worked"
         // only because it reset the cache; this makes client-side login behave the same.)
         queryClient.clear();
-        router.push('/');
+        router.push(next);
     }
 
     async function logout() {

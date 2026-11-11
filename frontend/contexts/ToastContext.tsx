@@ -88,7 +88,8 @@ function ToastItem({ toast, onClose }: { toast: Toast; onClose: () => void }) {
             ${bgColors[toast.type]}
         `}>
             {icons[toast.type]}
-            <p className="flex-1 text-sm font-medium">{toast.message}</p>
+            {/* A long unbroken message (a link to copy by hand) wraps and scrolls inside the toast. */}
+            <p className="flex-1 max-h-60 overflow-y-auto wrap-anywhere text-sm font-medium">{toast.message}</p>
             <button
                 onClick={onClose}
                 className="p-1 hover:bg-white/10 rounded-full transition-colors"

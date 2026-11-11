@@ -824,6 +824,27 @@ async def _is_high_bit_depth(dataset_id: int, path: str) -> bool:
         return False  # not an image Pillow reads: served as it is, as before
 
 
+async def _require_readable_source(dataset_id: int, path: str) -> None:
+    """The storage checks _fetch_media_bytes makes before it reads a source, without reading it: a local path must
+    stay under the data root, and an s3:// path must be in a bucket this dataset may use now.
+
+    A cached thumbnail, crop or overlay is served only after these, so restricting a storage configuration to other
+    datasets stops its derived images too, not only its originals. External URLs are refused where they are fetched.
+    """
+    if path.startswith(("http://", "https://")):
+        return
+    if not path.startswith("s3://"):
+        _resolve_local_path(path)
+        return
+    bucket, key = _parse_s3_path(path)
+    if not bucket or not key:
+        raise HTTPException(status_code=500, detail=f"Malformed s3 path: {path}")
+    _validate_s3_key(key)
+    _validate_bucket(bucket)
+    if await route_s3_bucket(dataset_id, bucket) is None:
+        raise HTTPException(status_code=403, detail="Bucket not authorized for this dataset")
+
+
 async def _fetch_media_bytes(dataset_id: int, path: str) -> tuple[bytes, str]:
     """Fetch the raw bytes for a resolved media path.
 
@@ -1017,6 +1038,8 @@ async def _serve_composite(
     # map_path, so an unbounded browser cache would keep serving a stale
     # composite after a heatmap re-point even though mp_hash busts the disk key.
     composite_headers = {"Cache-Control": "private, max-age=3600", "X-Overlay": overlay_field}
+    await _require_readable_source(dataset_id, base_path)
+    await _require_readable_source(dataset_id, map_path)
     cached = await asyncio.to_thread(read_cache, cache_path)
     if cached is not None:
         return Response(
@@ -1176,6 +1199,7 @@ async def _serve_crop_resize(
         "ETag": f'"{digest}"',
     }
 
+    await _require_readable_source(dataset_id, path)
     cached = await asyncio.to_thread(read_cache, cache_path)
     if cached is not None:
         return Response(
@@ -1288,6 +1312,13 @@ async def serve_media(
 ):
     """serve_sample_media's work. With check_access off, for a follower's request the followers router has
     authorized, the user's dataset access isn't checked and nothing is fetched from a primary."""
+    # Who is asking comes before anything is looked up: answering 404 for a missing sample and 401 for an existing
+    # one told an anonymous caller which sample ids exist, and which of a sample's fields hold a value.
+    user = None
+    if check_access:
+        user = await get_optional_user(request)
+        if user is None:
+            raise HTTPException(status_code=401, detail="Authentication required")
     sql = _build_media_path_sql(field, versioned=version_id is not None)
     media_args = [sample_id] if version_id is None else [sample_id, version_id]
     row = await db.fetchrow(sql, *media_args)
@@ -1296,6 +1327,9 @@ async def serve_media(
 
     dataset_id = row['dataset_id']
     path = row['path']
+    if check_access:
+        # Before the field's own error, for the same reason: a user without access learns nothing of its fields.
+        await check_dataset_access(dataset_id, user)
     if not path:
         raise HTTPException(
             status_code=404,
@@ -1303,8 +1337,6 @@ async def serve_media(
         )
 
     if check_access:
-        user = await get_optional_user(request)
-        await check_dataset_access(dataset_id, user)
         # A mirror's image this instance can't read (on the primary's disk, or in a bucket it has no credentials
         # for) comes from the primary, when the primary serves that dataset's images (docs/FOLLOWERS.md).
         if version_id is None and not await _readable_here(dataset_id, path):

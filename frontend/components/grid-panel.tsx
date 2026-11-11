@@ -25,6 +25,16 @@ const dismissCoverage = (datasetId: number) => {
     dismissListeners.forEach(listener => listener());
 };
 
+const gridSortKey = (datasetId: number) => `fridge:gridSort:${datasetId}`;
+/** The sort the dataset's grids open on (a link to the dataset sets it before they open). */
+export function rememberGridSort(datasetId: number, by: string | undefined, order: 'asc' | 'desc') {
+    try { localStorage.setItem(gridSortKey(datasetId), JSON.stringify({ by, order })); } catch { /* ignore */ }
+}
+/** The sort the dataset's grids are on (the last one changed); `by` unset is the default order. */
+export function readGridSort(datasetId: number): { by?: string; order?: 'asc' | 'desc' } {
+    try { return JSON.parse(localStorage.getItem(gridSortKey(datasetId)) || '{}'); } catch { return {}; }
+}
+
 interface GridPanelProps {
     datasetId: number;
     dataset: Dataset | undefined;
@@ -159,16 +169,13 @@ export function GridPanel({
 
     // Per-instance view settings. The sort is remembered per dataset, like the filters and the
     // selection (a reload went back to "Default (ID)").
-    const sortKey = `fridge:gridSort:${datasetId}`;
     const [savedSort] = useState<{ by?: string; order?: 'asc' | 'desc' }>(() => {
         if (typeof window === 'undefined') return {};
-        try { return JSON.parse(localStorage.getItem(sortKey) || '{}'); } catch { return {}; }
+        return readGridSort(datasetId);
     });
     const [sortBy, setSortBy] = useState<string | undefined>(savedSort.by || undefined);
     const [sortOrder, setSortOrder] = useState<'asc' | 'desc'>(savedSort.order === 'desc' ? 'desc' : 'asc');
-    useEffect(() => {
-        try { localStorage.setItem(sortKey, JSON.stringify({ by: sortBy, order: sortOrder })); } catch { /* ignore */ }
-    }, [sortKey, sortBy, sortOrder]);
+    useEffect(() => rememberGridSort(datasetId, sortBy, sortOrder), [datasetId, sortBy, sortOrder]);
     // Only what the server can sort: an array field (tags) or a boolean fell back to the default
     // order with the dropdown still claiming the sort.
     const sortableFields = (schema ?? []).filter(f => f.is_promoted && f.sortable !== false && SORTABLE_TYPES.has(f.type));

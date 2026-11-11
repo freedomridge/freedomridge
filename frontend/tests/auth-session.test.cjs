@@ -27,7 +27,7 @@ function harness(t) {
     const effects = [];
     const timers = new Map();
     const window = new EventTarget();
-    window.location = { pathname: '/datasets/1', href: '/datasets/1' };
+    window.location = { pathname: '/datasets/1', search: '?q=a', href: '/datasets/1?q=a' };
     const document = new EventTarget();
     document.visibilityState = 'visible';
     const oldWindow = global.window;
@@ -76,7 +76,7 @@ function harness(t) {
     const { Providers } = load('app/providers.tsx', {
         react, '@tanstack/react-query': query, '@/contexts/UserContext': { UserProvider },
         '@/contexts/ToastContext': { ToastProvider: () => null },
-        '@/lib/api': api, '@/lib/query-notify': { coalesceQueryNotifications() {} },
+        '@/lib/api': api, '@/lib/query-notify': { coalesceQueryNotifications() {} }, '@/lib/links': load('lib/links.ts', { './filter-query': load('lib/filter-query.ts') }),
     });
     t.after(() => {
         slots.forEach(slot => slot?.cleanup?.());
@@ -159,12 +159,13 @@ test('API and provider errors redirect only for 401, and queries retry 429', t =
     for (const status of [503, 500, 429, 403]) {
         const error = new h.api.ApiError(status, 'Temporary error');
         h.subscribers.forEach(callback => callback({ type: 'updated', query: { state: { status: 'error', error } }, mutation: { state: { status: 'error', error } } }));
-        assert.equal(h.window.location.href, '/datasets/1');
+        assert.equal(h.window.location.href, '/datasets/1?q=a');
         assert.equal(h.client.clear.mock.callCount(), 0);
     }
     assert.equal(options.defaultOptions.queries.retry(0, new h.api.ApiError(429, 'Busy')), true);
     assert.equal(options.defaultOptions.queries.retry(3, new h.api.ApiError(429, 'Busy')), false);
     new h.api.ApiError(401, 'Expired');
-    assert.equal(h.window.location.href, '/login?expired=true');
+    // The login page comes back to the page the session expired on.
+    assert.equal(h.window.location.href, '/login?expired=true&next=%2Fdatasets%2F1%3Fq%3Da');
     assert.equal(h.client.clear.mock.callCount(), 1);
 });

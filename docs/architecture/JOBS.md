@@ -718,6 +718,10 @@ functions above, so their semantics are the same as a local slot's:
 - Each checks that the job's `worker_id` is the caller's worker. A lost lease is 409 (`lease_lost`: stop
   without reporting), and a busy queue is 503 with Retry-After. A worker that stops renewing loses the job
   when its lease expires: the next claim requeues it with a failure, as for a local slot.
+- Heartbeat, complete and the file transfers also check, as a claim does, that the worker's owner may still
+  access the job's dataset; when they can't (an admin removed their access), the answer is the same 409
+  `lease_lost`, so the worker drops the job and goes on claiming, and its lease expires. Fail and release stay
+  open, to give the job back.
 
 `REMOTE_KINDS` lists what a worker can claim, with each kind's policy, which of its steps the worker runs,
 the job files it may download (`GET .../jobs/{job_id}/files/{name}`, Range requests resume it) and upload

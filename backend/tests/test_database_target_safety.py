@@ -136,8 +136,8 @@ asyncpg.connect = _connect
     # Check at collection time: backend modules must capture the verified DSN,
     # including when DATABASE_URL was absent or selected another database/user.
     (child / 'test_probe.py').write_text(
-        'import os\nfrom backend import database, init_db, job_service\n'
-        'assert database.DATABASE_URL == init_db.DATABASE_URL == os.environ["FRIDGE_TEST_POSTGRES_DSN"]\n'
+        'import os\nfrom backend import database, job_service\n'
+        'assert database.DATABASE_URL == os.environ["FRIDGE_TEST_POSTGRES_DSN"]\n'
         'assert job_service.DATABASE_URL == database.DATABASE_URL\n'
         f'def test_probe():\n    open({str(touched)!r}, "w").close()\n',
     )
@@ -190,9 +190,9 @@ def test_unit_only_session_cannot_reach_the_dev_database(tmp_path, database_url)
     (child / 'conftest.py').write_text((ROOT / 'backend/tests/conftest.py').read_text())
     (child / 'test_probe.py').write_text(
         'import asyncio, asyncpg, pytest\n'
-        'from backend import database, init_db, job_service\n'
+        'from backend import database, job_service\n'
         'def test_probe():\n'
-        '    assert database.DATABASE_URL == init_db.DATABASE_URL == job_service.DATABASE_URL\n'
+        '    assert database.DATABASE_URL == job_service.DATABASE_URL\n'
         "    assert '127.0.0.1:1/' in database.DATABASE_URL\n"
         '    with pytest.raises(OSError):\n'
         '        asyncio.run(asyncpg.connect(database.DATABASE_URL, timeout=5))\n',

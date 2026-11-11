@@ -4371,6 +4371,11 @@ def _compile_filter_node(
         # field's bare ::float cast matches its index; any other field guards the cast.
         promoted_numeric = bool(numeric_indexed_fields and field in numeric_indexed_fields)
         numeric_col = f"({col})::float" if promoted_numeric else _numeric_metadata_sql(field)
+        # Whether `=`/`in` take a numeric string as a number (_equality_number): on a promoted numeric field. The
+        # dataset's array context knows those fields too, so a caller that passes no numeric_indexed_fields (hash
+        # duplicates, sampling, bulk jobs, mirror tag forwarding, version queries) matches what the grid matches;
+        # the argument only picks the index-matching cast.
+        numeric_strings = promoted_numeric or field in getattr(array_cols, 'promoted_numeric', ())
 
         # A date / datetime given to day, minute or second precision means that whole unit
         #: `=` is the unit, `!=` its complement, `<=` ends where the next unit
@@ -4421,7 +4426,7 @@ def _compile_filter_node(
                 args.append(val if field in ['id', 'created_at'] else str(val))
                 return f"{col} = ${arg_idx}", arg_idx + 1
             else:
-                num = _equality_number(val, promoted_numeric)
+                num = _equality_number(val, numeric_strings)
                 if num is not None:
                     # A number compares as a number; a promoted field rides its float index.
                     args.append(num)
@@ -4447,7 +4452,7 @@ def _compile_filter_node(
                 return f"{col} IS DISTINCT FROM ${arg_idx}", arg_idx + 1
             # IS DISTINCT FROM so rows missing the field (NULL) are part of the
             # complement; _text_value handles booleans.
-            num = _equality_number(val, promoted_numeric)
+            num = _equality_number(val, numeric_strings)
             if num is not None:  # numeric, as for `=`; non-numeric rows are NULL here -> included
                 args.append(num)
                 return f"{numeric_col} IS DISTINCT FROM ${arg_idx}", arg_idx + 1
@@ -4521,7 +4526,7 @@ def _compile_filter_node(
             else:
                 if not val:
                     return "FALSE", arg_idx
-                nums = [_equality_number(v, promoted_numeric) for v in val]
+                nums = [_equality_number(v, numeric_strings) for v in val]
                 if all(n is not None for n in nums):  # numeric, as for `=`
                     args.append(nums)
                     return f"{numeric_col} = ANY(${arg_idx}::float8[])", arg_idx + 1
@@ -4547,7 +4552,7 @@ def _compile_filter_node(
                 return f"({col} IS NULL OR NOT ({col} = ANY(${arg_idx})))", arg_idx + 1
             # NULL-aware + text-typed to mirror `in`: rows missing the field are
             # part of the complement; _text_value handles booleans.
-            nums = [_equality_number(v, promoted_numeric) for v in val]
+            nums = [_equality_number(v, numeric_strings) for v in val]
             if val and all(n is not None for n in nums):  # numeric, as for `in`
                 args.append(nums)
                 return f"({numeric_col} IS NULL OR NOT ({numeric_col} = ANY(${arg_idx}::float8[])))", arg_idx + 1
@@ -7625,11 +7630,13 @@ async def run_aggregations(
     where_clause: str,
     base_args: list,
     with_clause: str = "",
+    array_columns: Optional[set] = None,
 ) -> dict:
     """Run aggregations over `samples` (or, given `with_clause`, a CTE named `samples`).
 
     `with_clause` is a leading ``WITH samples AS (...)`` that stands in for the table, which is how
-    a version's stored rows are aggregated with the live dataset's SQL.
+    a version's stored rows are aggregated with the live dataset's SQL. `array_columns` is the field
+    context for those rows (a version's own fields); by default the dataset's current one.
     """
     results = []
     for spec in aggregations:
@@ -7671,7 +7678,8 @@ async def run_aggregations(
             results.append({"op": op, "field": field, "quantiles": qs, "value": [float(x) for x in r] if r else []})
 
         elif op in ("count_values", "distinct", "values"):
-            value_expr = _agg_value_expr(field, array_columns=await get_dataset_array_columns(id))
+            columns = array_columns if array_columns is not None else await get_dataset_array_columns(id)
+            value_expr = _agg_value_expr(field, array_columns=columns)
             args = list(base_args)
             limit_sql = ""
             if spec.limit is not None:

@@ -771,7 +771,7 @@ export async function getDatasetViews(datasetId: number): Promise<View[]> {
 }
 
 export async function getView(slug: string): Promise<View> {
-    const res = await fetch(`${API_BASE}/views/${slug}`);
+    const res = await fetch(`${API_BASE}/views/${encodeURIComponent(slug)}`);  // a slug from a link is any text
     await ensureOk(res, 'Failed to fetch view');
     return res.json();
 }

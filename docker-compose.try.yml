@@ -9,6 +9,7 @@
 # Run Compose from this folder: the path comes from the shell's $PWD. MAPBOX_TOKEN in the environment or
 # a .env file turns the map on; FRIDGE_PORT and FRIDGE_API_PORT move the two ports. `npx freedomridge` runs
 # this file for you. A server needs docker-compose.prod.yml (docs/DOCKER_DEPLOYMENT.md).
+# Docker needs at least 4 GB of memory for it.
 name: freedomridge-try
 
 services:
@@ -18,7 +19,9 @@ services:
       POSTGRES_USER: freedomridge
       POSTGRES_PASSWORD: password
       POSTGRES_DB: freedomridge
-    command: postgres -c config_file=/etc/postgresql/postgresql.conf -c max_connections=250
+    # Sized for a laptop: postgresql.conf is tuned for a 32 GB server. POSTGRES_SHARED_BUFFERS,
+    # POSTGRES_EFFECTIVE_CACHE_SIZE, POSTGRES_WORK_MEM and POSTGRES_MAINTENANCE_WORK_MEM give it more.
+    command: postgres -c config_file=/etc/postgresql/postgresql.conf -c max_connections=250 -c shared_buffers=${POSTGRES_SHARED_BUFFERS:-512MB} -c effective_cache_size=${POSTGRES_EFFECTIVE_CACHE_SIZE:-2GB} -c work_mem=${POSTGRES_WORK_MEM:-16MB} -c maintenance_work_mem=${POSTGRES_MAINTENANCE_WORK_MEM:-256MB}
     shm_size: '1g'
     volumes:
       - postgres_data:/var/lib/postgresql/data

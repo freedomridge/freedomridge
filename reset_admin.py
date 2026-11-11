@@ -35,7 +35,18 @@ async def reset_admin(password: str | None = None):
                 not supplied,
             )
             await connection.execute('DELETE FROM sessions WHERE user_id=$1', user_id)
+            # A token copied by whoever had the account must not outlive the reset either.
+            revoked = await connection.execute(
+                'UPDATE api_tokens SET is_active=FALSE WHERE user_id=$1 AND is_active',
+                user_id,
+            )
         print('Admin password reset successfully')
+        if int(revoked.split()[-1]):
+            # Follower and worker tokens are this account's too: whatever used one is cut off until it has a new one.
+            print(
+                f'Revoked {int(revoked.split()[-1])} API token(s) of this account, follower and worker tokens '
+                'included. Issue new follower tokens from Settings → Followers.',
+            )
     finally:
         await connection.close()
 

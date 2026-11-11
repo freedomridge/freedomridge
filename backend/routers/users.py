@@ -203,18 +203,24 @@ async def reset_password(
     validate_new_password(password, target_username)
     password_hash = await hash_password(password)
 
-    await db.execute(
-        """
-        UPDATE users
-        SET password_hash = $1, must_change_password = true
-        WHERE id = $2
-        """,
-        password_hash,
-        id,
-    )
+    assert db.pool is not None  # connected at startup (lifespan)
+    async with db.pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute(
+                """
+                UPDATE users
+                SET password_hash = $1, must_change_password = true
+                WHERE id = $2
+                """,
+                password_hash,
+                id,
+            )
 
-    # Force the target user to re-authenticate: drop any sessions still tied to
-    # the old password so an admin reset actually locks out an active session.
-    await db.execute("DELETE FROM sessions WHERE user_id = $1", id)
+            # Force the target user to re-authenticate: drop any sessions still tied to
+            # the old password so an admin reset actually locks out an active session.
+            await conn.execute("DELETE FROM sessions WHERE user_id = $1", id)
+            # And end their API tokens: a token copied by whoever had the account would
+            # otherwise work again as soon as the user chose a new password.
+            await conn.execute("UPDATE api_tokens SET is_active = FALSE WHERE user_id = $1 AND is_active", id)
 
     return {"message": "Password reset successfully"}
