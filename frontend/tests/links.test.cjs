@@ -216,6 +216,23 @@ test('a stage holding a selection token makes no link, and names the chip', asyn
     );
 });
 
+test('an expired selection\'s chip makes no link, and names the chip', async () => {
+    const stages = fixture('f', 'plain filter').stages;
+    const one = [{ expired: true, description: 'Grid (60000 Selected)', count: 60000 }];
+    await assert.rejects(
+        datasetLink({ origin: ORIGIN, datasetId: 5, stages, expired: one, parts: null }),
+        (error) => error instanceof LinkError
+            && error.message === "Can't copy a link: “Grid (60000 Selected)” is an expired selection. Select the samples again, or remove it.",
+    );
+    const two = [...one, { expired: true, description: '50001 Selected', count: 50001 }];
+    await assert.rejects(
+        datasetLink({ origin: ORIGIN, datasetId: 5, stages: [], expired: two, parts: null }),
+        (error) => error instanceof LinkError && error.message.includes('“Grid (60000 Selected)”, “50001 Selected” are expired selections')
+            && error.message.endsWith('or remove them.'),
+    );
+    assert.equal(await datasetLink({ origin: ORIGIN, datasetId: 5, stages: [], expired: [], parts: null }), 'http://x.test/datasets/5?q=');
+});
+
 test('a link over 6,000 characters is refused, pointing to a saved view', async () => {
     const value = (n) => [`note = "${'x'.repeat(n)}"`];
     const length = async (n) => (await datasetLink({ origin: ORIGIN, datasetId: 5, stages: asStages([{}]), parts: value(n) })).length;

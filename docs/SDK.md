@@ -1545,9 +1545,9 @@ dataset.compute_hashes(image_loader=lambda fp: Image.open(fp))
 Create snapshots explicitly on the datasets that need them. Ordinary datasets incur no
 per-edit history writes. Full snapshots preserve sample membership, annotation metadata,
 tags, filepaths, media types, geography, dynamic arrays, and sample timestamps. They also
-capture dataset media settings, segmentation class mappings, and registered field types
-and display settings. Image hashes are compared but their values and embeddings are not
-restored.
+capture dataset media settings, segmentation class mappings, registered field types
+and display settings, and the dataset's public saved views. Image hashes are compared but
+their values and embeddings are not restored.
 
 Snapshots made by older versions remain readable, but fields they never recorded
 are unknown; current values are never substituted into historical reads.
@@ -1567,13 +1567,40 @@ fields) change during the copy, the server takes the snapshot again, up to twice
 attempt conflicts, it returns HTTP 409 with `Retry-After` and saves no partial version; retry
 after the writer finishes.
 
+A version records when it was made and who made it (`created_at`, `created_by`): now, and the
+user creating it. For history brought in from another system, pass the date and the author it
+had there:
+
+```python
+from datetime import datetime, timezone
+
+dataset.create_version(
+    "v0.9",
+    created_at=datetime(2024, 9, 7, 16, 21, tzinfo=timezone.utc),
+    created_by="ada",
+)
+```
+
+The version is listed, and is the latest or not, by that date. It needs a timezone and can't be
+in the future. `created_by` is a name, stored as given. A version given a date and no
+`created_by` has no recorded maker: whoever made it then is unknown, and it isn't whoever brings
+it in. A stated date or author is a claim about another system, so the version also records who
+made the request, as `imported_by`; the app shows "by ada, imported by richard". The snapshot is
+still of the dataset as it is now: bring the dataset to the state the version had before creating
+it.
+
 ### List Versions
 
 ```python
 versions = dataset.list_versions()
 for v in versions:
-    print(f"{v['name']} - {v['sample_count']} samples - {v['created_at']}")
+    print(f"{v['name']} - {v['sample_count']} samples - {v['created_at']} - {v['created_by']}")
 ```
+
+`created_by` is `None` when it isn't known who made the version: one made before versions
+recorded it, or history brought in without an author. The app shows such a version as made by
+unknown. `imported_by` is the user who brought a version in with a stated date or author, and
+`None` for every other version.
 
 ### Compare a Version Against Current State
 
@@ -1644,12 +1671,51 @@ settings = info["dataset_snapshot"]
 Diff responses include `dataset_changed` separately from sample counts; `None` means
 an older or hash-only version did not record dataset settings.
 
+### A Version's Saved Views
+
+A full version records the dataset's **public** saved views when it is made: each one's name,
+description and filters. A private view is its owner's and isn't recorded.
+
+```python
+v = dataset.version("v1.8")
+[view["name"] for view in v.list_views()]     # the views v1.8 recorded
+subset = v.load_view("evaluation subset")     # that view, on v1.8's stored samples
+subset.count()
+```
+
+`load_view` returns a `VersionView`, so it chains with `filter`, `select_fields` and the rest.
+It is the view as the version recorded it, applied to the samples as the version stored them:
+what the view showed then, whatever has changed since. A view whose filters read live data a
+version does not store is rejected like any such filter (above). A version made before versions
+recorded views has none to list, and `list_views` raises `ValueError` rather than report an
+empty list.
+
+In the app, **Browse snapshot** lists the version's views under **Saved view**; choosing one
+shows the samples it held at that version, and the search then works within it.
+
+Diff responses include `view_changes`: the names of the public saved views `added`, `removed`
+and with `filters_changed` between the two sides. A view is the same view while it keeps its
+name. `None` means one side recorded no views.
+
 ### Revert to a Version
 
-`revert()` restores saved sample fields, atomically saving an undo snapshot first.
-By default it preserves current sample membership. It leaves dataset settings,
-embeddings, and image-hash values unchanged. Use checkout or the snapshot browser
-for the exact historical dataset view.
+`revert()` restores saved sample fields and the public saved views the version recorded,
+atomically saving an undo snapshot first. By default it preserves current sample membership
+and leaves the dataset's settings as they are. It never restores embeddings or image-hash
+values. Use checkout or the snapshot browser for the exact historical dataset view.
+
+Reverting takes an `admin` (HTTP 403 otherwise): it can delete the samples added since a
+version, rewrite or remove public saved views whoever made them, and restore the dataset's
+settings, each of which takes an admin on its own. Deleting a version takes an `admin` too: it
+can't be brought back. Everyone with access to the dataset, guests included, can list, browse
+and compare its versions, and making one takes a `power_user`.
+
+A recorded view comes back under its name with its filters: a public view of that name is
+given them, and one deleted since is made again, with the link it had when that is still free.
+Public views added since the version stay, unless `exact_membership=True`. Private views are
+never touched; one that now has a recorded view's name stops the revert with HTTP 409, and
+nothing is changed. A version that recorded no views leaves the views as they are. The result
+counts `views_restored` and `views_removed`.
 
 ```python
 result = dataset.revert(version_name="v1.0")   # or revert(version_id=...)
@@ -1657,10 +1723,29 @@ result = dataset.revert(version_name="v1.0")   # or revert(version_id=...)
 result = dataset.revert(version_name="v1.0", restore_deleted=True)
 
 result = dataset.revert(version_name="v1.0", exact_membership=True)
+
+result = dataset.revert(version_name="v1.0", exact_membership=True, restore_settings=True)
 ```
 
-`exact_membership=True` also restores deleted samples and removes later additions;
-it is an explicit destructive operation. It supports empty snapshots. Restores run
+`restore_settings=True` also puts the dataset's settings back as the version recorded them:
+its description, its media fields and which one the grid and a sample's view show, the
+segmentation classes and colours, and the view it opens on (its default view, found again by
+name; none if the version had none). Not its name. A version that recorded no settings refuses
+it (HTTP 400) before anything is changed.
+
+Without it, the default view stays as it is, unless the revert removes that view
+(`exact_membership=True`, and the view was added since the version): the dataset then opens on
+no view.
+
+In the app, **Dataset Settings → Versions → Revert to this snapshot** is the exact revert:
+the dataset is that version again. Before it runs, it asks with the numbers counted at that
+moment: how many samples and public saved views it deletes and restores, and whether one of the
+deleted views is the one the dataset opens on. Two checkboxes above the list change what it
+does: one keeps what was added since (the button then reads **Restore sample data**), the
+other also restores the settings. For anyone but an admin the button is disabled and says why.
+
+`exact_membership=True` also restores deleted samples and removes later additions, samples
+and public saved views alike; it is an explicit destructive operation. It supports empty snapshots. Restores run
 in a serializable transaction and return HTTP 409 on a concurrent-write or filepath
 conflict, with all changes rolled back. Retry a concurrency conflict after the other
 writer finishes. The returned `auto_snapshot_id` can be restored with
@@ -1674,7 +1759,12 @@ require backfilling.
 status = dataset.version_status()
 if status.get("has_changes"):
     print("Uncommitted changes detected")
+    print(status["view_changes"])   # {"added": [...], "removed": [...], "filters_changed": [...]}
 ```
+
+A public saved view added, removed or given other filters since a version is a change, like a
+changed sample. `view_changes` names those views against the latest version; it is `None` when
+that version recorded no views.
 
 ---
 
@@ -2097,14 +2187,15 @@ class Dataset:
     def list_array_fields() -> list[str]
 
     # Versioning
-    def create_version(name: str, description: str = None, include_metadata: bool = True) -> dict
+    def create_version(name: str, description: str = None, include_metadata: bool = True,
+                       created_at: datetime = None, created_by: str = None) -> dict
     def list_versions() -> list[dict]
     def version_status() -> dict
     def diff(version_name: str = None, version_id: int = None) -> dict   # version vs current
     def checkout(version_name: str = None, version_id: int = None) -> Iterator[Sample]  # snapshot samples
     def version(version_name: str = None, version_id: int = None) -> VersionView  # queryable, read-only
     def revert(version_name: str = None, version_id: int = None, restore_deleted: bool = False,
-               exact_membership: bool = False) -> dict
+               exact_membership: bool = False, restore_settings: bool = False) -> dict
 ```
 
 ### DatasetView Class

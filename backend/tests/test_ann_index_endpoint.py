@@ -14,7 +14,8 @@ import time
 import pytest
 from fastapi import HTTPException
 
-from backend import index_jobs, job_queue, job_wait
+from backend import access, index_jobs, job_queue, job_wait
+from backend.routers import jobs as jobs_router
 from backend.routers import quality
 from backend.tests import job_helpers
 from backend.tests import test_field_registry_postgres as registry_helpers
@@ -68,6 +69,10 @@ def test_no_embeddings_mixed_dimensions_and_existing_index(registry_database, mo
         monkeypatch.setattr(quality, 'db', database)
         await vectors(database, 'mixed', ['[1,0]', '[1,0,0]'])
         await vectors(database, 'clip', ['[1,0]', '[0,1]', '[1,1]'])
+        # As after the upgrade (0021): each build removes its field's row once it has an index or nothing to index.
+        await database.execute(
+            "INSERT INTO ann_index_rebuilds (dataset_id, field_name) VALUES (1, 'absent'), (1, 'mixed'), (1, 'clip')",
+        )
         async with job_helpers.runner(database, kinds=[KIND]):
             with pytest.raises(HTTPException) as missing:
                 await quality.build_ann_index(1, quality.AnnIndexRequest(field='absent'), user=USER)
@@ -81,6 +86,13 @@ def test_no_embeddings_mixed_dimensions_and_existing_index(registry_database, mo
             assert await index_state(database, 'hnsw_emb_d1_clip') is True
             again = await quality.build_ann_index(1, quality.AnnIndexRequest(field='clip'), user=USER)
             assert again == {'field': 'clip', 'dim': 2, 'built': False, 'detail': 'index already exists'}
+            # Mixed dimensions stay queued, to be tried again once they are cleaned up.
+            assert await database.fetchval('SELECT array_agg(field_name) FROM ann_index_rebuilds') == ['mixed']
+            # The jobs list names each build's field, which its Retry builds again.
+            monkeypatch.setattr(jobs_router, 'db', database)
+            monkeypatch.setattr(access, 'db', database)
+            page = await jobs_router.list_dataset_jobs(1, limit=10, cursor=None, user=USER)
+            assert {(job.field, job.state) for job in page.items} >= {('mixed', 'failed'), ('clip', 'succeeded')}
         # The session that built the index left no lock or settings behind.
         async with database.pool.acquire() as connection:
             assert await connection.fetchval('SHOW maintenance_work_mem') != '256MB'

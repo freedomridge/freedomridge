@@ -10,7 +10,7 @@ from ..database import db
 from ..passwords import hash_password
 from ..security import private_guest
 from ..validation import clean_name
-from .auth import get_current_user
+from .auth import get_current_user, revoke_api_tokens
 
 router = APIRouter()
 
@@ -140,9 +140,19 @@ async def update_user(id: int, update: UserUpdate, admin: dict = Depends(require
     values.append(id)
     query = f"UPDATE users SET {', '.join(fields)} WHERE id = ${idx}"
 
-    if await db.execute(query, *values) == "UPDATE 0":  # said "updated successfully"
-        raise HTTPException(status_code=404, detail="User not found")
-    return {"message": "User updated successfully"}
+    revoked = None
+    assert db.pool is not None  # connected at startup (lifespan)
+    async with db.pool.acquire() as conn:
+        async with conn.transaction():
+            if await conn.execute(query, *values) == "UPDATE 0":  # said "updated successfully"
+                raise HTTPException(status_code=404, detail="User not found")
+            if update.is_active is False:
+                # Deactivating revokes the account's API tokens for good, follower and worker tokens included:
+                # reactivating it doesn't bring them back.
+                revoked = await revoke_api_tokens(conn, id)
+    if revoked is None:
+        return {"message": "User updated successfully"}
+    return {"message": "User updated successfully", "revoked_tokens": revoked}
 
 
 @router.delete("/users/{id}")
@@ -196,6 +206,9 @@ async def reset_password(
     # parameter — so the body was ignored and the endpoint never worked.
     password: str = Body(..., embed=True),
     admin: dict = Depends(require_admin),
+    # The Edit User dialog's "Also revoke their API tokens", ticked by default. Absent, as from a client before the
+    # choice, the tokens are revoked as they always were.
+    revoke_tokens: bool = Body(True, embed=True),
 ):
     target_username = await db.fetchval("SELECT username FROM users WHERE id = $1", id)
     if target_username is None:
@@ -219,14 +232,10 @@ async def reset_password(
             # Force the target user to re-authenticate: drop any sessions still tied to
             # the old password so an admin reset actually locks out an active session.
             await conn.execute("DELETE FROM sessions WHERE user_id = $1", id)
-            # And end their API tokens: a token copied by whoever had the account would
-            # otherwise work again as soon as the user chose a new password.
-            revoked = await conn.fetch(
-                "UPDATE api_tokens SET is_active = FALSE WHERE user_id = $1 AND is_active RETURNING scope",
-                id,
-            )
+            # And, unless the admin chose to keep them, end their API tokens: a token copied by whoever had the
+            # account would otherwise work again as soon as the user chose a new password.
+            revoked = {'full': 0, 'follower': 0, 'worker': 0}
+            if revoke_tokens:
+                revoked = await revoke_api_tokens(conn, id)
 
-    # By scope, so the page can say what stops working: a follower that connects with one of these stops syncing
-    # until it is given a new token, and on-demand machines started under a worker token end.
-    counts = {scope: sum(1 for row in revoked if row['scope'] == scope) for scope in ('full', 'follower', 'worker')}
-    return {"message": "Password reset successfully", "revoked_tokens": counts}
+    return {"message": "Password reset successfully", "revoked_tokens": revoked}

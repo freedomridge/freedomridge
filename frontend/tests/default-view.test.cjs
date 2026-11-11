@@ -66,6 +66,10 @@ test('the dataset opens on its default view only without kept filters and unless
     assert.equal(opensOnDefaultView([], 7, VIEW), false);
     assert.equal(opensOnDefaultView([], 6, VIEW), true);  // an earlier default view was dismissed, not this one
     assert.equal(opensOnDefaultView([], null, null), false);
+    // A selection that expired at the reload is a kept filter: its chip shows over the whole dataset.
+    const expired = [{ expired: true, description: '60000 Selected', count: 60000 }];
+    assert.equal(opensOnDefaultView([], null, VIEW, expired), false);
+    assert.equal(opensOnDefaultView([], null, VIEW, []), true);
 });
 
 function bar(stages, defaultView) {

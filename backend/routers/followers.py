@@ -465,7 +465,9 @@ async def follower_config(follower: dict = Depends(current_follower)):
     await stamp_starts(db, follower['id'], current)
     xmin = await db.fetchval('SELECT txid_snapshot_xmin(txid_current_snapshot())')
     rows = await db.fetch(
-        """SELECT f.dataset_id, d.name, f.tags, f.views, f.images, f.start_txid, f.acked_txid
+        # versions: how many versions this instance keeps of the dataset. They aren't sent; a mirror says they are here.
+        """SELECT f.dataset_id, d.name, f.tags, f.views, f.images, f.start_txid, f.acked_txid,
+                  (SELECT count(*) FROM dataset_versions v WHERE v.dataset_id = f.dataset_id) AS versions
            FROM follower_datasets f JOIN datasets d ON d.id = f.dataset_id WHERE f.follower_id = $1 ORDER BY d.name""",
         follower['id'],
     )
@@ -1037,4 +1039,4 @@ async def follower_delete_view(dataset_id: int, view_id: int, follower: dict = D
     )
     if not shared:
         raise HTTPException(status_code=404, detail='No such shared view in this dataset')
-    return await views_router.delete_view(view_id, user=account)
+    return await views_router.remove_view(view_id, account, check_access=False)

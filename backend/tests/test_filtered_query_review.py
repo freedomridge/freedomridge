@@ -5,7 +5,7 @@ import asyncio
 import pytest
 
 from backend.routers import datasets
-from backend.tests.test_field_registry_postgres import registry_database  # noqa: F401
+from backend.tests.test_field_registry_postgres import bulk_setup, registry_database  # noqa: F401
 from backend.tests.test_filtered_query_plans import FILTER, record_queries, seed
 
 
@@ -18,14 +18,16 @@ def test_few_early_matches_do_not_veto_filter_first(
 ):
     async def scenario(database):
         await seed(database, count=150_000)
-        # June OR WHEAT_EARLY4: most matches are late, with a few early tagged rows.
-        await database.execute("""
-            UPDATE samples SET metadata = metadata || jsonb_build_object(
-                'datetime', CASE WHEN id > 145000 THEN '2026-06-15' ELSE '2025-01-01' END),
-                tags = CASE WHEN id <= 8 THEN ARRAY['WHEAT_EARLY4'] ELSE ARRAY[]::text[] END;
-            CREATE INDEX test_datetime ON samples ((metadata->>'datetime')) WHERE dataset_id = 1;
-            ANALYZE samples;
-        """)
+        # June OR WHEAT_EARLY4: most matches are late, with a few early tagged rows. Set up like the seed: the update
+        # planned per row took 8.5 s of the fixture's 10 s statement timeout on an idle machine.
+        async with bulk_setup(database) as connection:
+            await connection.execute("""
+                UPDATE samples SET metadata = metadata || jsonb_build_object(
+                    'datetime', CASE WHEN id > 145000 THEN '2026-06-15' ELSE '2025-01-01' END),
+                    tags = CASE WHEN id <= 8 THEN ARRAY['WHEAT_EARLY4'] ELSE ARRAY[]::text[] END;
+                CREATE INDEX test_datetime ON samples ((metadata->>'datetime')) WHERE dataset_id = 1;
+                ANALYZE samples;
+            """)
         filters = {
             'logic': 'OR',
             'filters': [
@@ -146,11 +148,12 @@ def test_dataset_only_index_is_not_a_filter_index(registry_database, monkeypatch
 def test_broad_page_keeps_custom_plan_after_deep_pages(registry_database, monkeypatch, slim):  # noqa: F811
     async def scenario(database):
         await seed(database, count=150_000)
-        await database.execute("""
-            UPDATE samples SET metadata = metadata || '{"datetime":"2026-06-15"}';
-            CREATE INDEX test_datetime ON samples ((metadata->>'datetime')) WHERE dataset_id = 1;
-            ANALYZE samples;
-        """)
+        async with bulk_setup(database) as connection:  # as above
+            await connection.execute("""
+                UPDATE samples SET metadata = metadata || '{"datetime":"2026-06-15"}';
+                CREATE INDEX test_datetime ON samples ((metadata->>'datetime')) WHERE dataset_id = 1;
+                ANALYZE samples;
+            """)
         queries = record_queries(database, monkeypatch)
         filters = {
             'logic': 'AND',

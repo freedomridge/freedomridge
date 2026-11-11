@@ -1039,7 +1039,14 @@ $$ LANGUAGE plpgsql;
 CREATE OR REPLACE FUNCTION guard_dataset_row()
 RETURNS TRIGGER AS $$
 BEGIN
-    PERFORM require_writable_dataset(OLD.id, TG_OP = 'DELETE');
+    -- Except one update, in the deletion's own fenced transaction: removing the default view's row makes its foreign
+    -- key set default_view_id to NULL, and change nothing else. A dataset sealed before 2.9.0 kept its default view,
+    -- and its deletion failed there at every resume (0023).
+    IF TG_OP <> 'UPDATE' OR current_setting('fridge.deletion_dataset', TRUE) IS DISTINCT FROM OLD.id::text
+       OR NEW.default_view_id IS NOT NULL
+       OR (to_jsonb(NEW) - 'default_view_id') <> (to_jsonb(OLD) - 'default_view_id') THEN
+        PERFORM require_writable_dataset(OLD.id, TG_OP = 'DELETE');
+    END IF;
     IF TG_OP = 'UPDATE' AND NEW.deleting THEN
         -- The seal: later writes in this transaction must check again.
         PERFORM set_config('fridge.writable_dataset', '', TRUE);
@@ -1321,6 +1328,11 @@ BEGIN
         DELETE FROM vector_changes WHERE dataset_id = OLD.id;
         DELETE FROM dataset_changes WHERE dataset_id = OLD.id;
         DELETE FROM map_block_changes WHERE dataset_id = OLD.id;
+        RETURN NULL;
+    END IF;
+    -- The deletion's own change, its foreign key clearing the default view (guard_dataset_row), is no mirror's write
+    -- and no news for followers: the dataset is going (0023).
+    IF current_setting('fridge.deletion_dataset', TRUE) = NEW.id::text THEN
         RETURN NULL;
     END IF;
     IF (OLD.name, OLD.description, OLD.media_fields, OLD.grid_media_field, OLD.modal_media_field,

@@ -894,7 +894,7 @@ wheels = [
 
 [[package]]
 name = "freedomridge"
-version = "2.9.0"
+version = "2.10.0"
 source = { editable = "python" }
 dependencies = [
     { name = "numpy" },
@@ -985,7 +985,7 @@ provides-extras = ["embeddings", "huggingface-embeddings", "patch-embeddings", "
 
 [[package]]
 name = "freedomridge-app"
-version = "2.9.0"
+version = "2.10.0"
 source = { virtual = "." }
 dependencies = [
     { name = "aiofiles" },

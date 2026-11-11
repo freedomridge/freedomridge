@@ -120,6 +120,8 @@ class LoginRequest(BaseModel):
 class ChangePasswordRequest(BaseModel):
     current_password: str
     new_password: str
+    # Also revoke every API token of the account, follower and worker tokens included (the dialog's checkbox).
+    revoke_tokens: bool = False
 
 
 class UserResponse(BaseModel):
@@ -138,6 +140,17 @@ class UserResponse(BaseModel):
 # admin/admin123 bootstrap) could use the API (mint tokens, read/write data) before rotating the
 # password; the frontend change-password modal is UX, not a security boundary.
 _PW_CHANGE_ALLOWED = ("/auth/change-password", "/auth/me", "/auth/logout")
+
+
+async def revoke_api_tokens(connection, user_id: int) -> dict[str, int]:
+    """Revoke every active API token of the user and return how many of each scope. By scope, so the page can say
+    what stops working: a follower that connects with one of these stops syncing until it is given a new token, and
+    on-demand machines started under a worker token end."""
+    revoked = await connection.fetch(
+        "UPDATE api_tokens SET is_active = FALSE WHERE user_id = $1 AND is_active RETURNING scope",
+        user_id,
+    )
+    return {scope: sum(1 for row in revoked if row['scope'] == scope) for scope in ('full', 'follower', 'worker')}
 
 
 def _enforce_password_change(user: dict, request: Request) -> None:
@@ -426,29 +439,33 @@ async def change_password(data: ChangePasswordRequest, request: Request, user: d
     # Hash new password
     new_hash = await hash_password(data.new_password)
 
-    # Update password, clear must_change_password, and mark as no longer demo account
-    await db.execute(
-        """
-        UPDATE users
-        SET password_hash = $1, must_change_password = false, is_demo_account = false
-        WHERE id = $2
-        """,
-        new_hash,
-        user['id'],
-    )
+    revoked = {'full': 0, 'follower': 0, 'worker': 0}
+    async with db.pool.acquire() as connection, connection.transaction():
+        # Update password, clear must_change_password, and mark as no longer demo account
+        await connection.execute(
+            """
+            UPDATE users
+            SET password_hash = $1, must_change_password = false, is_demo_account = false
+            WHERE id = $2
+            """,
+            new_hash,
+            user['id'],
+        )
 
-    # Invalidate the user's OTHER sessions so a stolen or stale session can't
-    # outlive a password change. The current session is preserved so the user
-    # isn't logged out mid-action. (For a Bearer-token caller there's no session
-    # cookie, so this clears all their sessions, which is the safe default.)
-    current_sid = request.cookies.get("session_id")
-    await db.execute(
-        "DELETE FROM sessions WHERE user_id = $1 AND id IS DISTINCT FROM $2",
-        user['id'],
-        current_sid,
-    )
+        # Invalidate the user's OTHER sessions so a stolen or stale session can't
+        # outlive a password change. The current session is preserved so the user
+        # isn't logged out mid-action. (For a Bearer-token caller there's no session
+        # cookie, so this clears all their sessions, which is the safe default.)
+        current_sid = request.cookies.get("session_id")
+        await connection.execute(
+            "DELETE FROM sessions WHERE user_id = $1 AND id IS DISTINCT FROM $2",
+            user['id'],
+            current_sid,
+        )
+        if data.revoke_tokens:
+            revoked = await revoke_api_tokens(connection, user['id'])
 
-    return {"message": "Password changed successfully"}
+    return {"message": "Password changed successfully", "revoked_tokens": revoked}
 
 
 @router.post("/auth/demo-login")

@@ -1026,7 +1026,7 @@ Review security updates monthly and after relevant advisories. OS unattended
 upgrades do not update containers. Back up first, check out the release that has
 the fixes, pull its images with `docker compose -f docker-compose.prod.yml pull`
 (between releases, rebuild from the checkout with `build --pull`), stop the app
-(`docker compose -f docker-compose.prod.yml stop backend job-runner backup frontend`),
+(`docker compose -f docker-compose.prod.yml stop backend job-runner worker backup frontend`),
 apply migrations using the explicit production DB container, and recreate with
 `up -d` ([Upgrading](UPGRADING.md), step 4). nginx re-resolves Docker service IPs
 every 10 seconds; allow startup health checks and that DNS window after

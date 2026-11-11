@@ -2,6 +2,8 @@
 
 import React, { useState } from 'react';
 import { useUser } from '@/contexts/UserContext';
+import { useToast } from '@/contexts/ToastContext';
+import { passwordChangeMessage } from '@/lib/password-reset';
 import * as Dialog from '@radix-ui/react-dialog';
 import { Cross2Icon } from '@radix-ui/react-icons';
 
@@ -17,8 +19,10 @@ export function ChangePasswordModal({
     const [currentPassword, setCurrentPassword] = useState('');
     const [newPassword, setNewPassword] = useState('');
     const [confirmPassword, setConfirmPassword] = useState('');
+    const [revokeTokens, setRevokeTokens] = useState(false);
     const [error, setError] = useState('');
     const { changePassword } = useUser();
+    const { addToast } = useToast();
 
     const handleSubmit = async (e: React.FormEvent) => {
         e.preventDefault();
@@ -35,12 +39,15 @@ export function ChangePasswordModal({
         }
 
         try {
-            await changePassword(currentPassword, newPassword);
+            const revoked = await changePassword(currentPassword, newPassword, revokeTokens);
             onOpenChange(false);
+            // The dialog closes: say what was revoked once it has.
+            if (revokeTokens) addToast(passwordChangeMessage(revoked), 'success', 10000);
             // Clear form
             setCurrentPassword('');
             setNewPassword('');
             setConfirmPassword('');
+            setRevokeTokens(false);
         } catch (err: unknown) {
             setError(err instanceof Error ? err.message : String(err));
         }
@@ -98,6 +105,16 @@ export function ChangePasswordModal({
                                 value={confirmPassword}
                                 onChange={(e) => setConfirmPassword(e.target.value)}
                             />
+                        </div>
+                        <div className="flex items-center gap-2">
+                            <input
+                                type="checkbox"
+                                id="change_revoke_tokens"
+                                checked={revokeTokens}
+                                onChange={(e) => setRevokeTokens(e.target.checked)}
+                                className="rounded bg-zinc-800 border-zinc-700 text-cyan-600 focus:ring-cyan-500"
+                            />
+                            <label htmlFor="change_revoke_tokens" className="text-sm text-zinc-300">Also revoke my API tokens</label>
                         </div>
 
                         {error && (

@@ -11,7 +11,7 @@ import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 
-from ..access import check_dataset_access
+from ..access import check_dataset_access, missing_unless_allowed
 from ..database import db
 from ..index_actions import public_message
 from ..job_queue import JOB_TABLE, CancelRefused, QueueBusy, cancel_job
@@ -24,6 +24,9 @@ _PUBLIC_COLUMNS = (
     'id, kind, dataset_id, placement, lane, resources, state, progress_done, progress_total, message, '
     'result, error, created_by, created_at, updated_at, started_at, finished_at, '
     'heartbeat_at, attempt, failures, max_failures, available_at, cancel_requested, '
+    # An index build's field, so the jobs list can name it and build it again; no other job's arguments.
+    "CASE WHEN kind IN ('ann_index_build', 'field_index_build') "
+    "THEN COALESCE(args->>'field', args->>'field_name') END AS field, "
     "COALESCE((SELECT username FROM users WHERE users.id = jobs.created_by), "
     "CASE WHEN jobs.dedupe_owner = 'system' THEN 'System' ELSE 'Deleted user' END) AS started_by"
 )
@@ -46,6 +49,7 @@ class JobStatus(BaseModel):
     placement: Literal['server', 'compute']
     lane: Literal['maintenance', 'user']
     resources: dict[str, Any]
+    field: str | None = None
     state: Literal['queued', 'running', 'succeeded', 'failed', 'cancelled']
     progress: JobProgress
     result: Any = None
@@ -127,6 +131,7 @@ def job_status(job, user: dict) -> JobStatus:
         placement=job['placement'],
         lane=job['lane'],
         resources=job['resources'],
+        field=job.get('field'),  # job rows read elsewhere (job_queue) don't carry it
         state=job['state'],
         progress=JobProgress(done=job['progress_done'], total=job['progress_total'], message=_message(job, user)),
         created_by=None if private_guest(user) else job['created_by'],
@@ -173,11 +178,14 @@ async def _authorized_job(job_id: UUID, user: dict):
         if user['role'] != 'admin':
             raise HTTPException(status_code=403, detail='Only administrators can access global jobs')
     else:
-        try:
-            await check_dataset_access(job['dataset_id'], user)
-        except HTTPException as error:
-            if error.status_code != 404 or (user['role'] != 'admin' and job['created_by'] != user['id']):
-                raise
+        # A job of a dataset the caller can't open answers as a missing one (a 403 said it exists). A deleted
+        # dataset's jobs stay readable to whoever started them, and to administrators.
+        with missing_unless_allowed('Job not found'):
+            try:
+                await check_dataset_access(job['dataset_id'], user)
+            except HTTPException as error:
+                if error.status_code != 404 or (user['role'] != 'admin' and job['created_by'] != user['id']):
+                    raise
     return job
 
 

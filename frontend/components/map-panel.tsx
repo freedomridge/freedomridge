@@ -4,6 +4,7 @@ import { useEffect, useMemo, useState, useCallback, useRef } from 'react';
 import Map, { Source, Layer, ScaleControl, MapRef, type MapEvent, type MapMouseEvent, type LayerProps } from 'react-map-gl/mapbox';
 import { useQuery } from '@tanstack/react-query';
 import { getMapPoints, getMapExtent, getDatasetCoverage, type ComplexFilter } from '@/lib/api';
+import { tileBbox, viewBbox, type Bbox } from '@/lib/map-bounds';
 import { useRuntimeConfig } from '@/lib/runtime-config';
 import type { Feature, FeatureCollection, Point, Polygon } from 'geojson';
 import mapboxgl, { type LngLatBounds } from 'mapbox-gl';
@@ -19,28 +20,6 @@ const DEFAULT_MAP_CONFIG = {
 };
 
 const EMPTY_FC: FeatureCollection<Point> = { type: 'FeatureCollection', features: [] };
-
-// Mirror of backend _MAP_POINT_ZOOM (docs/MAP_REQUIREMENTS.md #1): at/above this zoom
-// the server returns individual points, so we DON'T enlarge the fetch region there
-// (it would risk the point cap).
-const MAP_POINT_ZOOM = 12;
-
-// Tile the viewport: snap the fetched bbox out to a fixed per-zoom world grid so that
-// panning WITHIN a tile produces the same request and hits the react-query cache,
-// instead of refetching on every pixel of pan. The grid depends only on zoom, so the
-// same tiles recur as you pan (and the whole-world view snaps to one stable tile).
-// Returns the viewport unchanged at points zooms. See docs/MAP_REQUIREMENTS.md #13.
-function tileBbox(bbox: [number, number, number, number], zoom: number): [number, number, number, number] {
-    if (zoom >= MAP_POINT_ZOOM) return bbox;
-    const step = 360 / Math.pow(2, Math.max(0, zoom - 1)); // ~2 web-mercator tiles wide
-    const [w, s, e, n] = bbox;
-    return [
-        Math.max(-180, Math.floor(w / step) * step),
-        Math.max(-85, Math.floor(s / step) * step),
-        Math.min(180, Math.ceil(e / step) * step),
-        Math.min(85, Math.ceil(n / step) * step),
-    ];
-}
 
 // A map_points item: with an `id` it's an individual sample point; without one it's
 // a cluster bubble (cell centroid + count, and the radius in px the server sized it for).
@@ -90,7 +69,7 @@ export function MapPanel({
 
     // Server-side clustering view: {zoom, bbox} drives what we fetch. Updated
     // (debounced) on map move so we fetch clusters/points for the current viewport.
-    const [view, setView] = useState<{ zoom: number; bbox: [number, number, number, number] } | null>(null);
+    const [view, setView] = useState<{ zoom: number; bbox: Bbox } | null>(null);
     const [forceMode, setForceMode] = useState<'auto' | 'points'>('auto');  // auto = per-cell hybrid
     const [zooming, setZooming] = useState(false);   // zoom-to-data fetch in flight
     const [showBusy, setShowBusy] = useState(false); // delayed "Loading…" pill (see effect below)
@@ -109,7 +88,8 @@ export function MapPanel({
 
     // Capture the current VISIBLE viewport (zoom + bbox) into `view`, which drives the
     // query. The server decides points-vs-clusters from this visible count and pads
-    // the points data itself, so we send the exact visible bounds (no client padding).
+    // the points data itself, so we send the exact visible bounds (no client padding), with the
+    // longitudes wrapped to one world copy (viewBbox: a view across the antimeridian ends past 180).
     const captureView = useCallback(() => {
         const map = mapRef.current?.getMap();
         if (!map) return;
@@ -117,7 +97,7 @@ export function MapPanel({
         if (!b) return;
         setView({
             zoom: map.getZoom(),
-            bbox: [b.getWest(), b.getSouth(), b.getEast(), b.getNorth()],
+            bbox: viewBbox([b.getWest(), b.getSouth(), b.getEast(), b.getNorth()]),
         });
     }, []);
 

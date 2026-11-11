@@ -22,6 +22,7 @@ test('a new user sees the home page right after the required password change', a
         await fillStable(fields.nth(0), password);
         await fillStable(fields.nth(1), `${password}-2`);
         await fillStable(fields.nth(2), `${password}-2`);
+        await expect(dialog.getByLabel('Also revoke my API tokens')).not.toBeChecked();  // offered, unticked
         await dialog.getByRole('button', { name: 'Change Password' }).click();
         await expect(dialog).toHaveCount(0);
 

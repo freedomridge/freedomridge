@@ -246,6 +246,8 @@ interface Props {
     gridSamplesRef?: React.MutableRefObject<Sample[]>;
     // null while the COUNT is in flight, then the real total — 0 included.
     onTotalChange?: (total: number | null) => void;
+    // True once the COUNT has failed (its retries spent) with no total to show.
+    onCountFailed?: (failed: boolean) => void;
     // Lets the sample modal walk past the rows loaded so far (see gridMoreRef in page.tsx).
     gridMoreRef?: React.MutableRefObject<GridMore | null>;
 }
@@ -313,7 +315,7 @@ function JumpBar({ fraction, total, onJump }: {
     );
 }
 
-export function DatasetGrid({ datasetId, filters, filtersReady = true, activeMediaField = 'filepath', activeOverlayFields = [], overlayConfigs, segmentationConfig, onSampleClick, selectedIds = [], selectAllActive = false, deselectedIds = [], onToggleSelection, onRangeSelection, sortBy, sortOrder, rankOrderIds, rankByParent, highlightBoxes, imageScale = 50, selectedPatches, onPatchSelect, gridPatchMode, gridSamplesRef, onTotalChange, gridMoreRef }: Props) {
+export function DatasetGrid({ datasetId, filters, filtersReady = true, activeMediaField = 'filepath', activeOverlayFields = [], overlayConfigs, segmentationConfig, onSampleClick, selectedIds = [], selectAllActive = false, deselectedIds = [], onToggleSelection, onRangeSelection, sortBy, sortOrder, rankOrderIds, rankByParent, highlightBoxes, imageScale = 50, selectedPatches, onPatchSelect, gridPatchMode, gridSamplesRef, onTotalChange, onCountFailed, gridMoreRef }: Props) {
     const scrollRef = useRef<HTMLDivElement>(null);
     const [containerWidth, setContainerWidth] = useState(0);
     // Absolute sample index anchored at the top of the rendered window (moved by
@@ -375,6 +377,16 @@ export function DatasetGrid({ datasetId, filters, filtersReady = true, activeMed
     const fetchingRef = useRef<Set<number>>(new Set());
     const fetchDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
     const [pageVersion, setPageVersion] = useState(0);
+    // How many rows the pages fetched for the query `key` show exist, and whether a short page has shown where
+    // it ends. While the COUNT can't be had (a guest's statement timeout on a large view), the grid spans these
+    // rows and one page more, so scrolling on keeps fetching pages until a short one: the view stays whole.
+    const [seen, setSeen] = useState<{ key: string; rows: number; end: boolean }>({ key: '', rows: 0, end: false });
+    const notePage = useCallback((key: string, page: number, length: number) => {
+        setSeen(prev => {
+            const base = prev.key === key ? prev : { key, rows: 0, end: false };
+            return { key, rows: Math.max(base.rows, page * PAGE_SIZE + length), end: base.end || length < PAGE_SIZE };
+        });
+    }, []);
 
     // Latest query params, read inside the (stable) fetcher so it never goes stale,
     // and so a response from a superseded filter/sort can be discarded.
@@ -389,6 +401,7 @@ export function DatasetGrid({ datasetId, filters, filtersReady = true, activeMed
             .then(res => {
                 if (paramsRef.current.key !== key) return;   // filters/sort changed → discard
                 pagesRef.current.set(p, res.items);
+                notePage(key, p, res.items.length);
                 // Evict the pages farthest from the one just fetched (which is in
                 // view) so the cache stays bounded during heavy scrubbing.
                 if (pagesRef.current.size > MAX_CACHED_PAGES) {
@@ -410,7 +423,7 @@ export function DatasetGrid({ datasetId, filters, filtersReady = true, activeMed
                 }
             })
             .finally(() => { fetchingRef.current.delete(p); });
-    }, []);
+    }, [notePage]);
 
     // Reset the cache (and scroll to top) whenever the query identity changes, and
     // kick page 0 immediately so the first screen paints without waiting on COUNT.
@@ -427,8 +440,16 @@ export function DatasetGrid({ datasetId, filters, filtersReady = true, activeMed
     }, [queryKeyStr, fetchPage, filtersReady]);
 
     const totalCount = countData ?? 0;
+    // The COUNT gave up (its retries are spent) and there is no total. The grid says so and offers to count again;
+    // meanwhile it spans the rows its pages have shown and a page more (see `seen`), so it never stops at page 0.
+    const countFailed = countData === undefined && !!countError;
+    const seenHere = seen.key === queryKeyStr ? seen : null;
     // Before COUNT resolves, fall back to page 0's length so the first screen shows.
-    const effectiveCount = totalCount > 0 ? totalCount : (pagesRef.current.get(0)?.length ?? 0);
+    const effectiveCount = totalCount > 0
+        ? totalCount
+        : countFailed && seenHere && seenHere.rows > 0
+            ? seenHere.rows + (seenHere.end ? 0 : PAGE_SIZE)
+            : (pagesRef.current.get(0)?.length ?? 0);
 
     const getSampleAt = useCallback((index: number): Sample | undefined => {
         return pagesRef.current.get(Math.floor(index / PAGE_SIZE))?.[index % PAGE_SIZE];
@@ -519,7 +540,11 @@ export function DatasetGrid({ datasetId, filters, filtersReady = true, activeMed
         gridMoreRef.current = {
             hasMore: () => {
                 const { pages } = contiguousRun();
-                return pages.length > 0 && countData !== undefined && (pages[pages.length - 1] + 1) * PAGE_SIZE < countData;
+                if (pages.length === 0) return false;
+                const last = pages[pages.length - 1];
+                // Without a count (it failed), a full last page may have more after it.
+                if (countData === undefined) return countFailed && pagesRef.current.get(last)?.length === PAGE_SIZE;
+                return (last + 1) * PAGE_SIZE < countData;
             },
             loadNextPage: async () => {
                 const { pages } = contiguousRun();
@@ -529,6 +554,7 @@ export function DatasetGrid({ datasetId, filters, filtersReady = true, activeMed
                 const res = await getSamples(datasetId, PAGE_SIZE, next * PAGE_SIZE, filters, sortBy, sortOrder, true, undefined, undefined, rankOrderIds, rankByParent);
                 if (paramsRef.current.key !== key) return contiguousRun().samples;
                 pagesRef.current.set(next, res.items);
+                notePage(key, next, res.items.length);
                 const run = contiguousRun().samples;
                 // Publish the longer run now: the page renders BEFORE this grid does, and it looks
                 // the modal's row up in this list — a stale one hid Next on the row it just loaded.
@@ -545,6 +571,9 @@ export function DatasetGrid({ datasetId, filters, filtersReady = true, activeMed
     useEffect(() => {
         if (onTotalChange) onTotalChange(countData ?? null);
     }, [countData, onTotalChange]);
+    useEffect(() => {
+        if (onCountFailed) onCountFailed(countFailed);
+    }, [countFailed, onCountFailed]);
 
     // --- Virtualized rows -----------------------------------------------------
     // Measure the scroll container so we can compute the real column count and the
@@ -686,6 +715,19 @@ export function DatasetGrid({ datasetId, filters, filtersReady = true, activeMed
         <div className="h-full flex flex-col">
             {windowed && !isEmpty && containerWidth > 0 && effectiveCount > 0 && (
                 <JumpBar fraction={posFraction} total={effectiveCount} onJump={jumpTo} />
+            )}
+            {countFailed && effectiveCount > 0 && (
+                <div data-testid="grid-count-failed" role="status" className="flex items-center gap-3 px-4 py-2 border-b border-zinc-800 bg-zinc-900/80 shrink-0 text-xs text-zinc-400">
+                    <span className="text-amber-300/90">Couldn&apos;t count this view: {countError?.message}</span>
+                    <span className="text-zinc-500">The rows keep loading as you scroll.</span>
+                    <button
+                        className="underline hover:text-white"
+                        // Counts again from scratch (an invalidation would wait out a retry); the rows stay.
+                        onClick={() => resetSampleCount(queryClient, datasetId, filters)}
+                    >
+                        Retry
+                    </button>
+                </div>
             )}
             <div ref={scrollRef} className="flex-1 min-h-0 overflow-y-auto p-4">
             {isEmpty ? (

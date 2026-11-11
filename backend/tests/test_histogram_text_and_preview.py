@@ -237,11 +237,13 @@ def test_small_dataset_gets_no_preview_or_sample(registry_database, monkeypatch)
 
 def test_sparse_sample_is_insufficient_not_a_guess(registry_database):
     async def scenario(database):
-        # 125,000 rows spread over 3 M ids: ~830 of 20,000 draws land on a row.
-        await database.execute("""
-            INSERT INTO samples (id,dataset_id,filepath,media_type,metadata)
-            SELECT n, 1, n::text, 'image', '{"value": 1}' FROM generate_series(1, 3000000, 24) n;
-        """)
+        # 125,000 rows spread over 3 M ids: ~830 of 20,000 draws land on a row. Set up like seed_broad: planned per
+        # row, the insert took 7-8 s of the fixture's 10 s statement timeout on an idle machine.
+        async with test_field_registry_postgres.bulk_setup(database) as connection:
+            await connection.execute("""
+                INSERT INTO samples (id,dataset_id,filepath,media_type,metadata)
+                SELECT n, 1, n::text, 'image', '{"value": 1}' FROM generate_series(1, 3000000, 24) n;
+            """)
         result = await preview()
         detail = result['preview']
         assert detail['status'] == 'insufficient_sample' and 'buckets' not in result

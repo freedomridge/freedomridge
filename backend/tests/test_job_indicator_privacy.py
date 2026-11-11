@@ -173,8 +173,9 @@ def test_private_diagnostics_follow_submitter_not_dataset_sharing(registry_datab
                         assert body['result'] == PRIVATE_RESULT
             identity.update(id=20, role='guest')
             await database.execute('DELETE FROM dataset_access WHERE dataset_id=1 AND user_id=20')
-            for endpoint in ('/api/datasets/1/jobs/active', '/api/datasets/1/jobs', f'/api/jobs/{submitted["id"]}'):
+            for endpoint in ('/api/datasets/1/jobs/active', '/api/datasets/1/jobs'):
                 assert (await client.get(endpoint)).status_code == 403
+            assert (await client.get(f'/api/jobs/{submitted["id"]}')).status_code == 404  # as a missing job
             await database.execute('UPDATE datasets SET is_global=true WHERE id=1')
             identity.update(id=21)
             detail = await client.get(f'/api/jobs/{submitted["id"]}')

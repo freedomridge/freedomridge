@@ -4,6 +4,159 @@ Freedom Ridge has one version for the server, the web app and the Python SDK (th
 file), following [Semantic Versioning](https://semver.org). A release lists **upgrade notes** when
 it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
 
+## 2.10.0 (2026-11-11)
+
+2.10.0 makes versions keep more of what a dataset was: who made each one, its public saved views and the view it
+opened on, and, for history brought in from another system, the date and author it had there. Reverting in the app
+puts the dataset back to exactly the version after saying what it will delete, and reverting or deleting a version
+now takes an admin. Vector index rebuilds go one at a time, smallest first, with Retry in the jobs list. Media from
+S3 is streamed and renders are bounded. Deactivating an account revokes its API tokens, and a password change makes
+revoking them a choice. It also frees a deletion stuck on a default view and fixes selections across grids, views
+whose count fails, the map across the antimeridian, field names that read as operators, and a follower's copy on an
+out-of-range `parent_id`. Four migrations, each instant.
+
+### Upgrade notes
+
+- Four database migrations, applied with `scripts/apply_migrations.sh` (step 4 of [Upgrading](docs/UPGRADING.md)),
+  each instant: `0023_stuck_deletion_default_view.sql` changes two database functions and no rows;
+  `0024_version_saved_views.sql`, `0025_version_created_by.sql` and `0026_mirror_primary_versions.sql` add nullable
+  columns, so they rewrite no table.
+- **Reverting a dataset to a version, and deleting a version, now take an admin.** A power user's revert or
+  delete, from the app, the API or an SDK script (`dataset.revert(...)`, `client.delete_version(...)`), gets HTTP
+  403. Nothing else about versions changes: everyone with access to the dataset, guests included, can still list,
+  browse and compare its versions, and making one still takes a power user.
+
+### Added
+
+- **Versions record the dataset's public saved views:** each view's name, description, filters, link and owner
+  when the version is made. The snapshot page lists them under **Saved view** and shows the samples a view held at
+  that version (`GET .../versions/{id}/samples?view=<name>`; in the SDK, `VersionView.list_views()` and
+  `load_view(name)`). A public view added, removed or given other filters since a version is a change since it,
+  and the diffs report `view_changes`. A revert puts the recorded views back, making a view deleted since again
+  with its link when that is still free. Private views are never recorded or touched. A version made before this
+  release recorded no views, and says so.
+- **Versions record who made them:** the username of whoever creates one, or reverts for a revert's undo point,
+  shown in the Versions tab and on the snapshot page. A version made before this release shows as made by unknown.
+- **History brought in from another system keeps its dates and authors.** `create_version(created_at=...,
+  created_by=...)` dates a version from when it was made there (with a UTC offset, not in the future) and records
+  the author it had there. Without `created_by` the author is unknown, not whoever brings the history in. The SDK
+  checks the server recorded both, so a server from before this raises instead of dating the version today.
+  A stated date or author is a claim, so such a version also records who made the request (`imported_by`), and
+  the app shows "by ada, imported by richard".
+- **A revert can restore the dataset's settings** (`restore_settings`; a second checkbox in the app): its
+  description, media fields, segmentation classes and colours, and the view it opens on, as the version recorded
+  them; not its name. Off by default. A version that recorded no settings refuses it before anything changes.
+- **A version records which view the dataset opened on.** The default view is recorded with the saved views, by
+  name, so a settings restore finds it again after the view was deleted and made again.
+- **A mirror's Versions tab says how many versions its primary keeps.** Versions aren't mirrored: they stay on
+  the primary, and those a mirror lists are its own ([FOLLOWERS.md](docs/FOLLOWERS.md)).
+
+### Fixed
+
+- **A selection made in one grid no longer shows in a grid of the other grain.** With an Images grid beside an
+  Objects grid, a Select All of more than 50,000 objects ticked every tile of the Images grid and showed its count
+  there, an image unticked there was counted against the objects, and Tag there tagged the objects. A selection now
+  belongs to the grain of the grid it was made in: only grids of that grain show it, and Tag and Export act on it
+  there. The other grid says how many are selected in another panel, and a pick in it starts a new selection.
+- **A view whose count fails can still be scrolled to its end.** When counting a view failed (on the public demo,
+  a guest's 30-second limit on a large dataset), the grid stopped at its first 200 rows and said "Counting…" for
+  good, with no way to count again. It now says the count is unavailable, keeps loading rows as you scroll, down
+  to the last one, and offers Retry. The total above the filters says "Count unavailable" too.
+- **A field whose name starts with `exclude_` or ends with `_min` or `_max` filters itself.** The sidebar read such
+  a name as an operator on another field: ticking `blurry` under a field named `exclude_reason` filtered on
+  "`reason` is not blurry", which matched every image while the chip said the filter was applied. Sidebar picks
+  saved in the browser before this release are read as they were then.
+- **Upgrading: step 4 stops every service but the database and nginx.** [Upgrading](docs/UPGRADING.md) stopped the
+  backend, the job runner, the backup service and the frontend before the migrations, and left the `worker`
+  service running. 2.9.0's vector migration refuses to run while anything else is connected, so the instruction is
+  now the one that needs no judgement about each service: stop `backend job-runner worker backup frontend`, in the
+  three guides that give the command.
+- **A signed-in user can no longer tell which samples, views and jobs exist in a dataset they can't open.** An
+  image request (`/api/samples/<id>/media`), deleting a view by its id, and reading, cancelling, resuming or
+  discarding a job answered 404 for an id that doesn't exist but 403 for one in a dataset the caller can't open, so
+  the ids of that dataset's rows could be probed. Both now answer the same 404. Nothing changes for a user who can
+  open the dataset, and a dataset's own id still answers 403.
+- **A dataset whose deletion is stuck on its default view is freed by resuming its deletion.** A dataset deleted
+  before 2.9.0 while it had a default view stayed "being deleted": the deletion failed when it reached the view, at
+  every resume, and the dataset's row refused every change, so 2.9.0 couldn't free it. **Resume deletion** (an
+  admin, on the dataset's page or the dataset list) now finishes it, a stopped mirror's too. The deletion may make
+  the one change that removing the view makes to the row, clearing its default view, and nothing else; outside the
+  deletion the row still refuses it.
+- **A selection that can't be kept across a reload says so.** An applied big Select All (the server keeps it for 2
+  hours) and an applied selection of over 50,000 samples were dropped at a reload or Back, and the grid showed
+  more samples with no word why. Their chip now stays, greyed and marked expired, and filters nothing: select the
+  samples again, or remove it. It is never sent to the server or kept in a saved view, and Copy link copies
+  nothing while one is shown and says why. A dataset that opens with one doesn't open on its default view, so the
+  count is the whole dataset's. Until the page reloads or Back is used, the selection filters as before.
+- **The map shows both sides of the antimeridian.** A view across longitude 180 (over Fiji, the Aleutians or the
+  Pacific) left out every sample east of it, with no message, and after panning on to a repeated copy of the world
+  the map was empty although the data was there. Both sides are shown now, at every zoom: a bubble on the
+  antimeridian counts the samples on both sides of it, and a click on it zooms to them. A map region drawn across
+  the antimeridian still selects only the samples west of it, and one drawn on a repeated copy of the world selects
+  none.
+- **Vector index rebuilds after an upgrade go one at a time, smallest first.** After 2.9.0's migration every rebuild
+  was queued at once. Background jobs listed dozens of "Building ANN index" jobs, the waiting ones showed
+  "QueueContended … retrying later" with their attempts counting up, and a large dataset's build could go before
+  small ones. Now:
+  - One build is queued at a time, the field with the fewest vectors first.
+  - A dataset busy with another job (a map re-fit, a bulk edit) is skipped rather than holding up the rest.
+  - A rebuild that fails is tried again a day later instead of being dropped.
+  - A job that waits for another says how long it has waited, instead of looking failed.
+  - A build no longer reads every vector to learn the field's dimension: that took over an hour on 3.7 million
+    vectors under load, before the build began. Mixed dimensions are refused before the build starts.
+- **Retry a failed vector index build from the jobs list.** A failed or cancelled "Building ANN index" job shows
+  its field and a **Retry** for power users and admins, until a later build of that field is waiting, running or
+  done.
+- **A follower's copy no longer stops on a `parent_id` past the integer range.** Ingest accepts any `parent_id`,
+  and the copy failed with "out of range for type integer" on a number such as `99999999999`, at every retry. Such a
+  number names no sample, so it's copied as no parent, like a negative one. A follower stuck on this recovers at its
+  next sync after the upgrade, since the batch is retried; there's nothing to do.
+- **A version delete that the server refuses says so.** The Versions tab ignored the answer, so a guest's Delete
+  ended silently with the version still listed. Making a version and deleting one are now disabled in the app
+  for a role that can't do them, with the reason as the tooltip.
+
+### Changed
+
+- **Deactivating an account revokes its API tokens for good** ([AUTHENTICATION.md](docs/AUTHENTICATION.md#api-tokens)).
+  Its tokens stopped working while it was inactive and worked again once it was reactivated. Deactivating now
+  revokes them all in the same step, follower and worker tokens included, and reactivating the account doesn't
+  bring them back. The Edit User dialog says so under **Active Account**, and after saving it says how many tokens
+  were revoked and how many of them were follower or worker tokens; `PATCH /api/users/{id}` answers
+  `revoked_tokens`. An account deactivated before this release keeps its tokens until it is saved inactive again
+  or an admin revokes them (`DELETE /api/users/{id}/tokens`).
+- **Revoking the API tokens is a choice when a password changes** ([AUTHENTICATION.md](docs/AUTHENTICATION.md#roles)).
+  This changes 2.9.0's behaviour. An admin reset no longer always revokes: it asks, ticked by default (**Also revoke
+  their API tokens** in the Edit User dialog). Unticked, the user is signed out and their tokens, follower and
+  worker tokens included, still work, and the dialog says so before and after. `POST /api/users/{id}/reset-password`
+  takes `"revoke_tokens": false` for that; without the field it revokes, so an older client resets as 2.9.0 did.
+  Changing your own password can now revoke your tokens too: **Also revoke my API tokens**, unticked by default,
+  also in the change asked for at the first login (`"revoke_tokens": true` in `POST /api/auth/change-password`).
+  It then says how many tokens were revoked and how many of them were follower or worker tokens.
+  `reset_admin.py --keep-tokens` keeps the admin's tokens; without it they are revoked, as before.
+- **Images and videos from S3 are streamed.** A full-size image or a video from a bucket not yet in the server's
+  cache was read whole into memory before the first byte went out, so a few large ones at once, or many at once
+  on the public demo, could use up the server's memory. It now goes out a megabyte at a time as it arrives, with
+  the same headers, and into the cache as before, the rest of it too when the viewer leaves early. Finding out
+  whether an S3 PNG or TIFF is 16-bit reads its header, not the whole file. Local files were already streamed.
+- **Thumbnails, crops and overlays render a few at a time.** Each needs the whole image in memory, so each backend
+  process renders as many at once as the machine has CPUs (`FRIDGE_MEDIA_RENDERS` sets another number; it is per
+  process, so the server as a whole renders the number of processes times it) and the others wait their turn: a
+  cold grid fills in a little more slowly under load, and none is refused. Cached thumbnails don't wait. No size
+  limit is added.
+- **Reverting takes an admin; it took a power user.** An exact revert deletes the samples added since, which
+  deleting samples already took an admin to do, and a revert can now also rewrite or remove public saved views
+  and restore the dataset's settings. In the app the button is disabled for anyone else and says why.
+- **Deleting a version takes an admin; it took a power user.** A deleted version can't be brought back, and it is
+  the record of what the dataset was.
+- **Reverting in the app puts the dataset back to exactly the version:** samples and public saved views added
+  since are removed, and deleted ones restored. The confirmation counts them first and says how many samples and
+  views it deletes and restores, that deleted samples lose their vectors and hashes, and when one of the deleted
+  views is the one the dataset opens on. Without the counts it doesn't ask and nothing is reverted. Unticked, the
+  revert is **Restore sample data**, as before. **The API's and the SDK's revert defaults are unchanged**
+  (`exact_membership=False`), so a script's revert doesn't start deleting samples.
+- The SDK's `add_samples(on_duplicate="update")` docstrings say what it keeps: an existing sample's tags are
+  merged, not replaced, and only the vectors and hashes given are replaced.
+
 ## 2.9.0 (2026-11-10)
 
 2.9.0 gives each dataset its own partition of the vector table, with its own vector indexes, so a search plans and

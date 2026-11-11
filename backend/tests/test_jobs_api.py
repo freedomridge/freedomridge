@@ -132,8 +132,10 @@ def test_existing_jobs_always_recheck_current_dataset_access(api, action):
             if action == 'list'
             else f'/api/jobs/{JOB_ID}',
         )
-    assert response.status_code == 403
-    assert response.json()['detail'] == 'Access revoked'
+    # A job by its id answers as a missing one; a dataset's job list keeps the dataset's 403.
+    assert (response.status_code, response.json()['detail']) == (
+        (404, 'Job not found') if action in ('get', 'cancel') else (403, 'Access revoked')
+    )
     api.cancellation.assert_not_awaited()
 
 
@@ -271,7 +273,7 @@ def test_real_job_history_pagination_and_cancellation_preserve_queue_state(regis
         await database.execute('UPDATE datasets SET owner_id=NULL WHERE id=1')
         with pytest.raises(HTTPException) as revoked:
             await jobs.get_job(expected[0], USER)
-        assert revoked.value.status_code == 403
+        assert revoked.value.status_code == 404
         deletion = await job_queue.enqueue_job(database.pool, 'delete_dataset', dataset_id=1, created_by=10)
         deleting = await job_queue.claim_job(database.pool, 'api-test-worker', kinds=['delete_dataset'])
         assert deleting is not None

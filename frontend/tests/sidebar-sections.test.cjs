@@ -115,8 +115,8 @@ const expanded = (html, name) => /aria-expanded="true"/.test(toggle(html, name))
 
 test('the fields a draft or an applied stage constrains', () => {
     const drafts = {
-        color: ['red'], exclude_shape: ['square'], brightness: { min: 1, max: 2 }, note: { _op: 'is_null' },
-        size_min: 5, label: { _op: 'text', values: [], contains: ['ab'] },
+        color: ['red'], 'exclude:shape': ['square'], brightness: { min: 1, max: 2 }, note: { _op: 'is_null' },
+        'size:min': 5, label: { _op: 'text', values: [], contains: ['ab'] },
         nothing: [], blank: { _op: 'text', values: [], contains: [] },
     };
     assert.deepEqual([...sections.filteredFieldNames(drafts)].sort(), ['brightness', 'color', 'label', 'note', 'shape', 'size']);
@@ -193,7 +193,7 @@ test('legacy exclusions remain read-only and separate from include-only inputs f
         { ...SCHEMA[1], type: 'string' },
         { ...SCHEMA[1], type: 'array', origin: 'native' },
     ]) {
-        const filters = { exclude_color: ['c1'] };
+        const filters = { 'exclude:color': ['c1'] };
         const before = structuredClone(filters);
         const { html } = render({ schema: [field], filters });
         assert.equal(expanded(html, 'color'), true);
@@ -207,12 +207,12 @@ test('legacy exclusions remain read-only and separate from include-only inputs f
 
 test('a legacy excluded text union stays visible beside included values', () => {
     const selection = { _op: 'text', values: ['c1'], contains: ['red'] };
-    const filters = { color: ['c2'], exclude_color: selection };
+    const filters = { color: ['c2'], 'exclude:color': selection };
     const props = { schema: [{ ...SCHEMA[1], declared_type: 'string' }], filters };
     const { html } = render(props);
     assert.match(html, /Additional filter: not \(color: c1 or contains &quot;red&quot;\)/);
     assert.doesNotMatch(html, /match mode/);
-    assert.deepEqual(convertSimpleFiltersToComplex({ exclude_color: selection }), {
+    assert.deepEqual(convertSimpleFiltersToComplex({ 'exclude:color': selection }), {
         logic: 'NOT', filters: [{ logic: 'OR', filters: [
             { field: 'color', operator: 'in', value: ['c1'] },
             { field: 'color', operator: 'contains', value: 'red' },

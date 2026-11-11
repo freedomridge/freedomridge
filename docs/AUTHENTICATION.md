@@ -36,13 +36,22 @@ docker compose -f docker-compose.prod.yml exec backend python /app/reset_admin.p
 With no argument this applies `FRIDGE_ADMIN_PASSWORD` from the container's environment; pass
 `--password` to choose another one. It also reactivates the account, signs out its sessions and revokes its API
 tokens, follower and worker tokens included: it prints how many, and followers that used one need a new token.
+Add `--keep-tokens` to keep the tokens working.
 
 ## Roles
 
 Each user has one role. Admins create users and set roles in **Settings → User Management**. New
 users, and users whose password an admin resets, must choose a new password at their next login. A reset also
-signs the user out and revokes their API tokens, the follower and worker tokens they issued included: a follower
-that connects with one stops syncing until it is given a new token (Settings → Followers).
+signs the user out and, with **Also revoke their API tokens** ticked (the default), revokes their API tokens, the
+follower and worker tokens they issued included: a follower that connects with one stops syncing until it is given
+a new token (Settings → Followers). Unticked, their tokens keep working. Deactivating an account (untick **Active
+Account**) revokes its API tokens the same way, for good: reactivating it doesn't bring them back.
+
+Changing your own password (**Change Password** in the user menu, or the change asked for at the first login)
+signs out your other sessions. Tick **Also revoke my API tokens** (unticked by default) to revoke all of your
+tokens too, follower and worker tokens included.
+
+When one of these revokes tokens, it says how many, and how many of them were follower or worker tokens.
 
 | Action | guest | power_user | admin |
 |---|---|---|---|
@@ -103,7 +112,13 @@ Details:
   disables a token immediately. Users can list and revoke only their own tokens
   (`client.list_tokens()`, `GET /api/tokens`). An admin can revoke all of another user's tokens with
   `DELETE /api/users/{id}/tokens`.
-- A deactivated user's tokens stop working (403).
+- `POST /api/users/{id}/reset-password` (`{"password": ..., "revoke_tokens": true}`) revokes the user's tokens
+  unless `revoke_tokens` is `false`; without the field it revokes them. `POST /api/auth/change-password` revokes
+  your own tokens only with `"revoke_tokens": true`. Both answer `revoked_tokens` with how many they revoked of
+  each scope (`full`, `follower`, `worker`), all 0 when not asked to revoke.
+- Deactivating a user revokes all of their tokens, follower and worker tokens included, in the same step;
+  reactivating the account doesn't bring them back. `PATCH /api/users/{id}` with `"is_active": false` answers
+  `revoked_tokens` with how many it revoked of each scope (`full`, `follower`, `worker`).
 - A **worker token** (on the tokens page, **Used by: a compute worker**; `"scope": "worker"`;
   `client.create_token(name, scope="worker")`) is for a compute
   worker, a machine that runs jobs for the server (`python -m fridge.worker`). Only the worker endpoints

@@ -44,5 +44,5 @@ async def test_thumbnail_redirect_does_not_bypass_dataset_access(external_media)
     access.side_effect = HTTPException(status_code=403)
     with pytest.raises(HTTPException) as error:
         await main.serve_sample_media(7, Mock(), w=256)
-    assert error.value.status_code == 403
+    assert error.value.status_code == 404  # as for a missing sample
     fetch.assert_not_awaited()

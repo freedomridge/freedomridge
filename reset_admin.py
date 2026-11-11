@@ -11,7 +11,7 @@ from backend.security import production
 DATABASE_URL = os.getenv('DATABASE_URL', 'postgresql://freedomridge:password@localhost:5432/freedomridge')
 
 
-async def reset_admin(password: str | None = None):
+async def reset_admin(password: str | None = None, keep_tokens: bool = False):
     password = password or os.getenv('FRIDGE_ADMIN_PASSWORD')
     supplied = bool(password)
     if not password:
@@ -35,16 +35,21 @@ async def reset_admin(password: str | None = None):
                 not supplied,
             )
             await connection.execute('DELETE FROM sessions WHERE user_id=$1', user_id)
-            # A token copied by whoever had the account must not outlive the reset either.
-            revoked = await connection.execute(
-                'UPDATE api_tokens SET is_active=FALSE WHERE user_id=$1 AND is_active',
-                user_id,
-            )
+            # A token copied by whoever had the account must not outlive the reset either, unless asked to keep them.
+            revoked = 0
+            if not keep_tokens:
+                status = await connection.execute(
+                    'UPDATE api_tokens SET is_active=FALSE WHERE user_id=$1 AND is_active',
+                    user_id,
+                )
+                revoked = int(status.split()[-1])
         print('Admin password reset successfully')
-        if int(revoked.split()[-1]):
+        if keep_tokens:
+            print('The API tokens of this account were kept: they still work.')
+        elif revoked:
             # Follower and worker tokens are this account's too: whatever used one is cut off until it has a new one.
             print(
-                f'Revoked {int(revoked.split()[-1])} API token(s) of this account, follower and worker tokens '
+                f'Revoked {revoked} API token(s) of this account, follower and worker tokens '
                 'included. Issue new follower tokens from Settings → Followers.',
             )
     finally:
@@ -54,4 +59,10 @@ async def reset_admin(password: str | None = None):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Reset admin using FRIDGE_ADMIN_PASSWORD or --password')
     parser.add_argument('--password', help='New password (prefer FRIDGE_ADMIN_PASSWORD to avoid shell history)')
-    asyncio.run(reset_admin(parser.parse_args().password))
+    parser.add_argument(
+        '--keep-tokens',
+        action='store_true',
+        help="Keep the account's API tokens (by default they are revoked, follower and worker tokens included)",
+    )
+    args = parser.parse_args()
+    asyncio.run(reset_admin(args.password, keep_tokens=args.keep_tokens))

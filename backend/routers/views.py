@@ -8,7 +8,7 @@ from fastapi.routing import APIRoute
 from pydantic import BaseModel
 
 from .. import public_settings
-from ..access import check_dataset_access, require_dataset_access
+from ..access import check_dataset_access, missing_unless_allowed, require_dataset_access
 from ..database import db
 from ..models import View, ViewCreate
 from ..security import private_guest, public_mode
@@ -247,14 +247,24 @@ async def get_view(slug: str, request: Request):
 
 @router.delete("/views/{id}")
 async def delete_view(id: int, user: dict = Depends(get_current_user)):
+    return await remove_view(id, user)
+
+
+async def remove_view(id: int, user: dict, *, check_access: bool = True):
+    """delete_view's work. With check_access off, for a follower's request the followers router has authorized (a
+    shared view of a dataset it follows), its account's dataset access isn't checked."""
     from .. import mirror_writes
 
     # Check ownership or admin
-    view = await db.fetchrow("SELECT user_id FROM views WHERE id = $1", id)
+    view = await db.fetchrow("SELECT user_id, dataset_id FROM views WHERE id = $1", id)
     if not view:
         raise HTTPException(status_code=404, detail="View not found")
 
     if view['user_id'] != user['id'] and user['role'] != 'admin':
+        if check_access:
+            # Someone else's view in a dataset the caller can't open answers as a missing one: a 403 said it exists.
+            with missing_unless_allowed("View not found"):
+                await check_dataset_access(view['dataset_id'], user)
         raise HTTPException(status_code=403, detail="Not authorized to delete this view")
     # A view a mirror copied from its primary is deleted there, when the mirror's views sync both ways.
     forwarded = await mirror_writes.forward_view_deletion(db, id)

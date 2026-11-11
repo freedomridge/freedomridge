@@ -1463,6 +1463,15 @@ CREATE TABLE IF NOT EXISTS dataset_versions (
     snapshot_format SMALLINT NOT NULL DEFAULT 1,
     dataset_snapshot JSONB,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    -- The dataset's public saved views when the version was made: [{name, description, content, is_default}] by
+    -- name (migration 0024). NULL: not recorded (a version from before 0024, or a hash-only one).
+    saved_views JSONB,
+    -- Who made the version: a username, or the author history from another system had there (migration 0025).
+    -- NULL: unknown (a version from before 0025, or history brought in without an author).
+    created_by TEXT,
+    -- Who brought the version in: the username of the request that stated its date or author (migration 0025).
+    -- NULL: not brought in.
+    imported_by TEXT,
     UNIQUE(dataset_id, name)
 );
 
@@ -2052,7 +2061,14 @@ $$ LANGUAGE plpgsql;
 CREATE OR REPLACE FUNCTION guard_dataset_row()
 RETURNS TRIGGER AS $$
 BEGIN
-    PERFORM require_writable_dataset(OLD.id, TG_OP = 'DELETE');
+    -- Except one update, in the deletion's own fenced transaction: removing the default view's row makes its foreign
+    -- key set default_view_id to NULL, and change nothing else. A dataset sealed before 2.9.0 kept its default view,
+    -- and its deletion failed there at every resume (0023).
+    IF TG_OP <> 'UPDATE' OR current_setting('fridge.deletion_dataset', TRUE) IS DISTINCT FROM OLD.id::text
+       OR NEW.default_view_id IS NOT NULL
+       OR (to_jsonb(NEW) - 'default_view_id') <> (to_jsonb(OLD) - 'default_view_id') THEN
+        PERFORM require_writable_dataset(OLD.id, TG_OP = 'DELETE');
+    END IF;
     IF TG_OP = 'UPDATE' AND NEW.deleting THEN
         -- The seal: later writes in this transaction must check again.
         PERFORM set_config('fridge.writable_dataset', '', TRUE);
@@ -2621,6 +2637,11 @@ BEGIN
         DELETE FROM map_block_changes WHERE dataset_id = OLD.id;
         RETURN NULL;
     END IF;
+    -- The deletion's own change, its foreign key clearing the default view (guard_dataset_row), is no mirror's write
+    -- and no news for followers: the dataset is going (0023).
+    IF current_setting('fridge.deletion_dataset', TRUE) = NEW.id::text THEN
+        RETURN NULL;
+    END IF;
     IF (OLD.name, OLD.description, OLD.media_fields, OLD.grid_media_field, OLD.modal_media_field,
         OLD.segmentation_config, OLD.default_view_id)
         IS DISTINCT FROM (NEW.name, NEW.description, NEW.media_fields, NEW.grid_media_field, NEW.modal_media_field,
@@ -2803,7 +2824,9 @@ CREATE TABLE IF NOT EXISTS mirrors (
     fields_reported_at TIMESTAMP WITH TIME ZONE,  -- when this instance last reported its own patch scales (0015)
     primary_identity TEXT,  -- the primary database it copies, so a new copy of it can resume into this one (0017)
     stopped_at TIMESTAMP WITH TIME ZONE,  -- when it stopped following; the latest stopped copy is the one resumed (0017)
-    keep_separate BOOLEAN NOT NULL DEFAULT FALSE  -- a stopped copy kept as it is, never resumed (0017)
+    keep_separate BOOLEAN NOT NULL DEFAULT FALSE,  -- a stopped copy kept as it is, never resumed (0017)
+    -- How many versions the primary keeps of the dataset, which stay there (0026). NULL: it hasn't said.
+    primary_versions INTEGER
 );
 -- One live mirror per primary dataset; a stopped one stays beside a new copy.
 CREATE UNIQUE INDEX IF NOT EXISTS mirrors_live_origin ON mirrors (link_id, origin_dataset_id) WHERE state <> 'stopped';
@@ -3114,5 +3137,9 @@ INSERT INTO schema_migrations (filename) VALUES
     ('0019_follower_truncate_guard.sql'),
     ('0020_mirror_restores.sql'),
     ('0021_embeddings_partitioned.sql'),
-    ('0022_local_fields.sql')
+    ('0022_local_fields.sql'),
+    ('0023_stuck_deletion_default_view.sql'),
+    ('0024_version_saved_views.sql'),
+    ('0025_version_created_by.sql'),
+    ('0026_mirror_primary_versions.sql')
 ON CONFLICT (filename) DO NOTHING;

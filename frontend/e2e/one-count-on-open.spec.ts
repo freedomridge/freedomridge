@@ -231,7 +231,7 @@ test.describe('datasets of its own', () => {
         await page.getByTitle('Dataset Settings').click();
         await page.getByRole('button', { name: 'Versions', exact: true }).click();
         const before = page.getByText('before', { exact: true }).locator('xpath=ancestor::div[contains(@class, "rounded-lg")][1]');
-        await before.getByRole('button', { name: 'Restore sample data' }).click();
+        await before.getByRole('button', { name: 'Revert to this snapshot' }).click();
         await expectTotal(page, 6);
         await expect(gridCount(page)).toHaveText(/^\s*6 images\s*$/);
         await page.waitForTimeout(1_500);

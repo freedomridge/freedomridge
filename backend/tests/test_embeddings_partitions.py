@@ -106,19 +106,162 @@ def test_the_sweeper_leaves_a_partition_it_cant_lock_for_the_next_sweep(registry
     registry_database(scenario)
 
 
-def test_rebuilds_queue_one_build_per_dataset_and_field_once(registry_database):
+async def _builds(database):
+    rows = await database.fetch(
+        "SELECT dataset_id, args->>'field' AS field FROM jobs WHERE kind = $1 ORDER BY created_at",
+        index_jobs.ANN_KIND,
+    )
+    return [(row['dataset_id'], row['field']) for row in rows]
+
+
+async def _finish_builds(database, dataset_id=None):
+    """The unfinished builds (of one dataset, given) succeed: their rows go, as ann_handler removes them."""
+    unfinished = "j.kind = $1 AND j.state IN ('queued', 'running') AND ($2::int IS NULL OR j.dataset_id = $2)"
+    await database.execute(
+        f"""DELETE FROM ann_index_rebuilds r USING jobs j WHERE {unfinished}
+            AND j.dataset_id = r.dataset_id AND j.args->>'field' = r.field_name""",
+        index_jobs.ANN_KIND,
+        dataset_id,
+    )
+    await database.execute(
+        f"UPDATE jobs j SET state = 'succeeded', finished_at = now() WHERE {unfinished}",
+        index_jobs.ANN_KIND,
+        dataset_id,
+    )
+
+
+async def _vectors(database, dataset_id, field, count):
+    sample_ids = (await ingest([{}] * count, dataset_id=dataset_id, prefix=f'{dataset_id}-{field}'))['ids']
+    await database.execute(
+        "INSERT INTO embeddings (dataset_id, sample_id, field_name, vector) "
+        "SELECT $1, sample_id, $2, '[1,0]' FROM unnest($3::integer[]) sample_id",
+        dataset_id,
+        field,
+        sample_ids,
+    )
+
+
+def test_rebuilds_queue_one_build_at_a_time_fewest_vectors_first(registry_database):
+    """Builds run one at a time on the server. Queued all at once, every waiting build was claimed, refused the lock
+    and put back over and over, and the first claimed after a build went next, a large dataset's before small ones.
+    One is queued at a time instead, the field with the fewest vectors first: by the field's own share of its
+    partition, so a dataset's small whole-image field doesn't wait behind its patch fields."""
+
     async def scenario(database):
+        await _vectors(database, 1, 'whole', 2)
+        await _vectors(database, 1, 'patch', 12)
+        await _vectors(database, 2, 'clip', 6)
+        await database.execute('ANALYZE embeddings_d1; ANALYZE embeddings_d2')
+        await database.execute(
+            "INSERT INTO ann_index_rebuilds (dataset_id, field_name) VALUES (1, 'patch'), (1, 'whole'), (2, 'clip')",
+        )
+        assert await index_jobs.queue_rebuilds(database.pool) == 1
+        assert await index_jobs.queue_rebuilds(database.pool) == 0  # one is queued: the rest wait their turn
+        for _ in range(2):
+            await _finish_builds(database)
+            assert await index_jobs.queue_rebuilds(database.pool) == 1
+        assert await _builds(database) == [(1, 'whole'), (2, 'clip'), (1, 'patch')]
+        await _finish_builds(database)
+        assert await database.fetchval('SELECT count(*) FROM ann_index_rebuilds') == 0
+        assert await index_jobs.queue_rebuilds(database.pool) == 0
+
+    registry_database(scenario)
+
+
+def test_a_failed_rebuild_keeps_its_row_and_is_tried_again_a_day_later(registry_database):
+    """A row stays until its build has its index: a build that failed (past its budget, out of disk, mixed
+    dimensions) is tried again, but not before a day has passed, so a build that can't succeed doesn't loop."""
+
+    async def scenario(database):
+        await database.execute(
+            "INSERT INTO ann_index_rebuilds (dataset_id, field_name) VALUES (1, 'clip'), (2, 'clip')",
+        )
+        assert await index_jobs.queue_rebuilds(database.pool) == 1
+        await database.execute(
+            """UPDATE jobs SET state = 'failed', finished_at = now(), error = '{"type": "JobConflict"}'
+               WHERE kind = $1""",
+            index_jobs.ANN_KIND,
+        )
+        assert await index_jobs.queue_rebuilds(database.pool) == 1
+        assert await _builds(database) == [(1, 'clip'), (2, 'clip')]  # 1's failed: 2 goes next, 1's row stays
+        await _finish_builds(database)
+        assert await index_jobs.queue_rebuilds(database.pool) == 0  # 1 failed under a day ago
+        assert await database.fetchval('SELECT count(*) FROM ann_index_rebuilds') == 1
+        await database.execute(
+            "UPDATE jobs SET finished_at = now() - interval '25 hours' WHERE kind = $1 AND state = 'failed'",
+            index_jobs.ANN_KIND,
+        )
+        assert await index_jobs.queue_rebuilds(database.pool) == 1
+        assert (await _builds(database))[-1] == (1, 'clip')
+
+    registry_database(scenario)
+
+
+def test_a_cancelled_rebuild_is_not_queued_again(registry_database):
+    """Whoever cancels a rebuild doesn't want it: its row goes (Retry in the jobs list builds it again)."""
+    from backend import job_queue
+
+    async def scenario(database):
+        await database.execute(
+            "INSERT INTO ann_index_rebuilds (dataset_id, field_name) VALUES (1, 'clip'), (2, 'clip')",
+        )
+        assert await index_jobs.queue_rebuilds(database.pool) == 1
+        [build] = await database.fetch('SELECT id FROM jobs WHERE kind = $1', index_jobs.ANN_KIND)
+        await job_queue.cancel_job(database.pool, build['id'])
+        assert await index_jobs.queue_rebuilds(database.pool) == 1
+        assert await _builds(database) == [(1, 'clip'), (2, 'clip')]
+        assert await database.fetchval('SELECT array_agg(dataset_id) FROM ann_index_rebuilds') == [2]
+        # Not a day later either; Retry (the build endpoint) still builds it.
+        await _finish_builds(database)
+        await database.execute(
+            "UPDATE jobs SET finished_at = now() - interval '25 hours' WHERE kind = $1",
+            index_jobs.ANN_KIND,
+        )
+        assert await index_jobs.queue_rebuilds(database.pool) == 0
+        await index_jobs.submit_ann_index(database.pool, 1, USER['id'], 'clip')
+        assert (await _builds(database))[-1] == (1, 'clip')
+        # A user's own build that was cancelled (Retry, the endpoint, the SDK) leaves a rebuild row alone: they
+        # cancelled their build, not the upgrade's.
+        [manual] = await database.fetch(
+            "SELECT id FROM jobs WHERE kind = $1 AND state = 'queued'",
+            index_jobs.ANN_KIND,
+        )
+        await job_queue.cancel_job(database.pool, manual['id'])
+        await database.execute("INSERT INTO ann_index_rebuilds (dataset_id, field_name) VALUES (1, 'clip')")
+        assert await index_jobs.queue_rebuilds(database.pool) == 1
+        assert (await _builds(database))[-1] == (1, 'clip')
+        assert await database.fetchval("SELECT count(*) FROM ann_index_rebuilds WHERE dataset_id = 1") == 1
+
+    registry_database(scenario)
+
+
+def test_a_dataset_whose_lane_is_held_does_not_hold_up_the_other_rebuilds(registry_database):
+    """A build can't start while another job holds its dataset's lane (a map re-fit, a bulk edit): such a build, or
+    a dataset whose lane is held, must not stop the other datasets' rebuilds."""
+    from backend import job_queue
+
+    async def scenario(database):
+        async with database.pool.acquire() as connection:
+            refit = await job_queue.enqueue_job(connection, 'map_refit', dataset_id=1, lane='user')
+        await database.execute('UPDATE jobs SET started_at = now() WHERE id = $1', refit['id'])  # it holds the lane
         await database.execute(
             "INSERT INTO ann_index_rebuilds (dataset_id, field_name) VALUES (1, 'clip'), (2, 'clip'), (2, 'dino')",
         )
-        assert await index_jobs.queue_rebuilds(database.pool) == 3
-        jobs = await database.fetch(
-            "SELECT dataset_id, args->>'field' AS field FROM jobs WHERE kind = $1 ORDER BY 1, 2",
-            index_jobs.ANN_KIND,
-        )
-        assert [(row['dataset_id'], row['field']) for row in jobs] == [(1, 'clip'), (2, 'clip'), (2, 'dino')]
-        assert await database.fetchval('SELECT count(*) FROM ann_index_rebuilds') == 0
-        assert await index_jobs.queue_rebuilds(database.pool) == 0
+        assert await index_jobs.queue_rebuilds(database.pool) == 1
+        assert await _builds(database) == [(2, 'clip')]  # dataset 1's lane is held, so it is skipped
+        await _finish_builds(database)
+        # A build of dataset 1 queued another way (a user's) can't start either, and doesn't count as waiting.
+        async with database.pool.acquire() as connection:
+            await job_queue.enqueue_job(connection, index_jobs.ANN_KIND, dataset_id=1, args={'field': 'manual'})
+        assert await index_jobs.queue_rebuilds(database.pool) == 1
+        assert (await _builds(database))[-1] == (2, 'dino')
+        await _finish_builds(database, dataset_id=2)
+        assert await index_jobs.queue_rebuilds(database.pool) == 0  # only dataset 1 is left, and its lane is held
+        await database.execute("UPDATE jobs SET state = 'succeeded', finished_at = now() WHERE id = $1", refit['id'])
+        assert await index_jobs.queue_rebuilds(database.pool) == 0  # now the user's build of dataset 1 can start
+        await _finish_builds(database)
+        assert await index_jobs.queue_rebuilds(database.pool) == 1
+        assert (await _builds(database))[-1] == (1, 'clip')
 
     registry_database(scenario)
 

@@ -12,7 +12,7 @@ export function filteredFieldNames(drafts: Filters, applied?: ComplexFilter): Se
         if (typeof node.field === 'string') names.add(node.field);
         node.filters?.forEach(visit);
     };
-    // The drafts' keys go through the same conversion Apply uses (exclude_ prefixes, _min/_max bounds).
+    // The drafts' keys go through the same conversion Apply uses (`exclude:` markers, `:min` / `:max` bounds).
     visit(convertSimpleFiltersToComplex(drafts));
     visit(applied);
     return names;

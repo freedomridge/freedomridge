@@ -362,7 +362,7 @@ test('non-admins get no System status card, no banner, and a 403', async ({ brow
             return route.fulfill({ json: fakeStatus('paused', 0.5) });
         });
         await page.goto('/settings');
-        await expect(page.getByText('API Tokens')).toBeVisible();
+        await expect(page.getByText('API Tokens', { exact: true })).toBeVisible();
         await expect(page.getByTestId('settings-system-status')).toHaveCount(0);
         await expect(page.getByTestId('low-disk-banner')).toHaveCount(0);
         expect(asked).toBe(0);  // the banner's query never runs for a non-admin

@@ -15,6 +15,41 @@ export function isTextFilter(value: unknown): value is TextFilter {
 // membership; a range object for min/max; an op marker for presence filters.
 export type SimpleFilterValue = string | number | boolean | string[] | number[] | RangeFilter | OpFilter | TextFilter;
 
+// A key of the simple-filter map is a field's name, or the name with a marker for how it filters:
+// `exclude:<field>` holds the values the field must not have, `<field>:min` and `<field>:max` a datetime bar's
+// bounds. No field a filter can name holds a ':' (letters, digits, `_` and `.`, after `@local.` for a mirror's
+// own), so a field whose own name starts with `exclude_` or ends with `_min` / `_max` filters itself. Those
+// spellings were the markers before, and read `exclude_reason` as "not reason": see upgradeDraftKeys.
+const EXCLUDE_MARK = 'exclude:';
+export const excludeKeyFor = (field: string): string => `${EXCLUDE_MARK}${field}`;
+export const boundKeyFor = (field: string, bound: 'min' | 'max'): string => `${field}:${bound}`;
+
+/** The field a simple-filter key filters, whether it excludes, and the bound it holds, if any. */
+export function parseDraftKey(key: string): { field: string; exclude: boolean; bound?: 'min' | 'max' } {
+    const exclude = key.startsWith(EXCLUDE_MARK);
+    const rest = exclude ? key.slice(EXCLUDE_MARK.length) : key;
+    const bound = rest.endsWith(':min') ? 'min' : rest.endsWith(':max') ? 'max' : undefined;
+    return { field: bound ? rest.slice(0, -':min'.length) : rest, exclude, bound };
+}
+
+/**
+ * A simple-filter map saved with the old markers (`exclude_<field>`, and `<field>_min` / `<field>_max` with a
+ * string or number), read as it was read then and given the new ones, so a draft saved before keeps filtering
+ * what it did. Only for a map saved before the new markers: it reads a field named `exclude_reason` as "not reason".
+ */
+export function upgradeDraftKeys(simpleFilters: Record<string, SimpleFilterValue>): Record<string, SimpleFilterValue> {
+    const upgraded: Record<string, SimpleFilterValue> = {};
+    for (const [key, value] of Object.entries(simpleFilters)) {
+        const exclude = key.startsWith('exclude_');
+        let field = exclude ? key.slice('exclude_'.length) : key;
+        if ((typeof value === 'string' || typeof value === 'number') && (field.endsWith('_min') || field.endsWith('_max'))) {
+            field = boundKeyFor(field.slice(0, -4), field.endsWith('_min') ? 'min' : 'max');
+        }
+        upgraded[exclude ? excludeKeyFor(field) : field] = value;
+    }
+    return upgraded;
+}
+
 const describeValue = (v: unknown): string => {
     if (typeof v === 'string' && /^\d{4}-\d{2}-\d{2}T/.test(v)) return v.slice(0, 10);
     if (typeof v === 'number' && !Number.isInteger(v)) return String(Number(v.toFixed(3)));
@@ -75,8 +110,7 @@ export function convertSimpleFiltersToComplex(simpleFilters: Record<string, Simp
     for (const [key, value] of Object.entries(simpleFilters)) {
         if (value === null || value === undefined || value === '') continue;
 
-        const isExclude = key.startsWith('exclude_');
-        const field = isExclude ? key.replace('exclude_', '') : key;
+        const { field, exclude: isExclude, bound } = parseDraftKey(key);
 
         if (isTextFilter(value)) {
             const alternatives: ComplexFilter[] = [];
@@ -107,15 +141,13 @@ export function convertSimpleFiltersToComplex(simpleFilters: Record<string, Simp
             continue;
         }
 
-        // Datetime range bounds arrive as flat suffixed keys (field_min / field_max
-        // with a string value, produced by the histogram panel). Strip the suffix
-        // and emit >= / <= on the real field, mirroring FilterContext — otherwise
-        // 'field_min' falls through to a `contains` on a nonexistent field and
-        // empties the grid on apply (preview != apply).
-        if ((typeof value === 'string' || typeof value === 'number') && (field.endsWith('_min') || field.endsWith('_max'))) {
-            const isMin = field.endsWith('_min');
-            const bound: ComplexFilter = { field: field.slice(0, -4), operator: isMin ? '>=' : '<=', value };
-            filters.push(isExclude ? { logic: 'NOT' as const, filters: [bound] } : bound);
+        // Datetime range bounds arrive as their own keys (`<field>:min` / `<field>:max`
+        // with a string value, produced by the histogram panel): emit >= / <= on the
+        // field — otherwise the bound falls through to a `contains` on a nonexistent
+        // field and empties the grid on apply (preview != apply).
+        if ((typeof value === 'string' || typeof value === 'number') && bound) {
+            const boundFilter: ComplexFilter = { field, operator: bound === 'min' ? '>=' : '<=', value };
+            filters.push(isExclude ? { logic: 'NOT' as const, filters: [boundFilter] } : boundFilter);
             continue;
         }
 
@@ -202,8 +234,7 @@ export function getSimpleFilterStages(simpleFilters: Record<string, SimpleFilter
     for (const [key, value] of Object.entries(simpleFilters)) {
         if (value === null || value === undefined || value === '') continue;
 
-        const isExclude = key.startsWith('exclude_');
-        const field = isExclude ? key.replace('exclude_', '') : key;
+        const { field, exclude: isExclude, bound } = parseDraftKey(key);
 
         // Skip empty arrays
         if (Array.isArray(value) && value.length === 0) continue;
@@ -231,16 +262,15 @@ export function getSimpleFilterStages(simpleFilters: Record<string, SimpleFilter
             continue;
         }
 
-        // Datetime range bounds as flat suffixed keys: emit a >= / <=
-        // stage on the real field instead of a `contains` on 'field_min'.
-        if ((typeof value === 'string' || typeof value === 'number') && (field.endsWith('_min') || field.endsWith('_max'))) {
-            const isMin = field.endsWith('_min');
-            const realField = field.slice(0, -4);
-            const bound: ComplexFilter = { field: realField, operator: isMin ? '>=' : '<=', value };
+        // Datetime range bounds as their own keys: emit a >= / <=
+        // stage on the field instead of a `contains` on '<field>:min'.
+        if ((typeof value === 'string' || typeof value === 'number') && bound) {
+            const isMin = bound === 'min';
+            const boundFilter: ComplexFilter = { field, operator: isMin ? '>=' : '<=', value };
             stages.push({
                 type: 'filter',
-                description: `${realField} ${isMin ? '>=' : '<='} ${value}${isExclude ? ' (Excluded)' : ''}`,
-                filter: isExclude ? { logic: 'NOT' as const, filters: [bound] } : bound,
+                description: `${field} ${isMin ? '>=' : '<='} ${value}${isExclude ? ' (Excluded)' : ''}`,
+                filter: isExclude ? { logic: 'NOT' as const, filters: [boundFilter] } : boundFilter,
             });
             continue;
         }

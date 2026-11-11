@@ -16,7 +16,7 @@ async function showAsMirror(page: import('@playwright/test').Page, datasetId: nu
         const response = await route.fetch();
         await route.fulfill({ response, json: { ...(await response.json()), mirror: {
             state: 'following', primary_url: 'https://primary.example.org/api', origin_dataset_id: 9,
-            tags: 'primary', views: 'primary', concept_views: [],
+            tags: 'primary', views: 'primary', concept_views: [], primary_versions: 3,
         } } });
     });
     await page.route(new RegExp(`/api/datasets/${datasetId}/field-stats$`), async route => {
@@ -71,4 +71,14 @@ test("a mirror's own fields: their own sidebar group, the sample view, and this 
     await expect(primary).toBeDisabled();
     await expect(mine).toHaveAttribute('aria-pressed', 'true');
     await expect(page.getByRole('heading', { name: /This server's tags/ })).toBeVisible();
+});
+
+test("a mirror's Versions tab says the primary keeps the dataset's versions", async ({ page }) => {
+    const { datasetId } = readState();
+    await showAsMirror(page, datasetId);
+    await gotoDataset(page);
+    await page.getByTitle('Dataset Settings').click();
+    await page.getByRole('button', { name: 'Versions', exact: true }).click();
+    await expect(page.getByTestId('primary-versions-note'))
+        .toContainText('primary.example.org keeps 3 versions of this dataset, and they stay there');
 });

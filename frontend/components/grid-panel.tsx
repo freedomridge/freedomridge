@@ -57,6 +57,8 @@ interface GridPanelProps {
     selectAllActive?: boolean;   // Select-All (token) mode — all rows selected minus deselectedIds
     deselectedIds?: number[];
     selectionCount?: number;     // effective count spanning both modes
+    // A selection made in a grid of the other grain: not shown, tagged or exported here.
+    otherSelection?: { count: number; grain: 'image' | 'object' };
     activeOverlayFields: string[];
     overlayConfigs?: Record<string, { colormap?: string; range?: [number, number]; opacity?: number } | null>;
     onSampleClick: (sample: Sample) => void;
@@ -104,6 +106,7 @@ export function GridPanel({
     selectAllActive = false,
     deselectedIds = [],
     selectionCount,
+    otherSelection,
     activeOverlayFields,
     overlayConfigs,
     onSampleClick,
@@ -185,6 +188,8 @@ export function GridPanel({
     const [mediaField, setMediaField] = useState<string>(dataset?.grid_media_field || 'filepath');
     // null while the grid's COUNT is in flight: show that, not the previous view's number.
     const [totalCount, setTotalCount] = useState<number | null>(null);
+    // The COUNT failed: no total is coming (the grid offers Retry), so it no longer says "Counting…".
+    const [countFailed, setCountFailed] = useState(false);
 
     useEffect(() => {
         // eslint-disable-next-line react-hooks/set-state-in-effect -- deliberate prop-sync: adopt the dataset's configured grid media field when it loads/changes
@@ -221,8 +226,8 @@ export function GridPanel({
                         unlike the Select All button below). */}
                     <span data-testid="grid-view-count" className="text-xs text-zinc-400 whitespace-nowrap">
                         {totalCount === null
-                            ? 'Counting…'
-                            : `${totalCount.toLocaleString()} ${grainMode === 'object' ? 'object' : 'image'}${totalCount === 1 ? '' : 's'}`}
+                            ? (countFailed ? 'Count unavailable' : 'Counting…')
+                            :`${totalCount.toLocaleString()} ${grainMode === 'object' ? 'object' : 'image'}${totalCount === 1 ? '' : 's'}`}
                     </span>
 
                     {/* Partial-coverage warning (see coverageGaps above) */}
@@ -271,6 +276,15 @@ export function GridPanel({
                             <span>{effectiveSelectionCount.toLocaleString()} selected{selectAllActive ? ' (all)' : ''}</span>
                             <span className="text-xs">&times;</span>
                         </button>
+                    )}
+                    {!hasSelection && otherSelection && otherSelection.count > 0 && (
+                        <span
+                            data-testid="grid-other-selection"
+                            className="text-xs text-zinc-500 whitespace-nowrap"
+                            title="Selected in a panel of the other grain, so not shown, tagged or exported here. Selecting here starts a new selection."
+                        >
+                            {otherSelection.count.toLocaleString()} {otherSelection.grain === 'object' ? 'object' : 'image'}{otherSelection.count === 1 ? '' : 's'} selected in another panel
+                        </span>
                     )}
 
                     {/* Patch selection indicator */}
@@ -504,6 +518,7 @@ export function GridPanel({
                     gridSamplesRef={ref}
                     gridMoreRef={gridMoreRef}
                     onTotalChange={setTotalCount}
+                    onCountFailed={setCountFailed}
                     selectedPatches={selectedPatches}
                     onPatchSelect={onPatchSelect}
                     gridPatchMode={gridPatchMode}

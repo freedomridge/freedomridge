@@ -33,8 +33,11 @@ test.beforeEach(async ({ page }) => {
             await route.fulfill({ json: { id: 1, username: 'viewer', role: 'guest' } });
         } else if (url.pathname === '/api/datasets/1/versions/41') {
             await route.fulfill({ json: snapshot });
+        } else if (url.pathname === '/api/datasets/1/versions/41/views') {
+            await route.fulfill({ json: { views: [{ name: 'rejected', description: 'tagged rejected' }] } });
         } else if (url.pathname === '/api/datasets/1/versions/41/samples') {
-            const items = url.searchParams.get('q') === 'missing-label' ? [] : [savedSample];
+            const none = url.searchParams.get('q') === 'missing-label' || url.searchParams.get('view') === 'rejected';
+            const items = none ? [] : [savedSample];
             await route.fulfill({ json: { items, total: items.length } });
         } else if (url.pathname === '/api/samples/7/media' && url.searchParams.get('version_id') === '41') {
             await route.fulfill({
@@ -72,6 +75,22 @@ test('search is applied to saved samples', async ({ page }) => {
     await page.getByRole('button', { name: 'Search', exact: true }).click();
     await expect(page.getByText('0 matching samples')).toBeVisible();
     await expect(page.getByRole('button', { name: 'Open saved sample 7' })).toHaveCount(0);
+});
+
+test('a saved view the version recorded narrows the saved samples', async ({ page }) => {
+    await page.goto('/datasets/1/versions/41');
+    await expect(page.getByText('1 matching samples')).toBeVisible();
+    await page.getByLabel('Saved view of this version').selectOption('rejected');
+    await expect(page.getByText('0 matching samples')).toBeVisible();
+    await page.getByLabel('Saved view of this version').selectOption('');
+    await expect(page.getByText('1 matching samples')).toBeVisible();
+});
+
+test('a version that recorded no saved views says so', async ({ page }) => {
+    await page.route('**/api/datasets/1/versions/41/views', route => route.fulfill({ json: { views: null } }));
+    await page.goto('/datasets/1/versions/41');
+    await expect(page.getByText("This version did not record the dataset's saved views.")).toBeVisible();
+    await expect(page.getByLabel('Saved view of this version')).toHaveCount(0);
 });
 
 test('hash-only snapshots explain why historical browsing is unavailable', async ({ page }) => {

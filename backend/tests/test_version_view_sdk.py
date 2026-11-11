@@ -104,3 +104,32 @@ def test_writes_and_unsupported_operations_raise_clearly(dataset):
         view.no_such_thing
     assert isinstance(view, VersionView)
     dataset.client.query_version_samples.assert_not_called()
+
+
+def test_a_saved_view_is_loaded_as_the_version_recorded_it(dataset):
+    train = {'field': 'split', 'operator': '=', 'value': 'train'}
+    dataset.client.get_version_views.return_value = [
+        {'name': 'everything', 'description': None, 'content': {'viewStages': []}},
+        {'name': 'train', 'description': 'the split', 'content': {'viewStages': [{'type': 'filter', 'filter': train}]}},
+    ]
+    version = dataset.version('v1')
+    assert [view['name'] for view in version.list_views()] == ['everything', 'train']
+    dataset.client.get_version_views.assert_called_with(7, 11)
+
+    assert version.load_view('train')._filters == {'logic': 'AND', 'filters': [train]}
+    narrowed = version.filter(F('a') == 1).load_view('train')
+    assert narrowed._filters['filters'] == [
+        {'field': 'a', 'operator': '=', 'value': 1},
+        version.load_view('train')._filters,
+    ]
+    assert version.load_view('everything')._filters is None
+    with pytest.raises(ValueError, match=r"no saved view named 'val'; it recorded: \['everything', 'train'\]"):
+        version.load_view('val')
+
+
+def test_a_version_that_recorded_no_views_says_so(dataset):
+    dataset.client.get_version_views.return_value = None
+    with pytest.raises(ValueError, match="'v1' recorded no saved views"):
+        dataset.version('v1').list_views()
+    with pytest.raises(ValueError, match="'v1' recorded no saved views"):
+        dataset.version('v1').load_view('train')

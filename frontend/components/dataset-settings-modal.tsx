@@ -4,7 +4,7 @@ import { segmentationLabelChoices } from '@/lib/labels';
 
 import * as Dialog from '@radix-ui/react-dialog';
 import { useState, useMemo } from 'react';
-import { Dataset, updateDataset, getDatasetSchema, promoteField, demoteField, setFieldDisplayType, setFieldType, SegmentationConfig, saveOverlayConfig, notifySamplesMutated, type SchemaField, type DeclaredFieldType } from '@/lib/api';
+import { Dataset, updateDataset, getDatasetSchema, promoteField, demoteField, setFieldDisplayType, setFieldType, SegmentationConfig, saveOverlayConfig, notifySamplesMutated, type DatasetMirror, type SchemaField, type DeclaredFieldType } from '@/lib/api';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { SAMPLE_COUNT_KEY } from '@/hooks/useSampleCount';
 import { SegmentationSettingsPanel } from './SegmentationSettingsPanel';
@@ -12,6 +12,8 @@ import { Rocket } from 'lucide-react';
 import Link from 'next/link';
 import { useUser } from '@/contexts/UserContext';
 import { IndexAdvisor } from './index-advisor';
+import { primaryHost } from './mirror-badge';
+import { revertQuestion, versionMaker, type ViewChanges } from '@/lib/version-revert';
 
 const API_BASE = '/api';
 
@@ -171,16 +173,45 @@ interface DatasetVersion {
     description?: string | null;
     sample_count: number;
     created_at: string;
+    // Who made it; null when unknown (a version made before versions recorded it, or history brought in
+    // without an author).
+    created_by?: string | null;
+    // Who brought it in, when its date or author was stated by the request that made it; null otherwise.
+    imported_by?: string | null;
     include_metadata?: boolean;
 }
 
-function VersionsPanel({ datasetId, onViewSamples }: { datasetId: number; onViewSamples?: (token: string, total: number, label: string) => void }) {
+// The view changes in words and, for a tooltip, by name; null when there are none to report.
+function describeViewChanges(changes: ViewChanges | null | undefined): { text: string; names: string } | null {
+    if (!changes) return null;
+    const kinds: [string[], string, string][] = [
+        [changes.added, 'new saved view', 'new saved views'],
+        [changes.removed, 'saved view removed', 'saved views removed'],
+        [changes.filters_changed, 'saved view with changed filters', 'saved views with changed filters'],
+    ];
+    const changed = kinds.filter(([names]) => names.length > 0);
+    if (changed.length === 0) return null;
+    return {
+        text: changed.map(([names, one, many]) => `${names.length} ${names.length === 1 ? one : many}`).join(', '),
+        names: changed.map(([names, one]) => `${one}: ${names.join(', ')}`).join('\n'),
+    };
+}
+
+function VersionsPanel({ datasetId, mirror, role, onViewSamples }: { datasetId: number; mirror?: DatasetMirror | null; role?: string; onViewSamples?: (token: string, total: number, label: string) => void }) {
+    // What the server allows: anyone with the dataset browses and compares versions, a power user makes them,
+    // an admin reverts to one or deletes one. What a role can't do is disabled here and says why.
+    const isAdmin = role === 'admin';
+    const canMakeVersions = isAdmin || role === 'power_user';
     const queryClient = useQueryClient();
     const [newName, setNewName] = useState('');
     const [newDesc, setNewDesc] = useState('');
     const [includeMetadata, setIncludeMetadata] = useState(true);
     const [creating, setCreating] = useState(false);
-    const [exactMembership, setExactMembership] = useState(false);
+    // A revert puts the dataset back to exactly the version unless this is turned off.
+    const [exactMembership, setExactMembership] = useState(true);
+    const [restoreSettings, setRestoreSettings] = useState(false);
+    // The version whose revert is being counted, before its question is asked.
+    const [countingRevert, setCountingRevert] = useState<number | null>(null);
     const [diffPair, setDiffPair] = useState<[number, number] | null>(null);
     const [diffVsCurrent, setDiffVsCurrent] = useState<number | null>(null);
 
@@ -244,16 +275,75 @@ function VersionsPanel({ datasetId, onViewSamples }: { datasetId: number; onView
         }
     };
 
-    const handleDelete = async (versionId: number) => {
-        await fetch(`${API_BASE}/datasets/${datasetId}/versions/${versionId}`, {
-            method: 'DELETE', credentials: 'include',
+    // Counts what the revert would change, asks with those numbers, then reverts. Without the numbers it doesn't ask.
+    const handleRevert = async (v: DatasetVersion) => {
+        setCountingRevert(v.id);
+        let question: string;
+        try {
+            const [diffRes, datasetRes] = await Promise.all([
+                fetch(`${API_BASE}/datasets/${datasetId}/versions/current-diff/${v.id}`, { credentials: 'include' }),
+                fetch(`${API_BASE}/datasets/${datasetId}`, { credentials: 'include' }),
+            ]);
+            const failed = [diffRes, datasetRes].find(res => !res.ok);
+            if (failed) {
+                const err = await failed.json().catch(() => ({}));
+                throw new Error(err.detail || `status ${failed.status}`);
+            }
+            const defaultView: string | null = (await datasetRes.json()).default_view?.name ?? null;
+            question = revertQuestion(v, await diffRes.json(), exactMembership, restoreSettings, defaultView);
+        } catch (e: unknown) {
+            alert(`Could not count what this revert would change, so nothing was reverted: ${e instanceof Error ? e.message : e}`);
+            return;
+        } finally {
+            setCountingRevert(null);
+        }
+        if (!confirm(question)) return;
+        const res = await fetch(`${API_BASE}/datasets/${datasetId}/versions/${v.id}/revert?exact_membership=${exactMembership}&restore_settings=${restoreSettings}`, {
+            method: 'POST', credentials: 'include',
         });
+        if (res.ok) {
+            // The counts are asked again by notifySamplesMutated (SAMPLE_COUNT_KEY).
+            queryClient.invalidateQueries({ predicate: query => query.queryKey[0] !== SAMPLE_COUNT_KEY });
+            // invalidateQueries can't reach the grid's manual
+            // page cache — signal it so reverted rows show.
+            notifySamplesMutated(datasetId);
+        } else {
+            const err = await res.json().catch(() => ({}));
+            alert(err.detail || 'Revert failed');
+        }
+    };
+
+    const handleDelete = async (versionId: number) => {
+        try {
+            const res = await fetch(`${API_BASE}/datasets/${datasetId}/versions/${versionId}`, {
+                method: 'DELETE', credentials: 'include',
+            });
+            if (!res.ok) {
+                const err = await res.json().catch(() => ({}));
+                throw new Error(err.detail || `status ${res.status}`);
+            }
+        } catch (e: unknown) {
+            alert(`The version was not deleted: ${e instanceof Error ? e.message : e}`);
+            return;
+        }
         queryClient.invalidateQueries({ queryKey: ['versions', datasetId] });
         if (diffVsCurrent === versionId) setDiffVsCurrent(null);
     };
 
+    const statusViewChanges = describeViewChanges(versionStatus?.view_changes);
+    const diffViewChanges = describeViewChanges(diffData?.view_changes);
+
+    const primaryVersions = mirror?.primary_versions ?? 0;
+
     return (
         <div className="space-y-4">
+            {mirror && primaryVersions > 0 && (
+                <p data-testid="primary-versions-note" className="text-xs text-zinc-400 bg-zinc-800/50 rounded border border-zinc-800 p-2">
+                    {primaryHost(mirror)} keeps {primaryVersions === 1 ? '1 version' : `${primaryVersions.toLocaleString()} versions`} of
+                    this dataset, and {primaryVersions === 1 ? 'it stays' : 'they stay'} there: a mirror follows the dataset as
+                    it is now, not its history. Versions listed here are ones made on this server.
+                </p>
+            )}
             {/* Current status */}
             {versionStatus && (
                 <div className={`border rounded-lg p-3 ${
@@ -276,11 +366,16 @@ function VersionsPanel({ datasetId, onViewSamples }: { datasetId: number; onView
                             <span className="text-zinc-400">No versions yet</span>
                         )}
                     </div>
+                    {statusViewChanges && (
+                        <p className="text-xs text-yellow-300/80 mt-1" title={statusViewChanges.names} data-testid="status-view-changes">
+                            {statusViewChanges.text}
+                        </p>
+                    )}
                 </div>
             )}
 
             {/* Create new version */}
-            <div className="border border-zinc-800 rounded-lg p-3 space-y-2">
+            <fieldset disabled={!canMakeVersions} title={canMakeVersions ? undefined : 'Making a version takes a power user'} className="min-w-0 border border-zinc-800 rounded-lg p-3 space-y-2 disabled:opacity-60">
                 <div className="text-sm font-medium text-zinc-200">Create Version</div>
                 <input
                     type="text"
@@ -338,7 +433,7 @@ function VersionsPanel({ datasetId, onViewSamples }: { datasetId: number; onView
                         {creating ? 'Creating snapshot...' : 'Create Version'}
                     </button>
                 </div>
-            </div>
+            </fieldset>
 
             {/* Version list */}
             {isLoading && <div className="text-sm text-zinc-500">Loading versions...</div>}
@@ -349,10 +444,17 @@ function VersionsPanel({ datasetId, onViewSamples }: { datasetId: number; onView
                 </div>
             )}
 
-            {!!versions?.length && <label className="flex items-center gap-2 text-xs text-zinc-400">
-                <input type="checkbox" checked={exactMembership} onChange={event => setExactMembership(event.target.checked)} />
-                When restoring, also restore deleted samples and remove samples added since the version
-            </label>}
+            {/* What a revert does; a revert takes an admin, so only an admin chooses. */}
+            {!!versions?.length && isAdmin && <div className="space-y-1 text-xs text-zinc-400">
+                <label className="flex items-center gap-2">
+                    <input type="checkbox" checked={exactMembership} onChange={event => setExactMembership(event.target.checked)} />
+                    A revert puts the dataset back to exactly the version: samples and public saved views added since are removed, deleted ones restored
+                </label>
+                <label className="flex items-center gap-2">
+                    <input type="checkbox" checked={restoreSettings} onChange={event => setRestoreSettings(event.target.checked)} />
+                    Also restore the dataset&apos;s settings: description, media fields, class names and colours, and the view it opens on
+                </label>
+            </div>}
             {versions && versions.map((v: DatasetVersion, idx: number) => (
                 <div key={v.id} className={`border rounded-lg p-3 ${idx === 0 ? 'border-cyan-800/50 bg-cyan-900/5' : 'border-zinc-800'}`}>
                     <div className="flex items-center justify-between">
@@ -371,6 +473,7 @@ function VersionsPanel({ datasetId, onViewSamples }: { datasetId: number; onView
                             {v.description && <div className="text-xs text-zinc-500 mt-0.5">{v.description}</div>}
                             <div className="text-xs text-zinc-600 mt-0.5">
                                 {v.sample_count.toLocaleString()} samples • {new Date(v.created_at).toLocaleDateString()}
+                                {' '}• {versionMaker(v)}
                             </div>
                         </div>
                         <div className="flex items-center gap-2">
@@ -387,25 +490,12 @@ function VersionsPanel({ datasetId, onViewSamples }: { datasetId: number; onView
                             {v.include_metadata !== false && <Link href={`/datasets/${datasetId}/versions/${v.id}`} className="text-xs text-cyan-400 px-2 py-1">Browse snapshot</Link>}
                             {v.include_metadata !== false && versionStatus?.current_version?.id !== v.id && (
                                 <button
-                                    onClick={async () => {
-                                        if (!confirm(`Restore sample data from "${v.name}"?\n\n${exactMembership ? 'Samples added since this version will be removed and deleted samples restored.' : 'Sample membership will stay unchanged.'}\nDataset settings stay unchanged. The current state will be saved first.`)) return;
-                                        const res = await fetch(`${API_BASE}/datasets/${datasetId}/versions/${v.id}/revert?exact_membership=${exactMembership}`, {
-                                            method: 'POST', credentials: 'include',
-                                        });
-                                        if (res.ok) {
-                                            // The counts are asked again by notifySamplesMutated (SAMPLE_COUNT_KEY).
-                                            queryClient.invalidateQueries({ predicate: query => query.queryKey[0] !== SAMPLE_COUNT_KEY });
-                                            // invalidateQueries can't reach the grid's manual
-                                            // page cache — signal it so reverted rows show.
-                                            notifySamplesMutated(datasetId);
-                                        } else {
-                                            const err = await res.json().catch(() => ({}));
-                                            alert(err.detail || 'Revert failed');
-                                        }
-                                    }}
-                                    className="text-xs text-zinc-400 hover:text-amber-400 border border-zinc-700 hover:border-amber-500/50 px-2 py-1 rounded transition-colors"
+                                    onClick={() => handleRevert(v)}
+                                    disabled={!isAdmin || countingRevert !== null}
+                                    title={isAdmin ? undefined : 'Reverting a dataset takes an admin: it can delete samples and saved views'}
+                                    className="text-xs text-zinc-400 hover:text-amber-400 border border-zinc-700 hover:border-amber-500/50 px-2 py-1 rounded transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
                                 >
-                                    Restore sample data
+                                    {countingRevert === v.id ? 'Counting…' : exactMembership ? 'Revert to this snapshot' : 'Restore sample data'}
                                 </button>
                             )}
                             {versionStatus?.current_version?.id === v.id && (
@@ -417,7 +507,9 @@ function VersionsPanel({ datasetId, onViewSamples }: { datasetId: number; onView
                                     if (!confirm(`Delete version "${v.name}"?\n\nThis cannot be undone.`)) return;
                                     handleDelete(v.id);
                                 }}
-                                className="text-xs text-zinc-600 hover:text-red-400 transition-colors"
+                                disabled={!isAdmin}
+                                title={isAdmin ? undefined : 'Deleting a version takes an admin: it cannot be undone'}
+                                className="text-xs text-zinc-600 hover:text-red-400 transition-colors disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:text-zinc-600"
                             >
                                 Delete
                             </button>
@@ -433,6 +525,11 @@ function VersionsPanel({ datasetId, onViewSamples }: { datasetId: number; onView
                         {diffData.vs === 'current' ? 'Changes since this version' : `Diff: v${diffData.version_a} → v${diffData.version_b}`}
                     </div>
                     {diffData.dataset_changed === true && <p className="text-xs text-amber-300">Dataset schema or display settings also changed.</p>}
+                    {diffViewChanges && (
+                        <p className="text-xs text-amber-300" title={diffViewChanges.names} data-testid="diff-view-changes">
+                            Saved views also changed: {diffViewChanges.text}.
+                        </p>
+                    )}
                     <div className="grid grid-cols-2 gap-2 text-sm">
                         {[
                             { type: 'added', color: 'green', count: diffData.added || 0 },
@@ -929,7 +1026,7 @@ export function DatasetSettingsModal({ dataset, onClose, readOnly = false, onVie
                         )}
 
                         {activeTab === 'versions' && (
-                            <VersionsPanel datasetId={dataset.id} onViewSamples={onViewSamples} />
+                            <VersionsPanel datasetId={dataset.id} mirror={dataset.mirror} role={user?.role} onViewSamples={onViewSamples} />
                         )}
 
                         {activeTab === 'segmentation' && (

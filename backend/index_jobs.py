@@ -208,6 +208,8 @@ async def _build(connection, name, statement, seconds):
         # `from None`: a transient cause (statement timeout) would make the runner rebuild it again.
         if isinstance(error, (asyncpg.QueryCanceledError, asyncio.TimeoutError, TimeoutError)):
             raise JobConflict(f'Index build exceeded its {seconds} s budget; nothing was kept') from None
+        if isinstance(error, asyncpg.DataError) and 'dimensions' in str(error):  # pgvector's cast: "expected 512 …"
+            raise JobUnprocessable(f'The field has mixed dimensions ({error}); clean them up before indexing') from None
         if isinstance(error, (asyncpg.DataError, asyncpg.IntegrityConstraintViolationError)):
             raise JobConflict('Index build failed or data changed; check values and retry') from None
         raise
@@ -429,32 +431,84 @@ async def cosine_hnsw_fields(connection, dataset_id: int, dim: int) -> set[str]:
     return fields
 
 
-async def queue_rebuilds(pool, limit=50):
-    """Queue the vector index builds 0021 recorded: the indexes it dropped with the old embeddings table, one per
-    dataset and field now. Smallest partition first, so most datasets search with an index soon. Returns how many
-    rows it took."""
+# A dataset lane another unfinished job owns: claim_job starts no new job in it until that job ends (job_queue).
+_LANE_OWNED = """EXISTS (SELECT 1 FROM jobs owner WHERE owner.dataset_id = {dataset} AND owner.lane = {lane}
+    AND owner.id IS DISTINCT FROM {job}
+    AND (owner.state = 'running' OR (owner.state = 'queued' AND owner.started_at IS NOT NULL)))"""
+
+
+async def queue_rebuilds(pool):
+    """Queue the next of the vector index builds 0021 recorded (the indexes it dropped with the old embeddings
+    table, one per dataset and field now), once no vector index build is running or waiting to start: the field
+    with the fewest vectors first, so most datasets search with an index soon. Builds run one at a time anyway.
+    Queued all at once, every waiting build was claimed, refused the build lock and put back again and again
+    (dozens of waiting jobs with their attempts counting up), and whichever was claimed first after a build went
+    next, a large dataset's before small ones.
+
+    A build can't start while another job holds its dataset's lane (a map re-fit, a bulk edit), so such a build
+    doesn't hold up the rest, and a dataset whose lane is held is skipped until it is free.
+
+    A row stays until its build has its index or finds nothing to index (ann_handler removes it), so a build that
+    failed (past its budget, out of disk, mixed dimensions) is tried again, at most once a day. When a build this
+    queued (args rebuild: true) is cancelled, its row goes: whoever cancelled it didn't want it, and Retry in the
+    jobs list builds it again. A cancelled build of a user's own (Retry, the endpoint, the SDK) leaves a rebuild row
+    alone. Returns how many it queued: 0 or 1."""
+    lane_owned = _LANE_OWNED.format(dataset='{dataset}', lane="'user'", job='{job}')
     async with job_queue._transaction(pool) as connection:
-        rows = await connection.fetch(
-            """SELECT r.dataset_id, r.field_name FROM ann_index_rebuilds r JOIN datasets d ON d.id = r.dataset_id
-               WHERE NOT d.deleting
-               ORDER BY pg_relation_size(to_regclass('embeddings_d' || r.dataset_id)), r.dataset_id, r.field_name
-               LIMIT $1 FOR UPDATE OF r SKIP LOCKED""",
-            limit,
+        await connection.execute('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', 'ann_index_rebuilds')
+        if await connection.fetchval(
+            f"""SELECT EXISTS(SELECT 1 FROM jobs build WHERE build.kind = $1 AND (build.state = 'running'
+                    OR (build.state = 'queued' AND (build.started_at IS NOT NULL
+                        OR NOT {lane_owned.format(dataset='build.dataset_id', job='build.id')}))))""",
+            ANN_KIND,
+        ):
+            return 0
+        await connection.execute(
+            """DELETE FROM ann_index_rebuilds r USING jobs cancelled WHERE cancelled.kind = $1
+                   AND cancelled.state = 'cancelled' AND cancelled.args->>'rebuild' = 'true'
+                   AND cancelled.dataset_id = r.dataset_id AND cancelled.args->>'field' = r.field_name
+                   AND NOT EXISTS (SELECT 1 FROM jobs later WHERE later.kind = $1 AND later.dataset_id = r.dataset_id
+                       AND later.args->>'field' = r.field_name AND later.created_at > cancelled.created_at)""",
+            ANN_KIND,
         )
-        for row in rows:
-            if await _unfinished(connection, ANN_KIND, row['dataset_id'], 'field', row['field_name']) is None:
-                await job_queue.enqueue_job(
-                    connection,
-                    ANN_KIND,
-                    dataset_id=row['dataset_id'],
-                    args={'field': row['field_name']},
-                )
-            await connection.execute(
-                'DELETE FROM ann_index_rebuilds WHERE dataset_id = $1 AND field_name = $2',
-                row['dataset_id'],
-                row['field_name'],
-            )
-        return len(rows)
+        # Each field's own vectors, estimated: the partition's rows times the field's share in its statistics (the
+        # vectors themselves are in TOAST, so the partition's size counts every field's rows alike). A field the
+        # statistics don't list counts as the whole partition.
+        row = await connection.fetchrow(
+            f"""SELECT r.dataset_id, r.field_name FROM ann_index_rebuilds r JOIN datasets d ON d.id = r.dataset_id
+               LEFT JOIN pg_class c ON c.oid = to_regclass('embeddings_d' || r.dataset_id)
+               LEFT JOIN pg_stats s ON s.schemaname = c.relnamespace::regnamespace::text AND s.tablename = c.relname
+                    AND s.attname = 'field_name' AND NOT s.inherited
+               WHERE NOT d.deleting AND NOT {lane_owned.format(dataset='r.dataset_id', job='NULL')}
+                 AND NOT EXISTS (SELECT 1 FROM jobs ended WHERE ended.kind = $1 AND ended.dataset_id = r.dataset_id
+                     AND ended.args->>'field' = r.field_name AND ended.state = 'failed'
+                     AND ended.finished_at > clock_timestamp() - interval '1 day')
+               ORDER BY coalesce(
+                    greatest(c.reltuples, 0) * (SELECT share.fraction FROM unnest(s.most_common_vals::text::text[],
+                        s.most_common_freqs) AS share(field_name, fraction) WHERE share.field_name = r.field_name),
+                    greatest(c.reltuples, 0)), r.dataset_id, r.field_name
+               LIMIT 1""",
+            ANN_KIND,
+        )
+        if row is None:
+            return 0
+        await job_queue.enqueue_job(
+            connection,
+            ANN_KIND,
+            dataset_id=row['dataset_id'],
+            args={'field': row['field_name'], 'rebuild': True},
+        )
+        return 1
+
+
+async def _rebuilt(connection, dataset_id, field):
+    """The field's rebuild is done: its index exists, or it has nothing to index."""
+    await connection.execute(
+        'DELETE FROM ann_index_rebuilds WHERE dataset_id = $1 AND field_name = $2',
+        dataset_id,
+        field,
+        timeout=5,
+    )
 
 
 def ann_handler(pool):
@@ -472,24 +526,43 @@ def ann_handler(pool):
         # tables, so a small dataset's build would sit behind a large one's until its budget ran out.
         async with _build_session(pool, ANN_LOCK, lock_value, ANN_BUILD_SECONDS, table='embeddings') as connection:
             if not await connection.fetchval('SELECT to_regclass($1) IS NOT NULL', table, timeout=5):
+                await _rebuilt(connection, dataset_id, field)
                 raise JobNotFound(f'Dataset {dataset_id} has no vectors partition')
-            # One scan of the field's vectors: part of the build, not of the request.
+            # One pass over the rows, not the vectors: reading every vector's dimension meant reading every vector
+            # out of TOAST, past an hour on 3.7M vectors under load, all before the build and holding the build lock.
+            # Each vector's dimension without reading TOAST: an inline vector is in the row already, and a TOASTed
+            # one's comes from its pointer's size (4·dim + 4, stored uncompressed). Sizes alone can't be compared:
+            # around the TOAST threshold one field's vectors can be stored both ways, and inline ones measure 4 bytes
+            # more. A compressed column (its storage changed by hand) can't be read this way: then the build's cast
+            # is the check (_build).
+            dims = (
+                'CASE WHEN pg_column_toast_chunk_id(vector) IS NULL THEN vector_dims(vector) '
+                'ELSE (pg_column_size(vector) - 4) / 4 END'
+            )
             try:
-                dims = await connection.fetch(
-                    'SELECT vector_dims(vector) AS d, count(*) AS n FROM embeddings WHERE dataset_id = $1 '
-                    'AND field_name = $2 AND vector IS NOT NULL GROUP BY 1',
+                rows = await connection.fetchrow(
+                    f'SELECT count(*) AS n, min({dims}) AS smallest, max({dims}) AS largest, '
+                    'bool_or(pg_column_compression(vector) IS NOT NULL) AS compressed '
+                    'FROM embeddings WHERE dataset_id = $1 AND field_name = $2 AND vector IS NOT NULL',
                     dataset_id,
                     field,
                     timeout=ANN_BUILD_SECONDS + 60,
                 )
+                dim = await connection.fetchval(
+                    'SELECT vector_dims(vector) FROM embeddings WHERE dataset_id = $1 AND field_name = $2 '
+                    'AND vector IS NOT NULL LIMIT 1',
+                    dataset_id,
+                    field,
+                    timeout=60,
+                )
             except (asyncpg.QueryCanceledError, asyncio.TimeoutError, TimeoutError):
                 raise JobConflict(f"Reading field '{field}' exceeded the {ANN_BUILD_SECONDS} s budget") from None
-            if not dims:
+            if dim is None:
+                await _rebuilt(connection, dataset_id, field)
                 raise JobNotFound(f"No embeddings for field '{field}'")
-            if len(dims) > 1:
-                mixed = sorted(row['d'] for row in dims)
-                raise JobUnprocessable(f"Field '{field}' has mixed dimensions {mixed} — clean up before indexing")
-            dim = int(dims[0]['d'])
+            if rows['smallest'] != rows['largest'] and not rows['compressed']:
+                raise JobUnprocessable(f"Field '{field}' has mixed dimensions — clean up before indexing")
+            count = rows['n']
             if await valid_hnsw_index(connection, dataset_id, field, dim):
                 result = {'field': field, 'dim': dim, 'built': False, 'detail': 'index already exists'}
             else:
@@ -505,7 +578,7 @@ def ann_handler(pool):
                     ANN_MIN_BUILD_MEMORY,
                     timeout=5,
                 )
-                budget = ann_build_seconds(int(dims[0]['n']), dim)
+                budget = ann_build_seconds(count, dim)
                 await connection.execute(f"SET statement_timeout = '{budget}s'", timeout=5)
                 await _build(
                     connection,
@@ -522,6 +595,7 @@ def ann_handler(pool):
                     'built': True,
                     'seconds': round(time.monotonic() - started, 1),
                 }
+            await _rebuilt(connection, dataset_id, field)
         return StepResult(finished=True, result=result, message='ANN index ready')
 
     return measure

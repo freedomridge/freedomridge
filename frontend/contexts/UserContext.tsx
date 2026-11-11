@@ -3,6 +3,7 @@
 import React, { createContext, useContext, useState, useEffect, useRef, useCallback } from 'react';
 import { useRouter } from 'next/navigation';
 import { useQueryClient } from '@tanstack/react-query';
+import type { RevokedTokens } from '@/lib/password-reset';
 
 interface User {
     id: number;
@@ -20,7 +21,8 @@ interface UserContextType {
     isLoading: boolean;
     login: (username: string, password: string, next?: string) => Promise<void>;
     logout: () => Promise<void>;
-    changePassword: (current: string, newPass: string) => Promise<void>;
+    // revokeTokens: also revoke every API token of the account; answers how many of each scope were revoked.
+    changePassword: (current: string, newPass: string, revokeTokens?: boolean) => Promise<RevokedTokens | undefined>;
     checkAuth: () => Promise<void>;
     isAuthenticated: boolean;
 }
@@ -162,14 +164,15 @@ export function UserProvider({ children }: { children: React.ReactNode }) {
         }
     }
 
-    async function changePassword(current: string, newPass: string) {
+    async function changePassword(current: string, newPass: string, revokeTokens = false) {
         const wasRequired = !!user?.must_change_password;
         const res = await fetch('/api/auth/change-password', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
                 current_password: current,
-                new_password: newPass
+                new_password: newPass,
+                revoke_tokens: revokeTokens,
             }),
         });
 
@@ -177,6 +180,7 @@ export function UserProvider({ children }: { children: React.ReactNode }) {
             const error = await res.json();
             throw new Error(error.detail || 'Password change failed');
         }
+        const { revoked_tokens: revoked } = (await res.json()) as { revoked_tokens?: RevokedTokens };
 
         // Optimistically clear the must_change_password flag so the modal can close
         setUser((prev) => prev ? { ...prev, must_change_password: false } : prev);
@@ -186,6 +190,7 @@ export function UserProvider({ children }: { children: React.ReactNode }) {
         // While the change was required every API but auth answered 403, so the open page's queries
         // (the home page's dataset list) failed. Refetch them now that they can succeed.
         if (wasRequired) void queryClient.resetQueries();
+        return revoked;
     }
 
     return (

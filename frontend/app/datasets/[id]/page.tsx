@@ -116,6 +116,9 @@ async function linkQueryParts(datasetId: number, stages: ViewStage[]): Promise<s
     }
 }
 
+// The ids a grid of the other grain than the selection's is given: one empty array, so its memoized id sets stay put.
+const NO_IDS: number[] = [];
+
 // A draft-filter chip with its own clear (✕) button, so each transient selection /
 // filter group in the draft bar can be cleared independently (not just "Clear Draft").
 function DraftChip({ label, tone, onClear }: {
@@ -220,7 +223,8 @@ function DatasetPageContent() {
     // Tag dialog opened from the single-image view: tags exactly the image shown (without it,
     // tagging it meant closing the view, ticking its tile, using the grid's Tag).
     const [tagSampleId, setTagSampleId] = useState<number | null>(null);
-    const [showExportDialog, setShowExportDialog] = useState(false);
+    // The grain of the grid whose Export opened the dialog (null: closed).
+    const [exportGrain, setExportGrain] = useState<Grain | null>(null);
     const queryClient = useQueryClient();
     const { user } = useUser();
     const [selectionNotice, setSelectionNotice] = useState<{ view: string; message: string } | null>(null);
@@ -233,6 +237,8 @@ function DatasetPageContent() {
         userFilters,
         viewStages,
         setViewStages,
+        expiredSelections,
+        setExpiredSelections,
         addStage,
         removeStage,
         updateStage,
@@ -259,6 +265,8 @@ function DatasetPageContent() {
         selectionCount,
         toggleSampleSelected,
         isSampleSelected,
+        selectionGrain,
+        setSelectionGrain,
         brushedIds,
         setBrushedIds,
         currentPolygon,
@@ -350,7 +358,7 @@ function DatasetPageContent() {
     // when using transient selections (like embeddings or map) until applied.
     // Shared with any grid asking the same (useSampleCount): with nothing staged, one request answers both.
     // After a tag edit or a finished job it keeps the number while the same filters are counted again.
-    const { data: appliedCount, failureReason: globalCountFailure } = useSampleCount(datasetId, imageGrainFilters, {
+    const { data: appliedCount, failureReason: globalCountFailure, error: globalCountError } = useSampleCount(datasetId, imageGrainFilters, {
         // Not for the saved filters a link is about to replace.
         enabled: !linkPending && (grainKnown || !globalFilters.filters?.length),
         keepWhileRecounting: true,
@@ -793,10 +801,23 @@ function DatasetPageContent() {
         }
     }, [stagedViewKey, selectionCount, clearSelection]);
 
+    // A selection is of the grain it was made in: an Objects grid's Select All is a token of its objects, and sample
+    // ids differ across grains. A grid of the other grain beside it ticked every tile in token mode, and its Tag
+    // tagged the objects. Only grids of the selection's grain show it now, so Tag and Export act on what is ticked,
+    // and a pick in a grid of the other grain starts a new selection there.
+    const ownsSelection = (grain: Grain) => selectionGrain === null || selectionGrain === grain;
+    // Make the selection `grain`'s, dropping one of the other grain first. True when it was already this grain's.
+    const claimSelection = (grain: Grain) => {
+        const owned = ownsSelection(grain);
+        if (!owned) clearSelection();
+        setSelectionGrain(grain);
+        return owned;
+    };
+
     // Select all samples matching current filters.
     // `filters` is the calling grid panel's grain-scoped staged filters, so Select All
     // selects exactly that grid's grain (e.g. its objects), not the grain-less superset.
-    const selectAllVisible = async (filters: ComplexFilter) => {
+    const selectAllVisible = async (filters: ComplexFilter, grain: Grain) => {
         setSelectionNotice(null);
         try {
             // Small selections keep the explicit id list (so id-based ops — concepts,
@@ -814,6 +835,7 @@ function DatasetPageContent() {
             setSelectAll(null);
             setSelectedIds([]);
             setDeselectedIds([]);
+            setSelectionGrain(grain);
             if (!total || total <= 0) {
                 setSelectionSource('Select All');
                 return;
@@ -1059,6 +1081,7 @@ function DatasetPageContent() {
     // Panel Renderer
     const renderPanel = (type: PanelType, panelId: string) => {
         const g = getGrain(panelId);  // this panel's grain (image|object) + optional pivot
+        const owns = ownsSelection(g.grain);  // a grid shows (and tags, exports) only a selection of its grain
         const pivotCount = Array.isArray(g.pivot?.value) ? (g.pivot.value as unknown[]).length : 0;
         const rank = rankForGrain(g.grain);  // similarity rank list for this grid's grain
         // On an object→image ranked grid, outline the matching object's box on each parent image.
@@ -1091,20 +1114,24 @@ function DatasetPageContent() {
                         rankByParent={rank.byParent}
                         highlightBoxes={highlightBoxes}
                         schema={schema || []}
-                        selectedIds={selectedIds}
-                        selectAllActive={!!selectAll}
-                        deselectedIds={deselectedIds}
-                        selectionCount={selectionCount}
+                        selectedIds={owns ? selectedIds : NO_IDS}
+                        selectAllActive={owns && !!selectAll}
+                        deselectedIds={owns ? deselectedIds : NO_IDS}
+                        selectionCount={owns ? selectionCount : 0}
+                        otherSelection={!owns && selectionGrain ? { count: selectionCount, grain: selectionGrain } : undefined}
                         activeOverlayFields={activeOverlayFields}
                         overlayConfigs={overlayConfigs}
                         onSampleClick={(s) => handleSampleClick(s, panelId)}
                         onToggleSelection={(sid) => {
                             setSelectionSource('Grid');
-                            toggleSampleSelected(sid);
+                            if (claimSelection(g.grain)) toggleSampleSelected(sid);
+                            else setSelectedIds([sid]);
                         }}
                         onRangeSelection={(ids, select = true) => {
                             setSelectionSource('Grid');
-                            if (selectAll) {
+                            if (!claimSelection(g.grain)) {
+                                if (select) setSelectedIds(ids);
+                            } else if (selectAll) {
                                 // In select-all mode a range toggles EXCEPTIONS: "deselect" adds to
                                 // the exception set, "select" removes from it.
                                 const s = new Set(ids);
@@ -1119,10 +1146,10 @@ function DatasetPageContent() {
                             }
                         }}
                         onClearSelection={clearSelection}
-                        onSelectAll={() => selectAllVisible(withGrain(stagedFilters, g.grain, g.pivot, hasObjects))}
+                        onSelectAll={() => selectAllVisible(withGrain(stagedFilters, g.grain, g.pivot, hasObjects), g.grain)}
                         guest={user?.role === 'guest'}
                         onTagClick={() => setShowTagModal(true)}
-                        onExportClick={() => setShowExportDialog(true)}
+                        onExportClick={() => setExportGrain(g.grain)}
                         // Always: with nothing filtered or selected it exports the whole dataset (the
                         // button only appeared once a filter, draft or selection existed).
                         canExport
@@ -1252,6 +1279,7 @@ function DatasetPageContent() {
                                 // Only auto-select individual IDs if under 10K to prevent browser crash
                                 // The polygon filter already scopes the grid regardless
                                 if (ids.length > 0 && ids.length <= 10000) {
+                                    claimSelection('image');  // the map's points are images
                                     setSelectedIds(ids);
                                 }
                             }}
@@ -1291,10 +1319,12 @@ function DatasetPageContent() {
                             onSampleClick={(s) => { setModalSourcePanelId(null); setSelectedSample(s); }}
                             onToggleSelection={(id) => {
                                 setSelectionSource('Duplicates');
+                                // The panel's groups are images.
+                                const kept = claimSelection('image') ? selectedIds : NO_IDS;
                                 setSelectedIds(
-                                    selectedIds.includes(id)
-                                        ? selectedIds.filter(sid => sid !== id)
-                                        : [...selectedIds, id]
+                                    kept.includes(id)
+                                        ? kept.filter(sid => sid !== id)
+                                        : [...kept, id]
                                 );
                             }}
                         />
@@ -1361,6 +1391,7 @@ function DatasetPageContent() {
             origin: window.location.origin,
             datasetId,
             stages,
+            expired: expiredSelections,
             parts: await linkQueryParts(datasetId, stages),
             sort: readGridSort(datasetId),
             sample: sampleId,
@@ -1520,6 +1551,7 @@ function DatasetPageContent() {
                                 onLoadView={(view) => {
                                     if (view.content.viewStages) {
                                         setViewStages(view.content.viewStages);
+                                        setExpiredSelections([]);
                                     }
                                 }}
                             />
@@ -1565,6 +1597,8 @@ function DatasetPageContent() {
                 <div className="px-6 pb-3 pt-0">
                     <QueryBuilderBar
                         stages={viewStages}
+                        expiredSelections={expiredSelections}
+                        onRemoveExpired={(index) => setExpiredSelections(prev => prev.filter((_, i) => i !== index))}
                         onRemoveStage={removeStage}
                         onUpdateStage={updateStage}
                         onAddStage={addStage}
@@ -1595,7 +1629,7 @@ function DatasetPageContent() {
                                     ? `${appliedCount} ${hasObjects ? 'images' : 'samples'}`
                                     : isRescoringRefusal(globalCountFailure)
                                         ? 'Waiting for concept scoring…'
-                                        : 'Counting…'}
+                                        : globalCountError ? 'Count unavailable' : 'Counting…'}
                             </div>
                         }
                         activeSearchId={lastSearch?.id ?? null}
@@ -1633,7 +1667,11 @@ function DatasetPageContent() {
                     // image, and toggling that id selected an image no object grid highlights
                     //. The context helpers also honour token Select-All.
                     const selectionTarget = modalSourceId ?? selectedSample.id;
-                    const sampleIsSelected = isSampleSelected(selectionTarget);
+                    // That row's grain: its grid's, or (opened from another panel) the sample's own.
+                    const modalGrain: Grain = modalSourcePanelId
+                        ? getGrain(modalSourcePanelId).grain
+                        : selectedSample.media_type === 'object' ? 'object' : 'image';
+                    const sampleIsSelected = ownsSelection(modalGrain) && isSampleSelected(selectionTarget);
                     return (
                         <SampleModal
                             sample={selectedSample}
@@ -1670,7 +1708,8 @@ function DatasetPageContent() {
                             isSelected={sampleIsSelected}
                             onToggleSelection={() => {
                                 setSelectionSource('Grid');
-                                toggleSampleSelected(selectionTarget);
+                                if (claimSelection(modalGrain)) toggleSampleSelected(selectionTarget);
+                                else setSelectedIds([selectionTarget]);
                             }}
                             onFindSimilar={embeddingFields && embeddingFields.length > 0 ? () => {
                                 // Seed with the CLICKED row (an object in object grain), like Space does.
@@ -1787,7 +1826,7 @@ function DatasetPageContent() {
                 )
             }
 
-            {showExportDialog && datasetId && (
+            {exportGrain && datasetId && (
                 <ExportDialog
                     datasetId={datasetId}
                     schema={schema || []}
@@ -1796,7 +1835,9 @@ function DatasetPageContent() {
                     // Export applies the same IMAGE grain `appliedCount` is measured at, so the
                     // displayed count and the exported rows describe the same set.
                     hasObjects={hasObjects}
-                    onClose={() => setShowExportDialog(false)}
+                    // A selection of the other grain isn't the opening grid's to export.
+                    offerSelection={ownsSelection(exportGrain)}
+                    onClose={() => setExportGrain(null)}
                 />
             )}
         </div >
