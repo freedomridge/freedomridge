@@ -74,7 +74,8 @@ def test_the_feed_serves_blocks_vectors_and_state_and_acknowledgements_prune(mon
         await ingest([{'crop': 'corn'}, {'crop': 'soy'}], dataset_id=1, prefix='s3://images/a')
         ids = [row['id'] for row in await database.fetch('SELECT id FROM samples WHERE dataset_id = 1 ORDER BY id')]
         await database.execute(
-            "INSERT INTO embeddings (sample_id, field_name, vector) VALUES ($1, 'clip', '[0.5,0.25]')",
+            "INSERT INTO embeddings (dataset_id, sample_id, field_name, vector) VALUES ("
+            "(SELECT dataset_id FROM samples WHERE id = $1), $1, 'clip', '[0.5,0.25]')",
             ids[0],
         )
         page = await feed(follower, start)

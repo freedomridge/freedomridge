@@ -22,7 +22,8 @@ async def sample(database, path, vector='[1,0]', dataset_id=1):
         path,
     )
     await database.execute(
-        "INSERT INTO embeddings(sample_id,field_name,vector) VALUES($1,'clip',$2::text::vector)",
+        "INSERT INTO embeddings(dataset_id,sample_id,field_name,vector) VALUES("
+        "(SELECT dataset_id FROM samples WHERE id = $1),$1,'clip',$2::text::vector)",
         sample_id,
         vector,
     )
@@ -130,14 +131,15 @@ def test_incremental_counts_follow_sample_cascades_without_rescoring_other_sampl
 def test_incremental_scoring_does_not_read_unchanged_score_history(registry_database):
     async def scenario(database):
         concept_id = await concept(database)
-        await database.execute(
-            """INSERT INTO samples(dataset_id,filepath,media_type)
-               SELECT 1,number::text,'image' FROM generate_series(1,100000) number""",
-        )
-        await database.execute(
-            """INSERT INTO embeddings(sample_id,field_name,vector)
-               SELECT id,'clip','[1,0]'::vector FROM samples WHERE dataset_id=1""",
-        )
+        async with registry_helpers.bulk_setup(database) as connection:
+            await connection.execute(
+                """INSERT INTO samples(dataset_id,filepath,media_type)
+                   SELECT 1,number::text,'image' FROM generate_series(1,100000) number""",
+            )
+            await connection.execute(
+                """INSERT INTO embeddings(dataset_id,sample_id,field_name,vector)
+                   SELECT dataset_id,id,'clip','[1,0]'::vector FROM samples WHERE dataset_id=1""",
+            )
         await score(database, concept_id, full=True)
         await database.execute('ANALYZE embeddings; ANALYZE embedding_concept_scores; ANALYZE samples')
         for table in ('concept_embedding_pending', 'concept_score_pending', 'concept_score_count_deltas'):

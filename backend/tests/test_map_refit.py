@@ -70,8 +70,8 @@ async def seed(db, n=200, dim=8, dataset_id=1, start=1, field=FIELD):
     )
     vectors = rng.normal(size=(n, dim))
     await db.execute(
-        "INSERT INTO embeddings(sample_id,field_name,vector) "
-        "SELECT i,$3,v::vector FROM unnest($1::int[],$2::text[]) u(i,v)",
+        "INSERT INTO embeddings(dataset_id,sample_id,field_name,vector) "
+        "SELECT (SELECT dataset_id FROM samples WHERE id = i),i,$3,v::vector FROM unnest($1::int[],$2::text[]) u(i,v)",
         ids,
         [str(list(map(float, row))) for row in vectors],
         field,
@@ -188,7 +188,8 @@ async def add_sample(db, sample_id, vector, dataset_id=1, field=FIELD):
         dataset_id,
     )
     await db.execute(
-        'INSERT INTO embeddings(sample_id,field_name,vector) VALUES ($1,$2,$3::vector)',
+        'INSERT INTO embeddings(dataset_id,sample_id,field_name,vector) VALUES ('
+        '(SELECT dataset_id FROM samples WHERE id = $1),$1,$2,$3::vector)',
         sample_id,
         field,
         str(vector),

@@ -341,7 +341,8 @@ def test_only_deletes_block_fk_writers_on_matching_rows(registry_database, monke
                     async with writer.transaction():
                         await writer.execute("SET LOCAL lock_timeout='200ms'")
                         await writer.execute(
-                            "INSERT INTO embeddings(sample_id,field_name,vector) VALUES($1,'clip','[1,0,0]')",
+                            "INSERT INTO embeddings(dataset_id,sample_id,field_name,vector) VALUES("
+                            "(SELECT dataset_id FROM samples WHERE id = $1),$1,'clip','[1,0,0]')",
                             ids[0],
                         )
                     outcome.append('inserted')

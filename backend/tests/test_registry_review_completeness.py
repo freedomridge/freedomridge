@@ -505,8 +505,9 @@ def test_promoted_numeric_enum_choices_match_across_query_surfaces(registry_data
         request = Request({'type': 'http', 'method': 'POST', 'path': '/search', 'headers': []})
         sample_ids = (await ingest([{'level': 1.0}, {'level': 2.0}]))['ids']
         await database.execute(
-            """INSERT INTO embeddings (sample_id, field_name, vector)
-               SELECT sample_id, field_name, '[1,0]'::vector FROM unnest($1::integer[]) sample_id
+            """INSERT INTO embeddings (dataset_id, sample_id, field_name, vector)
+               SELECT (SELECT dataset_id FROM samples WHERE id = sample_id), sample_id, field_name, '[1,0]'::vector
+               FROM unnest($1::integer[]) sample_id
                CROSS JOIN unnest(ARRAY['clip', 'clip_obj', 'clip_patch_2x2_r0c0']) field_name""",
             sample_ids,
         )

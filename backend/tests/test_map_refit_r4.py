@@ -145,10 +145,14 @@ def test_writers_during_the_rank_step(registry_database, tmp_path, monkeypatch, 
         await database.execute("SELECT setval(pg_get_serial_sequence('samples', 'id'), 10000)")
         await database.execute("INSERT INTO samples(id,dataset_id,filepath,media_type) VALUES (5001,1,'u.jpg','image')")
         await database.execute(
-            "INSERT INTO embeddings(sample_id,field_name,vector) VALUES (5001,$1,'[1,2,3,4]')",
+            "INSERT INTO embeddings(dataset_id,sample_id,field_name,vector) VALUES ("
+            "(SELECT dataset_id FROM samples WHERE id = 5001),5001,$1,'[1,2,3,4]')",
             FIELD,
         )
-        await database.execute("INSERT INTO embeddings(sample_id,field_name,vector) VALUES (5001,'other','[1,2,3,4]')")
+        await database.execute(
+            "INSERT INTO embeddings(dataset_id,sample_id,field_name,vector) VALUES ("
+            "(SELECT dataset_id FROM samples WHERE id = 5001),5001,'other','[1,2,3,4]')",
+        )
         original = map_refit._rank
 
         async def timed(name, coroutine):
@@ -296,7 +300,8 @@ def test_a_rank_step_that_fails_for_good_is_healed_and_the_counter_stays_right(
         assert await map_refit.current_points(database, 1, FIELD) == 400
         await database.execute("INSERT INTO samples(id,dataset_id,filepath,media_type) VALUES (7001,1,'p.jpg','image')")
         await database.execute(
-            "INSERT INTO embeddings(sample_id,field_name,vector) VALUES (7001,$1,'[1,2,3,4]')",
+            "INSERT INTO embeddings(dataset_id,sample_id,field_name,vector) VALUES ("
+            "(SELECT dataset_id FROM samples WHERE id = 7001),7001,$1,'[1,2,3,4]')",
             FIELD,
         )
         await database.execute(

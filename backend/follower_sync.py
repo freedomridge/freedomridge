@@ -462,7 +462,7 @@ async def write_vectors(connection, dataset_id: int, named: list, vectors: dict)
     kept = [(sample_id, field) for field, rows in vectors.items() for sample_id, _ in rows]
     await connection.execute(
         """DELETE FROM embeddings e USING mirror_samples m, unnest($2::int[], $3::text[]) AS n(origin_id, field_name)
-           WHERE m.dataset_id = $1 AND m.origin_id = n.origin_id AND e.sample_id = m.sample_id
+           WHERE m.dataset_id = $1 AND m.origin_id = n.origin_id AND e.dataset_id = $1 AND e.sample_id = m.sample_id
              AND (e.field_name = n.field_name OR n.field_name IS NULL)
              AND e.field_name = ANY((SELECT vector_fields FROM mirrors WHERE dataset_id = $1)::text[])
              AND NOT EXISTS (SELECT 1 FROM unnest($4::int[], $5::text[]) AS k(origin_id, field_name)
@@ -493,28 +493,29 @@ async def write_vectors(connection, dataset_id: int, named: list, vectors: dict)
                 await connection.execute(
                     """UPDATE embeddings e SET vector = st.vector FROM mirror_vector_stage st
                        JOIN mirror_samples m ON m.dataset_id = $1 AND m.origin_id = st.sample_id
-                       WHERE e.sample_id = m.sample_id AND e.field_name = $2 AND e.vector IS DISTINCT FROM st.vector""",
+                       WHERE e.dataset_id = $1 AND e.sample_id = m.sample_id AND e.field_name = $2
+                         AND e.vector IS DISTINCT FROM st.vector""",
                     dataset_id,
                     field,
                 )
                 await connection.execute(
-                    """INSERT INTO embeddings (sample_id, field_name, vector)
-                       SELECT m.sample_id, $2, st.vector FROM mirror_vector_stage st
+                    """INSERT INTO embeddings (dataset_id, sample_id, field_name, vector)
+                       SELECT $1, m.sample_id, $2, st.vector FROM mirror_vector_stage st
                        JOIN mirror_samples m ON m.dataset_id = $1 AND m.origin_id = st.sample_id
                        WHERE NOT EXISTS (SELECT 1 FROM embeddings e
-                                         WHERE e.sample_id = m.sample_id AND e.field_name = $2)
-                       ON CONFLICT (sample_id, field_name) DO NOTHING""",
+                                         WHERE e.dataset_id = $1 AND e.sample_id = m.sample_id AND e.field_name = $2)
+                       ON CONFLICT (dataset_id, sample_id, field_name) DO NOTHING""",
                     dataset_id,
                     field,
                 )
             except asyncpg.PostgresError as error:
                 if 'dimensions' not in str(error):
                     raise
-                # A vector index is per field name, over every dataset here (index_jobs.py).
+                # A vector index is per dataset and field (index_jobs.py): this copy's own index of the field.
                 raise MirrorFieldClash(
-                    f"The primary's vector field {field!r} has {len(group[0][1])} dimensions, but a field of that name "
-                    f'here is indexed at another size ({error}). Field names are shared by every dataset on this '
-                    "instance: rename this instance's field, or drop its index, and the mirror catches up.",
+                    f"The primary's vector field {field!r} has {len(group[0][1])} dimensions, but this copy's index "
+                    f'of that field was built at another size ({error}). Drop that index here, and the mirror '
+                    'catches up.',
                 ) from error
     await clear_placement(connection, dataset_id, sorted({sample_id for sample_id, _ in named}))
 
@@ -535,7 +536,8 @@ async def supersede(connection, dataset_id: int, column: str, fields: list, what
     if 'embeddings' in what:
         await connection.execute(
             """DELETE FROM embeddings e USING mirror_samples m
-               WHERE m.dataset_id = $1 AND e.sample_id = m.sample_id AND e.field_name = ANY($2::text[])""",
+               WHERE m.dataset_id = $1 AND e.dataset_id = $1 AND e.sample_id = m.sample_id
+                 AND e.field_name = ANY($2::text[])""",
             dataset_id,
             arriving,
         )
@@ -585,11 +587,11 @@ async def write_coordinates(connection, dataset_id: int, blocks: list, coordinat
     )
     if coordinates:
         await connection.execute(
-            """INSERT INTO embedding_coordinates AS c (sample_id, field_name, x, y)
-               SELECT m.sample_id, n.field_name, n.x, n.y
+            """INSERT INTO embedding_coordinates AS c (sample_id, field_name, x, y, dataset_id)
+               SELECT m.sample_id, n.field_name, n.x, n.y, $1
                FROM unnest($2::int[], $3::text[], $4::float8[], $5::float8[]) AS n(origin_id, field_name, x, y)
                JOIN mirror_samples m ON m.dataset_id = $1 AND m.origin_id = n.origin_id
-               JOIN embeddings e ON e.sample_id = m.sample_id AND e.field_name = n.field_name
+               JOIN embeddings e ON e.dataset_id = $1 AND e.sample_id = m.sample_id AND e.field_name = n.field_name
                ON CONFLICT (sample_id, field_name) DO UPDATE SET x = EXCLUDED.x, y = EXCLUDED.y
                WHERE (c.x, c.y) IS DISTINCT FROM (EXCLUDED.x, EXCLUDED.y)""",
             dataset_id,

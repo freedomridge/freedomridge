@@ -27,7 +27,8 @@ async def preview(field='value', bins=None, filters=None, top=50, as_number=Fals
 
 async def seed_broad(database):
     """150,000 dense rows: country USA 105,000 / Canada 44,996 / Mexico 4; speed 0-24.75; code '0'-'6'."""
-    await database.execute("""
+    async with test_field_registry_postgres.bulk_setup(database) as connection:
+        await connection.execute("""
         INSERT INTO dataset_fields (dataset_id,field_name,field_type)
             VALUES (1,'country','string'),(1,'speed','number'),(1,'code','string');
         INSERT INTO samples (dataset_id,filepath,media_type,metadata)

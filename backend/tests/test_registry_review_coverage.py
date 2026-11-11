@@ -36,13 +36,15 @@ def test_coverage_presence_composes_with_scoped_array_filters(registry_database,
         )
         first, second, _ = result['ids']
         await database.execute(
-            "INSERT INTO embeddings (sample_id, field_name, vector) VALUES ($1, 'clip', '[1,0]')",
+            "INSERT INTO embeddings (dataset_id, sample_id, field_name, vector) VALUES ("
+            "(SELECT dataset_id FROM samples WHERE id = $1), $1, 'clip', '[1,0]')",
             first,
         )
         await database.execute("INSERT INTO embedding_coordinates VALUES ($1, 'clip', 0, 0)", first)
         await database.execute(
-            """INSERT INTO embeddings (sample_id, field_name, vector)
-               SELECT sample_id, 'view', '[1,0]'::vector FROM unnest($1::integer[]) sample_id""",
+            """INSERT INTO embeddings (dataset_id, sample_id, field_name, vector)
+               SELECT (SELECT dataset_id FROM samples WHERE id = sample_id), sample_id, 'view', '[1,0]'::vector
+               FROM unnest($1::integer[]) sample_id""",
             result['ids'],
         )
         await database.execute(

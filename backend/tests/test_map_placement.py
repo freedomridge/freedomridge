@@ -49,8 +49,8 @@ async def add_samples(db, ids, groups, seed=0):
         ids,
     )
     await db.execute(
-        "INSERT INTO embeddings(sample_id,field_name,vector) "
-        "SELECT i,$3,v::vector FROM unnest($1::int[],$2::text[]) u(i,v)",
+        "INSERT INTO embeddings(dataset_id,sample_id,field_name,vector) "
+        "SELECT (SELECT dataset_id FROM samples WHERE id = i),i,$3,v::vector FROM unnest($1::int[],$2::text[]) u(i,v)",
         ids,
         [str(list(map(float, vector))) for vector in vectors],
         FIELD,
@@ -296,8 +296,8 @@ def test_an_empty_map_is_not_scheduled_and_unplaceable_samples_back_off_for_five
             'FROM generate_series(1001, 1003) i',
         )
         await database.execute(
-            'INSERT INTO embeddings(sample_id,field_name,vector) '
-            'SELECT i,$1,$2::vector FROM generate_series(1001, 1003) i',
+            'INSERT INTO embeddings(dataset_id,sample_id,field_name,vector) '
+            'SELECT (SELECT dataset_id FROM samples WHERE id = i),i,$1,$2::vector FROM generate_series(1001, 1003) i',
             FIELD,
             str([0.0] * DIM),
         )
@@ -322,7 +322,7 @@ def test_the_lookup_uses_the_fields_vector_index(registry_database, tmp_path, fa
     async def scenario(database):
         await refitted_map(database, store, n=50)
         await database.execute(
-            f'CREATE INDEX hnsw_test_{FIELD} ON embeddings USING hnsw ((vector::vector({DIM})) vector_cosine_ops) '
+            f'CREATE INDEX hnsw_test_{FIELD} ON embeddings_d1 USING hnsw ((vector::vector({DIM})) vector_cosine_ops) '
             f"WHERE field_name = '{FIELD}'",
         )
 

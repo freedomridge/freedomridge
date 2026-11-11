@@ -221,6 +221,12 @@ To change the schema:
    queues, and keep that job kind working for the rest of the major version, since a database from
    that release can upgrade straight to any later one. Migrations only go forward; going back is
    restoring the backup taken before the upgrade.
+   The one exception is `0021_embeddings_partitioned.sql`, which copies every vector into the
+   partitioned table itself: copying while the app ran would have needed every vector write and query
+   in two versions until it finished. It refuses to run while anything else is connected, checks the
+   disk and the lock table first, and its progress notices start with its number (`0021: ...`), which
+   `apply_migrations.sh` shows as they come. A migration that has to do the same follows that pattern,
+   and its release's upgrade notes say to stop the app.
 4. Think about followers ([docs/FOLLOWERS.md](docs/FOLLOWERS.md)) when a migration changes rows, not only the
    schema. Statements on the tables followers read (`samples`, `embeddings`, `sample_hashes`,
    `embedding_coordinates`, `dataset_fields`, `views`, `embedding_viz_meta` and `datasets`: the ones with the

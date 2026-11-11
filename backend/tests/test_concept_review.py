@@ -26,7 +26,8 @@ async def bulk_samples(database, count):
         count,
     )
     await database.execute(
-        "INSERT INTO embeddings(sample_id,field_name,vector) SELECT id,'clip','[1,0]' FROM samples",
+        "INSERT INTO embeddings(dataset_id,sample_id,field_name,vector) "
+        "SELECT dataset_id,id,'clip','[1,0]' FROM samples",
     )
 
 

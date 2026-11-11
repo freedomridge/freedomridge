@@ -233,11 +233,11 @@ class PatchEmbeddingUpload(BaseModel):
         return self
 
 
-async def validate_embedding_dims(field_dims: Dict[str, Set[int]]) -> None:
+async def validate_embedding_dims(dataset_id: int, field_dims: Dict[str, Set[int]]) -> None:
     """Reject an embedding write whose vector length disagrees with the field's established
-    dimension, or is internally inconsistent within the request.
+    dimension in this dataset, or is internally inconsistent within the request.
 
-    Embedding dimension is a property of the field_name (the model that produced it) — search,
+    Embedding dimension is a property of the dataset's field_name (the model that produced it) — search,
     concepts and quality all cast to `vector(D)` probed from an existing row, so a wrong-dim
     vector silently POISONS the field (query-time cast errors / garbage results) with no signal
     at ingest. A brand-new field is accepted and establishes the dimension. Raises 422 on a
@@ -254,7 +254,9 @@ async def validate_embedding_dims(field_dims: Dict[str, Set[int]]) -> None:
             )
         incoming = next(iter(dims))
         established = await db.fetchval(
-            "SELECT vector_dims(vector) FROM embeddings WHERE field_name = $1 AND vector IS NOT NULL LIMIT 1",
+            "SELECT vector_dims(vector) FROM embeddings WHERE dataset_id = $1 AND field_name = $2 "
+            "AND vector IS NOT NULL LIMIT 1",
+            dataset_id,
             field_name,
         )
         if established is None:
@@ -263,17 +265,19 @@ async def validate_embedding_dims(field_dims: Dict[str, Set[int]]) -> None:
             indexed = await db.fetchval(
                 """SELECT substring(pg_get_indexdef(i.indexrelid) from 'vector\\((\\d+)\\)')::int
                    FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid JOIN pg_am am ON am.oid = c.relam
-                   WHERE i.indrelid = 'embeddings'::regclass AND am.amname = 'hnsw'
+                   WHERE i.indrelid = to_regclass($2) AND am.amname = 'hnsw'
                      AND position($1 in pg_get_indexdef(i.indexrelid)) > 0
                    LIMIT 1""",
                 f"field_name = '{field_name}'",
+                f'embeddings_d{int(dataset_id)}',
             )
             if indexed is not None and indexed != incoming:
                 raise HTTPException(
                     status_code=422,
                     detail=(
                         f"Embedding dimension mismatch for field '{field_name}': got {incoming}, but the field's "
-                        f"ANN index ({ann_index_name(field_name)}) was built for {indexed}-d vectors and no vectors "
+                        f"ANN index ({ann_index_name(dataset_id, field_name)}) was built for {indexed}-d vectors "
+                        f"and no vectors "
                         f"remain to show the field's dimension. Remove the index (Indexes panel, admin) before "
                         f"uploading {incoming}-d vectors, or use a distinct field_name."
                     ),
@@ -283,9 +287,8 @@ async def validate_embedding_dims(field_dims: Dict[str, Set[int]]) -> None:
                 status_code=422,
                 detail=(
                     f"Embedding dimension mismatch for field '{field_name}': got {incoming}, "
-                    f"field is {established}-d. The dimension is fixed per field name across every "
-                    f"dataset on this server, not per dataset — use a distinct field_name for a "
-                    f"different model/dimension."
+                    f"field is {established}-d in this dataset. The dimension is fixed per field name "
+                    f"within a dataset — use a distinct field_name for a different model/dimension."
                 ),
             )
 
@@ -311,7 +314,7 @@ async def import_patch_vectors(id: int, request: PatchVectorImport, user: dict =
 
     prefix, info = await patch_import.check_prefix(db.pool, id, request.prefix)
     fields = patch_import.patch_fields(request.field_name, info['scale'])
-    await validate_embedding_dims({field: {info['shape'][1]} for field in fields})
+    await validate_embedding_dims(id, {field: {info['shape'][1]} for field in fields})
     job = await patch_import.enqueue(db.pool, id, user['id'], prefix, info, request.field_name, request.build_indexes)
     return accepted(job)
 
@@ -345,15 +348,15 @@ async def upload_patch_embeddings(
     for e in embeddings:
         fn = _patch_field_name(e.field_name, e.patch_scale, e.patch_row, e.patch_col)
         field_dims.setdefault(fn, set()).add(len(e.vector))
-        values.append((e.sample_id, str(e.vector), fn))
-    await validate_embedding_dims(field_dims)
+        values.append((e.sample_id, str(e.vector), fn, id))
+    await validate_embedding_dims(id, field_dims)
     async with db.pool.acquire() as conn:  # a full disk mid-ingest PANICs Postgres
         await require_free_space(conn, len(values) * INGEST_ROW_BYTES, f"adding {len(values)} patch embeddings")
 
     query = """
-        INSERT INTO embeddings (sample_id, vector, field_name)
-        VALUES ($1, $2, $3)
-        ON CONFLICT (sample_id, field_name)
+        INSERT INTO embeddings (dataset_id, sample_id, vector, field_name)
+        VALUES ($4, $1, $2, $3)
+        ON CONFLICT (dataset_id, sample_id, field_name)
         DO UPDATE SET vector = EXCLUDED.vector
     """
 
@@ -398,17 +401,17 @@ async def upload_embeddings(
     for e in embeddings:
         field_dims.setdefault(e.field_name, set()).add(len(e.vector))
         vector_str = str(e.vector)
-        values.append((e.sample_id, vector_str, e.field_name))
-    await validate_embedding_dims(field_dims)
+        values.append((e.sample_id, vector_str, e.field_name, id))
+    await validate_embedding_dims(id, field_dims)
     async with db.pool.acquire() as conn:  # a full disk mid-ingest PANICs Postgres
         await require_free_space(conn, len(values) * INGEST_ROW_BYTES, f"adding {len(values)} embeddings")
 
     # An identical re-send keeps its row version: no new tuple or HNSW entry, and a map re-fit that
     # exported this vector still places it.
     query = """
-        INSERT INTO embeddings (sample_id, vector, field_name)
-        VALUES ($1, $2, $3)
-        ON CONFLICT (sample_id, field_name)
+        INSERT INTO embeddings (dataset_id, sample_id, vector, field_name)
+        VALUES ($4, $1, $2, $3)
+        ON CONFLICT (dataset_id, sample_id, field_name)
         DO UPDATE SET vector = EXCLUDED.vector
         WHERE embeddings.vector IS DISTINCT FROM EXCLUDED.vector
     """
@@ -573,8 +576,7 @@ async def reduce_embeddings(id: int, req: ReduceRequest, user: dict = Depends(re
         fields += [
             row['field_name']
             for row in await db.fetch(
-                f"SELECT DISTINCT e.field_name FROM embeddings e JOIN samples s ON s.id=e.sample_id "
-                f"WHERE {field_condition} AND s.dataset_id=$2",
+                f"SELECT DISTINCT e.field_name FROM embeddings e WHERE {field_condition} AND e.dataset_id=$2",
                 field_arg,
                 id,
             )
@@ -586,7 +588,7 @@ async def reduce_embeddings(id: int, req: ReduceRequest, user: dict = Depends(re
     # fit UMAP in-process. Explicit 413 (not a silent cap): the full reduction stays reachable via
     # the SDK. A caller may still opt into a bounded subset via max_embeddings.
     matched = await db.fetchval(
-        f"SELECT COUNT(*) FROM embeddings e JOIN samples s ON e.sample_id = s.id "
+        f"SELECT COUNT(*) FROM embeddings e JOIN samples s ON s.dataset_id = e.dataset_id AND s.id = e.sample_id "
         f"WHERE {field_condition} AND s.dataset_id = $2",
         field_arg,
         id,
@@ -612,7 +614,7 @@ async def reduce_embeddings(id: int, req: ReduceRequest, user: dict = Depends(re
         f"""
         SELECT e.id, e.vector, e.field_name
         FROM embeddings e
-        JOIN samples s ON e.sample_id = s.id
+        JOIN samples s ON s.dataset_id = e.dataset_id AND s.id = e.sample_id
         WHERE {field_condition} AND s.dataset_id = $2
         {limit_clause}
     """,
@@ -651,11 +653,11 @@ async def reduce_embeddings(id: int, req: ReduceRequest, user: dict = Depends(re
             needed += await estimate_viz_rank_bytes(conn, id, req.field_name)
         await require_free_space(conn, needed, f"saving {len(update_values)} reduced coordinates")
         await conn.execute(
-            "INSERT INTO embedding_coordinates AS c (sample_id, field_name, x, y) "
-            "SELECT e.sample_id, e.field_name, v.x, v.y FROM "
-            "unnest($1::int[], $2::float8[], $3::float8[]) AS v(id, x, y) "
-            "JOIN embeddings e ON e.id = v.id "
-            "JOIN samples s ON s.id=e.sample_id WHERE s.dataset_id=$4 AND e.field_name=ANY($5::text[]) "
+            "INSERT INTO embedding_coordinates AS c (sample_id, field_name, x, y, dataset_id) "
+            "SELECT e.sample_id, e.field_name, v.x, v.y, $4 FROM "
+            "unnest($1::bigint[], $2::float8[], $3::float8[]) AS v(id, x, y) "
+            "JOIN embeddings e ON e.dataset_id = $4 AND e.id = v.id "
+            "WHERE e.field_name=ANY($5::text[]) "
             "ON CONFLICT (sample_id, field_name) DO UPDATE SET x = EXCLUDED.x, y = EXCLUDED.y "
             "WHERE (c.x, c.y) IS DISTINCT FROM (EXCLUDED.x, EXCLUDED.y)",
             emb_ids,
@@ -1533,7 +1535,7 @@ async def get_embedding_field_inventory(id: int):
         """
         SELECT e.field_name, count(*) AS count
         FROM embeddings e
-        JOIN samples s ON e.sample_id = s.id
+        JOIN samples s ON s.dataset_id = e.dataset_id AND s.id = e.sample_id
         WHERE s.dataset_id = $1
         GROUP BY e.field_name
         ORDER BY e.field_name
@@ -1580,7 +1582,7 @@ async def get_embedding_fields(id: int):
     rows = await db.fetch(
         """
         SELECT DISTINCT field_name FROM embeddings
-        JOIN samples s ON embeddings.sample_id = s.id
+        JOIN samples s ON s.dataset_id = embeddings.dataset_id AND s.id = embeddings.sample_id
         WHERE s.dataset_id = $1
     """,
         id,
@@ -1720,12 +1722,12 @@ async def get_vectors(
     if pending_only:
         source = (
             "embedding_projection_pending p JOIN embeddings e "
-            "ON e.sample_id = p.sample_id AND e.field_name = p.field_name"
+            "ON e.dataset_id = p.dataset_id AND e.sample_id = p.sample_id AND e.field_name = p.field_name"
         )
         scope = "p.field_name = $1 AND p.dataset_id = $2"
         cursor = "p.sample_id"
     else:
-        source = "embeddings e JOIN samples s ON e.sample_id = s.id"
+        source = "embeddings e JOIN samples s ON s.dataset_id = e.dataset_id AND s.id = e.sample_id"
         scope = "e.field_name = $1 AND s.dataset_id = $2"
         cursor = "e.sample_id"
     columns = "e.sample_id, e.vector" + (", e.xmin::text AS vector_version" if pending_only else "")
@@ -1790,7 +1792,7 @@ async def get_vectors_by_ids(id: int, request: VectorsByIdsRequest):
     rows = await db.fetch(
         """
         SELECT e.sample_id, e.field_name, e.vector
-        FROM embeddings e JOIN samples s ON e.sample_id = s.id
+        FROM embeddings e JOIN samples s ON s.dataset_id = e.dataset_id AND s.id = e.sample_id
         WHERE s.dataset_id = $1 AND e.sample_id = ANY($2) AND e.field_name = ANY($3)
         ORDER BY e.sample_id, e.field_name
         """,

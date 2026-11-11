@@ -21,13 +21,19 @@ _SCHEMA = Path(__file__).resolve().parents[1] / "db" / "schema.sql"
 _LINE_COMMENT = re.compile(r"--[^\n]*")
 _CREATE_TABLE = re.compile(r"CREATE TABLE(?:\s+IF NOT EXISTS)?\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(", re.I)
 _FK_SAMPLES = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s+\w+.*\bREFERENCES\s+samples\b", re.I | re.M)
-_PRIMARY_KEY = re.compile(r"PRIMARY KEY\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)", re.I)
-_UNIQUE = re.compile(r"UNIQUE\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)", re.I)
+# A table-level FK names its columns: embeddings' is (dataset_id, sample_id), to its dataset's partition (0021).
+_TABLE_FK_SAMPLES = re.compile(r"FOREIGN KEY\s*\(([^)]*)\)\s*REFERENCES\s+samples\b", re.I)
+_PRIMARY_KEY = re.compile(r"PRIMARY KEY\s*\(([^)]*)\)", re.I)
+_UNIQUE = re.compile(r"UNIQUE\s*\(([^)]*)\)", re.I)
 _CREATE_INDEX = re.compile(
     r"CREATE(?:\s+UNIQUE)?\s+INDEX(?:\s+IF NOT EXISTS)?\s+\S+\s+ON\s+([A-Za-z_][A-Za-z0-9_]*)"
-    r"\s*(?:USING\s+\w+\s*)?\(\s*([A-Za-z_][A-Za-z0-9_]*)",
+    r"\s*(?:USING\s+\w+\s*)?\(([^;]*?)\)\s*(?:WHERE|;|$)",
     re.I,
 )
+
+
+def _columns(listed):
+    return tuple(column.strip().lower() for column in listed.split(','))
 
 
 def _table_body(sql, start):
@@ -46,27 +52,29 @@ def _table_body(sql, start):
 def test_every_samples_fk_has_a_leading_index():
     sql = _LINE_COMMENT.sub("", _SCHEMA.read_text())
 
-    # (table, fk_column) pairs for every inline `col ... REFERENCES samples`; PRIMARY KEY /
-    # UNIQUE table constraints both create an index led by their first column.
-    fks = []
-    leading = set()
+    # (table, fk columns) for every inline `col ... REFERENCES samples` and table-level FOREIGN KEY;
+    # PRIMARY KEY / UNIQUE table constraints both create an index on their columns.
+    fks: list[tuple[str, tuple[str, ...]]] = []
+    indexed: set[tuple[str, tuple[str, ...]]] = set()
     for m in _CREATE_TABLE.finditer(sql):
         table = m.group(1).lower()
         body = _table_body(sql, m.end() - 1)
-        fks += [(table, col.lower()) for col in _FK_SAMPLES.findall(body)]
-        leading |= {(table, col.lower()) for col in _PRIMARY_KEY.findall(body)}
-        leading |= {(table, col.lower()) for col in _UNIQUE.findall(body)}
-    assert ("embeddings", "sample_id") in fks, "parser broke: embeddings.sample_id FK not found"
+        fks += [(table, (col.lower(),)) for col in _FK_SAMPLES.findall(body) if col.lower() != 'foreign']
+        fks += [(table, _columns(cols)) for cols in _TABLE_FK_SAMPLES.findall(body)]
+        indexed |= {(table, _columns(cols)) for cols in _PRIMARY_KEY.findall(body)}
+        indexed |= {(table, _columns(cols)) for cols in _UNIQUE.findall(body)}
+    assert ("embeddings", ("dataset_id", "sample_id")) in fks, "parser broke: embeddings' FK not found"
 
-    # leading column of every full (non-partial) index; index statements are single-statement
+    # the columns of every full (non-partial) index; index statements are single-statement
     # in schema.sql so a WHERE before the next ';' marks a partial index.
     for m in _CREATE_INDEX.finditer(sql):
         stmt = sql[m.start() : sql.index(";", m.start())]
         if re.search(r"\bWHERE\b", stmt, re.I):
             continue
-        leading.add((m.group(1).lower(), m.group(2).lower()))
+        indexed.add((m.group(1).lower(), _columns(m.group(2))))
 
-    missing = [(t, c) for t, c in fks if (t, c) not in leading]
+    # The FK's lookup needs an index that leads with all of its columns.
+    missing = [(t, c) for t, c in fks if not any(table == t and columns[: len(c)] == c for table, columns in indexed)]
     assert not missing, (
         f"FK columns referencing samples(id) with no leading index (sample deletes will "
         f"seq-scan these tables per deleted row): {missing}. Add an index on (col) in the "

@@ -26,17 +26,19 @@ USER = {'id': 1, 'role': 'admin'}
 
 
 async def seed(db, n=8, field='clip'):
-    await db.execute(
-        "INSERT INTO samples(id,dataset_id,filepath,media_type) "
-        "SELECT i,1,'image-' || i,'image' FROM generate_series(1,$1::int) i ON CONFLICT DO NOTHING",
-        n,
-    )
-    await db.execute(
-        "INSERT INTO embeddings(sample_id,field_name,vector) "
-        "SELECT i,$2,'[1,2,3]'::vector FROM generate_series(1,$1::int) i",
-        n,
-        field,
-    )
+    async with test_field_registry_postgres.bulk_setup(db) as connection:
+        await connection.execute(
+            "INSERT INTO samples(id,dataset_id,filepath,media_type) "
+            "SELECT i,1,'image-' || i,'image' FROM generate_series(1,$1::int) i ON CONFLICT DO NOTHING",
+            n,
+        )
+        await connection.execute(
+            "INSERT INTO embeddings(dataset_id,sample_id,field_name,vector) "
+            "SELECT (SELECT dataset_id FROM samples WHERE id = i),i,$2,'[1,2,3]'::vector "
+            "FROM generate_series(1,$1::int) i",
+            n,
+            field,
+        )
 
 
 async def upload(ids, shift=0, field='clip'):
@@ -282,7 +284,10 @@ def test_coordinate_scope_and_duplicate_input(registry_database, monkeypatch):
     async def scenario(db):
         await seed(db, 2)
         await db.execute("INSERT INTO samples(id,dataset_id,filepath,media_type) VALUES(3,2,'foreign','image')")
-        await db.execute("INSERT INTO embeddings(sample_id,vector) VALUES(3,'[1,2,3]')")
+        await db.execute(
+            "INSERT INTO embeddings(dataset_id,sample_id,vector) VALUES("
+            "(SELECT dataset_id FROM samples WHERE id = 3),3,'[1,2,3]')",
+        )
         await embeddings.upload_coordinates(
             1,
             'clip',
@@ -312,13 +317,14 @@ def test_repeated_coordinate_updates_leave_hnsw_size_unchanged(
         # Insert at full size: rewriting seed()'s 3-d vectors leaves dead rows that VACUUM keeps while any
         # other transaction is open, and CREATE INDEX still casts them ("expected 1024 dimensions, not 3").
         await db.execute(
-            "INSERT INTO embeddings(sample_id,field_name,vector) SELECT i,'clip',"
+            "INSERT INTO embeddings(dataset_id,sample_id,field_name,vector) "
+            "SELECT (SELECT dataset_id FROM samples WHERE id = i),i,'clip',"
             f"(SELECT array_agg(sin(i*d)::real) FROM generate_series(1,{dimensions}) d)::vector "
             "FROM generate_series(1,200) i",
         )
         await db.execute(
-            'ALTER TABLE embeddings SET (autovacuum_enabled=false);'
-            'CREATE INDEX layout_test_hnsw ON embeddings USING hnsw '
+            'ALTER TABLE embeddings_d1 SET (autovacuum_enabled=false);'
+            'CREATE INDEX layout_test_hnsw ON embeddings_d1 USING hnsw '
             f'((vector::vector({dimensions})) vector_cosine_ops)',
         )
         before = await db.fetchval("SELECT pg_relation_size('layout_test_hnsw')")

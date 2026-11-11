@@ -66,8 +66,9 @@ async def seed(database):
     ids = (await ingest([{'score': 1}, {'score': 2}, {'score': 3}]))['ids']
     await ingest([{'kept': True}], dataset_id=2)
     await database.execute(
-        """INSERT INTO embeddings(sample_id,field_name,vector)
-           SELECT id,'patch_'||n,'[1,0]'::vector FROM samples CROSS JOIN generate_series(1,30) n WHERE dataset_id=1""",
+        """INSERT INTO embeddings(dataset_id,sample_id,field_name,vector)
+           SELECT dataset_id,id,'patch_'||n,'[1,0]'::vector FROM samples CROSS JOIN generate_series(1,30) n
+           WHERE dataset_id=1""",
     )
     await database.execute(
         "INSERT INTO sample_hashes(sample_id,field_name,hash_hex) SELECT id,'hash','abcd' FROM samples",
@@ -490,7 +491,11 @@ def test_all_write_families_reject_deleting_and_old_snapshot(registry_database):
         statements = [
             ("INSERT INTO samples(dataset_id,filepath,media_type) VALUES(1,'late','image')", []),
             ("UPDATE samples SET tags=ARRAY['late'] WHERE id=$1", [ids[0]]),
-            ("INSERT INTO embeddings(sample_id,field_name,vector) VALUES($1,'late','[1,0]')", [ids[0]]),
+            (
+                "INSERT INTO embeddings(dataset_id,sample_id,field_name,vector) VALUES("
+                "(SELECT dataset_id FROM samples WHERE id = $1),$1,'late','[1,0]')",
+                [ids[0]],
+            ),
             ("UPDATE sample_hashes SET hash_hex='bad' WHERE sample_id=$1", [ids[0]]),
             ("UPDATE dataset_fields SET display_type='enum' WHERE dataset_id=1", []),
             ("UPDATE embedding_concepts SET threshold=0.2 WHERE id=$1", [concept_id]),
@@ -816,8 +821,9 @@ def test_delete_500k_two_vector_fields(registry_database):
                 vector = '[' + ','.join(str(((i * 7907) % 65537) / 65537) for i in range(dimensions)) + ']'
                 for lower in range(0, 500000, 50000):
                     await connection.execute(
-                        """INSERT INTO embeddings(sample_id,field_name,vector)
-                           SELECT id,$1,$2::vector FROM samples WHERE dataset_id=1 AND id>$3 AND id<=$3+50000""",
+                        """INSERT INTO embeddings(dataset_id,sample_id,field_name,vector)
+                           SELECT dataset_id,id,$1,$2::vector FROM samples
+                           WHERE dataset_id=1 AND id>$3 AND id<=$3+50000""",
                         field,
                         vector,
                         lower,

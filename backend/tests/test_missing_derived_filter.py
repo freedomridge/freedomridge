@@ -36,7 +36,10 @@ def test_exists_is_the_complement():
 
 def test_missing_embedding_uses_the_joined_sample_id():
     sql, args, _ = _sql('embeddings.clip', field_mapping=SAMPLES_JOIN_FIELD_MAPPING)
-    assert sql == 'NOT EXISTS (SELECT 1 FROM embeddings _d WHERE _d.sample_id = s.id AND _d.field_name = $1)'
+    assert sql == (
+        'NOT EXISTS (SELECT 1 FROM embeddings _d WHERE _d.dataset_id = s.dataset_id AND _d.sample_id = s.id '
+        'AND _d.field_name = $1)'
+    )
     assert args == ['clip']
 
 

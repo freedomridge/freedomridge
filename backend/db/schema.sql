@@ -198,23 +198,32 @@ CREATE TABLE IF NOT EXISTS dataset_fields (
     UNIQUE(dataset_id, field_name)
 );
 
+-- Sample indexes
+CREATE INDEX IF NOT EXISTS idx_samples_dataset_id ON samples(dataset_id);
+-- Unique so embeddings' FK can name the dataset along with the sample (0021).
+CREATE UNIQUE INDEX IF NOT EXISTS idx_samples_dataset_id_id ON samples(dataset_id, id);
+
 -- Embeddings table for vector storage
 -- Patch embeddings use field_name convention: "clip_patch_4x4_r0c0"
 -- This avoids schema changes and works with the existing unique constraint.
+-- One partition per dataset, embeddings_d<dataset id>, made with the dataset (create_embeddings_partition), so a
+-- search plans and locks one dataset's vectors and indexes only, and a dataset's vectors go with one DROP (0021).
+-- Rows are routed by dataset_id before any trigger runs, so every insert names it. The FK names it too: a vector
+-- with the wrong dataset_id fails instead of hiding in another dataset's partition, and a sample's delete cascades
+-- into its own partition alone.
 CREATE TABLE IF NOT EXISTS embeddings (
-    id SERIAL PRIMARY KEY,
-    sample_id INTEGER REFERENCES samples(id) ON DELETE CASCADE,
+    id BIGINT GENERATED ALWAYS AS IDENTITY,
+    sample_id INTEGER NOT NULL,
     field_name TEXT NOT NULL DEFAULT 'clip', -- Name of the embedding field
     vector vector, -- Variable-dimension embeddings (CLIP-512, DINOv2-1024, etc.)
     x FLOAT, -- Legacy, frozen and unused (coordinates live in embedding_coordinates); to be dropped
     y FLOAT, -- Legacy, frozen and unused
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE(sample_id, field_name)
-);
-
--- Sample indexes
-CREATE INDEX IF NOT EXISTS idx_samples_dataset_id ON samples(dataset_id);
-CREATE INDEX IF NOT EXISTS idx_samples_dataset_id_id ON samples(dataset_id, id);
+    dataset_id INTEGER NOT NULL,
+    PRIMARY KEY (dataset_id, id),
+    UNIQUE (dataset_id, sample_id, field_name),
+    FOREIGN KEY (dataset_id, sample_id) REFERENCES samples (dataset_id, id) ON DELETE CASCADE
+) PARTITION BY LIST (dataset_id);
 CREATE INDEX IF NOT EXISTS idx_samples_metadata ON samples USING gin (metadata);
 CREATE INDEX IF NOT EXISTS idx_samples_metadata_gin ON samples USING gin (metadata jsonb_path_ops);
 CREATE INDEX IF NOT EXISTS idx_samples_location ON samples USING gist (location) WHERE location IS NOT NULL;
@@ -243,8 +252,10 @@ CREATE TABLE IF NOT EXISTS embedding_coordinates (
     field_name TEXT NOT NULL,
     x DOUBLE PRECISION NOT NULL CHECK (x > '-Infinity'::float8 AND x < 'Infinity'::float8),
     y DOUBLE PRECISION NOT NULL CHECK (y > '-Infinity'::float8 AND y < 'Infinity'::float8),
+    dataset_id INTEGER NOT NULL,  -- for the FK into the dataset's partition; filled from samples on insert (0021)
     PRIMARY KEY (sample_id, field_name),
-    FOREIGN KEY (sample_id, field_name) REFERENCES embeddings(sample_id, field_name) ON DELETE CASCADE
+    FOREIGN KEY (dataset_id, sample_id, field_name) REFERENCES embeddings(dataset_id, sample_id, field_name)
+        ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_embedding_coordinates_visualization
     ON embedding_coordinates(field_name, x, y, sample_id);
@@ -256,10 +267,83 @@ CREATE TABLE IF NOT EXISTS embedding_projection_pending (
     field_name TEXT NOT NULL,
     dataset_id INTEGER NOT NULL REFERENCES datasets(id) ON DELETE CASCADE,
     PRIMARY KEY (sample_id, field_name),
-    FOREIGN KEY (sample_id, field_name) REFERENCES embeddings(sample_id, field_name) ON DELETE CASCADE
+    FOREIGN KEY (dataset_id, sample_id, field_name) REFERENCES embeddings(dataset_id, sample_id, field_name)
+        ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_embedding_projection_pending_dataset
     ON embedding_projection_pending(dataset_id, field_name, sample_id);
+
+-- A dataset's embeddings partition, made when the dataset is. CREATE TABLE … PARTITION OF would lock every search
+-- out (ACCESS EXCLUSIVE on embeddings, queued behind a long search); CREATE TABLE then ATTACH takes SHARE UPDATE
+-- EXCLUSIVE, which searches and writes don't wait for. ATTACH does block writes to samples, embedding_coordinates and
+-- embedding_projection_pending until the creating transaction commits (their FKs), so each wait for them gives up
+-- after 500 ms rather than hold writers behind it (create_dataset tries again, then answers 503). Made again if
+-- missing, and attached if detached.
+CREATE OR REPLACE FUNCTION create_embeddings_partition(p_schema TEXT, p_dataset_id INTEGER) RETURNS void
+SET lock_timeout = '500ms' AS $$
+DECLARE
+    partition TEXT := format('%I.%I', p_schema, 'embeddings_d' || p_dataset_id);
+BEGIN
+    IF to_regclass(partition) IS NULL THEN
+        EXECUTE format('CREATE TABLE %s (LIKE %I.embeddings)', partition, p_schema);
+    ELSIF EXISTS (SELECT 1 FROM pg_inherits WHERE inhrelid = to_regclass(partition)) THEN
+        RETURN;
+    END IF;
+    -- ATTACH locks the parent and the tables its foreign keys tie the partition to (samples, which it references;
+    -- coordinates and pending rows, which reference it). They are taken first, in one order, each waiting in the
+    -- queue (so writers that keep overlapping can't starve it) for at most lock_timeout, which is under
+    -- deadlock_timeout. Whoever waits on a lock held here started waiting after this did, so this times out first in
+    -- any cycle (a writer taking them in the other order, an index build on samples waiting for this transaction): it
+    -- fails with lock_not_available, its transaction rolls back holding nothing, and the caller tries again.
+    EXECUTE format('LOCK TABLE %I.embeddings IN SHARE UPDATE EXCLUSIVE MODE', p_schema);
+    EXECUTE format('LOCK TABLE %1$I.samples, %1$I.embedding_coordinates, %1$I.embedding_projection_pending '
+                   'IN SHARE ROW EXCLUSIVE MODE', p_schema);
+    EXECUTE format('ALTER TABLE %I.embeddings ATTACH PARTITION %s FOR VALUES IN (%s)', p_schema, partition, p_dataset_id);
+    -- A TRUNCATE of one partition fires only that partition's triggers, so each carries the follower guard (0019).
+    EXECUTE format('CREATE OR REPLACE TRIGGER follower_truncate_guard BEFORE TRUNCATE ON %s '
+                   'FOR EACH STATEMENT EXECUTE FUNCTION %I.refuse_followed_truncate()', partition, p_schema);
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION datasets_create_embeddings_partition() RETURNS trigger AS $$
+BEGIN
+    PERFORM create_embeddings_partition(TG_TABLE_SCHEMA, NEW.id);
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+CREATE TRIGGER trg_datasets_embeddings_partition
+    AFTER INSERT ON datasets FOR EACH ROW EXECUTE FUNCTION datasets_create_embeddings_partition();
+
+-- Each statement planned for its own values, in every session: a generic plan, which a prepared statement switches to
+-- after five runs and foreign-key checks use too, plans and locks every partition of embeddings and their indexes. The
+-- app also sets it on its own connections (database.PLANNING), which covers a database it may not alter. The same as
+-- database_settings.sql, which apply_migrations.sh runs every time: a restored backup doesn't carry it.
+DO $$
+BEGIN
+    EXECUTE format('ALTER DATABASE %I SET plan_cache_mode = force_custom_plan', current_database());
+EXCEPTION WHEN insufficient_privilege THEN
+    RAISE NOTICE 'plan_cache_mode not set on the database (%); the app sets it on its own connections', SQLERRM;
+END $$;
+
+-- The vector indexes 0021 dropped with the old embeddings table, by dataset and field: the app builds each again on
+-- the dataset's partition (index_jobs). Empty on a fresh install.
+CREATE TABLE IF NOT EXISTS ann_index_rebuilds (
+    dataset_id INTEGER NOT NULL REFERENCES datasets(id) ON DELETE CASCADE,
+    field_name TEXT NOT NULL,
+    PRIMARY KEY (dataset_id, field_name)
+);
+
+-- embedding_coordinates.dataset_id is there for the FK into the dataset's partition: filled from the sample, so its
+-- writers still name only the sample and field.
+CREATE OR REPLACE FUNCTION embedding_coordinates_fill_dataset() RETURNS trigger AS $$
+BEGIN
+    SELECT dataset_id INTO NEW.dataset_id FROM samples WHERE id = NEW.sample_id;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+CREATE TRIGGER trg_embedding_coordinates_fill_dataset
+    BEFORE INSERT ON embedding_coordinates FOR EACH ROW WHEN (NEW.dataset_id IS NULL)
+    EXECUTE FUNCTION embedding_coordinates_fill_dataset();
 
 -- Precomputed even-coverage scatter ranks. Dedicated NARROW table (not a column on the
 -- wide, TOASTed-vector, multi-indexed `embeddings`, where updating an indexed rank in place
@@ -527,6 +611,8 @@ CREATE TRIGGER trg_coordinates_update
     FOR EACH STATEMENT EXECUTE FUNCTION coordinates_sync_viz_rank();
 
 CREATE OR REPLACE FUNCTION coordinates_delete_viz_rank() RETURNS trigger AS $$
+DECLARE
+    deleted_dataset INTEGER;
 BEGIN
     IF NULLIF(current_setting('fridge.deletion_dataset', TRUE), '') IS NOT NULL THEN
         RETURN NULL;
@@ -539,23 +625,32 @@ BEGIN
        FROM (SELECT s.dataset_id FROM coordinate_old o JOIN samples s ON s.id = o.sample_id
              UNION SELECT r.dataset_id FROM coordinate_old o JOIN embedding_viz_rank r
                    ON r.sample_id = o.sample_id AND r.field_name = o.field_name ORDER BY 1) d;
-    EXECUTE $q$
-        UPDATE embedding_viz_meta m SET rank_stale = TRUE
-          FROM coordinate_old o JOIN embeddings e USING (sample_id, field_name)
-          JOIN samples s ON s.id = o.sample_id
-         WHERE m.dataset_id = s.dataset_id AND m.field_name = o.field_name AND NOT m.rank_stale$q$;
+    -- Statements that read embeddings run once per dataset with its id as a value, so each reads that dataset's
+    -- partition only: a join on o.dataset_id plans and locks every partition (0021).
+    FOR deleted_dataset IN SELECT DISTINCT dataset_id FROM coordinate_old ORDER BY 1 LOOP
+        EXECUTE $q$
+            UPDATE embedding_viz_meta m SET rank_stale = TRUE
+              FROM coordinate_old o JOIN embeddings e
+                ON e.dataset_id = $1 AND e.sample_id = o.sample_id AND e.field_name = o.field_name
+              JOIN samples s ON s.id = o.sample_id
+             WHERE o.dataset_id = $1 AND m.dataset_id = s.dataset_id AND m.field_name = o.field_name
+               AND NOT m.rank_stale$q$ USING deleted_dataset;
+    END LOOP;
     EXECUTE $q$
         DELETE FROM embedding_viz_rank r USING coordinate_old o
          WHERE r.sample_id = o.sample_id AND r.field_name = o.field_name$q$;
     -- Explicit clearing schedules re-projection; cascades cannot resurrect work
     -- because the embedding/sample no longer exists in this transaction.
-    EXECUTE $q$
-        INSERT INTO embedding_projection_pending (sample_id, field_name, dataset_id)
-        SELECT e.sample_id, e.field_name, s.dataset_id
-          FROM coordinate_old o JOIN embeddings e USING (sample_id, field_name)
-          JOIN samples s ON s.id = e.sample_id
-         WHERE e.vector IS NOT NULL
-        ON CONFLICT DO NOTHING$q$;
+    FOR deleted_dataset IN SELECT DISTINCT dataset_id FROM coordinate_old ORDER BY 1 LOOP
+        EXECUTE $q$
+            INSERT INTO embedding_projection_pending (sample_id, field_name, dataset_id)
+            SELECT e.sample_id, e.field_name, s.dataset_id
+              FROM coordinate_old o JOIN embeddings e
+                ON e.dataset_id = $1 AND e.sample_id = o.sample_id AND e.field_name = o.field_name
+              JOIN samples s ON s.id = e.sample_id
+             WHERE o.dataset_id = $1 AND e.vector IS NOT NULL
+            ON CONFLICT DO NOTHING$q$ USING deleted_dataset;
+    END LOOP;
     RETURN NULL;
 END;
 $$ LANGUAGE plpgsql;
@@ -1161,8 +1256,8 @@ BEGIN
     END IF;
     observed_snapshot := txid_current_snapshot()::text;
     EXECUTE $q$SELECT embedding.id FROM embeddings embedding
-        JOIN samples sample ON sample.id=embedding.sample_id
-        WHERE embedding.id>$1 AND embedding.field_name=$2 AND sample.dataset_id=$3
+        JOIN samples sample ON sample.dataset_id=embedding.dataset_id AND sample.id=embedding.sample_id
+        WHERE embedding.dataset_id=$3 AND embedding.id>$1 AND embedding.field_name=$2
         ORDER BY embedding.id DESC LIMIT 1$q$
     INTO new_watermark USING definition.last_scored_embedding_id,
         definition.embedding_field,definition.dataset_id;
@@ -1172,8 +1267,9 @@ BEGIN
         INSERT INTO embedding_concept_scores(concept_id, sample_id, score)
         SELECT p_concept_id, embedding.sample_id,
                concept_score_value(definition.kind, embedding.vector, definition.weight::vector, definition.bias)
-        FROM embeddings embedding JOIN samples sample ON sample.id = embedding.sample_id
-        WHERE sample.dataset_id = definition.dataset_id
+        FROM embeddings embedding
+        JOIN samples sample ON sample.dataset_id = embedding.dataset_id AND sample.id = embedding.sample_id
+        WHERE embedding.dataset_id = definition.dataset_id
           AND embedding.field_name = definition.embedding_field AND embedding.vector IS NOT NULL;
         GET DIAGNOSTICS scored = ROW_COUNT;
         UPDATE embedding_concepts SET scored_count = scored,
@@ -1185,9 +1281,10 @@ BEGIN
             -- "Score new" on a manual concept keeps the indexed append-only contract.
             -- Replan with the current watermark rather than caching a broad ID-range plan.
             EXECUTE $q$SELECT array_agg(embedding.sample_id)
-                FROM embeddings embedding JOIN samples sample ON sample.id=embedding.sample_id
-                WHERE embedding.id>$1 AND embedding.id<=$4
-                  AND embedding.field_name=$2 AND sample.dataset_id=$3$q$
+                FROM embeddings embedding
+                JOIN samples sample ON sample.dataset_id=embedding.dataset_id AND sample.id=embedding.sample_id
+                WHERE embedding.dataset_id=$3 AND embedding.id>$1 AND embedding.id<=$4
+                  AND embedding.field_name=$2$q$
             INTO target_ids USING definition.last_scored_embedding_id,
                 definition.embedding_field,definition.dataset_id,new_watermark;
         ELSE
@@ -1214,7 +1311,8 @@ BEGIN
                concept_score_value(definition.kind, embedding.vector, definition.weight::vector, definition.bias)
         FROM unnest(target_ids) target(sample_id)
         JOIN samples sample ON sample.id = target.sample_id AND sample.dataset_id = definition.dataset_id
-        JOIN embeddings embedding ON embedding.sample_id = target.sample_id
+        JOIN embeddings embedding ON embedding.dataset_id = definition.dataset_id
+          AND embedding.sample_id = target.sample_id
           AND embedding.field_name = definition.embedding_field AND embedding.vector IS NOT NULL
         ON CONFLICT (concept_id, sample_id) DO UPDATE SET score = EXCLUDED.score
         WHERE embedding_concept_scores.score IS DISTINCT FROM EXCLUDED.score;
@@ -1222,8 +1320,10 @@ BEGIN
         DELETE FROM embedding_concept_scores existing
         WHERE existing.concept_id = p_concept_id AND existing.sample_id = ANY(target_ids)
           AND NOT EXISTS (
-              SELECT 1 FROM embeddings embedding JOIN samples sample ON sample.id = embedding.sample_id
-              WHERE sample.id = existing.sample_id AND sample.dataset_id = definition.dataset_id
+              SELECT 1 FROM embeddings embedding
+              JOIN samples sample ON sample.dataset_id = embedding.dataset_id AND sample.id = embedding.sample_id
+              WHERE embedding.dataset_id = definition.dataset_id AND embedding.sample_id = existing.sample_id
+                AND sample.id = existing.sample_id AND sample.dataset_id = definition.dataset_id
                 AND embedding.field_name = definition.embedding_field AND embedding.vector IS NOT NULL
           );
         LOOP
@@ -2955,5 +3055,6 @@ INSERT INTO schema_migrations (filename) VALUES
     ('0017_mirror_resume.sql'),
     ('0018_follower_leave.sql'),
     ('0019_follower_truncate_guard.sql'),
-    ('0020_mirror_restores.sql')
+    ('0020_mirror_restores.sql'),
+    ('0021_embeddings_partitioned.sql')
 ON CONFLICT (filename) DO NOTHING;

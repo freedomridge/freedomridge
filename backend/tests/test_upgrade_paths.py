@@ -118,7 +118,8 @@ def test_every_release_upgrades_to_a_fresh_installs_schema(database):
         'No release tags in this checkout: run `git fetch --tags` (CI checks out with fetch-depth 0). '
         'In a fork: `git fetch upstream --tags && git push origin --tags`.'
     )
-    fresh = make((ROOT / 'backend/db/schema.sql').read_text())
+    # Seeded like the upgraded ones: each dataset has its own embeddings partition (0021).
+    fresh = make((ROOT / 'backend/db/schema.sql').read_text() + SEED)
     expected_schema = schema(fresh)
     expected_ledger = psql(fresh, 'SELECT string_agg(filename, \',\' ORDER BY filename) FROM schema_migrations')
 
@@ -144,3 +145,122 @@ def test_every_release_upgrades_to_a_fresh_installs_schema(database):
             " || (SELECT count(*) FROM views)",
         )
         assert rows == '1,1,1', tag
+
+
+# The last release before 0021 rewrote embeddings, with what followers keep: a followed dataset (a subscription, an
+# acknowledged cursor, change-log rows) and a mirror of another primary's dataset (written as its sync writes it).
+FOLLOWER_RELEASE = 'v2.8.0'
+FOLLOWER_SEED = """
+INSERT INTO users (username, password_hash, role) VALUES ('follower:lab', 'x', 'power_user');
+INSERT INTO datasets (name) VALUES ('followed'), ('mirror');
+INSERT INTO followers (name, user_id) SELECT 'lab', id FROM users WHERE username = 'follower:lab';
+INSERT INTO follower_datasets (follower_id, dataset_id, start_txid, acked_txid)
+    SELECT id, 1, txid_current(), txid_current() FROM followers;
+INSERT INTO samples (dataset_id, filepath, media_type)
+    SELECT 1, 'followed-' || g, 'image' FROM generate_series(1, 20) g;
+INSERT INTO embeddings (sample_id, field_name, vector) SELECT id, 'clip', ARRAY[id, 1]::real[]::vector FROM samples;
+INSERT INTO embedding_coordinates (sample_id, field_name, x, y) SELECT id, 'clip', id, -id FROM samples;
+INSERT INTO primary_links (url, token_encrypted, identity) VALUES ('https://primary.example/api', 'x', 'cluster');
+INSERT INTO mirrors (dataset_id, link_id, origin_dataset_id, state, feed_cursor, vector_fields)
+    SELECT 2, id, 5, 'following', 12345, '{clip}' FROM primary_links;
+BEGIN;
+SELECT set_config('fridge.mirror_sync', '2', TRUE);
+INSERT INTO samples (dataset_id, filepath, media_type)
+    SELECT 2, 'mirror-' || g, 'image' FROM generate_series(1, 10) g;
+INSERT INTO mirror_samples (dataset_id, origin_id, sample_id)
+    SELECT 2, 1000 + id, id FROM samples WHERE dataset_id = 2;
+INSERT INTO embeddings (sample_id, field_name, vector)
+    SELECT id, 'clip', ARRAY[id, 2]::real[]::vector FROM samples WHERE dataset_id = 2;
+INSERT INTO embedding_coordinates (sample_id, field_name, x, y)
+    SELECT id, 'clip', id, id FROM samples WHERE dataset_id = 2;
+COMMIT;
+"""
+# Each as text, in both schemas: the followers' logs, the mirror's samples and cursor, and every vector and point.
+FOLLOWER_STATE = {
+    'logs': """SELECT (SELECT string_agg(format('%s/%s/%s/%s/%s', dataset_id, sample_id, kind, field_name,
+                                                transaction_id), ',' ORDER BY id) FROM vector_changes)
+               || '|' || (SELECT count(*) FROM sample_block_changes) || '|' || (SELECT count(*) FROM dataset_changes)
+               || '|' || (SELECT count(*) FROM map_block_changes)""",
+    'mirror': """SELECT (SELECT string_agg(format('%s/%s', origin_id, sample_id), ',' ORDER BY origin_id)
+                         FROM mirror_samples)
+                 || '|' || (SELECT feed_cursor FROM mirrors WHERE dataset_id = 2)""",
+    'vectors': """SELECT string_agg(format('%s/%s/%s/%s', s.dataset_id, e.sample_id, e.field_name, e.vector), ','
+                                    ORDER BY e.sample_id)
+                  FROM embeddings e JOIN samples s ON s.id = e.sample_id""",
+    'points': """SELECT string_agg(format('%s/%s/%s/%s', sample_id, field_name, x, y), ',' ORDER BY sample_id)
+                 FROM embedding_coordinates""",
+}
+
+
+def test_0021_keeps_what_followers_and_mirrors_hold_and_logs_nothing(database):
+    """0021 copies every vector and gives every map point its dataset. On a primary, none of it is a change its
+    followers must fetch again; on a follower, its mirrors' rows are copied though only their sync may write them."""
+    make, psql, _, migrate = database
+    old_schema_sql = subprocess.run(
+        ['git', '-C', str(ROOT), 'show', f'{FOLLOWER_RELEASE}:backend/db/schema.sql'],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    name = make(old_schema_sql + FOLLOWER_SEED)
+    before = {key: psql(name, query) for key, query in FOLLOWER_STATE.items()}
+    assert before['logs'].count('/clip/') == 20, before['logs']  # the followed dataset's vectors were logged
+    result = migrate(name)
+    assert result.returncode == 0, f'apply_migrations.sh failed\n{result.stdout}\n{result.stderr}'
+    after = {key: psql(name, query) for key, query in FOLLOWER_STATE.items()}
+    assert after == before
+    assert psql(name, 'SELECT count(*) FROM embeddings_d2') == '10'
+
+
+def test_0021_continues_vector_ids_after_the_old_sequence_without_samples_index(database):
+    """New ids continue after the last one the old table gave out, not after the newest vector left: a manual
+    concept's "Score new" scores ids above its watermark, which is past max(id) once the newest vectors were deleted.
+    The index advisor can have removed samples' (dataset_id, id) index, which 0021 makes unique."""
+    make, psql, _, migrate = database
+    old_schema_sql = subprocess.run(
+        ['git', '-C', str(ROOT), 'show', f'{FOLLOWER_RELEASE}:backend/db/schema.sql'],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    name = make(
+        old_schema_sql
+        + SEED
+        + """
+INSERT INTO samples (dataset_id, filepath, media_type)
+    SELECT id, 's3://upgrade-check/' || g || '.jpg', 'image' FROM datasets, generate_series(2, 4) g;
+INSERT INTO embeddings (sample_id, field_name, vector) SELECT id, 'clip', '[1,0]' FROM samples ORDER BY id;
+DELETE FROM embeddings WHERE id > (SELECT min(id) FROM embeddings);
+DROP INDEX idx_samples_dataset_id_id;
+""",
+    )
+    given = int(psql(name, 'SELECT last_value FROM embeddings_id_seq'))
+    assert given == 4 and psql(name, 'SELECT max(id) FROM embeddings') == '1'
+    result = migrate(name)
+    assert result.returncode == 0, f'apply_migrations.sh failed\n{result.stdout}\n{result.stderr}'
+    new_id = psql(
+        name,
+        "INSERT INTO embeddings (dataset_id, sample_id, field_name, vector) "
+        "SELECT dataset_id, id, 'other', '[1,1]' FROM samples ORDER BY id LIMIT 1 RETURNING id",
+    )
+    assert int(new_id) > given
+    assert (
+        psql(name, "SELECT indisunique FROM pg_index WHERE indexrelid = 'idx_samples_dataset_id_id'::regclass") == 't'
+    )
+
+
+def test_apply_migrations_sets_the_databases_plan_cache_mode_on_every_run(database):
+    """A restored backup doesn't carry the database's settings (pg_dump without --create): the runner sets them again
+    each time, as schema.sql does on a fresh install."""
+    make, psql, _, migrate = database
+    name = make((ROOT / 'backend/db/schema.sql').read_text())
+    setting = (
+        "SELECT coalesce(array_to_string(setconfig, ','), '') FROM pg_db_role_setting WHERE setrole = 0 "
+        'AND setdatabase = (SELECT oid FROM pg_database WHERE datname = current_database())'
+    )
+    assert 'plan_cache_mode=force_custom_plan' in psql(name, setting)
+    psql(name, f'ALTER DATABASE {name} RESET plan_cache_mode')
+    assert 'plan_cache_mode' not in psql(name, setting)
+    result = migrate(name)
+    assert result.returncode == 0, f'apply_migrations.sh failed\n{result.stdout}\n{result.stderr}'
+    assert 'plan_cache_mode=force_custom_plan' in psql(name, setting)

@@ -245,7 +245,8 @@ def test_row_update_guard_refuses_in_place_updates_and_moves(registry_database, 
         await seed_stack(db)
         ids = await stack_ids(db)
         await db.execute(
-            "INSERT INTO embeddings(sample_id,field_name,vector) VALUES($1,'moved','[1,0]')",
+            "INSERT INTO embeddings(dataset_id,sample_id,field_name,vector) VALUES("
+            "(SELECT dataset_id FROM samples WHERE id = $1),$1,'moved','[1,0]')",
             ids['second'],
         )
         # Moves must meet only the guard, not unique or projection-queue foreign keys.
@@ -330,8 +331,8 @@ def test_bulk_updates_run_no_per_row_guard_work(registry_database, sql, transiti
             """INSERT INTO samples(dataset_id,filepath,media_type,metadata)
                SELECT 1,'bulk-'||n,'image',jsonb_build_object('blob',repeat(md5(n::text),50))
                FROM generate_series(1,1000) n;
-               INSERT INTO embeddings(sample_id,field_name,vector)
-               SELECT id,'patch_1','[1,0]' FROM samples WHERE filepath LIKE 'bulk-%';
+               INSERT INTO embeddings(dataset_id,sample_id,field_name,vector)
+               SELECT dataset_id,id,'patch_1','[1,0]' FROM samples WHERE filepath LIKE 'bulk-%';
                INSERT INTO embedding_coordinates SELECT id,'patch_1',1,2 FROM samples WHERE filepath LIKE 'bulk-%';
                INSERT INTO embedding_concept_scores SELECT concept.id,sample.id,0.5
                FROM embedding_concepts concept CROSS JOIN samples sample WHERE sample.filepath LIKE 'bulk-%';

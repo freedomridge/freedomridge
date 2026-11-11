@@ -258,7 +258,13 @@ def classify(index: Dict[str, Any]) -> Tuple[str, Optional[int], Optional[str]]:
         return 'field', int(match.group(1)), field.group(1).replace("''", "'") if field else None
     if index['method'] == 'hnsw' or index['name'].startswith('hnsw_emb_'):
         field = re.search(r"field_name = '((?:[^']|'')*)'", index['definition'] or '')
-        return 'ann', None, field.group(1).replace("''", "'") if field else None
+        # Each dataset's vector indexes are on its own embeddings partition (0021).
+        partition = re.fullmatch(r'embeddings_d(\d+)', index['table_name'] or '')
+        return (
+            'ann',
+            int(partition.group(1)) if partition else None,
+            field.group(1).replace("''", "'") if field else None,
+        )
     if index['name'] in core_indexes() or index['constraint_backed']:
         return 'core', None, None
     if index['table_name'] == 'samples' and _ARRAY_INDEX.match(index['name']):

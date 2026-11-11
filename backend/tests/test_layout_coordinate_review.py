@@ -20,8 +20,10 @@ pytestmark = pytest.mark.skipif(not os.getenv('FRIDGE_TEST_POSTGRES_DSN'), reaso
     [
         'UPDATE embeddings SET x=1,y=2',
         'UPDATE embeddings SET x=NULL',
-        "INSERT INTO embeddings(sample_id,field_name,x,y) VALUES(1,'legacy',1,2)",
-        "INSERT INTO embeddings(sample_id,field_name,x) VALUES(1,'legacy',1)",
+        "INSERT INTO embeddings(dataset_id,sample_id,field_name,x,y) VALUES("
+        "(SELECT dataset_id FROM samples WHERE id = 1),1,'legacy',1,2)",
+        "INSERT INTO embeddings(dataset_id,sample_id,field_name,x) VALUES("
+        "(SELECT dataset_id FROM samples WHERE id = 1),1,'legacy',1)",
     ],
 )
 def test_legacy_coordinate_writes_fail_loudly(registry_database, statement):
@@ -59,7 +61,9 @@ def test_empty_embedding_statements_do_not_touch_projection_tables(registry_data
             async with db.pool.acquire() as conn:
                 await conn.execute("SET lock_timeout='100ms'")
                 await conn.execute('UPDATE embeddings SET vector=vector WHERE FALSE')
-                await conn.execute('INSERT INTO embeddings(sample_id,field_name) SELECT 1,\'clip\' WHERE FALSE')
+                await conn.execute(
+                    'INSERT INTO embeddings(dataset_id,sample_id,field_name) SELECT 1,1,\'clip\' WHERE FALSE',
+                )
 
     registry_database(scenario)
 

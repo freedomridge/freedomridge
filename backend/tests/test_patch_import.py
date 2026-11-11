@@ -178,7 +178,8 @@ def test_refusals_come_before_anything_is_queued(monkeypatch, registry_database)
         await ingest([{}], prefix='s3://images/old')
         sample = await database.fetchval('SELECT id FROM samples LIMIT 1')
         await database.execute(
-            "INSERT INTO embeddings (sample_id, field_name, vector) VALUES ($1, 'clip_patch_4x4_r0c0', '[1,0,0]')",
+            "INSERT INTO embeddings (dataset_id, sample_id, field_name, vector) VALUES ("
+            "(SELECT dataset_id FROM samples WHERE id = $1), $1, 'clip_patch_4x4_r0c0', '[1,0,0]')",
             sample,
         )
         status, _ = await refused(

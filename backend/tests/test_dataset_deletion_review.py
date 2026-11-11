@@ -170,7 +170,8 @@ def test_seal_for_update_fences_old_snapshots_after_nonkey_update(registry_datab
     async def scenario(database):
         sample_id = (await ingest([{}]))['ids'][0]
         await database.execute(
-            "INSERT INTO embeddings(sample_id,field_name,vector) VALUES($1,'clip','[1,0]')",
+            "INSERT INTO embeddings(dataset_id,sample_id,field_name,vector) VALUES("
+            "(SELECT dataset_id FROM samples WHERE id = $1),$1,'clip','[1,0]')",
             sample_id,
         )
         async with database.pool.acquire() as writer, writer.transaction(isolation='repeatable_read'):

@@ -647,17 +647,17 @@ still work, but they scan whole tables.
 python -c 'from fridge import Dataset, connect; connect(); ds = Dataset("coco-val2017"); print(ds.build_ann_index("clip")); print(ds.build_ann_index("clip_obj"))'
 docker compose -f docker-compose.prod.yml exec worker python3 scripts/backfill_sample_lonlat.py
 docker compose -f docker-compose.prod.yml exec db psql -U freedomridge -d freedomridge -Atc \
-  "SELECT indexname FROM pg_indexes WHERE indexname IN ('hnsw_emb_clip', 'hnsw_emb_clip_obj', 'idx_samples_lonlat_cover')"
+  "SELECT indexname FROM pg_indexes WHERE indexname LIKE 'hnsw\_emb\_d%' OR indexname = 'idx_samples_lonlat_cover'"
 ```
 
-- `build_ann_index` builds one HNSW index per embedding field, covering every
-  dataset, so it does not matter which dataset you call it on. `clip` serves image and
-  text search, `clip_obj` object search: about 520,000 vectors between them. Each build
-  is a server job; the call waits and prints the result, and progress shows under
-  Background jobs. A build has a one-hour limit. If it fails on time, run the same
-  build in the worker container, which has no limit:
-  `docker compose -f docker-compose.prod.yml exec worker python3 scripts/build_ann_indexes.py --field clip`
-  (then `--field clip_obj`).
+- `build_ann_index` builds the HNSW index of one embedding field in the dataset it's
+  called on (`hnsw_emb_d<dataset>_<field>`); build it on each dataset that searches. `clip`
+  serves image and text search, `clip_obj` object search: about 520,000 vectors between
+  them. Each build is a server job; the call waits and prints the result, and progress
+  shows under Background jobs. A build has a one-hour limit. If it fails on time, run the
+  same build in the worker container, which has no limit:
+  `docker compose -f docker-compose.prod.yml exec worker python3 scripts/build_ann_indexes.py --dataset 1 --field clip`
+  (then `--field clip_obj`; the dataset's id is in its URL).
 - Patch search and find-unlabeled rank every tile of a scale unless each tile position
   has its own index; on a small server that takes 15-30 s for Open Images. Build the 16
   `4x4` position indexes the same way (about 18 s each for 55,000 vectors):

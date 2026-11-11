@@ -179,7 +179,8 @@ def test_inferred_tags_scatter_uses_metadata_unless_dataset_owns_column(registry
             )
         sample_id = (await ingest([{'inferred_tags': ['metadata-label']}]))['ids'][0]
         await database.execute(
-            "INSERT INTO embeddings (sample_id, field_name, vector) VALUES ($1, 'clip', '[1,0]')",
+            "INSERT INTO embeddings (dataset_id, sample_id, field_name, vector) VALUES ("
+            "(SELECT dataset_id FROM samples WHERE id = $1), $1, 'clip', '[1,0]')",
             sample_id,
         )
         await database.execute("INSERT INTO embedding_coordinates VALUES ($1, 'clip', 0, 0)", sample_id)

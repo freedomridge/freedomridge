@@ -248,7 +248,8 @@ def test_a_mixed_case_concept_filter_is_refused_on_every_read_path(registry_data
     async def scenario(database):
         await seed(database)
         await database.execute("""
-            INSERT INTO embeddings(sample_id,field_name,vector) SELECT id,'clip','[1,0]' FROM samples;
+            INSERT INTO embeddings(dataset_id,sample_id,field_name,vector)
+                SELECT dataset_id,id,'clip','[1,0]' FROM samples;
             INSERT INTO embedding_coordinates(sample_id,field_name,x,y) SELECT id,'clip',id,id FROM samples;
         """)
         await database.execute('UPDATE embedding_concepts SET scores_ready = FALSE WHERE id = 4')

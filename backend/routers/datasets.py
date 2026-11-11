@@ -222,6 +222,11 @@ async def _require_storage_config_serves(storage_config_id: int, dataset_id: Opt
     raise HTTPException(status_code=400, detail=detail)
 
 
+# A new dataset's vectors partition waits at most 500 ms for samples, coordinates and pending rows
+# (create_embeddings_partition), queued ahead of later writers, so it gets them as the running writes finish.
+_PARTITION_RETRY_SECONDS = 10.0
+
+
 @router.post("/datasets", response_model=Dataset)
 async def create_dataset(dataset: DatasetCreate, user: dict = Depends(require_role("admin"))):
     dataset.name = await _clean_dataset_name(dataset.name)
@@ -232,21 +237,35 @@ async def create_dataset(dataset: DatasetCreate, user: dict = Depends(require_ro
         VALUES ($1, $2, $3, $4, $5, $6)
         RETURNING {_DATASET_SELECT}
     """
-    try:
-        row = await db.fetchrow(
-            query,
-            dataset.name,
-            dataset.description,
-            dataset.media_fields,
-            dataset.storage_config_id,
-            user['id'],
-            dataset.is_global,
-        )
-        return _parse_dataset_row(row)
-    except asyncpg.UniqueViolationError:
-        raise HTTPException(status_code=400, detail="Dataset with this name already exists")
-    except asyncpg.ForeignKeyViolationError:
-        raise HTTPException(status_code=400, detail="Invalid storage_config_id")
+    deadline, pause = _time.monotonic() + _PARTITION_RETRY_SECONDS, 0.05
+    while True:
+        try:
+            row = await db.fetchrow(
+                query,
+                dataset.name,
+                dataset.description,
+                dataset.media_fields,
+                dataset.storage_config_id,
+                user['id'],
+                dataset.is_global,
+            )
+            return _parse_dataset_row(row)
+        except asyncpg.UniqueViolationError:
+            raise HTTPException(status_code=400, detail="Dataset with this name already exists")
+        except asyncpg.ForeignKeyViolationError:
+            raise HTTPException(status_code=400, detail="Invalid storage_config_id")
+        except asyncpg.LockNotAvailableError:
+            if _time.monotonic() + pause > deadline:
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        "The server is busy writing samples or building an index on them, so the dataset wasn't "
+                        "created; try again in a moment"
+                    ),
+                    headers={'Retry-After': '5'},
+                ) from None
+            await asyncio.sleep(pause * random.uniform(0.5, 1.5))
+            pause = min(pause * 2, 0.5)
 
 
 async def _clean_dataset_name(name: str, exclude_id: Optional[int] = None) -> str:
@@ -3370,7 +3389,7 @@ async def dataset_coverage(id: int):
                     ELSE e.field_name
                 END AS field_name,
                 count(DISTINCT e.sample_id) AS present
-            FROM embeddings e JOIN samples s ON e.sample_id = s.id
+            FROM embeddings e JOIN samples s ON s.dataset_id = e.dataset_id AND s.id = e.sample_id
             WHERE s.dataset_id = $1
             GROUP BY 1 ORDER BY 1
         """,
@@ -4262,7 +4281,11 @@ def _compile_filter_node(
                     "_d.field_name ~ '_patch_[0-9]+x[0-9]+_r[0-9]+c[0-9]+$' "
                     f"AND regexp_replace(_d.field_name, '_r[0-9]+c[0-9]+$', '') = ${arg_idx}"
                 )
-            lookup = f"EXISTS (SELECT 1 FROM {table} _d WHERE _d.sample_id = {id_col} AND {match})"
+            # A sample's vectors are in its dataset's partition (0021): naming the dataset keeps the lookup there.
+            scope = ''
+            if table == 'embeddings':
+                scope = f"_d.dataset_id = {id_col.rsplit('.', 1)[0] + '.' if '.' in id_col else ''}dataset_id AND "
+            lookup = f"EXISTS (SELECT 1 FROM {table} _d WHERE {scope}_d.sample_id = {id_col} AND {match})"
             return (lookup if present else f"NOT {lookup}"), arg_idx + 1
 
         # Per-object match: `field` is an array-of-objects label field and `value`
@@ -6483,7 +6506,7 @@ async def add_samples(id: int, payload: Any = Body(...), user: dict = Depends(re
                 _emb_field_dims.setdefault(_fn, set()).add(len(_vec))
             except TypeError:
                 pass  # non-sized vector — let the insert surface any real error
-    await validate_embedding_dims(_emb_field_dims)
+    await validate_embedding_dims(id, _emb_field_dims)
 
     sample_ids: List[int] = []
     skipped = 0

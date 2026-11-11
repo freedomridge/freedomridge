@@ -6,6 +6,25 @@ it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
 
 ## Unreleased
 
+### Upgrade notes
+
+- One database migration, `0021_embeddings_partitioned.sql`, applied with `scripts/apply_migrations.sh` (step 4 of
+  [Upgrading](docs/UPGRADING.md)).
+- **Stop the app before the migrations** ([Upgrading](docs/UPGRADING.md#upgrading-across-290)). `0021` copies every
+  vector into a table with one partition per dataset, so it refuses to run while anything else is connected to the
+  database. It takes about a minute per million vectors (9.4 minutes for 9.7 million, measured), and needs free
+  disk about the size of the vectors and their plain indexes, plus `max_wal_size` and a quarter again; it checks
+  first and prints its progress. If it fails or is interrupted (a dropped ssh session: run it in tmux), nothing has
+  changed and it can run again. If the database server itself crashes during the copy, the partial copy's files stay
+  on disk until that database is dropped ([Upgrading](docs/UPGRADING.md#upgrading-across-290) says how).
+- The vector (HNSW) indexes aren't copied. When the app starts it builds them again, one per dataset and field,
+  smallest dataset first, and a dataset's similarity searches are exact until its index is built: on 3.7 million
+  1,024-dimension vectors, 8 s warm and up to 90 s cold, for 2 to 6 hours until both of its fields' indexes are
+  built. A guest's search there can hit its 30 s limit meanwhile. Every dataset and field a shared index served gets
+  its own, a follower's mirrors and small datasets included.
+- `apply_migrations.sh` now also sets the database's `plan_cache_mode` on every run (`database_settings.sql`): a
+  restored backup doesn't carry database settings.
+
 ### Added
 
 - **Links that open a dataset on a filter, a saved view or a sample.** `/datasets/<id>?q=split = train` opens the
@@ -27,6 +46,17 @@ it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
 - **Signing in goes back to the page asked for.** Opening a link while signed out, or a session expiring, goes to
   the login page and then back to that page, filters included. Only a page of this server is followed; anything
   else goes to the dataset list.
+
+### Changed
+
+- **Each dataset's vectors are their own partition** of the embeddings table, with their own vector indexes
+  (`hnsw_emb_d<dataset>_<field>`). A search plans and locks one dataset's vectors and indexes only: with shared
+  indexes, every statement paid for every dataset's (up to 330 ms of planning at 3,000 indexes, and concurrent
+  searches failing with "out of shared memory"). `build_ann_index` builds the index of the dataset it's called on.
+- **An embedding field's dimension is fixed per dataset**, not across every dataset on the server.
+- **Near-duplicates and uniqueness compare a dataset's samples with each other only.** Their neighbours came from
+  every dataset with the same field name before.
+- Deleting a dataset drops its vectors' partition once its rows are gone.
 
 ### Fixed
 
@@ -111,6 +141,7 @@ it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
   configuration to other datasets, the original images of a dataset that lost it were refused, but thumbnails,
   crops and heatmap overlays already made from them were still served from the cache to anyone with access to
   that dataset. The bucket is now checked before the cache is read. Nothing else changes.
+
 
 ## 2.8.0 (2026-11-10)
 

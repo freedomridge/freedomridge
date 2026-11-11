@@ -33,6 +33,7 @@ def runner_tree(tmp_path, migrations):
         shutil.copy(ROOT / 'scripts' / name, tree / 'scripts' / name)
     (tree / 'backend/db/migrations').mkdir(parents=True)
     shutil.copy(ROOT / 'backend/db/functions.sql', tree / 'backend/db/functions.sql')
+    shutil.copy(ROOT / 'backend/db/database_settings.sql', tree / 'backend/db/database_settings.sql')
     for real in (ROOT / 'backend/db/migrations').glob('*.sql'):
         shutil.copy(real, tree / 'backend/db/migrations' / real.name)
     for name, sql in migrations.items():

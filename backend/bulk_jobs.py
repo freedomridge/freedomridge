@@ -358,9 +358,10 @@ async def _mutate(connection, job, ids, removed_fields):
     if operation == 'delete_embeddings':
         # Cascades remove the vectors' coordinates and queued projections; triggers keep map rank rows and counts.
         status = await connection.execute(
-            'DELETE FROM embeddings WHERE field_name=$1 AND sample_id=ANY($2::int[])',
+            'DELETE FROM embeddings WHERE dataset_id=$3 AND field_name=$1 AND sample_id=ANY($2::int[])',
             request['field_name'],
             ids,
+            dataset_id,
         )
         return int(status.split()[-1])
     if operation == 'tag':

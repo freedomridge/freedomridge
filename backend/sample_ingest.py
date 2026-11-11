@@ -84,6 +84,10 @@ async def insert_samples(connection, dataset_id, samples, on_duplicate, array_fi
     """
     written = {}
     rows = list(grouped.values())
+    # The samples insert and its row triggers never read embeddings, so a generic plan can't lock its partitions:
+    # planned per row (database.PLANNING), the triggers halved this statement's speed. The vectors below, and the
+    # pending rows whose foreign key checks embeddings, plan per statement again.
+    await connection.execute('SET LOCAL plan_cache_mode = auto')
     for start in range(0, len(rows), 500):
         payloads = [
             {
@@ -94,6 +98,7 @@ async def insert_samples(connection, dataset_id, samples, on_duplicate, array_fi
         ]
         inserted = await connection.fetch(query, dataset_id, payloads)
         written.update({row['filepath']: row['id'] for row in inserted})
+    await connection.execute('SET LOCAL plan_cache_mode = DEFAULT')
 
     existing = {}
     if on_duplicate == 'error':
@@ -169,12 +174,13 @@ async def insert_samples(connection, dataset_id, samples, on_duplicate, array_fi
             hashes[len(value)].append((sample_id, field, value))
     for start in range(0, len(vectors), 500):
         await connection.execute(
-            """INSERT INTO embeddings (sample_id, field_name, vector)
-               SELECT sample_id, field_name, vector::vector FROM jsonb_to_recordset($1::jsonb)
+            """INSERT INTO embeddings (dataset_id, sample_id, field_name, vector)
+               SELECT $2, sample_id, field_name, vector::vector FROM jsonb_to_recordset($1::jsonb)
                    AS payload(sample_id integer, field_name text, vector text)
-               ON CONFLICT (sample_id, field_name) DO UPDATE SET vector = EXCLUDED.vector
+               ON CONFLICT (dataset_id, sample_id, field_name) DO UPDATE SET vector = EXCLUDED.vector
                WHERE embeddings.vector IS DISTINCT FROM EXCLUDED.vector""",
             vectors[start : start + 500],
+            dataset_id,
         )
     for length, values in hashes.items():
         await connection.executemany(hash_upsert_sql(length), values)

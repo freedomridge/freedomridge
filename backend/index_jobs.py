@@ -1,7 +1,7 @@
 """Index builds as user-lane jobs: one CREATE INDEX CONCURRENTLY per unit, on its own connection.
 
 The build holds a session advisory lock for its whole duration (field indexes: the dataset's index
-operation guard 20261017; ANN indexes: 20261066 per embedding field), so a retry never drops or
+operation guard 20261017; ANN indexes: 20261066 per dataset and embedding field), so a retry never drops or
 rebuilds an index a live build owns. A build that dies leaves an INVALID index; the next attempt,
 holding the same lock, drops that carcass concurrently and builds again. The build connection asks
 PostgreSQL to notice a dead client (client_connection_check_interval), so a killed runner's build
@@ -36,9 +36,24 @@ TABLE_LOCK = 20261067
 # The API's former caps: promote ran under the 600 s command timeout, the ANN build had 3600 s.
 FIELD_BUILD_SECONDS = 3600
 ANN_BUILD_SECONDS = 3600
+# A vector index's build grows with its vectors and their dimension: about 1.5 µs per vector dimension, serial, at
+# 8 GB of maintenance_work_mem (3.73M 1024-d vectors in 95 min, 512-d in 41 min, measured 2026-11-09), and 3.6 µs at
+# 256 MB (512-d in 1 h 54 min). Its budget is ANN_BUILD_FACTOR times the first, at least ANN_BUILD_SECONDS and at most
+# ANN_BUILD_MAX_SECONDS.
+ANN_SECONDS_PER_VECTOR_DIMENSION = 1.5e-6
+ANN_BUILD_FACTOR = 4
+ANN_BUILD_MAX_SECONDS = 12 * 3600
 # Above the build budget, so PostgreSQL's statement timeout ends a slow build before the runner does.
 FIELD_POLICY = job_queue.JobPolicy(max_unit_seconds=3900, max_failures=3, retry_seconds=5, max_retry_seconds=300)
-ANN_POLICY = job_queue.JobPolicy(max_unit_seconds=4500, max_failures=3, retry_seconds=5, max_retry_seconds=300)
+ANN_POLICY = job_queue.JobPolicy(
+    max_unit_seconds=ANN_BUILD_MAX_SECONDS + 900,
+    max_failures=3,
+    retry_seconds=5,
+    max_retry_seconds=300,
+)
+# A serial build keeps its graph in the backend's own memory, not in /dev/shm, so it can use the server's
+# maintenance_work_mem (more of the graph in memory builds much faster); never less than this.
+ANN_MIN_BUILD_MEMORY = '256MB'
 _SAFE_FIELD = re.compile(r'^[a-zA-Z0-9_]+$')
 logger = logging.getLogger(__name__)
 _VALIDITY = (
@@ -356,40 +371,55 @@ def field_handler(pool):
     return measure
 
 
-def ann_index_name(field: str) -> str:
-    """Deterministic ≤63-char index name. Plain truncation collided: two fields sharing
-    their first ~54 chars truncated to the SAME name, so the second build's IF NOT EXISTS
-    "succeeded" without ever creating an index. Over-long names get a hash suffix."""
-    name = f"hnsw_emb_{field}"
+def partition(dataset_id: int) -> str:
+    """The dataset's embeddings partition (0021)."""
+    return f'embeddings_d{int(dataset_id)}'
+
+
+def ann_index_name(dataset_id: int, field: str) -> str:
+    """The dataset's vector index of `field`, on its embeddings partition: a deterministic ≤63-char name. Plain
+    truncation collided: two fields sharing their first ~54 chars truncated to the SAME name, so the second build's IF
+    NOT EXISTS "succeeded" without ever creating an index. Over-long names get a hash suffix."""
+    name = f'hnsw_emb_d{int(dataset_id)}_{field}'
     if len(name) <= 63:
         return name
     import hashlib
 
-    return name[:54] + "_" + hashlib.sha1(field.encode()).hexdigest()[:8]
+    return name[:54] + '_' + hashlib.sha1(f'{int(dataset_id)}:{field}'.encode()).hexdigest()[:8]
 
 
-# indisvalid matters: a failed CREATE INDEX CONCURRENTLY leaves an INVALID index that pg_indexes
-# still lists.
-_VALID_HNSW_INDEXDEFS = (
-    "SELECT ix.indexdef FROM pg_indexes ix "
-    "JOIN pg_class c ON c.relname = ix.indexname AND c.relnamespace = ix.schemaname::regnamespace "
-    "JOIN pg_index i ON i.indexrelid = c.oid "
-    "WHERE ix.tablename = 'embeddings' AND ix.indexdef LIKE '%hnsw%' AND i.indisvalid"
-)
+def ann_build_seconds(vectors: int, dimension: int) -> int:
+    """The statement budget of one vector index build (see ANN_SECONDS_PER_VECTOR_DIMENSION)."""
+    estimate = vectors * dimension * ANN_SECONDS_PER_VECTOR_DIMENSION * ANN_BUILD_FACTOR
+    return int(min(ANN_BUILD_MAX_SECONDS, max(ANN_BUILD_SECONDS, estimate)))
+
+
+def ann_lock_value(dataset_id: int, field: str) -> str:
+    """ANN_LOCK's second key for one dataset's field (keyed by hashtext): its builds, carcass sweeps and index
+    actions all take this one."""
+    return f'{int(dataset_id)}:{field}'
+
+
+# A dataset's valid vector indexes, from its partition's own index list (pg_index by indrelid), rather than by
+# parsing every index on the server. indisvalid matters: a failed CREATE INDEX CONCURRENTLY leaves an INVALID index.
+_DATASET_HNSW_INDEXDEFS = """
+    SELECT pg_get_indexdef(i.indexrelid) AS indexdef FROM pg_index i
+    JOIN pg_class c ON c.oid = i.indexrelid JOIN pg_am a ON a.oid = c.relam
+    WHERE i.indrelid = to_regclass($1) AND a.amname = 'hnsw' AND i.indisvalid AND i.indisready"""
 # The field of a per-field index, as PostgreSQL prints its predicate: WHERE (field_name = 'clip'::text)
 _INDEXED_FIELD = re.compile(r"WHERE \(field_name = '([a-zA-Z0-9_]+)'::text\)$")
 
 
-async def valid_hnsw_index(connection, field: str, dim: int) -> bool:
-    rows = await connection.fetch(_VALID_HNSW_INDEXDEFS)
+async def valid_hnsw_index(connection, dataset_id: int, field: str, dim: int) -> bool:
+    rows = await connection.fetch(_DATASET_HNSW_INDEXDEFS, partition(dataset_id))
     need_dim, need_field = f"vector({dim})", f"field_name = '{field}'"
     return any(need_dim in row['indexdef'] and need_field in row['indexdef'] for row in rows)
 
 
-async def cosine_hnsw_fields(connection, dim: int) -> set[str]:
-    """Fields with a valid per-field cosine HNSW index at dimension `dim`: the ones an
-    `ORDER BY vector::vector(dim) <=> ...` query on `field_name = '<field>'` can use."""
-    rows = await connection.fetch(_VALID_HNSW_INDEXDEFS)
+async def cosine_hnsw_fields(connection, dataset_id: int, dim: int) -> set[str]:
+    """The dataset's fields with a valid per-field cosine HNSW index at dimension `dim`: the ones an
+    `ORDER BY vector::vector(dim) <=> ...` query on its partition and `field_name = '<field>'` can use."""
+    rows = await connection.fetch(_DATASET_HNSW_INDEXDEFS, partition(dataset_id))
     fields = set()
     for row in rows:
         indexdef = row['indexdef']
@@ -399,22 +429,56 @@ async def cosine_hnsw_fields(connection, dim: int) -> set[str]:
     return fields
 
 
+async def queue_rebuilds(pool, limit=50):
+    """Queue the vector index builds 0021 recorded: the indexes it dropped with the old embeddings table, one per
+    dataset and field now. Smallest partition first, so most datasets search with an index soon. Returns how many
+    rows it took."""
+    async with job_queue._transaction(pool) as connection:
+        rows = await connection.fetch(
+            """SELECT r.dataset_id, r.field_name FROM ann_index_rebuilds r JOIN datasets d ON d.id = r.dataset_id
+               WHERE NOT d.deleting
+               ORDER BY pg_relation_size(to_regclass('embeddings_d' || r.dataset_id)), r.dataset_id, r.field_name
+               LIMIT $1 FOR UPDATE OF r SKIP LOCKED""",
+            limit,
+        )
+        for row in rows:
+            if await _unfinished(connection, ANN_KIND, row['dataset_id'], 'field', row['field_name']) is None:
+                await job_queue.enqueue_job(
+                    connection,
+                    ANN_KIND,
+                    dataset_id=row['dataset_id'],
+                    args={'field': row['field_name']},
+                )
+            await connection.execute(
+                'DELETE FROM ann_index_rebuilds WHERE dataset_id = $1 AND field_name = $2',
+                row['dataset_id'],
+                row['field_name'],
+            )
+        return len(rows)
+
+
 def ann_handler(pool):
     async def measure(job):
         if job['lane'] != 'user':
             raise ValueError('Index builds belong to the user lane')
-        field = job['args']['field']
+        field, dataset_id = job['args']['field'], job['dataset_id']
         if not _SAFE_FIELD.match(field or ''):
             raise JobUnprocessable(f'Unsafe field name {field!r}')
         started = time.monotonic()
-        async with pool.acquire(timeout=1) as connection:
-            lock_value = await connection.fetchval('SELECT hashtext($1)', field, timeout=5)
+        table = partition(dataset_id)
+        lock_value = ann_lock_value(dataset_id, field)
+        # One vector index build at a time on the whole server, as before partitions: concurrent CREATE INDEX
+        # CONCURRENTLY builds of expression or partial indexes wait for each other's snapshots even on different
+        # tables, so a small dataset's build would sit behind a large one's until its budget ran out.
         async with _build_session(pool, ANN_LOCK, lock_value, ANN_BUILD_SECONDS, table='embeddings') as connection:
+            if not await connection.fetchval('SELECT to_regclass($1) IS NOT NULL', table, timeout=5):
+                raise JobNotFound(f'Dataset {dataset_id} has no vectors partition')
             # One scan of the field's vectors: part of the build, not of the request.
             try:
                 dims = await connection.fetch(
-                    'SELECT DISTINCT vector_dims(vector) AS d FROM embeddings WHERE field_name = $1 '
-                    'AND vector IS NOT NULL',
+                    'SELECT vector_dims(vector) AS d, count(*) AS n FROM embeddings WHERE dataset_id = $1 '
+                    'AND field_name = $2 AND vector IS NOT NULL GROUP BY 1',
+                    dataset_id,
                     field,
                     timeout=ANN_BUILD_SECONDS + 60,
                 )
@@ -426,23 +490,30 @@ def ann_handler(pool):
                 mixed = sorted(row['d'] for row in dims)
                 raise JobUnprocessable(f"Field '{field}' has mixed dimensions {mixed} — clean up before indexing")
             dim = int(dims[0]['d'])
-            if await valid_hnsw_index(connection, field, dim):
+            if await valid_hnsw_index(connection, dataset_id, field, dim):
                 result = {'field': field, 'dim': dim, 'built': False, 'detail': 'index already exists'}
             else:
-                name = ann_index_name(field)
-                # Bound the build's memory to fit any deployment: the server may tune
-                # maintenance_work_mem near (or above) the container's /dev/shm, and a PARALLEL
-                # index build allocates a shared-memory segment of about that size — which
-                # ENOSPC-crashes in a default Docker shm. Serial + bounded always completes.
-                await connection.execute("SET maintenance_work_mem = '256MB'", timeout=5)
+                name = ann_index_name(dataset_id, field)
+                # Serial: a PARALLEL index build allocates a shared-memory segment of about
+                # maintenance_work_mem, which ENOSPC-crashes in a default Docker /dev/shm. A serial one keeps
+                # its graph in the backend's memory, so it takes the server's setting, at least 256 MB.
                 await connection.execute('SET max_parallel_maintenance_workers = 0', timeout=5)
+                await connection.execute(
+                    "SELECT set_config('maintenance_work_mem', CASE WHEN pg_size_bytes(current_setting("
+                    "'maintenance_work_mem')) < pg_size_bytes($1) THEN $1 ELSE current_setting('maintenance_work_mem') "
+                    'END, FALSE)',
+                    ANN_MIN_BUILD_MEMORY,
+                    timeout=5,
+                )
+                budget = ann_build_seconds(int(dims[0]['n']), dim)
+                await connection.execute(f"SET statement_timeout = '{budget}s'", timeout=5)
                 await _build(
                     connection,
                     name,
                     f'CREATE INDEX CONCURRENTLY IF NOT EXISTS "{name}" '
-                    f"ON embeddings USING hnsw ((vector::vector({dim})) vector_cosine_ops) "
+                    f'ON "{table}" USING hnsw ((vector::vector({dim})) vector_cosine_ops) '
                     f"WHERE field_name = '{field}'",
-                    ANN_BUILD_SECONDS,
+                    budget,
                 )
                 result = {
                     'field': field,
@@ -465,7 +536,7 @@ _CARCASSES = r"""
     WHERE NOT i.indisvalid AND c.relnamespace = current_schema()::regnamespace
       AND NOT EXISTS (SELECT 1 FROM pg_stat_progress_create_index p WHERE p.index_relid = i.indexrelid)
       AND ((t.relname = 'samples' AND c.relname LIKE 'idx\_samples\_meta\_%')
-        OR (t.relname = 'embeddings' AND c.relname LIKE 'hnsw\_emb\_%'))
+        OR (t.relname ~ '^embeddings_d[0-9]+$' AND c.relname LIKE 'hnsw\_emb\_%'))
     ORDER BY c.relname LIMIT $1"""
 
 
@@ -484,11 +555,17 @@ async def sweep_invalid_indexes(pool, limit=2):
         if owner is None:
             continue
         async with pool.acquire(timeout=1) as connection:
+            key: tuple[int, int | str]
             if candidate['table_name'] == 'samples':
                 key = (INDEX_LOCK, int(owner.group(1)))
             else:
-                key = (ANN_LOCK, await connection.fetchval('SELECT hashtext($1)', owner.group(1), timeout=5))
-            locks = session_locks(key[0], key[1], candidate['table_name'])
+                key = (
+                    ANN_LOCK,
+                    ann_lock_value(int(candidate['table_name'].removeprefix('embeddings_d')), owner.group(1)),
+                )
+            # Vector index builds hold embeddings' table lock, whichever partition they build on.
+            table = 'samples' if candidate['table_name'] == 'samples' else 'embeddings'
+            locks = session_locks(key[0], key[1], table)
             try:
                 await take_locks(connection, locks)
             except job_queue.QueueContended:
