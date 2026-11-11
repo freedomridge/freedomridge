@@ -52,11 +52,11 @@ def canonical_type(field_type: str) -> str:
     }.get(field_type, field_type if field_type in FIELD_TYPES else 'unknown')
 
 
-def validate_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
+def validate_metadata(metadata: dict[str, Any], *, allow_local: bool = False) -> dict[str, Any]:
     """Reject non-finite/out-of-float8-range numbers before JSON can silently turn them into null, and keys that name
-    a mirror's own fields."""
+    a mirror's own fields, except in an edit that routes them there (allow_local: local_writes)."""
     reserved = sorted(key for key in metadata if key.startswith(LOCAL_PREFIX))
-    if reserved:
+    if reserved and not allow_local:
         raise ValueError(f"metadata key(s) {reserved}: names starting with {LOCAL_PREFIX} are a mirror's own fields")
 
     def visit(value: Any, path: str) -> None:

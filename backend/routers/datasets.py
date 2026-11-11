@@ -47,7 +47,7 @@ from backend.label_fields import (
 from backend.local_fields import LOCAL_TAGS, local_field
 from backend.sample_ingest import insert_samples
 
-from .. import class_rules, dataset_deletion, field_usage, job_queue, job_wait, statistics
+from .. import class_rules, dataset_deletion, field_usage, job_queue, job_wait, local_writes, statistics
 from ..access import check_dataset_access, filter_datasets_for_user, require_dataset_access
 from ..database import db
 from ..diskspace import INGEST_ROW_BYTES, require_free_space
@@ -6741,7 +6741,8 @@ class SampleUpdate(BaseModel):
     @field_validator('metadata')
     @classmethod
     def _metadata(cls, metadata: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-        return validate_metadata(metadata) if metadata is not None else None
+        # `@local.` keys are a mirror's own fields: update_sample routes them (local_writes).
+        return validate_metadata(metadata, allow_local=True) if metadata is not None else None
 
     tags: Optional[List[str]] = None
     metadata: Optional[Dict[str, Any]] = None
@@ -6775,7 +6776,27 @@ async def update_sample(
     - heading: If provided, replaces the heading
 
     Only admin and power_user roles can update samples.
+
+    On a mirror, `@local.<name>` keys in metadata / remove_metadata_keys, and `@local.tags` in array_fields, write
+    this server's own fields (docs/FOLLOWERS.md): a request with them changes nothing of the primary's.
     """
+    local_set, local_remove, primary_set, primary_remove = local_writes.split_metadata(
+        request.metadata,
+        request.remove_metadata_keys,
+    )
+    local_tags = (request.array_fields or {}).get(LOCAL_TAGS)
+    if local_set or local_remove or local_tags is not None:
+        primary_edits = (
+            primary_set,
+            primary_remove,
+            set(request.array_fields or {}) - {LOCAL_TAGS},
+            request.tags is not None,
+            request.location is not None,
+            request.heading is not None,
+        )
+        if any(primary_edits):
+            raise HTTPException(status_code=409, detail=local_writes.MIXED)
+        return await _update_local_fields(id, sample_id, local_set, local_remove, local_tags, user)
     valid_cols = await get_dataset_array_columns(id) - {'tags'} if request.array_fields else set()
     if request.array_fields and set(request.array_fields) - valid_cols:
         raise HTTPException(
@@ -6888,6 +6909,44 @@ async def update_sample(
     return {"message": "Sample updated", "sample_id": sample_id}
 
 
+async def _update_local_fields(
+    id: int,
+    sample_id: int,
+    values: Dict[str, Any],
+    remove: List[str],
+    tags: Optional[List[str]],
+    user: dict,
+) -> Dict[str, Any]:
+    """update_sample on a mirror's own fields: merge `values`, drop `remove`, replace `@local.tags` when given."""
+    tags = clean_tags([clean_name(tag, "Tag") for tag in tags]) if tags is not None else None
+    async with db.pool.acquire() as conn, conn.transaction():
+        await local_writes.begin(conn, id, exclusive=bool(remove))
+        found = await conn.fetchval(
+            'SELECT 1 FROM samples WHERE id = $1 AND dataset_id = $2 FOR NO KEY UPDATE',
+            sample_id,
+            id,
+        )
+        if not found:
+            raise HTTPException(status_code=404, detail="Sample not found")
+        await conn.execute(
+            """UPDATE samples SET local_metadata = (local_metadata || $3::jsonb) - $4::text[],
+                                  local_tags = COALESCE($5::text[], local_tags)
+               WHERE id = $1 AND dataset_id = $2""",
+            sample_id,
+            id,
+            values,
+            remove,
+            tags,
+        )
+        written = {name: value for name, value in values.items() if name not in remove}
+        await local_writes.register(conn, id, [written])
+        if tags is not None:
+            await local_writes.register_tags(conn, id, tags, user['id'])
+        await local_writes.finish(conn, id, [*written, *(['tags'] if tags is not None else [])], remove)
+        await local_writes.prune(conn, id, remove)
+    return {"message": "Sample updated", "sample_id": sample_id}
+
+
 class BulkTargetRequest(BaseModel):
     sample_ids: List[int] = []
     selection_token: Optional[str] = None
@@ -6909,7 +6968,11 @@ async def _bulk_response(id, user, operation, payload):
             status_code=409,
             detail=f"{payload['field_name']} of this mirror comes from its primary: delete it there",
         )
-    if mirror is not None and not own_vectors:
+    # This server's own fields (`@local.`): the job writes only them (bulk_jobs._mutate_local).
+    own_fields = operation in ('set', 'tag') and payload.get('local')
+    if own_fields:
+        await local_writes.require_mirror(db, id)
+    elif mirror is not None and not own_vectors:
         raise HTTPException(
             status_code=409,
             detail='This dataset is a read-only mirror of a dataset on another Freedom Ridge instance: change it there',
@@ -7038,6 +7101,8 @@ async def tag_samples(id: int, request: BulkTagRequest, user: dict, made_by: str
     request.add_tags = clean_tags([clean_name(t, "Tag") for t in request.add_tags])
 
     col = request.field_name
+    if col == LOCAL_TAGS:  # a mirror's own tags: never sent to the primary
+        return await _tag_local(id, request, user)
     array_cols = await get_dataset_array_columns(id)
     if col not in array_cols:
         raise HTTPException(status_code=400, detail=f"'{col}' is not a registered array field")
@@ -7167,15 +7232,60 @@ async def tag_samples(id: int, request: BulkTagRequest, user: dict, made_by: str
     return {"updated_count": updated, "message": f"Updated {col} for {updated} samples"}
 
 
+def _metadata_with_local(metadata: Dict[str, Any]) -> Dict[str, Any]:
+    """`@local.` keys are a mirror's own fields: bulk_set_metadata routes them (local_writes)."""
+    return validate_metadata(metadata, allow_local=True)
+
+
+async def _tag_local(id: int, request: BulkTagRequest, user: dict) -> Any:
+    """tag_samples on `@local.tags`, a mirror's own tags: written here only, whatever its tags option says."""
+    await local_writes.require_mirror(db, id)
+    overlap = sorted(set(request.add_tags) & set(request.remove_tags))
+    if overlap:
+        raise HTTPException(status_code=400, detail=f"Tag(s) {overlap} are both added and removed")
+    request.sample_ids = list(dict.fromkeys(request.sample_ids))
+    if not request.selection_token and request.filters is None:
+        count = await db.fetchval(
+            "SELECT COUNT(*) FROM samples WHERE id = ANY($1) AND dataset_id = $2",
+            request.sample_ids,
+            id,
+        )
+        if count != len(request.sample_ids):
+            raise HTTPException(status_code=400, detail=f"Some samples not found in dataset {id}")
+    if (
+        request.background
+        or request.selection_token
+        or request.filters is not None
+        or (await _large_bulk_target(id, request.sample_ids))
+    ):
+        return await _bulk_response(id, user, 'tag', {**request.model_dump(), 'local': True})
+    async with db.pool.acquire() as conn, conn.transaction():
+        await local_writes.begin(conn, id)
+        status = await conn.execute(
+            """UPDATE samples SET local_tags = ARRAY(SELECT DISTINCT unnest(COALESCE(local_tags, '{}') || $3::text[])
+                                              EXCEPT SELECT unnest($4::text[]))
+               WHERE dataset_id = $1 AND id = ANY($2::int[])
+                 AND (NOT COALESCE(local_tags, '{}') @> $3::text[] OR local_tags && $4::text[])""",
+            id,
+            request.sample_ids,
+            request.add_tags,
+            request.remove_tags,
+        )
+        updated = _parse_update_status(status, 0)
+        await local_writes.register_tags(conn, id, request.add_tags, user['id'])
+        await local_writes.finish(conn, id, ['tags'])
+    return {"updated_count": updated, "message": f"Updated {LOCAL_TAGS} for {updated} samples"}
+
+
 class BulkSetUpdate(BaseModel):
-    _metadata = field_validator('metadata')(validate_metadata)
+    _metadata = field_validator('metadata')(_metadata_with_local)
 
     sample_id: int
     metadata: Dict[str, Any] = {}
 
 
 class BulkSetRequest(BulkTargetRequest):
-    _metadata = field_validator('metadata')(validate_metadata)
+    _metadata = field_validator('metadata')(_metadata_with_local)
 
     sample_ids: List[int] = []
     metadata: Dict[str, Any] = {}
@@ -7202,7 +7312,13 @@ async def bulk_set_metadata(id: int, request: BulkSetRequest, user: dict = Depen
         `remove_metadata_keys` (mirrors the single-sample PATCH).
       - per sample: `updates=[{sample_id, metadata}, ...]` merges each sample
         with its own patch (used for per-sample scores like uniqueness).
+
+    On a mirror, `@local.<name>` keys write this server's own fields (docs/FOLLOWERS.md), never mixed with the
+    primary's in one request.
     """
+    local = await _bulk_set_local(id, request, user)
+    if local is not None:
+        return local
     patches = {update.sample_id: update.metadata for update in request.updates} if request.updates is not None else None
     sample_ids = list(patches) if patches is not None else request.sample_ids
     if sample_ids:
@@ -7268,6 +7384,89 @@ async def bulk_set_metadata(id: int, request: BulkSetRequest, user: dict = Depen
                 )
                 await prune_fields(conn, id, remove_keys)
     return {"updated_count": updated, "message": f"Updated metadata for {updated} samples"}
+
+
+async def _bulk_set_local(id: int, request: BulkSetRequest, user: dict) -> Any:
+    """bulk_set_metadata on a mirror's own fields, or None when the request names none of them."""
+    values: Dict[str, Any] = {}
+    remove: List[str] = []
+    patches: Optional[Dict[int, Dict[str, Any]]] = None
+    if request.updates is not None:
+        parts = {update.sample_id: local_writes.split_metadata(update.metadata, None) for update in request.updates}
+        patches = {sample_id: part[0] for sample_id, part in parts.items()}
+        mixed = any(part[2] for part in parts.values())
+        named = any(part[0] for part in parts.values())
+    else:
+        values, remove, primary_set, primary_remove = local_writes.split_metadata(
+            request.metadata,
+            request.remove_metadata_keys,
+        )
+        mixed = bool(primary_set or primary_remove)
+        named = bool(values or remove)
+    if not named:
+        return None
+    if mixed:
+        raise HTTPException(status_code=409, detail=local_writes.MIXED)
+    await local_writes.require_mirror(db, id)
+    sample_ids = list(patches) if patches is not None else request.sample_ids
+    if sample_ids:
+        async with db.pool.acquire() as conn:
+            await require_free_space(
+                conn,
+                len(sample_ids) * INGEST_ROW_BYTES,
+                f"setting fields on {len(sample_ids)} samples",
+            )
+    if (
+        request.background
+        or request.selection_token
+        or request.filters is not None
+        or await _large_bulk_target(id, sample_ids, PER_SAMPLE_SYNC_LIMIT if patches is not None else 1000)
+    ):
+        payload = {
+            **request.model_dump(),
+            'metadata': values,
+            'remove_metadata_keys': remove,
+            'updates': None if patches is None else [{'sample_id': k, 'metadata': v} for k, v in patches.items()],
+            'per_sample': patches is not None,
+            'local': True,
+        }
+        return await _bulk_response(id, user, 'set', payload)
+    async with db.pool.acquire() as conn, conn.transaction():
+        await local_writes.begin(conn, id, exclusive=bool(remove))
+        await conn.fetchval(
+            'SELECT count(*) FROM (SELECT id FROM samples WHERE dataset_id = $1 '
+            'AND id = ANY($2::int[]) ORDER BY id FOR NO KEY UPDATE) locked_samples',
+            id,
+            sample_ids,
+        )
+        if patches is None:
+            status = await conn.execute(
+                """UPDATE samples SET local_metadata = (local_metadata || $1::jsonb) - $2::text[]
+                   WHERE dataset_id = $3 AND id = ANY($4::int[])""",
+                values,
+                remove,
+                id,
+                sample_ids,
+            )
+            updated = _parse_update_status(status, 0)
+            written = [{name: value for name, value in values.items() if name not in remove}]
+        else:
+            rows = await conn.fetch(
+                """UPDATE samples AS samples SET local_metadata = samples.local_metadata || payload.patch::jsonb
+                   FROM unnest($1::int[], $2::text[]) AS payload(id, patch)
+                   WHERE samples.id = payload.id AND samples.dataset_id = $3
+                   RETURNING samples.id""",
+                sample_ids,
+                [json.dumps(patch) for patch in patches.values()],
+                id,
+            )
+            updated = len(rows)
+            written = [patches[row['id']] for row in rows]
+        if updated:
+            await local_writes.register(conn, id, written)
+        await local_writes.finish(conn, id, {name for patch in written for name in patch}, remove)
+        await local_writes.prune(conn, id, remove)
+    return {"updated_count": updated, "message": f"Updated this server's own fields for {updated} samples"}
 
 
 class FieldRenameRequest(BaseModel):
