@@ -37,6 +37,8 @@ A query is an AND of parts. In the SDK and the API, each top-level `AND` part be
 
 - A field is named as the dataset names it: `split`, `score`, `detections.label`.
 - The fields every dataset has are `id`, `filepath`, `media_type`, `created_at` and `tags`.
+- On a mirror, its own fields are named `@local.<name>` and written as they are: `@local.weeds > 3`,
+  `@local.tags in ("checked")` ([FOLLOWERS.md](FOLLOWERS.md#fields-of-its-own)).
 - A name that isn't a plain word, or that is one of the language's keywords, goes in backticks: `` `weather station` = "A" `` or `` `in` = 1 ``.
 - Names are case sensitive. `Split` gets "unknown field 'Split'" with the suggestion `split`.
 

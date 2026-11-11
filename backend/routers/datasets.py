@@ -8066,9 +8066,13 @@ async def get_tag_counts(id: int, request: TagCountsRequest, user: dict = Depend
         return {"all_tags": [], "tag_counts": {}, "total_samples": 0}
     await _require_live_selection(request.selection_token)
 
-    array_cols = await get_dataset_array_columns(id)
-    if col not in array_cols:
-        raise HTTPException(status_code=400, detail=f"'{col}' is not a registered array field")
+    if col == LOCAL_TAGS:
+        column = 'local_tags'  # a mirror's own tags (docs/FOLLOWERS.md)
+    else:
+        array_cols = await get_dataset_array_columns(id)
+        if col not in array_cols:
+            raise HTTPException(status_code=400, detail=f"'{col}' is not a registered array field")
+        column = col
 
     # Selection predicate over `s`: token mode resolves the set via region_selections
     # (minus any exceptions); id-list mode uses ANY($sample_ids). Same $-numbering either way.
@@ -8084,14 +8088,14 @@ async def get_tag_counts(id: int, request: TagCountsRequest, user: dict = Depend
 
     async def measure(source):
         all_vals = await source.fetch(
-            f"""SELECT DISTINCT unnest({col}) as tag FROM samples
-                WHERE dataset_id = $1 AND {col} IS NOT NULL AND array_length({col}, 1) > 0
+            f"""SELECT DISTINCT unnest({column}) as tag FROM samples
+                WHERE dataset_id = $1 AND {column} IS NOT NULL AND array_length({column}, 1) > 0
                 ORDER BY tag""",
             id,
         )
         count_rows = await source.fetch(
             f"""SELECT t.tag AS tag, count(DISTINCT s.id) AS cnt
-                FROM samples s, unnest(s.{col}) AS t(tag)
+                FROM samples s, unnest(s.{column}) AS t(tag)
                 WHERE {sel_where}
                 GROUP BY t.tag""",
             *sel_args,

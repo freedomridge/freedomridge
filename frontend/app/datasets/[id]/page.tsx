@@ -1137,9 +1137,10 @@ function DatasetPageContent() {
                         } : undefined}
                         hashFields={hashFieldsData || []}
                         onShowDuplicates={handleShowDuplicates}
-                        // A mirror's tags are the primary's; with tags both ways, a tag edit here is made there.
+                        // A mirror's tags are the primary's (with tags both ways, a tag edit here is made there), and its own
+                        // tags (`@local.tags`) are its own while it follows: the tag dialog offers whichever it may edit.
                         canTag={(user?.role === 'admin' || user?.role === 'power_user')
-                            && (!dataset?.mirror || (dataset.mirror.tags === 'both' && dataset.mirror.state === 'following'))}
+                            && (!dataset?.mirror || dataset.mirror.state !== 'stopped')}
                         gridSamplesRef={getGridSamplesRef(panelId)}
                         gridMoreRef={getGridMoreRef(panelId)}
                         // Patches are a sub-grid of IMAGES only. An object-grain grid never shows
@@ -1684,6 +1685,7 @@ function DatasetPageContent() {
                             onCloseOverlay={() => setTagSampleId(null)}
                             overlay={tagSampleId !== null && datasetId ? (
                                 <TagManagementModal
+                                    mirror={dataset?.mirror ?? null}
                                     selectedSampleIds={[tagSampleId]}
                                     selectionCount={1}
                                     datasetId={datasetId}
@@ -1767,6 +1769,7 @@ function DatasetPageContent() {
             {
                 showTagModal && datasetId && (
                     <TagManagementModal
+                        mirror={dataset?.mirror ?? null}
                         selectedSampleIds={selectedIds}
                         selectionToken={selectAll?.token ?? null}
                         excludedIds={deselectedIds}

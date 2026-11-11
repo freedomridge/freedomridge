@@ -598,6 +598,24 @@ export function FilterSidebar({
         );
     };
 
+    // On a mirror, its own fields (`@local.<name>`, docs/FOLLOWERS.md) come first, under their own heading, and the
+    // primary's after them. Any other dataset has none, and its list is as it was.
+    const ownFields = schema.filter(f => f.origin === 'local');
+    const orderedSchema = ownFields.length > 0 ? [...ownFields, ...schema.filter(f => f.origin !== 'local')] : schema;
+    // The rows, one per field of orderedSchema, with the two headings put in before the first of each group.
+    const withOwnHeadings = (rows: ReactNode[]): ReactNode[] => {
+        if (ownFields.length === 0) return rows;
+        const heading = (key: string, text: string) => (
+            <h3 key={key} className="text-xs font-semibold text-zinc-500 uppercase tracking-wider">{text}</h3>
+        );
+        return [
+            heading('own-fields-heading', 'On this server'),
+            ...rows.slice(0, ownFields.length),
+            ...(rows.length > ownFields.length ? [heading('primary-fields-heading', 'From the primary')] : []),
+            ...rows.slice(ownFields.length),
+        ];
+    };
+
     return (
         <aside className="w-full bg-zinc-900/30">
             <div className="p-6">
@@ -671,7 +689,7 @@ export function FilterSidebar({
                             );
                         })()}
 
-                        {schema.map((schemaField, index) => {
+                        {withOwnHeadings(orderedSchema.map((schemaField, index) => {
                             const field = withFacet(schemaField);
                             // Skip internal or complex fields that don't make sense to filter easily yet
                             if (field.name === 'location' || field.name === 'metadata') {
@@ -968,7 +986,7 @@ export function FilterSidebar({
                             }
 
                             return null;
-                        })}
+                        }))}
                     </div>
                 )}
             </div>

@@ -696,3 +696,18 @@ test('arbitrary box and polyline fields have separate overlay rows and legacy al
         assert.match(html, new RegExp(`data-testid="overlay-toggle-${name}" aria-pressed="${name !== 'pedestrians'}"`));
     }
 });
+
+test("a mirror's own fields come first, under On this server, and the primary's after them", () => {
+    const own = [
+        { name: '@local.weeds', type: 'number', origin: 'local', owner: 'self', min: 1, max: 9 },
+        { name: '@local.tags', type: 'array', origin: 'local', owner: 'self', values: ['checked'] },
+    ];
+    const { html } = render({ schema: [...SCHEMA.map(f => ({ ...f, owner: 'primary' })), ...own] });
+    const at = text => html.indexOf(text);
+    assert.ok(at('On this server') > 0 && at('From the primary') > at('On this server'), html);
+    assert.ok(at('>@local.weeds<') > at('On this server') && at('>@local.weeds<') < at('From the primary'));
+    assert.ok(at('>brightness<') > at('From the primary'));
+    // Any other dataset's list has no such headings.
+    const plain = render({}).html;
+    assert.equal(plain.includes('On this server') || plain.includes('From the primary'), false);
+});

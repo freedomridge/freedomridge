@@ -10,6 +10,7 @@ import { AnnotationOverlay } from './annotations/AnnotationOverlay';
 import { ClassRuleEditor } from './annotations/ClassRuleEditor';
 import { defaultRule, type ClassProbabilities, type ClassRule, type ProbabilityView } from '@/lib/class-rules';
 import { PatchGridOverlay } from './annotations/PatchGridOverlay';
+import { localEntries } from '@/lib/local-fields';
 
 interface Props {
     sample: Sample;
@@ -121,6 +122,14 @@ export function SampleModal({ sample, activeMediaField = 'filepath', availableMe
 
     // Annotation state is sample-local; declare it before the reset effects.
     const [hiddenAnnotations, setHiddenAnnotations] = useState<Record<string, Set<number>>>({});
+    // On a mirror, its own fields (`@local.<name>`) are listed apart from the primary's, by their full names.
+    const ownFields = useMemo(() => localEntries(sample), [sample]);
+    const primaryFields = useMemo(() => {
+        const rest: Partial<typeof sample> = { ...sample };
+        delete rest.local_metadata;
+        delete rest.local_tags;
+        return rest;
+    }, [sample]);
     const [selectedAnnotation, setSelectedAnnotation] = useState<{ key: string; index: number } | null>(null);
     const [selectedPatch, setSelectedPatch] = useState<{ row: number; col: number } | null>(null);
 
@@ -606,9 +615,17 @@ export function SampleModal({ sample, activeMediaField = 'filepath', availableMe
 
                         <div className="w-80 border-l border-zinc-800 overflow-y-auto p-6">
                             <h3 className="text-sm font-semibold mb-4 text-zinc-400">Properties</h3>
+                            {Object.keys(ownFields).length > 0 && (
+                                <div data-testid="own-fields" className="mb-4 pb-4 border-b border-zinc-800">
+                                    <h4 className="text-xs font-semibold mb-2 text-zinc-500 uppercase tracking-wider">On this server</h4>
+                                    <dl className="space-y-3">
+                                        <PropertyViewer data={ownFields} />
+                                    </dl>
+                                </div>
+                            )}
                             <dl className="space-y-3">
                                 <PropertyViewer
-                                    data={sample}
+                                    data={primaryFields}
                                     hiddenAnnotations={hiddenAnnotations}
                                     selectedAnnotation={selectedAnnotation}
                                     onToggleVisibility={toggleAnnotationVisibility}

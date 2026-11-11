@@ -225,7 +225,33 @@ With the **views** option both ways:
 
 With views from the primary only, views made on the mirror stay there. Either way, a copied view's sample ids
 are translated, so a saved search (patch search included, which saves its results) shows the same samples on
-both. Every other edit of a mirror (bulk set, rename, clear or delete) is refused before it's queued.
+both. Every other edit of the primary's fields on a mirror (bulk set, rename, clear or delete) is refused before
+it's queued.
+
+### Fields of its own
+
+A follower may add fields of its own to a mirror (labels, predictions, notes and tags) beside the primary's. It
+can never change or remove the primary's. Its fields are named `@local.<name>` (a letter or `_`, then letters,
+digits or `_`): `@local.weeds`, and `@local.tags` for its own tags. No field the primary has can start with `@`, so
+a primary field named `weeds` or `local` sits beside `@local.weeds` and nothing is renamed or overwritten.
+
+- **Writing them:** `POST .../samples/bulk-set` and `PATCH .../samples/{id}` with `@local.` keys in `metadata` and
+  `remove_metadata_keys` (`array_fields` for `@local.tags` on one sample), and `POST .../samples/bulk-tag` with
+  `field_name` `@local.tags`. In the app, the tag dialog on a mirror offers **This server's tags** beside the
+  primary's, which it may edit only with the tags option both ways. A request that writes fields of the mirror's
+  own and the primary's together is refused (409), and so is one on a mirror that no longer follows (409) or on a
+  dataset that isn't a mirror (400).
+- **What they are for the rest of the app:** the sidebar lists them first, under **On this server**, with the
+  primary's under **From the primary**. They filter, sort, colour a map, show on the grid and in a sample's view
+  (under **On this server**), and export under their full names, as any field. In the SDK, `sample['@local.weeds']`
+  and `sample.local` read them, and `dataset.filter(F('@local.weeds') > 3)` filters on them.
+- **What happens to them:** the primary never sees them, and a re-read or a resumed copy keeps them on the samples
+  that remain. A sample the primary deletes goes with them. A view that filters on one stays on the mirror. A
+  version of a mirror keeps no history of them, and filtering a version on one is refused. Copying a dataset to
+  another instance (`fridge.sync_between_instances`) leaves them out and says so: the target isn't a mirror.
+- **Removing one:** remove the key from every sample (bulk set with `remove_metadata_keys`). The field leaves the
+  sidebar once no sample holds it: at once for a small mirror, and after the bulk job's last steps, which read the
+  dataset in bounded windows, for a large one. Rename, clone and clear don't take them yet.
 
 ### When it stops
 

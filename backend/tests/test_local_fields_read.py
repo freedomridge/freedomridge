@@ -55,6 +55,14 @@ def test_a_mirrors_rows_carry_its_own_fields(registry_database):
         other = await datasets._list_samples_post(1, datasets.SamplesRequest(limit=10))
         assert all('local_metadata' not in item for item in other['items'])
 
+        # The tag dialog's counts for this server's own tags.
+        counts = await datasets.get_tag_counts(
+            2,
+            datasets.TagCountsRequest(field_name='@local.tags', sample_ids=[first]),
+            user=USER,
+        )
+        assert (counts['all_tags'], counts['tag_counts']) == (['checked'], {'checked': 1})
+
         # Who owns each field, and `@local.tags` shown as the array it is, with its values.
         await run_refresh(database, 2)
         fields = {field['name']: field for field in await datasets.get_dataset_schema(2)}

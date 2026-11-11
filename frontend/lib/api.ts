@@ -418,6 +418,9 @@ export interface Sample {
         type: string;
         coordinates: [number, number];
     };
+    // On a mirror, its own fields (`@local.<name>`, lib/local-fields.ts).
+    local_metadata?: Record<string, unknown> | null;
+    local_tags?: string[] | null;
     distance?: number;
     created_at?: string;
     last_modified_at?: string;
@@ -497,7 +500,10 @@ export type FacetProvenance = 'exact' | 'cached' | 'pending' | 'out_of_budget';
 
 export interface SchemaField {
     declared_type?: DeclaredFieldType;
-    origin?: 'metadata' | 'native_array' | 'system';
+    // 'local': a mirror's own field (`@local.<name>`, docs/FOLLOWERS.md), stored beside the primary's.
+    origin?: 'metadata' | 'native_array' | 'system' | 'local';
+    // Who may change it: on a mirror, 'primary' for the primary's fields and 'self' for this server's own.
+    owner?: 'self' | 'primary';
     values_complete?: boolean;
     values_truncated?: boolean;
     stats_pending?: boolean;

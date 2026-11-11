@@ -8,8 +8,8 @@ it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
 
 ### Upgrade notes
 
-- One database migration, `0021_embeddings_partitioned.sql`, applied with `scripts/apply_migrations.sh` (step 4 of
-  [Upgrading](docs/UPGRADING.md)).
+- Two database migrations, `0021_embeddings_partitioned.sql` and `0022_local_fields.sql`, applied with
+  `scripts/apply_migrations.sh` (step 4 of [Upgrading](docs/UPGRADING.md)).
 - **Stop the app before the migrations** ([Upgrading](docs/UPGRADING.md#upgrading-across-290)). `0021` copies every
   vector into a table with one partition per dataset, so it refuses to run while anything else is connected to the
   database. It takes about a minute per million vectors (9.4 minutes for 9.7 million, measured), and needs free
@@ -24,6 +24,11 @@ it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
   its own, a follower's mirrors and small datasets included.
 - `apply_migrations.sh` now also sets the database's `plan_cache_mode` on every run (`database_settings.sql`): a
   restored backup doesn't carry database settings.
+- `0022` adds two columns to samples with constant defaults, so it rewrites no table. It first stops, naming them,
+  if an array field is already called `local_metadata` or `local_tags`, or a field's name already starts with
+  `@local.`.
+- **A metadata key starting with `@local.` is refused on every dataset now** (422 when samples are added or set).
+  The prefix names a mirror's own fields. Other keys that start with `@`, such as `@timestamp`, are unaffected.
 
 ### Added
 
@@ -46,6 +51,14 @@ it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
 - **Signing in goes back to the page asked for.** Opening a link while signed out, or a session expiring, goes to
   the login page and then back to that page, filters included. Only a page of this server is followed; anything
   else goes to the dataset list.
+- **A follower's fields of its own on a mirror** ([FOLLOWERS.md](docs/FOLLOWERS.md#fields-of-its-own)). A follower
+  can add labels, predictions, notes and tags to a mirror beside the primary's, named `@local.<name>`
+  (`@local.weeds`, and `@local.tags` for its own tags), and can never change or remove the primary's. They filter,
+  sort, colour a map, show on the grid and in a sample's view, and export like any field. The sidebar lists them
+  under **On this server**, and the tag dialog offers **This server's tags**. The primary never sees them, and a
+  re-read or resumed copy keeps them. They're written through bulk-set, bulk-tag and the sample edit, or the SDK
+  (`client.bulk_set_metadata(dataset_id, sample_ids=[...], metadata={'@local.weeds': 3})`), and read with
+  `sample['@local.weeds']`.
 
 ### Changed
 

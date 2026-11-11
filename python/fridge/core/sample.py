@@ -66,7 +66,7 @@ class Sample:
         self.hashes = hashes or {}
         self.array_fields = array_fields or {}  # {field_name: [values]}
         # On a mirror, this server's own fields (`@local.<name>`, docs/FOLLOWERS.md) by name without the prefix,
-        # `tags` for `@local.tags`. Read with `sample['@local.weeds']`; write with Dataset.bulk_set_metadata.
+        # `tags` for `@local.tags`. Read with `sample['@local.weeds']`; write with Client.bulk_set_metadata.
         self.local: Dict[str, Any] = {}
         self.created_at = None
         self.last_modified_at = None
