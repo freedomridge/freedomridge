@@ -9,16 +9,19 @@
 # Run Compose from this folder: the path comes from the shell's $PWD. MAPBOX_TOKEN in the environment or
 # a .env file turns the map on; FRIDGE_PORT and FRIDGE_API_PORT move the two ports. `npx freedomridge` runs
 # this file for you. A server needs docker-compose.prod.yml (docs/DOCKER_DEPLOYMENT.md).
+# Docker needs at least 4 GB of memory for it.
 name: freedomridge-try
 
 services:
   db:
-    image: ghcr.io/freedomridge/db:2.8.0
+    image: ghcr.io/freedomridge/db:2.9.0
     environment:
       POSTGRES_USER: freedomridge
       POSTGRES_PASSWORD: password
       POSTGRES_DB: freedomridge
-    command: postgres -c config_file=/etc/postgresql/postgresql.conf -c max_connections=250
+    # Sized for a laptop: postgresql.conf is tuned for a 32 GB server. POSTGRES_SHARED_BUFFERS,
+    # POSTGRES_EFFECTIVE_CACHE_SIZE, POSTGRES_WORK_MEM and POSTGRES_MAINTENANCE_WORK_MEM give it more.
+    command: postgres -c config_file=/etc/postgresql/postgresql.conf -c max_connections=250 -c shared_buffers=${POSTGRES_SHARED_BUFFERS:-512MB} -c effective_cache_size=${POSTGRES_EFFECTIVE_CACHE_SIZE:-2GB} -c work_mem=${POSTGRES_WORK_MEM:-16MB} -c maintenance_work_mem=${POSTGRES_MAINTENANCE_WORK_MEM:-256MB}
     shm_size: '1g'
     volumes:
       - postgres_data:/var/lib/postgresql/data
@@ -33,7 +36,7 @@ services:
     restart: unless-stopped
 
   backend:
-    image: ghcr.io/freedomridge/backend:2.8.0
+    image: ghcr.io/freedomridge/backend:2.9.0
     environment:
       DATABASE_URL: postgresql://freedomridge:password@db:5432/freedomridge
       FRIDGE_ENV: development
@@ -55,7 +58,7 @@ services:
     restart: unless-stopped
 
   job-runner:
-    image: ghcr.io/freedomridge/worker:2.8.0
+    image: ghcr.io/freedomridge/worker:2.9.0
     command: python3 -m backend.job_service
     init: true
     environment:
@@ -73,7 +76,7 @@ services:
     stop_grace_period: 30s
 
   frontend:
-    image: ghcr.io/freedomridge/frontend:2.8.0
+    image: ghcr.io/freedomridge/frontend:2.9.0
     environment:
       # Next standalone otherwise binds to Docker's hostname and its localhost healthcheck fails.
       HOSTNAME: 0.0.0.0

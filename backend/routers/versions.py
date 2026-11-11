@@ -2,6 +2,7 @@
 
 import asyncio
 import contextlib
+import copy
 import json
 import secrets
 from typing import Any, Optional
@@ -13,8 +14,8 @@ from pydantic import BaseModel
 from ..access import require_dataset_access
 from ..database import db
 from ..diskspace import estimate_snapshot_bytes, require_free_space
-from ..field_registry import REQUEST_FULL_REFRESH, _value_names, lock_field_lifecycle
-from ..label_fields import DISCOVERY_TYPES, label_context
+from ..field_registry import LOCAL_PREFIX, REQUEST_FULL_REFRESH, _value_names, lock_field_lifecycle
+from ..label_fields import DISCOVERY_TYPES, LEGACY_LABEL_FIELDS, DatasetArrayColumns, label_context
 from ..request_limits import guest_heavy
 from ..validation import clean_name
 from .auth import require_role
@@ -759,6 +760,12 @@ def _reject_live_only_filters(node: Any) -> None:
         return
     operator = str(node.get('operator', '=')).lower()
     field = node['field']
+    if isinstance(field, str) and field.startswith(LOCAL_PREFIX):
+        # A version keeps no history of a mirror's own fields, by decision (docs/FOLLOWERS.md).
+        raise HTTPException(
+            status_code=400,
+            detail=f"Filter on {field!r}: a version keeps no history of this server's own (@local.) fields",
+        )
     derived = isinstance(field, str) and field != 'location' and _derived_field(field) is not None
     if operator in _LIVE_ONLY_FILTER_OPS or derived:
         raise HTTPException(
@@ -767,26 +774,56 @@ def _reject_live_only_filters(node: Any) -> None:
         )
 
 
-async def _queryable_version(id: int, version_id: int) -> None:
-    """404 unless the version belongs to this dataset; 400 if it kept no sample data (hash-only)."""
+async def _queryable_version(id: int, version_id: int) -> dict:
+    """The version; 404 unless it belongs to this dataset, 400 if it kept no sample data (hash-only)."""
     version = await get_version(id, version_id)
     if version['include_metadata'] is False:
         raise HTTPException(status_code=400, detail="Hash-only versions have no historical sample data")
+    return version
 
 
-async def _version_query(id: int, version_id: int, filters: Optional[dict]) -> tuple[str, str, list, list]:
-    """(WITH clause, WHERE clause, args, stored array columns) to query a version's rows like the live table.
+async def _version_columns(id: int, version: dict) -> DatasetArrayColumns:
+    """The field context a version's rows are read with: the fields the version stored, not today's.
+
+    Which dotted paths are list elements (``animals.label``) depends on the declared fields. Taken
+    from the live registry, a version's answer changed when the live dataset did: clearing a list
+    field, or the next statistics refresh after its last value went, made the same query on an
+    unchanged version match nothing. Only the declarations are the version's: the physical array
+    columns (the snapshot's stored arrays are rebuilt into them) and anything else the context holds
+    about the dataset as it is now stay the live context's. A snapshot from before the field registry
+    (no ``field_registry_version``) kept no reliable field list and reads with the live one, as before.
+    """
+    live = await get_dataset_array_columns(id)
+    snapshot = version.get('dataset_snapshot') or {}
+    if snapshot.get('field_registry_version') != 1:
+        return live
+    fields = snapshot.get('fields') or []
+    columns = copy.copy(live)
+    columns.label_fields = set(LEGACY_LABEL_FIELDS)
+    columns.registered = {field['field_name'] for field in fields}
+    columns.list_fields = {field['field_name'] for field in fields if field.get('field_type') == 'list'}
+    return columns
+
+
+async def _version_query(
+    id: int,
+    version_id: int,
+    filters: Optional[dict],
+) -> tuple[str, str, list, list, DatasetArrayColumns]:
+    """(WITH clause, WHERE clause, args, stored array columns, field context) to query a version's rows like
+    the live table.
 
     The WITH clause names a CTE ``samples`` holding the version's rows under the live column names, so
     the live filter compiler and aggregations run on it unchanged: ``id`` is the sample id,
     ``dataset_id`` the dataset, and each registered array field is rebuilt from the snapshot's
     ``array_fields_snapshot`` (NULL where the version never recorded it). The CTE is referenced once per
-    statement, so PostgreSQL inlines it and only computes the columns a query touches.
+    statement, so PostgreSQL inlines it and only computes the columns a query touches. Label paths are
+    read with the version's own fields (_version_columns).
     """
-    await _queryable_version(id, version_id)
+    version = await _queryable_version(id, version_id)
     if filters:
         _reject_live_only_filters(filters)
-    array_columns = await get_dataset_array_columns(id)
+    array_columns = await _version_columns(id, version)
     stored = [c for c in sorted(array_columns & await get_array_columns()) if c != 'tags']
     rebuilt = ''.join(
         f", CASE WHEN jsonb_typeof(v.array_fields_snapshot->'{c}') = 'array' "
@@ -803,7 +840,7 @@ async def _version_query(id: int, version_id: int, filters: Optional[dict]) -> t
         filters=json.dumps(filters) if filters else None,
         array_columns=array_columns,
     )
-    return with_clause, where, args, stored
+    return with_clause, where, args, stored, array_columns
 
 
 class VersionAggregateRequest(BaseModel):
@@ -816,8 +853,8 @@ class VersionAggregateRequest(BaseModel):
 async def aggregate_version(id: int, version_id: int, request: VersionAggregateRequest):
     """Aggregate a version's stored samples, optionally filtered; same specs and results as
     ``POST /datasets/{id}/aggregate``, computed in the database against the version."""
-    with_clause, where, args, _ = await _version_query(id, version_id, request.filters)
-    return await run_aggregations(id, request.aggregations, where, args, with_clause)
+    with_clause, where, args, _, columns = await _version_query(id, version_id, request.filters)
+    return await run_aggregations(id, request.aggregations, where, args, with_clause, array_columns=columns)
 
 
 class VersionSamplesQueryRequest(BaseModel):
@@ -837,7 +874,7 @@ async def query_version_samples(id: int, version_id: int, request: VersionSample
     """
     if not 1 <= request.limit <= 10000 or (request.after_id is not None and request.after_id < 0):
         raise HTTPException(status_code=400, detail="Invalid snapshot pagination")
-    with_clause, where, args, stored = await _version_query(id, version_id, request.filters)
+    with_clause, where, args, stored, _ = await _version_query(id, version_id, request.filters)
     if request.after_id is not None:
         args.append(request.after_id)
         where += f" AND id > ${len(args)}"

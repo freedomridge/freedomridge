@@ -290,9 +290,15 @@ def test_the_startup_ann_warning_skips_an_index_removed_on_purpose(monkeypatch, 
 
         async def fetch(self, query, *args):
             if 'FROM removed_indexes' in query:
-                return [{'field_name': name} for name in self.removed]
+                return [{'dataset_id': 1, 'field_name': name} for name in self.removed]
             if 'pg_get_indexdef' in query:
                 return []
+            if 'pg_stats' in query:
+                return []
+            if "to_regclass('embeddings_d'" in query:  # the partitions: one, stale, so its rows are read
+                return [
+                    {'dataset_id': 1, 'relname': 'embeddings_d1', 'nspname': 'public', 'reltuples': 0, 'stale': True},
+                ]
             return [{'field_name': 'clip'}]
 
     caplog.set_level(logging.WARNING)

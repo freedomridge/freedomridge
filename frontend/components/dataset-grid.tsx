@@ -12,6 +12,7 @@ import { RetryImg } from './retry-img';
 import { resetSampleCount, useSampleCount } from '@/hooks/useSampleCount';
 import { parseAnnotations, isOverlayActive, isDerivedLabelField } from '@/lib/labels';
 import type { PatchInfo } from '@/hooks/usePatchState';
+import { isLocalField, localValue } from '@/lib/local-fields';
 
 interface GridCellProps {
     sample: Sample;
@@ -180,6 +181,7 @@ const GridCell = memo(function GridCell({
                             // Check top-level fields first (tags, id, filepath), then metadata
                             const val: unknown = field === 'id' ? sample.id
                                 : field === 'filepath' ? sample.filepath
+                                : isLocalField(field) ? localValue(sample, field)
                                 : (sample as unknown as Record<string, unknown>)[field] ?? sample.metadata?.[field];
 
                             if (Array.isArray(val) && val.length > 0) {

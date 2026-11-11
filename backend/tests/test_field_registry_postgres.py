@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock
@@ -12,7 +13,7 @@ import asyncpg
 import pytest
 from fastapi import HTTPException
 
-from backend.database import Database, init_connection
+from backend.database import PLANNING, Database, init_connection
 from backend.routers import datasets, embeddings, quality, versions
 from backend.tests.statistics_helpers import run_refresh
 
@@ -21,6 +22,16 @@ pytestmark = pytest.mark.skipif(
     reason='Requires an isolated PostgreSQL/PostGIS test database',
 )
 USER = {'id': 1, 'role': 'admin'}
+
+
+@asynccontextmanager
+async def bulk_setup(database):
+    """A connection for a test's bulk setup, planned as before database.PLANNING. Re-planning the row triggers and
+    foreign-key checks for every row doubles a 150,000-row insert, past the fixture's statement timeout when the
+    machine is loaded. What a test checks still runs with the app's planning."""
+    async with database.pool.acquire() as connection, connection.transaction():
+        await connection.execute('SET LOCAL plan_cache_mode = auto')
+        yield connection
 
 
 @pytest.fixture
@@ -39,7 +50,7 @@ def registry_database(monkeypatch):
                     min_size=1,
                     max_size=pool_size,
                     init=init_connection,
-                    server_settings={'search_path': f'{namespace},public', 'statement_timeout': '10000'},
+                    server_settings={'search_path': f'{namespace},public', 'statement_timeout': '10000', **PLANNING},
                 )
                 await database.execute((Path(datasets.__file__).parents[1] / 'db/schema.sql').read_text())
                 # Open to every user; tests needing a private dataset set FALSE.
@@ -129,7 +140,8 @@ def test_metadata_lists_do_not_join_native_catalog(registry_database):
         assert 'reviewed' not in await embeddings._array_field_names(1)
         assert 'kw' not in await embeddings._array_field_names(1)
         await database.execute(
-            "INSERT INTO embeddings (sample_id, field_name, vector) VALUES ($1, 'clip', '[1,0]')",
+            "INSERT INTO embeddings (dataset_id, sample_id, field_name, vector) VALUES ("
+            "(SELECT dataset_id FROM samples WHERE id = $1), $1, 'clip', '[1,0]')",
             sample_id,
         )
         await database.execute("INSERT INTO embedding_coordinates VALUES ($1, 'clip', 0, 0)", sample_id)
@@ -324,7 +336,8 @@ def test_quality_output_is_registered_without_refresh(registry_database):
     async def scenario(database):
         sample_id = (await ingest([{}]))['ids'][0]
         await database.execute(
-            "INSERT INTO embeddings (sample_id, field_name, vector) VALUES ($1, 'test', '[1,0]')",
+            "INSERT INTO embeddings (dataset_id, sample_id, field_name, vector) VALUES ("
+            "(SELECT dataset_id FROM samples WHERE id = $1), $1, 'test', '[1,0]')",
             sample_id,
         )
         await quality.representativeness_compute(

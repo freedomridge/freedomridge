@@ -32,6 +32,10 @@ class FakeClient:
     def get_samples(self, dataset_id, limit, offset):
         return {'total': 1}
 
+    def get_schema(self, dataset_id, filters=None, lightning_mode=True):
+        # The source is a mirror with a field of its own.
+        return [{'name': 'crop', 'origin': 'metadata'}, {'name': '@local.weeds', 'origin': 'local'}]
+
     def list_array_fields(self, dataset_id):
         # A fresh target already lists only the seeded `tags`.
         return [{'name': 'class_names'}, {'name': 'tags'}] if self.base_url == 'source' else [{'name': 'tags'}]
@@ -50,9 +54,10 @@ class FakeClient:
         return {value: 70 for value in values}
 
 
-def test_tags_travel_as_the_builtin_column(monkeypatch):
+def test_tags_travel_as_the_builtin_column(monkeypatch, capsys):
     monkeypatch.setattr(sync_between_instances, 'Client', FakeClient)
     sync_between_instances.sync('source', 'target', 'demo', skip_embeddings=True, skip_hashes=True)
+    assert "Left out, 1 field(s) of the source server's own: @local.weeds" in capsys.readouterr().out
     target = FakeClient.instances['target']
     assert target.created_fields == ['class_names']
     [row] = target.added

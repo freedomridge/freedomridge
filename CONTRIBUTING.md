@@ -221,6 +221,12 @@ To change the schema:
    queues, and keep that job kind working for the rest of the major version, since a database from
    that release can upgrade straight to any later one. Migrations only go forward; going back is
    restoring the backup taken before the upgrade.
+   The one exception is `0021_embeddings_partitioned.sql`, which copies every vector into the
+   partitioned table itself: copying while the app ran would have needed every vector write and query
+   in two versions until it finished. It refuses to run while anything else is connected, checks the
+   disk and the lock table first, and its progress notices start with its number (`0021: ...`), which
+   `apply_migrations.sh` shows as they come. A migration that has to do the same follows that pattern,
+   and its release's upgrade notes say to stop the app.
 4. Think about followers ([docs/FOLLOWERS.md](docs/FOLLOWERS.md)) when a migration changes rows, not only the
    schema. Statements on the tables followers read (`samples`, `embeddings`, `sample_hashes`,
    `embedding_coordinates`, `dataset_fields`, `views`, `embedding_viz_meta` and `datasets`: the ones with the
@@ -263,6 +269,11 @@ migrations the database records but the code doesn't have: the database is newer
   keep the full data reachable.
 - Before changing the map panel or the `map_points` endpoint, read
   [the map requirements](docs/MAP_REQUIREMENTS.md).
+- Copied links must keep opening. `frontend/tests/link-fixtures.json` holds frozen `q=` and `f=` links, and the
+  frontend, backend and e2e tests open them. A change to the stage or filter shape, an operator, or the query
+  language that breaks one either keeps reading the old shape (the fixtures stay), or gives `f=` a new version
+  (`LINK_VERSION` in `frontend/lib/links.ts`) on purpose: it removes the old version's fixtures and says in the
+  CHANGELOG's upgrade notes that links copied before the release no longer open.
 - Commit messages are one short sentence, optionally prefixed with the area (`Sidebar: ...`).
 
 ## Pull requests

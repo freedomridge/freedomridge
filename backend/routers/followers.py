@@ -761,7 +761,7 @@ async def follower_vectors(dataset_id: int, request: VectorRequest, follower: di
     await subscription(db, follower, dataset_id)
     rows = await db.fetch(
         """SELECT e.sample_id, e.field_name, e.vector::real[] AS vector
-           FROM embeddings e JOIN samples s ON s.id = e.sample_id
+           FROM embeddings e JOIN samples s ON s.dataset_id = e.dataset_id AND s.id = e.sample_id
            WHERE s.dataset_id = $1 AND e.sample_id = ANY($2::int[])
              AND (cardinality($3::text[]) = 0 OR e.field_name = ANY($3))
            ORDER BY 1, 2""",

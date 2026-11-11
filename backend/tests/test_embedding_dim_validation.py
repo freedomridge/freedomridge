@@ -25,7 +25,7 @@ class _DimDB:
 
 def _run(field_dims, established, monkeypatch):
     monkeypatch.setattr(emb, "db", _DimDB(established))
-    return asyncio.run(emb.validate_embedding_dims(field_dims))
+    return asyncio.run(emb.validate_embedding_dims(1, field_dims))
 
 
 def test_matching_dimension_accepted(monkeypatch):

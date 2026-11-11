@@ -115,3 +115,22 @@ export async function expectTotal(page: Page, n: number) {
         // "images" on a dataset with object rows: the sub-header counts the image grain there.
         new RegExp(`^\\s*${n} (samples|images)\\s*$`), { timeout: 15_000 });
 }
+
+/**
+ * A Select All over 50,000 samples, applied as a server token. The 12-row fixture never needs one, so the two
+ * responses it gets (its count, its token) are faked.
+ */
+export async function bigSelectAll(page: Page) {
+    await page.route('**/samples/query', async route => {
+        if (route.request().postDataJSON()?.limit === 1) {
+            await route.fulfill({ json: { items: [], total: 60_000 } });  // Select All's count probe
+        } else {
+            await route.continue();
+        }
+    });
+    await page.route('**/selection_token', route => route.fulfill({ json: { token: 'e2e-expired-token', count: 60_000 } }));
+    await page.getByTestId('grid-select-all').click();
+    await expect(page.getByTestId('grid-selection-count')).toContainText('60,000', { timeout: 10_000 });
+    await page.unroute('**/samples/query');
+    await page.unroute('**/selection_token');
+}

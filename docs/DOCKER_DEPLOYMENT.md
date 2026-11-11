@@ -226,8 +226,10 @@ migrations before starting clients. Use the exact commands in the
 docker compose -f docker-compose.prod.yml logs --tail=100 backend nginx backup
 docker compose -f docker-compose.prod.yml exec db pg_isready -U freedomridge
 docker compose -f docker-compose.prod.yml exec nginx nginx -t
-# After backing up and checking out a release (a revision that isn't one: build --pull instead):
+# After backing up and checking out a release (a revision that isn't one: build --pull instead);
+# the migrations run with the app stopped (Upgrading, step 4):
 docker compose -f docker-compose.prod.yml pull
+docker compose -f docker-compose.prod.yml stop backend job-runner backup frontend
 FRIDGE_DB_CONTAINER=$(docker compose -f docker-compose.prod.yml ps -q db) \
   bash scripts/apply_migrations.sh
 docker compose -f docker-compose.prod.yml up -d

@@ -3,6 +3,7 @@ machine (on-demand when AWS has no spot capacity), within the time limits; every
 it's over its time, or when its worker never came or went quiet, and its token goes with it. EC2 is a fake here."""
 
 import os
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from botocore.exceptions import ClientError, ParamValidationError
@@ -111,13 +112,15 @@ async def launches(database):
     return [dict(row) for row in await database.fetch('SELECT * FROM compute_launches ORDER BY id')]
 
 
-async def connect_worker(database, name, heartbeat_minutes_ago=0):
+async def connect_worker(database, name, heartbeat_minutes_ago=0, user_id=USER['id']):
+    """A compute worker of `user_id` (the admin by default, as an on-demand machine's worker is)."""
     await database.execute(
-        """INSERT INTO workers (id, placement, name, capabilities, heartbeat_at)
-           VALUES ($1, 'compute', $1, '{"kinds": ["map_refit"]}', now() - make_interval(mins => $2))
+        """INSERT INTO workers (id, placement, name, capabilities, heartbeat_at, user_id)
+           VALUES ($1, 'compute', $1, '{"kinds": ["map_refit"]}', now() - make_interval(mins => $2), $3)
            ON CONFLICT (id) DO UPDATE SET heartbeat_at = EXCLUDED.heartbeat_at""",
         name,
         heartbeat_minutes_ago,
+        user_id,
     )
 
 
@@ -412,5 +415,196 @@ def test_a_launch_aws_never_answered_keeps_its_machine(registry_database):
         await database.execute("UPDATE compute_launches SET state = 'ended'")
         await run(database, FakeEC2(unsent=True))
         assert (await launches(database))[-1]['end_reason'].startswith('AWS refused the launch')
+
+    registry_database(scenario)
+
+
+def test_a_power_user_s_worker_counts_only_for_jobs_on_datasets_they_can_access(registry_database):
+    """A power user's worker claims only jobs on datasets its owner can access (routers/workers.py). Counted as free
+    for every job, it held back the machine an admin's re-fit needed until the re-fit expired unclaimed."""
+
+    async def scenario(database):
+        ec2 = FakeEC2()
+        await configure(database, max_machines=5)
+        power = await database.fetchval("INSERT INTO users (username, role) VALUES ('pu', 'power_user') RETURNING id")
+        await database.execute("INSERT INTO datasets (id, name, is_global, owner_id) VALUES (3, 'private', FALSE, 1)")
+        await connect_worker(database, 'desk', user_id=power)
+        private = await job_queue.enqueue_job(
+            database.pool,
+            'map_refit',
+            dataset_id=3,
+            placement='compute',
+            lane='maintenance',
+        )
+        await database.execute(
+            "UPDATE jobs SET available_at = now() - interval '10 minutes', updated_at = now() - interval '10 minutes' "
+            'WHERE id = $1',
+            private['id'],
+        )
+        await run(database, ec2)  # the power user's worker can't take it: a machine starts
+        assert len(ec2.requests) == 1
+        assert [row['job_id'] for row in await launches(database)] == [private['id']]
+
+        # A job on a dataset the power user can access (a global one): their worker takes it, no second machine.
+        await waiting_fit(database)
+        await run(database, ec2)
+        assert len(ec2.requests) == 1
+
+        # Once the power user is deactivated, their worker can't claim anything either.
+        await database.execute('UPDATE users SET is_active = FALSE WHERE id = $1', power)
+        await run(database, ec2)
+        assert len(ec2.requests) == 2
+
+    registry_database(scenario)
+
+
+async def last_error(database):
+    return await database.fetchval('SELECT last_error FROM compute_launcher')
+
+
+def test_launches_stop_after_two_machines_never_connected_until_the_settings_are_saved(registry_database):
+    """A machine that can't work (an image that doesn't start, no way to reach the server) powers off or is ended,
+    and the job still waits: without a stop, a new machine started every minute, each one billed."""
+
+    async def scenario(database):
+        ec2 = FakeEC2()
+        # Saved an hour ago: the launches below, the one dated 20 minutes back too, came since.
+        await configure(
+            database,
+            max_machines=5,
+            monthly_hours=1000,
+            updated_at=datetime.now(timezone.utc) - timedelta(hours=1),
+        )
+        await waiting_fit(database)
+        await run(database, ec2)
+        [first] = await launches(database)
+        # The first powers off before its worker connects; the second's worker never comes in 15 minutes.
+        ec2.instances[first['instance_id']]['State'] = {'Name': 'terminated'}
+        ec2.instances[first['instance_id']]['StateReason'] = {'Code': 'Client.InstanceInitiatedShutdown'}
+        await run(database, ec2)
+        second = (await launches(database))[-1]
+        assert len(ec2.requests) == 2 and second['state'] == 'starting'
+        await database.execute(
+            "UPDATE compute_launches SET launched_at = now() - interval '20 minutes' WHERE id = $1",
+            second['id'],
+        )
+        await run(database, ec2)  # the second is ended, and no third starts
+        assert len(ec2.requests) == 2
+        assert [row['end_reason'] for row in await launches(database)] == [
+            compute_launcher.POWERED_OFF_UNCONNECTED,
+            compute_launcher.NEVER_CONNECTED,
+        ]
+        assert 'never connected' in await last_error(database) and 'save them' in await last_error(database)
+        message = await database.fetchval("SELECT message FROM jobs WHERE state = 'queued'")
+        assert message.startswith('Waiting for a compute worker: on-demand machines are stopped')
+        await run(database, ec2)
+        assert len(ec2.requests) == 2
+
+        # Saving the settings starts them again, and a successful start clears the error.
+        await database.execute('UPDATE compute_launcher SET updated_at = clock_timestamp()')
+        await run(database, ec2)
+        assert len(ec2.requests) == 3 and await last_error(database) is None
+
+        # A machine that connected breaks the run: one that didn't, after it, doesn't stop the next.
+        third = (await launches(database))[-1]
+        await connect_worker(database, third['worker_name'])
+        await run(database, ec2)
+        await database.execute('UPDATE workers SET current_job_id = (SELECT id FROM jobs LIMIT 1)')
+        ec2.instances[third['instance_id']]['State'] = {'Name': 'terminated'}
+        ec2.instances[third['instance_id']]['StateReason'] = {'Code': 'Server.SpotInstanceTermination'}
+        await run(database, ec2)
+        fourth = (await launches(database))[-1]
+        assert len(ec2.requests) == 4
+        ec2.instances[fourth['instance_id']]['State'] = {'Name': 'terminated'}
+        ec2.instances[fourth['instance_id']]['StateReason'] = {'Code': 'Client.InstanceInitiatedShutdown'}
+        await run(database, ec2)
+        assert len(ec2.requests) == 5
+
+    registry_database(scenario)
+
+
+def test_no_machine_starts_while_the_admin_who_saved_the_settings_is_not_an_active_admin(registry_database):
+    """The machines' worker tokens are that admin's: a deactivated account's token is refused, a demoted one's worker
+    claims only jobs on datasets it can access. Either way each machine would idle and power off, then the next."""
+
+    async def scenario(database):
+        ec2 = FakeEC2()
+        await configure(database)
+        await waiting_fit(database)
+        await database.execute('UPDATE users SET is_active = FALSE WHERE id = $1', USER['id'])
+        await run(database, ec2)
+        assert ec2.requests == [] and 'no longer an active admin' in await last_error(database)
+        await database.execute("UPDATE users SET is_active = TRUE, role = 'power_user' WHERE id = $1", USER['id'])
+        await run(database, ec2)
+        assert ec2.requests == []
+        await database.execute("UPDATE users SET role = 'admin' WHERE id = $1", USER['id'])
+        await run(database, ec2)
+        assert len(ec2.requests) == 1 and await last_error(database) is None
+
+    registry_database(scenario)
+
+
+def test_a_machine_is_looked_at_and_ended_in_the_region_it_started_in(registry_database):
+    """Asked in a region saved since, AWS doesn't know the machine's id: it looked gone, its record ended and it ran
+    on, uncounted and never ended by the time limits."""
+
+    async def scenario(database):
+        east, west = FakeEC2(), FakeEC2()  # an instance id is known only in its own region
+        west.instances['i-west'] = {'InstanceId': 'i-west', 'State': {'Name': 'terminated'}}  # ids are unique
+
+        async def schedule():
+            await compute_launcher.schedule(
+                database.pool,
+                client_factory=lambda settings: east if settings['region'] == 'us-east-1' else west,
+            )
+
+        await configure(database, region='us-east-1')
+        await waiting_fit(database)
+        await schedule()
+        [launch] = await launches(database)
+        assert (launch['region'], launch['instance_id']) == ('us-east-1', 'i-0001')
+
+        # Saved directly: the settings page refuses this while a machine runs (below).
+        await configure(database, region='us-west-2')
+        await schedule()
+        [launch] = await launches(database)
+        assert launch['state'] == 'starting'  # still looked after, and still covering the waiting job
+        assert west.requests == []
+        await database.execute("UPDATE compute_launches SET launched_at = now() - interval '20 minutes'")
+        await schedule()  # its worker never came: ended in us-east-1, then a machine starts in us-west-2
+        rows = await launches(database)
+        assert east.terminated == ['i-0001'] and rows[0]['end_reason'] == compute_launcher.NEVER_CONNECTED
+        assert [(row['region'], row['state']) for row in rows[1:]] == [('us-west-2', 'starting')]
+
+    registry_database(scenario)
+
+
+def test_the_region_and_keys_stay_while_a_machine_runs(monkeypatch, registry_database):
+    async def scenario(database):
+        monkeypatch.setattr(launcher_router, 'db', database)
+        settings = launcher_router.LauncherSettings(
+            enabled=True,
+            region='us-east-1',
+            server_url='https://fr.example.com/api',
+            access_key_id='AKIAEXAMPLEEXAMPLE12',
+            secret_access_key='a-secret',
+        )
+        await launcher_router.set_launcher(settings, user=USER)
+        await database.execute(
+            "INSERT INTO compute_launches (region, instance_type, market, worker_name, state, instance_id) "
+            "VALUES ('us-east-1', 'r7g.2xlarge', 'spot', 'on-demand-1', 'running', 'i-live')",
+        )
+        kept = settings.model_copy(update={'secret_access_key': None})
+        for change in ({'region': 'us-west-2'}, {'access_key_id': 'AKIAOTHEREXAMPLE1234'}, {'secret_access_key': 'b'}):
+            with pytest.raises(HTTPException) as refused:
+                await launcher_router.set_launcher(kept.model_copy(update=change), user=USER)
+            assert refused.value.status_code == 409 and 'still running' in refused.value.detail
+        # Everything else can change, turning it off included.
+        turned_off = kept.model_copy(update={'enabled': False, 'max_machines': 3})
+        saved = await launcher_router.set_launcher(turned_off, user=USER)
+        assert (saved['enabled'], saved['max_machines'], saved['region']) == (False, 3, 'us-east-1')
+        await database.execute("UPDATE compute_launches SET state = 'ended'")
+        saved = await launcher_router.set_launcher(kept.model_copy(update={'region': 'us-west-2'}), user=USER)
+        assert saved['region'] == 'us-west-2'
 
     registry_database(scenario)

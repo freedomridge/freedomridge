@@ -18,6 +18,7 @@ from backend import access, dataset_deletion, job_queue
 from backend.routers import datasets, jobs
 from backend.tests import test_field_registry_postgres
 from backend.tests.test_field_registry_postgres import USER, ingest
+from backend.tests.test_job_runner import make_worker
 
 registry_database = test_field_registry_postgres.registry_database
 pytestmark = pytest.mark.skipif(not os.getenv('FRIDGE_TEST_POSTGRES_DSN'), reason='Requires disposable PostgreSQL')
@@ -65,8 +66,9 @@ async def seed(database):
     ids = (await ingest([{'score': 1}, {'score': 2}, {'score': 3}]))['ids']
     await ingest([{'kept': True}], dataset_id=2)
     await database.execute(
-        """INSERT INTO embeddings(sample_id,field_name,vector)
-           SELECT id,'patch_'||n,'[1,0]'::vector FROM samples CROSS JOIN generate_series(1,30) n WHERE dataset_id=1""",
+        """INSERT INTO embeddings(dataset_id,sample_id,field_name,vector)
+           SELECT dataset_id,id,'patch_'||n,'[1,0]'::vector FROM samples CROSS JOIN generate_series(1,30) n
+           WHERE dataset_id=1""",
     )
     await database.execute(
         "INSERT INTO sample_hashes(sample_id,field_name,hash_hex) SELECT id,'hash','abcd' FROM samples",
@@ -128,6 +130,47 @@ def test_delete_returns_202_one_job_and_keeps_dataset(registry_database):
         current = await claim(database)
         assert current['kind'] == 'dataset_deletion' and current['lane'] == 'user'
         assert (await datasets.delete_dataset(1, USER))['job_id'] == submitted['job_id']
+
+    registry_database(scenario)
+
+
+def test_a_dataset_with_a_default_view_is_deleted(registry_database):
+    """Removing the default view's row sets datasets.default_view_id to NULL (its foreign key), an update the
+    sealed dataset refused: the deletion failed on that unit at every resume."""
+
+    async def scenario(database):
+        await ingest([{'score': 1}])
+        view_id = await database.fetchval(
+            "INSERT INTO views(dataset_id,name,slug) VALUES(1,'opening','opening-slug') RETURNING id",
+        )
+        await database.execute('UPDATE datasets SET default_view_id=$1 WHERE id=1', view_id)
+        await datasets.delete_dataset(1, USER)
+        assert await database.fetchval('SELECT default_view_id FROM datasets WHERE id=1') is None
+        assert (await finish(database))['state'] == 'succeeded'
+        assert await database.fetchval('SELECT count(*) FROM datasets WHERE id=1') == 0
+        assert await database.fetchval('SELECT count(*) FROM views WHERE id=$1', view_id) == 0
+
+    registry_database(scenario)
+
+
+def test_a_stopped_mirror_with_a_default_view_is_deleted(registry_database):
+    """A mirror usually has its primary's default view, and "stop following, then delete the copy" is what the
+    docs offer. Its settings are read-only outside its sync, so the seal's change of the default view needs the
+    same opening."""
+
+    async def scenario(database):
+        await ingest([{'score': 1}], dataset_id=2)
+        view_id = await database.fetchval(
+            "INSERT INTO views(dataset_id,name,slug) VALUES(2,'opening','mirror-opening') RETURNING id",
+        )
+        await database.execute('UPDATE datasets SET default_view_id=$1 WHERE id=2', view_id)
+        await database.execute(
+            "INSERT INTO mirrors (dataset_id, origin_dataset_id, feed_cursor, state) VALUES (2, 7, 0, 'stopped')",
+        )
+        await datasets.delete_dataset(2, USER)
+        assert (await finish(database))['state'] == 'succeeded'
+        assert await database.fetchval('SELECT count(*) FROM datasets WHERE id=2') == 0
+        assert await database.fetchval('SELECT count(*) FROM mirrors WHERE dataset_id=2') == 0
 
     registry_database(scenario)
 
@@ -374,6 +417,66 @@ def test_index_drop_is_owned_fenced_and_repeatable_after_crash(registry_database
     registry_database(scenario)
 
 
+async def run_deletion(database, worker, job_id, until=lambda row: False):
+    """Runner slices, each retry made due at once, until the job ends or `until(row)`; the job's row then."""
+    for _ in range(500):
+        row = await database.fetchrow('SELECT * FROM jobs WHERE id=$1', job_id)
+        if row['state'] in ('failed', 'succeeded') or until(row):
+            return row
+        await database.execute('UPDATE jobs SET available_at=clock_timestamp() WHERE id=$1', job_id)
+        await worker.run_once()
+    pytest.fail('The deletion neither ended nor reached the expected state')
+
+
+def test_index_removal_waits_for_a_long_reader_of_samples_without_failing(registry_database):
+    """A backup's pg_dump (or a map re-fit's export) holds samples for its whole transaction, and DROP INDEX
+    CONCURRENTLY waits for it. That wait used to count as a failure: five and the deletion failed with every sample
+    gone, the dataset stuck 'deleting' until someone resumed it."""
+
+    async def scenario(database):
+        await ingest([{'score': 1}, {'score': 2}])
+        await database.execute('CREATE INDEX idx_samples_meta_1_score ON samples(id) WHERE dataset_id=1')
+        job_id = (await datasets.delete_dataset(1, USER))['job_id']
+        worker = await make_worker(
+            database,
+            {dataset_deletion.KIND: dataset_deletion.handler(database.pool)},
+            policies={dataset_deletion.KIND: dataset_deletion.POLICY},
+        )
+        async with database.pool.acquire() as reader, reader.transaction(isolation='repeatable_read'):
+            await reader.execute('LOCK TABLE samples IN ACCESS SHARE MODE')  # what pg_dump holds
+            # More tries than the failure budget allows.
+            tries = dataset_deletion.POLICY.max_failures + 2
+            row = await run_deletion(database, worker, job_id, until=lambda row: row['contentions'] >= tries)
+            assert row['checkpoint']['phase'] == 'indexes'
+            assert (row['state'], row['failures']) == ('queued', 0)
+            assert row['error']['type'] == 'QueueContended' and 'transactions on samples' in row['error']['message']
+            assert await database.fetchval('SELECT count(*) FROM samples WHERE dataset_id=1') == 0
+        row = await run_deletion(database, worker, job_id)
+        assert row['state'] == 'succeeded'
+        assert await database.fetchval("SELECT to_regclass('idx_samples_meta_1_score')") is None
+        assert await database.fetchval('SELECT count(*) FROM datasets WHERE id=1') == 0
+
+    registry_database(scenario, pool_size=8)
+
+
+def test_index_removal_waits_for_a_backup_before_dropping(registry_database):
+    async def scenario(database):
+        await database.execute('CREATE INDEX idx_samples_meta_1_retry ON samples(id) WHERE dataset_id=1')
+        backup = await job_queue.enqueue_job(database.pool, 'backup', lane='maintenance')
+        await datasets.delete_dataset(1, USER)
+        current = await claim(database)
+        while current['checkpoint'].get('phase') != 'indexes':
+            current = await step(database, current)
+        with pytest.raises(job_queue.QueueContended, match='backup'):
+            await dataset_deletion.handler(database.pool)(current)
+        assert await database.fetchval("SELECT to_regclass('idx_samples_meta_1_retry')") is not None
+        await job_queue.cancel_job(database.pool, backup['id'])  # the backup is over
+        await finish(database, current)
+        assert await database.fetchval("SELECT to_regclass('idx_samples_meta_1_retry')") is None
+
+    registry_database(scenario)
+
+
 def test_all_write_families_reject_deleting_and_old_snapshot(registry_database):
     async def scenario(database):
         ids, concept_id, version_id = await seed(database)
@@ -388,7 +491,11 @@ def test_all_write_families_reject_deleting_and_old_snapshot(registry_database):
         statements = [
             ("INSERT INTO samples(dataset_id,filepath,media_type) VALUES(1,'late','image')", []),
             ("UPDATE samples SET tags=ARRAY['late'] WHERE id=$1", [ids[0]]),
-            ("INSERT INTO embeddings(sample_id,field_name,vector) VALUES($1,'late','[1,0]')", [ids[0]]),
+            (
+                "INSERT INTO embeddings(dataset_id,sample_id,field_name,vector) VALUES("
+                "(SELECT dataset_id FROM samples WHERE id = $1),$1,'late','[1,0]')",
+                [ids[0]],
+            ),
             ("UPDATE sample_hashes SET hash_hex='bad' WHERE sample_id=$1", [ids[0]]),
             ("UPDATE dataset_fields SET display_type='enum' WHERE dataset_id=1", []),
             ("UPDATE embedding_concepts SET threshold=0.2 WHERE id=$1", [concept_id]),
@@ -714,8 +821,9 @@ def test_delete_500k_two_vector_fields(registry_database):
                 vector = '[' + ','.join(str(((i * 7907) % 65537) / 65537) for i in range(dimensions)) + ']'
                 for lower in range(0, 500000, 50000):
                     await connection.execute(
-                        """INSERT INTO embeddings(sample_id,field_name,vector)
-                           SELECT id,$1,$2::vector FROM samples WHERE dataset_id=1 AND id>$3 AND id<=$3+50000""",
+                        """INSERT INTO embeddings(dataset_id,sample_id,field_name,vector)
+                           SELECT dataset_id,id,$1,$2::vector FROM samples
+                           WHERE dataset_id=1 AND id>$3 AND id<=$3+50000""",
                         field,
                         vector,
                         lower,

@@ -70,8 +70,10 @@ def test_vectors_and_hashes_are_logged_per_sample_and_field(registry_database):
         other = await database.fetchval('SELECT id FROM samples WHERE dataset_id = 2')
         for sample in (followed, other):
             await database.execute(
-                "INSERT INTO embeddings (sample_id, field_name, vector) "
-                "VALUES ($1, 'clip', '[1,0]'), ($1, 'dinov3', '[0,1]')",
+                "INSERT INTO embeddings (dataset_id, sample_id, field_name, vector) "
+                "SELECT dataset_id, id, f, v::vector FROM samples, "
+                "(VALUES ('clip', '[1,0]'), ('dinov3', '[0,1]')) AS t(f, v) "
+                "WHERE id = $1",
                 sample,
             )
         await database.execute("UPDATE embeddings SET vector = '[0.5,0.5]' WHERE field_name = 'clip'")
@@ -106,7 +108,8 @@ def test_one_transaction_logs_one_transaction_id(registry_database):
             )
             await connection.execute("UPDATE samples SET tags = '{x}' WHERE id = $1", sample)
             await connection.execute(
-                "INSERT INTO embeddings (sample_id, field_name, vector) VALUES ($1, 'clip', '[1]')",
+                "INSERT INTO embeddings (dataset_id, sample_id, field_name, vector) VALUES ("
+                "(SELECT dataset_id FROM samples WHERE id = $1), $1, 'clip', '[1]')",
                 sample,
             )
         assert await database.fetchval('SELECT array_agg(DISTINCT transaction_id) FROM sample_block_changes') == [

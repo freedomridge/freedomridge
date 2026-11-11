@@ -208,6 +208,46 @@ The view must be one of the dataset's saved views and public (400 otherwise), an
 private while it is the default (409). Deleting the view, which its owner can do, leaves the dataset
 without a default view.
 
+## Links to a filter, a view or a sample
+
+The web app copies a link that opens a dataset as you see it:
+
+- **Copy link**, beside **Saved Views**: the applied filters and the grid's sort.
+- The link icon on a view in **Saved Views**: that view.
+- **Copy link** in a sample's view: the applied filters and that sample. Next and previous walk the grid.
+
+A link is `/datasets/<id>?<parameters>`, each optional:
+
+| Parameter | Meaning |
+|---|---|
+| `q=<text>` | The filters in the [filter query language](FILTER_QUERY.md), one chip per top-level `AND` part. Empty (`q=`) means no filters, which is what Copy link writes when none are applied. |
+| `f=<version>.<data>` | The filters encoded, when a chip has no text form: a map region, a lasso, picked samples, a search, a concept, a duplicate collapse. |
+| `view=<slug>` | A saved view. |
+| `sort=<field>`, `dir=asc` or `desc` | The grid's sort. |
+| `sample=<id>` | The sample whose view opens. |
+
+Copy link writes `q=` when every chip can be written as text, so a person or a script can read, edit or
+write one: `/datasets/12?q=split = train AND score > 0.5` (the browser encodes the spaces; write `+`, `&`
+and `#` in a value as `%2B`, `%26` and `%23`). The link's
+filters replace the ones the browser kept for the dataset, which are one Back away, and the address loses
+the parameters once the page has opened them.
+
+A link doesn't carry:
+
+- **Access.** The reader signs in (a link opened signed out goes through the login page and back) and
+  needs access to the dataset, and to the view for a view link.
+- **The draft.** Only the applied filters go in: not the sidebar's draft, a brush or ticked samples.
+- **A big Select All.** Its selection is kept on the server for 2 hours, so Copy link refuses it. Save a
+  view and copy the view's link: the view keeps the filters, which is what a Select All shows.
+- **A selection too large for a link.** A link holds at most 6,000 characters, about a thousand picked
+  samples of a dataset of millions. Copy link refuses a longer one; save a view and copy its link.
+- **Another server.** A link names this server's dataset, samples and views by their ids and slugs (the
+  ids inside `f=` too). A follower's copies have their own.
+- **A snapshot.** A link shows what matches its filters when it is opened.
+
+An `f=` made by a version of Freedom Ridge that encodes filters differently says so, and the dataset opens
+without it.
+
 ## Delete a dataset (admin)
 
 ```python

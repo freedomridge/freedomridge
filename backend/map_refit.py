@@ -110,7 +110,7 @@ PUBLISH_MIN_SECONDS = 600.0
 STOP_GRACE_SECONDS = 8
 SDK_ROOT = Path(__file__).resolve().parent.parent / 'python'
 _EXPORT = """SELECT e.sample_id, e.xmin::text::bigint, e.vector
-             FROM embeddings e JOIN samples s ON s.id = e.sample_id
+             FROM embeddings e JOIN samples s ON s.dataset_id = e.dataset_id AND s.id = e.sample_id
              WHERE s.dataset_id = $1 AND e.field_name = $2 AND e.vector IS NOT NULL"""
 _STATE = """SELECT m.*, (j.state IN ('queued','running')) IS TRUE AS active
             FROM embedding_map_state m LEFT JOIN jobs j ON j.id = m.active_job_id
@@ -417,7 +417,8 @@ async def _estimate(pool, dataset_id: int, field: str) -> Tuple[int, int]:
                    (SELECT sample_id FROM embedding_viz_rank WHERE dataset_id=$1 AND field_name=$2 LIMIT 1)
                    UNION ALL
                    (SELECT sample_id FROM embedding_projection_pending WHERE dataset_id=$1 AND field_name=$2 LIMIT 1)
-               ) one JOIN embeddings e ON e.sample_id = one.sample_id AND e.field_name = $2 LIMIT 1""",
+               ) one JOIN embeddings e ON e.dataset_id = $1 AND e.sample_id = one.sample_id AND e.field_name = $2
+               LIMIT 1""",
             dataset_id,
             field,
             timeout=60,
@@ -500,7 +501,8 @@ async def _export(pool, job, store, fits_here=True):
         )
         dimension = await connection.fetchval(
             """SELECT vector_dims(e.vector) FROM embedding_viz_rank r
-               JOIN embeddings e ON e.sample_id = r.sample_id AND e.field_name = r.field_name
+               JOIN embeddings e ON e.dataset_id = r.dataset_id AND e.sample_id = r.sample_id
+                                AND e.field_name = r.field_name
                WHERE r.dataset_id=$1 AND r.field_name=$2 LIMIT 1""",
             dataset_id,
             field,
@@ -985,7 +987,7 @@ async def _publish(pool, job, store):
                     """WITH valid AS (
                            INSERT INTO map_refit_valid
                            SELECT st.sample_id, st.x, st.y FROM map_refit_stage st
-                           JOIN embeddings e ON e.sample_id = st.sample_id AND e.field_name = $2
+                           JOIN embeddings e ON e.dataset_id = $1 AND e.sample_id = st.sample_id AND e.field_name = $2
                             AND e.xmin::text::bigint = st.vector_version
                            JOIN samples s ON s.id = st.sample_id AND s.dataset_id = $1
                            RETURNING 1)

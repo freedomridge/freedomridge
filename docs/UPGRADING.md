@@ -34,12 +34,18 @@ From the checkout the server runs, with `docker-compose.prod.yml`:
    ```
    To build them from the checkout instead, as releases before 2.2.0 need, run
    `docker compose -f docker-compose.prod.yml build --pull`.
-4. Apply the migrations, then recreate the containers:
+4. Stop the app, apply the migrations with it stopped, then recreate the containers. Crossing 2.9.0, read
+   [Upgrading across 2.9.0](#upgrading-across-290) first: its migration takes longer.
    ```bash
+   docker compose -f docker-compose.prod.yml stop backend job-runner backup frontend
    FRIDGE_DB_CONTAINER=$(docker compose -f docker-compose.prod.yml ps -q db) \
      bash scripts/apply_migrations.sh
    docker compose -f docker-compose.prod.yml up -d
    ```
+   Running, the old version would go on serving requests and running jobs against the changed schema until it is
+   replaced: its API checks the schema only in `/api/health`, and its job runner only when it starts. The `backup`
+   service is stopped too: a scheduled dump that ran during the migrations would make them wait behind it, or fail.
+   `up -d` starts all four again. The server is down from the `stop` until the new version answers in step 5.
 5. Check `https://YOUR_DOMAIN/api/health`. It answers `"status": "ok"` with the new `version`.
    While it answers 503 (and the backend container reports unhealthy), its lists say why:
    `pending_migrations` or `stale_functions` (run step 4 again), or `unknown_migrations` (the
@@ -72,6 +78,36 @@ its own migrations, and they talk only through the follower API. So:
   mirrors, reading every block again: hours for a large dataset. A dataset it started following after the backup
   is copied as a new one.
 
+## Upgrading across 2.9.0
+
+2.9.0's migration `0021_embeddings_partitioned.sql` copies every vector into a table with one partition per
+dataset. Nothing else may write meanwhile, so it refuses to run while anything else is connected to the
+database, and names what is. Step 4 stops the backend, the job runner, the backup service and the frontend;
+stop anything else that connects too (a compute worker, a script, a `psql` session). A backup's dump started
+first makes the migration refuse to start, and one started during the copy waits for it and then fails (its
+snapshot is older than the new tables) until its next run. The launcher (`npx freedomridge`) stops the app itself
+before it migrates. In a development checkout, stop the backend, the job runner and any workers.
+
+- **How long:** about a minute per million vectors (9.4 minutes for 9.7 million, measured), then the app
+  starts. `apply_migrations.sh` prints the estimate and each dataset's progress.
+- **Disk:** about the size of the vectors and their plain indexes, plus `max_wal_size` and a quarter again. The
+  migration checks first and says how much it needs.
+- **If it stops:** a failure or an interruption (over ssh, run it in tmux) rolls it back, and it runs again
+  from the start. If the database server itself crashes or is killed during the copy, the rollback still
+  happens, but PostgreSQL leaves the partial copy's files on disk: up to the size of the vectors copied so far,
+  which `pg_database_size` shows and which the next attempt needs room beside. Only dropping that database frees
+  them. With room for a second copy, restore the backup from step 2 into a new database, switch to it, then drop
+  the old one. Without it, first check that the step-2 backup is complete and stored off this disk, then drop the
+  database and restore it.
+- **After:** the vector indexes are built again in the background, one per dataset and field, smallest
+  dataset first (Background jobs shows them). A dataset's similarity searches are exact until its index is
+  built, and slower: on 3.7 million 1,024-dimension vectors, measured, 8 s warm, up to 90 s cold, and 20 to 30 s
+  while another index builds. A large dataset's fields come last and one at a time: on 3.7 million vectors, the
+  512-dimension field took 40 minutes to 2 hours and the 1,024-dimension one 1.5 to 4 hours after it, depending on
+  `maintenance_work_mem`. So its searches can be slow for 2 to 6 hours, and a guest's search there can hit its
+  30 s limit meanwhile. A build that fails three times stays failed on Background jobs;
+  build it again with `dataset.build_ann_index(field)` in the SDK.
+
 ## Going back
 
 Stop the services and restore the backup from step 2 into an empty database
@@ -85,9 +121,10 @@ Don't run an older version against the upgraded database: its migration runner a
 git pull --ff-only
 uv sync --extra cuda          # or --extra cpu
 cd frontend && npm ci && cd ..
-# When the pull brought new backend/db/migrations (the Quick Start's database container):
+# When the pull brought new backend/db/migrations (the Quick Start's database container), with the
+# backend, the job runner and the frontend stopped:
 FRIDGE_DB_CONTAINER=freedomridge-db ./scripts/apply_migrations.sh
 ```
 
-Then restart the backend and the frontend. How the dependency versions themselves are chosen and
-updated: [Updating dependencies](DEPENDENCIES.md).
+Then start the backend, the job runner and the frontend again. How the dependency versions themselves are
+chosen and updated: [Updating dependencies](DEPENDENCIES.md).

@@ -1,10 +1,11 @@
 # Filter query language
 
-A filter written as text. The same text works in three places:
+A filter written as text. The same text works in four places:
 
 - **The app's filter cards:** each filter's card, and the **Add Filter** card, switch between **Builder** (the form) and **Query** (the filter as text). You can read, copy, paste or edit it, then press **Apply** (or Ctrl+Enter).
 - **The SDK:** `dataset.query("...")` returns a view, and `dataset.create_view(name, query="...")` saves one.
 - **The HTTP API:** `POST /api/datasets/{id}/filter_query/parse` and `.../format` convert between text and filters, for scripts and for AI tools.
+- **Links:** `/datasets/<id>?q=<text>` opens the dataset on the filter, one chip per top-level `AND` part, and **Copy link** writes one when every chip has a text form ([links](DATASET_MANAGEMENT.md#links-to-a-filter-a-view-or-a-sample)).
 
 The server parses every query against the dataset's own fields (`backend/filter_query.py`). A misspelt field, an operator that doesn't apply, or a value of the wrong type is reported with its line, column and suggestions. It is never quietly turned into a filter that matches nothing.
 
@@ -36,6 +37,8 @@ A query is an AND of parts. In the SDK and the API, each top-level `AND` part be
 
 - A field is named as the dataset names it: `split`, `score`, `detections.label`.
 - The fields every dataset has are `id`, `filepath`, `media_type`, `created_at` and `tags`.
+- On a mirror, its own fields are named `@local.<name>` and written as they are: `@local.weeds > 3`,
+  `@local.tags in ("checked")` ([FOLLOWERS.md](FOLLOWERS.md#fields-of-its-own)).
 - A name that isn't a plain word, or that is one of the language's keywords, goes in backticks: `` `weather station` = "A" `` or `` `in` = 1 ``.
 - Names are case sensitive. `Split` gets "unknown field 'Split'" with the suggestion `split`.
 

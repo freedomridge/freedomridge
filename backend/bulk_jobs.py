@@ -6,9 +6,10 @@ from datetime import datetime
 
 from fastapi import HTTPException
 
-from . import job_queue
+from . import job_queue, local_writes
 from .diskspace import INGEST_ROW_BYTES, require_free_space
 from .field_registry import (
+    LOCAL_PREFIX,
     invalidate_values,
     lock_field_lifecycle,
     prune_fields,
@@ -339,12 +340,63 @@ async def resume(pool, job_id):
         return {'job_id': str(job_id), 'state': 'queued'}
 
 
+async def _mutate_local(connection, job, ids):
+    """A set or tag job on a mirror's own fields (`@local.`): this unit writes local_metadata or local_tags only. The
+    unit holds the field lifecycle gate shared (handler's publish); removed fields are unregistered by the job's last
+    steps, which read the dataset in bounded windows and take the gate exclusively only to unregister."""
+    request, dataset_id = job['args'], job['dataset_id']
+    await local_writes.require_mirror(connection, dataset_id)  # it may have stopped since the job was queued
+    await connection.execute("SELECT set_config('fridge.mirror_local', $1, TRUE)", str(dataset_id))
+    if request['operation'] == 'tag':
+        status = await connection.execute(
+            """UPDATE samples SET local_tags = ARRAY(SELECT DISTINCT unnest(COALESCE(local_tags, '{}') || $3::text[])
+                                              EXCEPT SELECT unnest($4::text[]))
+               WHERE dataset_id = $1 AND id = ANY($2::int[])
+                 AND (NOT COALESCE(local_tags, '{}') @> $3::text[] OR local_tags && $4::text[])""",
+            dataset_id,
+            ids,
+            request['add_tags'],
+            request['remove_tags'],
+        )
+        await local_writes.register_tags(connection, dataset_id, request['add_tags'], job['created_by'])
+        await local_writes.finish(connection, dataset_id, ['tags'])
+        return int(status.split()[-1])
+    remove = request['remove_metadata_keys']
+    if request.get('per_sample'):
+        rows = await connection.fetch(
+            """UPDATE samples s SET local_metadata = s.local_metadata || t.patch
+               FROM bulk_job_targets t WHERE t.job_id = $1 AND t.sample_id = s.id
+               AND s.dataset_id = $2 AND s.id = ANY($3::int[]) RETURNING t.patch""",
+            job['id'],
+            dataset_id,
+            ids,
+        )
+        written, count = [row['patch'] for row in rows], len(rows)
+    else:
+        status = await connection.execute(
+            """UPDATE samples SET local_metadata = (local_metadata || $3::jsonb) - $4::text[]
+               WHERE dataset_id = $1 AND id = ANY($2::int[])""",
+            dataset_id,
+            ids,
+            request['metadata'],
+            remove,
+        )
+        written = [{name: value for name, value in request['metadata'].items() if name not in remove}]
+        count = int(status.split()[-1])
+    if count:
+        await local_writes.register(connection, dataset_id, written)
+    await local_writes.finish(connection, dataset_id, {name for patch in written for name in patch}, remove)
+    return count
+
+
 async def _mutate(connection, job, ids, removed_fields):
     from .routers import datasets
 
     request = job['args']
     operation = request['operation']
     dataset_id = job['dataset_id']
+    if request.get('local'):
+        return await _mutate_local(connection, job, ids)
     if operation == 'delete':
         removed = await connection.fetch(
             'DELETE FROM samples WHERE dataset_id=$1 AND id=ANY($2::int[]) RETURNING metadata',
@@ -358,9 +410,10 @@ async def _mutate(connection, job, ids, removed_fields):
     if operation == 'delete_embeddings':
         # Cascades remove the vectors' coordinates and queued projections; triggers keep map rank rows and counts.
         status = await connection.execute(
-            'DELETE FROM embeddings WHERE field_name=$1 AND sample_id=ANY($2::int[])',
+            'DELETE FROM embeddings WHERE dataset_id=$3 AND field_name=$1 AND sample_id=ANY($2::int[])',
             request['field_name'],
             ids,
+            dataset_id,
         )
         return int(status.split()[-1])
     if operation == 'tag':
@@ -489,6 +542,34 @@ def handler(pool):
             if request['operation'] in ('rename', 'clear'):
                 names.append(request['field_name'])
             index = checkpoint.get('pruned', 0)
+            if index < len(names) and request.get('local'):
+                # A mirror's own field (names without the prefix): one window of the walk per step, read outside the
+                # gate (local_metadata has no index); only the unregister takes it. The field's row xmin when the
+                # walk began is kept: a write of the field since touches the row, and the unregister then keeps it.
+                after, mark = checkpoint.get('prune_after', 0), checkpoint.get('prune_mark')
+                async with job_queue._transaction(pool) as connection:
+                    if after == 0:
+                        mark = await connection.fetchval(
+                            'SELECT xmin::text FROM dataset_fields WHERE dataset_id=$1 AND field_name=$2',
+                            job['dataset_id'],
+                            LOCAL_PREFIX + names[index],
+                        )
+                    found, last = await local_writes.holds(connection, job['dataset_id'], names[index], after)
+                done_name = {**checkpoint, 'pruned': index + 1, 'prune_after': 0, 'prune_mark': None}
+                if found or mark is None:  # still held, or not registered at all
+                    return StepResult(checkpoint=done_name)
+                if last is not None:
+                    return StepResult(checkpoint={**checkpoint, 'prune_after': last, 'prune_mark': mark})
+
+                async def unregister_local(connection):
+                    if not await connection.fetchval(
+                        'SELECT pg_try_advisory_xact_lock(20261016,$1)',
+                        job['dataset_id'],
+                    ):
+                        raise job_queue.QueueContended('Waiting to prune the field definition')
+                    await local_writes.unregister(connection, job['dataset_id'], names[index], mark)
+
+                return StepResult(checkpoint=done_name, publish=unregister_local)
             if index < len(names):
 
                 async def prune(connection):

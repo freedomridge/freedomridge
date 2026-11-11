@@ -210,7 +210,8 @@ def test_layout_updates_and_unrelated_fields_do_not_queue_concept_work(registry_
         await database.execute('UPDATE embeddings SET vector=vector WHERE sample_id=$1', sample_id)
         assert await database.fetchval('SELECT count(*) FROM concept_embedding_pending') == 0
         await database.execute(
-            "INSERT INTO embeddings(sample_id,field_name,vector) VALUES($1,'different','[1,0]')",
+            "INSERT INTO embeddings(dataset_id,sample_id,field_name,vector) VALUES("
+            "(SELECT dataset_id FROM samples WHERE id = $1),$1,'different','[1,0]')",
             sample_id,
         )
         await sample(database, 'other-dataset', dataset_id=2)

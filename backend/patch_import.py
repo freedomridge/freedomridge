@@ -48,10 +48,10 @@ LOCK_SECONDS = 5
 _SCALE_RE = re.compile(r'^(\d+)x(\d+)$')
 
 _UPSERT = """
-    INSERT INTO embeddings (sample_id, vector, field_name)
-    SELECT sample_id, vector, $1 || '_patch_' || $2 || '_r' || (position / $3) || 'c' || (position % $3)
+    INSERT INTO embeddings (dataset_id, sample_id, vector, field_name)
+    SELECT $4, sample_id, vector, $1 || '_patch_' || $2 || '_r' || (position / $3) || 'c' || (position % $3)
     FROM patch_import_stage
-    ON CONFLICT (sample_id, field_name)
+    ON CONFLICT (dataset_id, sample_id, field_name)
     DO UPDATE SET vector = EXCLUDED.vector
     WHERE embeddings.vector IS DISTINCT FROM EXCLUDED.vector
 """
@@ -286,7 +286,7 @@ def handler(pool):
                 )
                 payload = copy_payload(sample_ids, tiles, values)
                 await connection.copy_to_table('patch_import_stage', source=io.BytesIO(payload), format='binary')
-                await connection.execute(_UPSERT, field_name, scale, cols)
+                await connection.execute(_UPSERT, field_name, scale, cols, dataset_id)
             if result is not None and args['build_indexes']:
                 # The search index of each tile position, as build_ann_index would queue them.
                 queued = []

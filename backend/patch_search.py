@@ -33,9 +33,9 @@ def indexed_grid(base_field: str, scale: str, indexed: set[str]) -> list[str] | 
 
 
 async def indexed_patch_fields(conn, dataset_id: int, base_field: str, scale: str, dims: int) -> list[str] | None:
-    """The scale's tile fields when each has its own HNSW index at `dims` in this dataset, else None (an exact scan).
-    Indexes are per field name over every dataset for now, so `dataset_id` doesn't narrow it yet."""
-    return indexed_grid(base_field, scale, await index_jobs.cosine_hnsw_fields(conn, dims) if dims else set())
+    """The scale's tile fields when each has its own HNSW index at `dims` in this dataset, else None (an exact scan)."""
+    indexed = await index_jobs.cosine_hnsw_fields(conn, dataset_id, dims) if dims else set()
+    return indexed_grid(base_field, scale, indexed)
 
 
 # A tile field's base field, scale and position, e.g. clip_patch_8x8_r2c3.
@@ -52,7 +52,7 @@ async def dataset_patch_scales(conn, dataset_id: int, base_field: str | None = N
         """
         SELECT DISTINCT e.field_name
         FROM embeddings e
-        JOIN samples s ON e.sample_id = s.id
+        JOIN samples s ON s.dataset_id = e.dataset_id AND s.id = e.sample_id
         WHERE s.dataset_id = $1 AND e.field_name LIKE $2
         """,
         dataset_id,
@@ -66,7 +66,8 @@ async def dataset_patch_scales(conn, dataset_id: int, base_field: str | None = N
     scales: dict[tuple[str, str], dict] = {}
     for (base, scale), fields in sorted(tiles.items()):
         dims = await conn.fetchval(
-            """SELECT vector_dims(e.vector) FROM embeddings e JOIN samples s ON e.sample_id = s.id
+            """SELECT vector_dims(e.vector) FROM embeddings e
+                   JOIN samples s ON s.dataset_id = e.dataset_id AND s.id = e.sample_id
                WHERE s.dataset_id = $1 AND e.field_name = $2 LIMIT 1""",
             dataset_id,
             min(fields),
@@ -164,7 +165,7 @@ async def nearest_patches(
         dist = f"(e.vector::vector({dims}) <=> $1::vector({dims}))"
         distances = "\nUNION ALL\n".join(
             f"""(SELECT e.sample_id, e.field_name, {dist} AS distance
-                 FROM embeddings e JOIN samples s ON e.sample_id = s.id
+                 FROM embeddings e JOIN samples s ON s.dataset_id = e.dataset_id AND s.id = e.sample_id
                  WHERE e.field_name = '{field}' AND {where_clause}
                  ORDER BY {dist} LIMIT $2)"""
             for field in fields or ()
@@ -172,7 +173,7 @@ async def nearest_patches(
     else:
         args = [*args, like_pattern]
         distances = f"""SELECT e.sample_id, e.field_name, (e.vector <=> $1) AS distance
-            FROM embeddings e JOIN samples s ON e.sample_id = s.id
+            FROM embeddings e JOIN samples s ON s.dataset_id = e.dataset_id AND s.id = e.sample_id
             WHERE {where_clause} AND e.field_name LIKE ${len(args)}"""
     query = f"""
         WITH distances AS ({distances}),
@@ -190,6 +191,8 @@ async def nearest_patches(
         LIMIT $2
     """
     async with conn.transaction():
+        # A plan for this dataset's partition alone: a generic plan would lock every dataset's (0021).
+        await conn.execute("SET LOCAL plan_cache_mode = force_custom_plan")
         if indexed:
             # As in vector_search: ef_search >= limit, and an iterative scan so filters applied
             # after the index (the dataset, the user's filters) still leave `limit` rows.

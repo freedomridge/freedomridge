@@ -95,7 +95,7 @@ test('a copy held after its primary was restored asks whether to resume', async 
         retry_after: null, stopped_at: new Date().toISOString(), keep_separate: false, resumable: false,
         restore: {
             origin_name: 'coco', hash_field: 'dhash_8', total: 42000, matched: 41982, matched_hash: 41950,
-            only_here: 6, phase: 'ask', decision: null, compared: true, last_error: null, retry_after: null,
+            only_here: 6, only_here_local: 2, phase: 'ask', decision: null, compared: true, last_error: null, retry_after: null,
         },
     };
     await page.route('**/api/primaries', route => route.fulfill({
@@ -120,10 +120,12 @@ test('a copy held after its primary was restored asks whether to resume', async 
     );
     await expect(row.getByTestId('mirror-restore')).toContainText('18 don\'t match: they\'re copied fresh.');
     await expect(row.getByTestId('mirror-restore')).toContainText('6 here that the primary no longer has go.');
+    await expect(row.getByTestId('mirror-restore')).toContainText("2 of them have fields of this instance's own");
     await expect(row.getByTestId('mirror-error')).toHaveCount(0);  // held, not failing
     // Resuming deletes the copy's samples the primary doesn't have: it says how many before it does.
     await row.getByTestId('mirror-restore-resume').click();
     await expect(row.getByTestId('mirror-restore-confirm')).toContainText('deletes 6 samples here');
+    await expect(row.getByTestId('mirror-restore-confirm')).toContainText('including the fields of its own on 2 of them.');
     expect(decision).toBeUndefined();
     await row.getByTestId('mirror-restore-confirm-resume').click();
     await expect.poll(() => decision).toEqual({ decision: 'resume' });

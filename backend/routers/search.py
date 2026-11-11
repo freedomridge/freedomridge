@@ -86,7 +86,7 @@ async def vector_search(req: SearchRequest, request: Request):
         # probed for embedding presence across datasets.
         rows = await db.fetch(
             """
-            SELECT e.vector FROM embeddings e JOIN samples s ON e.sample_id = s.id
+            SELECT e.vector FROM embeddings e JOIN samples s ON s.dataset_id = e.dataset_id AND s.id = e.sample_id
             WHERE e.sample_id = ANY($1) AND e.field_name = $2 AND s.dataset_id = $3
         """,
             req.sample_ids,
@@ -105,7 +105,7 @@ async def vector_search(req: SearchRequest, request: Request):
         vector_str = '[' + ','.join(str(x) for x in centroid) + ']'
     elif req.sample_id:
         vector_query = """
-            SELECT e.vector FROM embeddings e JOIN samples s ON e.sample_id = s.id
+            SELECT e.vector FROM embeddings e JOIN samples s ON s.dataset_id = e.dataset_id AND s.id = e.sample_id
             WHERE e.sample_id = $1 AND e.field_name = $2 AND s.dataset_id = $3
         """
         vector_row = await db.fetchrow(vector_query, req.sample_id, req.field_name, req.dataset_id)
@@ -135,8 +135,10 @@ async def vector_search(req: SearchRequest, request: Request):
             )
         vec = await encode_text(req.text, registered)
         field_dim = await db.fetchval(
-            "SELECT vector_dims(vector) FROM embeddings WHERE field_name = $1 AND vector IS NOT NULL LIMIT 1",
+            "SELECT vector_dims(vector) FROM embeddings WHERE dataset_id = $2 AND field_name = $1 "
+            "AND vector IS NOT NULL LIMIT 1",
             req.field_name,
+            req.dataset_id,
         )
         if field_dim is not None and field_dim != len(vec):
             raise HTTPException(
@@ -217,7 +219,8 @@ async def vector_search(req: SearchRequest, request: Request):
     # and two datasets can share a field_name at different dims (e.g. 512-d CLIP vs 1024-d
     # DINOv3), so an unscoped LIMIT 1 could pick the wrong dimension and mis-cast the KNN.
     dim_row = await db.fetchrow(
-        "SELECT vector_dims(e.vector) AS d FROM embeddings e JOIN samples s ON e.sample_id = s.id "
+        "SELECT vector_dims(e.vector) AS d FROM embeddings e "
+        "JOIN samples s ON s.dataset_id = e.dataset_id AND s.id = e.sample_id "
         "WHERE e.field_name = $1 AND s.dataset_id = $2 AND e.vector IS NOT NULL LIMIT 1",
         req.field_name,
         req.dataset_id,
@@ -242,7 +245,7 @@ async def vector_search(req: SearchRequest, request: Request):
                s.created_at, s.last_modified_at,
                {dist_expr} as distance
         FROM embeddings e
-        JOIN samples s ON e.sample_id = s.id
+        JOIN samples s ON s.dataset_id = e.dataset_id AND s.id = e.sample_id
         WHERE {where_clause}
         ORDER BY {order_by} ASC
         LIMIT {limit_param}
@@ -260,6 +263,8 @@ async def vector_search(req: SearchRequest, request: Request):
     incomplete = False
     async with db.pool.acquire() as conn:
         async with conn.transaction():
+            # A plan for this dataset's partition alone: a generic plan would lock every dataset's (0021).
+            await conn.execute("SET LOCAL plan_cache_mode = force_custom_plan")
             if req.limit <= 1000:
                 await conn.execute("SELECT '[0]'::vector(1)")
                 await conn.execute(f"SET LOCAL hnsw.ef_search = {min(1000, max(req.limit * 2, 100))}")
@@ -288,7 +293,8 @@ async def vector_search(req: SearchRequest, request: Request):
                         await conn.execute(f"SET LOCAL statement_timeout = '{int(_SHORT_CHECK_SECONDS * 1000)}ms'")
                         matching = await conn.fetchval(
                             f"""SELECT count(*) FROM (
-                                    SELECT 1 FROM embeddings e JOIN samples s ON e.sample_id = s.id
+                                    SELECT 1 FROM embeddings e
+                                    JOIN samples s ON s.dataset_id = e.dataset_id AND s.id = e.sample_id
                                     WHERE {where_clause} AND {vector_param}::text IS NOT NULL
                                     LIMIT {limit_param}
                                 ) matches""",
@@ -486,8 +492,10 @@ async def search_by_image(req: ImageSearchRequest, request: Request):
     vec = await encode_image(image_bytes, registered)
 
     field_dim = await db.fetchval(
-        "SELECT vector_dims(vector) FROM embeddings WHERE field_name = $1 AND vector IS NOT NULL LIMIT 1",
+        "SELECT vector_dims(vector) FROM embeddings WHERE dataset_id = $2 AND field_name = $1 AND vector IS NOT NULL "
+        "LIMIT 1",
         req.field_name,
+        req.dataset_id,
     )
     if field_dim is not None and field_dim != len(vec):
         raise HTTPException(
@@ -550,7 +558,8 @@ async def patch_search(req: PatchSearchRequest, request: Request):
     # treatment as the vector_search seed lookups above.
     vector_row = await db.fetchrow(
         """
-        SELECT e.vector, vector_dims(e.vector) AS dim FROM embeddings e JOIN samples s ON e.sample_id = s.id
+        SELECT e.vector, vector_dims(e.vector) AS dim FROM embeddings e
+            JOIN samples s ON s.dataset_id = e.dataset_id AND s.id = e.sample_id
         WHERE e.sample_id = $1 AND e.field_name = $2 AND s.dataset_id = $3
     """,
         req.sample_id,
@@ -630,7 +639,8 @@ async def object_to_patch_search(req: ObjectToPatchSearchRequest, request: Reque
 
     seed = await db.fetchrow(
         """
-        SELECT e.vector, vector_dims(e.vector) AS dim FROM embeddings e JOIN samples s ON e.sample_id = s.id
+        SELECT e.vector, vector_dims(e.vector) AS dim FROM embeddings e
+            JOIN samples s ON s.dataset_id = e.dataset_id AND s.id = e.sample_id
         WHERE e.sample_id = $1 AND e.field_name = 'clip_obj' AND s.dataset_id = $2
         """,
         req.object_sample_id,
@@ -689,15 +699,14 @@ async def object_to_patch_search(req: ObjectToPatchSearchRequest, request: Reque
                     dim,
                 )
             elif dim:
-                indexed = await index_jobs.cosine_hnsw_fields(conn, dim)
+                indexed = await index_jobs.cosine_hnsw_fields(conn, req.dataset_id, dim)
                 if any(field.startswith(f"{req.base_field}_patch_") for field in indexed):
                     # All scales: the dataset's own tile fields decide, so a scale without indexes is
                     # never skipped (it sends the search to the exact scan instead).
                     present = [
                         r['field_name']
                         for r in await conn.fetch(
-                            "SELECT DISTINCT e.field_name FROM embeddings e JOIN samples s ON e.sample_id = s.id "
-                            "WHERE s.dataset_id = $1 AND e.field_name LIKE $2",
+                            "SELECT DISTINCT field_name FROM embeddings WHERE dataset_id = $1 AND field_name LIKE $2",
                             req.dataset_id,
                             patch_pattern,
                         )

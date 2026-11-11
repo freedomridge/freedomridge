@@ -33,7 +33,10 @@ async def populate(db, n=20):
     await db.execute('UPDATE samples SET tags=NULL,media_type=NULL WHERE id=4')
     await db.execute("UPDATE samples SET media_type='object' WHERE id=5")
     await db.execute("INSERT INTO samples(id,dataset_id,filepath) VALUES(200001,2,'other')")
-    await db.execute("INSERT INTO embeddings(sample_id,field_name) VALUES(200001,'clip')")
+    await db.execute(
+        "INSERT INTO embeddings(dataset_id,sample_id,field_name) VALUES("
+        "(SELECT dataset_id FROM samples WHERE id = 200001),200001,'clip')",
+    )
     await db.execute("INSERT INTO embedding_coordinates VALUES(200001,'clip',4,5)")
     await db.execute("SELECT recompute_viz_rank(2,'clip')")
     await db.execute(
@@ -267,7 +270,10 @@ def test_scatter_fallback_equivalence(registry_database, monkeypatch, case):
             await db.execute('DELETE FROM embedding_viz_rank; DELETE FROM embedding_viz_meta')
         elif case == 'patch':
             await db.execute("DELETE FROM embeddings WHERE sample_id=20")
-            await db.execute("INSERT INTO embeddings(sample_id,field_name) VALUES(20,'clip_patch_2x2_r0c0')")
+            await db.execute(
+                "INSERT INTO embeddings(dataset_id,sample_id,field_name) VALUES("
+                "(SELECT dataset_id FROM samples WHERE id = 20),20,'clip_patch_2x2_r0c0')",
+            )
             await db.execute("INSERT INTO embedding_coordinates VALUES(20,'clip_patch_2x2_r0c0',1,2)")
             request.field = 'clip_patch_2x2'
         elif case == 'or':

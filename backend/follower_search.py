@@ -105,7 +105,7 @@ async def held_here(source, dataset_id: int, base_field: str, scale: str) -> boo
         return cached[1]
     held = bool(
         await source.fetchval(
-            """SELECT 1 FROM embeddings e JOIN samples s ON e.sample_id = s.id
+            """SELECT 1 FROM embeddings e JOIN samples s ON s.dataset_id = e.dataset_id AND s.id = e.sample_id
                WHERE s.dataset_id = $1 AND e.field_name = $2 LIMIT 1""",
             dataset_id,
             f'{base_field}_patch_{scale}_r0c0',
@@ -383,9 +383,11 @@ async def run_search(pool, link_id: int, item: dict) -> list[dict]:
             seed = to_local.get(seed_origin)
             tile = f"{base_field}_patch_{scale}_r{int(request['row'])}c{int(request['col'])}"
             vector = await connection.fetchrow(
-                'SELECT vector, vector_dims(vector) AS dims FROM embeddings WHERE sample_id = $1 AND field_name = $2',
+                'SELECT vector, vector_dims(vector) AS dims FROM embeddings '
+                'WHERE dataset_id = $3 AND sample_id = $1 AND field_name = $2',
                 seed,
                 tile,
+                dataset_id,
             )
             if seed is None or vector is None:
                 raise RelayRefused(f'no {tile} vector here for sample {seed_origin}')

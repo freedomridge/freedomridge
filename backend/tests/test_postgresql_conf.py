@@ -9,6 +9,8 @@ import asyncpg
 import pytest
 
 CONF = Path(__file__).resolve().parents[1] / 'db' / 'postgresql.conf'
+TRY_COMPOSE = Path(__file__).resolve().parents[2] / 'docker-compose.try.yml'
+MEMORY = ('shared_buffers', 'effective_cache_size', 'work_mem', 'maintenance_work_mem')
 
 
 def _settings() -> dict:
@@ -18,6 +20,29 @@ def _settings() -> dict:
         if match:
             found[match.group(1)] = match.group(2).strip().strip("'")
     return found
+
+
+def _bytes(value: str) -> int:
+    match = re.fullmatch(r'(\d+)(kB|MB|GB|TB)', value)
+    assert match, value
+    return int(match.group(1)) * 1024 ** {'kB': 1, 'MB': 2, 'GB': 3, 'TB': 4}[match.group(2)]
+
+
+def test_the_try_file_sizes_postgresql_for_a_laptop():
+    """`npx freedomridge` runs docker-compose.try.yml on laptops, with this file mounted. Its memory settings are for a
+    32 GB server: 8 GB of shared buffers alone is more than a small Docker Desktop VM has, and PostgreSQL then doesn't
+    start. The try file sets each one smaller, from an environment variable to give it more."""
+    command = re.search(r'^\s+command: (postgres .*)$', TRY_COMPOSE.read_text(), re.M)
+    assert command, 'docker-compose.try.yml has no postgres command'
+    overrides = dict(re.findall(r'-c ([a-z_]+)=(\S+)', command.group(1)))
+    server = _settings()
+    defaults = {}
+    for name in MEMORY:
+        default = re.fullmatch(r'\$\{POSTGRES_[A-Z_]+:-(\w+)\}', overrides.get(name, ''))
+        assert default, f'docker-compose.try.yml sets {name} from no environment variable: {overrides.get(name)}'
+        defaults[name] = _bytes(default.group(1))
+        assert defaults[name] < _bytes(server[name]), name
+    assert defaults['shared_buffers'] <= _bytes('1GB')
 
 
 def test_map_refit_swaps_get_room_for_wal():

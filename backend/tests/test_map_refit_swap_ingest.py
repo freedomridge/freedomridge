@@ -214,7 +214,8 @@ def test_the_rerank_runs_after_the_swap_with_ingest_flowing(registry_database, t
                 "INSERT INTO samples(id,dataset_id,filepath,media_type) VALUES (9001,1,'n.jpg','image')",
             )
             await database.execute(
-                "INSERT INTO embeddings(sample_id,field_name,vector) VALUES (9001,$1,'[1,2,3,4]')",
+                "INSERT INTO embeddings(dataset_id,sample_id,field_name,vector) VALUES ("
+                "(SELECT dataset_id FROM samples WHERE id = 9001),9001,$1,'[1,2,3,4]')",
                 FIELD,
             )
             await database.execute(

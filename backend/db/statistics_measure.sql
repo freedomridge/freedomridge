@@ -2,12 +2,18 @@ WITH definitions AS MATERIALIZED (
     SELECT * FROM jsonb_to_recordset($4::jsonb)
         AS definition(field_name TEXT, field_type TEXT, origin TEXT, token TEXT, label_list BOOLEAN)
 ), source AS MATERIALIZED (
-    SELECT id, metadata, tags, media_type, __NATIVE__ AS native
+    SELECT id, metadata, tags, media_type, local_metadata, local_tags, __NATIVE__ AS native
     FROM samples WHERE dataset_id=$1 AND id >= $2 AND id < $3
 ), metadata_entries AS MATERIALIZED (
     SELECT source.id, definition.field_name, definition.field_type, definition.token, definition.label_list, entry.value
     FROM source CROSS JOIN LATERAL jsonb_each(metadata) entry
     JOIN definitions definition ON definition.field_name=entry.key AND definition.origin='metadata'
+), local_entries AS MATERIALIZED (
+    -- A mirror's own fields: `@local.x` is local_metadata->'x' (`@local.tags` is the local_tags array, below).
+    SELECT source.id, definition.field_name, definition.field_type, definition.token, entry.value
+    FROM source CROSS JOIN LATERAL jsonb_each(local_metadata) entry
+    JOIN definitions definition ON definition.field_name='@local.' || entry.key AND definition.origin='local'
+    WHERE entry.key<>'tags'
 ), overlay_entries AS MATERIALIZED (
     SELECT id, field_name, token, value, CASE
         WHEN jsonb_typeof(value)='object' THEN CASE
@@ -32,6 +38,11 @@ WITH definitions AS MATERIALIZED (
     UNION SELECT field_name FROM overlay_entries WHERE kind IN ('detection','polyline','keypoint','classification') AND jsonb_typeof(value)='array'
 ), entries AS MATERIALIZED (
     SELECT id, field_name, field_type, token, value FROM metadata_entries
+    UNION ALL
+    SELECT id, field_name, field_type, token, value FROM local_entries
+    UNION ALL
+    SELECT source.id, definition.field_name, 'enum', definition.token, to_jsonb(COALESCE(local_tags, '{}'))
+    FROM source CROSS JOIN definitions definition WHERE definition.field_name='@local.tags'
     UNION ALL
     SELECT id, 'tags', 'enum', NULL, to_jsonb(tags) FROM source
     UNION ALL

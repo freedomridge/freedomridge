@@ -71,18 +71,21 @@ def test_a_mirror_changes_only_through_its_sync(registry_database):
         # Vector and hash fields from the primary are read-only; fields only this instance has are not.
         await refused(
             database,
-            "INSERT INTO embeddings (sample_id, field_name, vector) VALUES ($1, 'clip', '[1,0]')",
+            "INSERT INTO embeddings (dataset_id, sample_id, field_name, vector) VALUES ("
+            "(SELECT dataset_id FROM samples WHERE id = $1), $1, 'clip', '[1,0]')",
             mirrored,
             message='came from another Freedom Ridge instance',
         )
         await database.execute(
-            "INSERT INTO embeddings (sample_id, field_name, vector) VALUES ($1, 'patches', '[1,0]')",
+            "INSERT INTO embeddings (dataset_id, sample_id, field_name, vector) VALUES ("
+            "(SELECT dataset_id FROM samples WHERE id = $1), $1, 'patches', '[1,0]')",
             mirrored,
         )
         await as_sync(
             database,
             1,
-            "INSERT INTO embeddings (sample_id, field_name, vector) VALUES ($1, 'clip', '[1,0]')",
+            "INSERT INTO embeddings (dataset_id, sample_id, field_name, vector) VALUES ("
+            "(SELECT dataset_id FROM samples WHERE id = $1), $1, 'clip', '[1,0]')",
             mirrored,
         )
         await refused(

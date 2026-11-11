@@ -31,7 +31,7 @@ from ..field_registry import (
     prune_fields,
     register_fields,
 )
-from ..index_jobs import ann_index_name, submit_ann_index
+from ..index_jobs import submit_ann_index, valid_hnsw_index
 from .auth import require_role
 
 router = APIRouter(
@@ -47,34 +47,26 @@ def _clamp_ef(ef: int) -> int:
     return max(10, min(1000, int(ef)))
 
 
-async def _probe_dim(field: str) -> Optional[int]:
+async def _probe_dim(dataset_id: int, field: str) -> Optional[int]:
     row = await db.fetchrow(
-        "SELECT vector_dims(vector) AS d FROM embeddings WHERE field_name = $1 AND vector IS NOT NULL LIMIT 1",
+        "SELECT vector_dims(vector) AS d FROM embeddings WHERE dataset_id = $1 AND field_name = $2 "
+        "AND vector IS NOT NULL LIMIT 1",
+        dataset_id,
         field,
     )
     return int(row['d']) if row and row['d'] else None
 
 
-async def _has_hnsw_index(field: str, dim: int) -> bool:
-    # indisvalid matters: a failed CREATE INDEX CONCURRENTLY leaves an INVALID index that
-    # pg_indexes still lists — counting it as present would send the ANN endpoints down a
-    # per-sample seq scan while claiming to be indexed (the exact cliff the 409 prevents).
-    rows = await db.fetch(
-        "SELECT ix.indexdef FROM pg_indexes ix "
-        "JOIN pg_class c ON c.relname = ix.indexname AND c.relnamespace = ix.schemaname::regnamespace "
-        "JOIN pg_index i ON i.indexrelid = c.oid "
-        "WHERE ix.tablename = 'embeddings' AND ix.indexdef LIKE '%hnsw%' AND i.indisvalid",
-    )
-    need_dim, need_field = f"vector({dim})", f"field_name = '{field}'"
-    return any(need_dim in r['indexdef'] and need_field in r['indexdef'] for r in rows)
-
-
-async def _require_ann(field: str, allow_seq_scan: bool) -> int:
-    """Probe the field's dimension and ensure an eligible HNSW index exists."""
-    dim = await _probe_dim(field)
+async def _require_ann(dataset_id: int, field: str, allow_seq_scan: bool) -> int:
+    """Probe the field's dimension in the dataset and ensure its eligible HNSW index exists. Only a valid one counts:
+    an INVALID leftover would send the ANN endpoints down a per-sample seq scan while claiming to be indexed (the
+    exact cliff the 409 prevents)."""
+    dim = await _probe_dim(dataset_id, field)
     if dim is None:
         raise HTTPException(status_code=404, detail=f"No embeddings for field '{field}'")
-    if not await _has_hnsw_index(field, dim) and not allow_seq_scan:
+    async with db.pool.acquire() as connection:
+        indexed = await valid_hnsw_index(connection, dataset_id, field, dim)
+    if not indexed and not allow_seq_scan:
         raise HTTPException(
             status_code=409,
             detail=(
@@ -90,9 +82,6 @@ async def _require_ann(field: str, allow_seq_scan: bool) -> int:
 # Matches scripts/build_ann_indexes.py — the field name becomes part of the CREATE
 # INDEX DDL below (identifier + literal), so it must be strictly alphanumeric.
 _SAFE_FIELD = re.compile(r"^[a-zA-Z0-9_]+$")
-
-
-_index_name = ann_index_name
 
 
 class AnnIndexRequest(BaseModel):
@@ -148,14 +137,14 @@ async def uniqueness_compute(id: int, request: UniquenessRequest, user: dict = D
 
     Loop with after_id = last_id until processed < chunk, then /range + /normalize.
     """
-    dim = await _require_ann(request.field, request.allow_seq_scan)
+    dim = await _require_ann(id, request.field, request.allow_seq_scan)
     k = max(1, int(request.k))
     chunk = max(1, min(50000, int(request.chunk)))
     sql = f"""
         WITH seeds AS (
             SELECT e1.sample_id AS sid, e1.vector AS vec
-            FROM embeddings e1 JOIN samples s ON e1.sample_id = s.id
-            WHERE e1.field_name = $1 AND s.dataset_id = $2 AND e1.sample_id > $3
+            FROM embeddings e1
+            WHERE e1.dataset_id = $2 AND e1.field_name = $1 AND e1.sample_id > $3
             ORDER BY e1.sample_id LIMIT $4
         ),
         scored AS (
@@ -163,7 +152,7 @@ async def uniqueness_compute(id: int, request: UniquenessRequest, user: dict = D
             FROM seeds sd CROSS JOIN LATERAL (
                 SELECT (e2.vector::vector({dim}) <=> sd.vec::vector({dim})) AS dist
                 FROM embeddings e2
-                WHERE e2.field_name = $1 AND e2.sample_id <> sd.sid
+                WHERE e2.dataset_id = $2 AND e2.field_name = $1 AND e2.sample_id <> sd.sid
                 ORDER BY e2.vector::vector({dim}) <=> sd.vec::vector({dim})
                 LIMIT $5
             ) nn
@@ -180,6 +169,7 @@ async def uniqueness_compute(id: int, request: UniquenessRequest, user: dict = D
     async with db.pool.acquire() as conn:
         async with conn.transaction():
             await conn.execute(f"SET LOCAL hnsw.ef_search = {_clamp_ef(request.ef_search)}")
+            await conn.execute("SET LOCAL plan_cache_mode = force_custom_plan")
             await lock_field_lifecycle(conn, id)
             row = await conn.fetchrow(sql, request.field, id, request.after_id, chunk, k, request.metadata_field)
             if row['written']:
@@ -208,13 +198,13 @@ async def representativeness_centroid(id: int, request: CentroidRequest):
     """Compute the dataset centroid (mean of unit vectors, re-normalized). Returns
     it as a pgvector literal the caller passes back to /representativeness/compute.
     O(n) single scan; no index needed."""
-    dim = await _probe_dim(request.field)
+    dim = await _probe_dim(id, request.field)
     if dim is None:
         raise HTTPException(status_code=404, detail=f"No embeddings for field '{request.field}'")
     row = await db.fetchrow(
         f"""
         SELECT l2_normalize(avg(l2_normalize(e.vector::vector({dim}))))::text AS centroid
-        FROM embeddings e JOIN samples s ON e.sample_id = s.id
+        FROM embeddings e JOIN samples s ON s.dataset_id = e.dataset_id AND s.id = e.sample_id
         WHERE e.field_name = $1 AND s.dataset_id = $2
     """,
         request.field,
@@ -241,7 +231,7 @@ async def representativeness_compute(
 ):
     """Write RAW cosine similarity to the centroid for one keyset chunk. No ANN
     index needed (plain scan), so no guard. Loop, then /range + /normalize."""
-    dim = await _probe_dim(request.field)
+    dim = await _probe_dim(id, request.field)
     if dim is None:
         raise HTTPException(status_code=404, detail=f"No embeddings for field '{request.field}'")
     chunk = max(1, min(100000, int(request.chunk)))
@@ -249,7 +239,7 @@ async def representativeness_compute(
         WITH seeds AS (
             SELECT e.sample_id AS sid,
                    (1 - (e.vector::vector({dim}) <=> $5::vector({dim}))) AS sim
-            FROM embeddings e JOIN samples s ON e.sample_id = s.id
+            FROM embeddings e JOIN samples s ON s.dataset_id = e.dataset_id AND s.id = e.sample_id
             WHERE e.field_name = $1 AND s.dataset_id = $2 AND e.sample_id > $3
             ORDER BY e.sample_id LIMIT $4
         ),
@@ -376,7 +366,7 @@ async def duplicates_compute(
 ):
     """Stream candidate near-duplicate pairs (HNSW top-k within `thresh`) for one
     keyset chunk into quality_dup_pairs[token]. Loop, then /duplicates/finalize."""
-    dim = await _require_ann(request.field, request.allow_seq_scan)
+    dim = await _require_ann(id, request.field, request.allow_seq_scan)
     if not (0 < request.thresh <= 0.5):
         raise HTTPException(status_code=400, detail="thresh must be in (0, 0.5] for near-duplicates")
     k = max(1, min(100, int(request.k)))
@@ -386,8 +376,8 @@ async def duplicates_compute(
     sql = f"""
         WITH seeds AS (
             SELECT e1.sample_id AS sid, e1.vector AS vec
-            FROM embeddings e1 JOIN samples s ON e1.sample_id = s.id
-            WHERE e1.field_name = $1 AND s.dataset_id = $2 AND e1.sample_id > $3
+            FROM embeddings e1
+            WHERE e1.dataset_id = $2 AND e1.field_name = $1 AND e1.sample_id > $3
             ORDER BY e1.sample_id LIMIT $4
         ),
         pairs AS (
@@ -395,7 +385,7 @@ async def duplicates_compute(
             FROM seeds sd CROSS JOIN LATERAL (
                 SELECT e2.sample_id AS b, (e2.vector::vector({dim}) <=> sd.vec::vector({dim})) AS dist
                 FROM embeddings e2
-                WHERE e2.field_name = $1 AND e2.sample_id <> sd.sid
+                WHERE e2.dataset_id = $2 AND e2.field_name = $1 AND e2.sample_id <> sd.sid
                 ORDER BY e2.vector::vector({dim}) <=> sd.vec::vector({dim})
                 LIMIT $5
             ) nn
@@ -411,6 +401,7 @@ async def duplicates_compute(
     async with db.pool.acquire() as conn:
         async with conn.transaction():
             await conn.execute(f"SET LOCAL hnsw.ef_search = {_clamp_ef(request.ef_search)}")
+            await conn.execute("SET LOCAL plan_cache_mode = force_custom_plan")
             row = await conn.fetchrow(sql, request.field, id, request.after_id, chunk, k, request.thresh, request.token)
     processed = row['processed']
     return {

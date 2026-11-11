@@ -4,6 +4,7 @@ import React, { useEffect, useState } from 'react';
 import { useUser } from '@/contexts/UserContext';
 import { useRouter } from 'next/navigation';
 import { ChangePasswordModal } from './ChangePasswordModal';
+import { loginPath } from '@/lib/links';
 
 export function ProtectedRoute({ children }: { children: React.ReactNode }) {
     const { user, isLoading, isAuthenticated } = useUser();
@@ -13,7 +14,7 @@ export function ProtectedRoute({ children }: { children: React.ReactNode }) {
 
     useEffect(() => {
         if (!isLoading && !isAuthenticated) {
-            router.push('/login');
+            router.push(loginPath(window.location));  // back here after signing in
         }
     }, [isLoading, isAuthenticated, router]);
 

@@ -35,7 +35,10 @@ REBUILD = "SELECT recompute_viz_rank(1,'clip')"
 async def fixture(db):
     await seed(db, 3)  # dataset 1: samples 1..3 with 'clip' vectors
     await db.execute("INSERT INTO samples(id,dataset_id,filepath,media_type) VALUES(900,2,'other','image')")
-    await db.execute("INSERT INTO embeddings(sample_id,field_name,vector) VALUES(900,'clip','[1,2,3]')")
+    await db.execute(
+        "INSERT INTO embeddings(dataset_id,sample_id,field_name,vector) VALUES("
+        "(SELECT dataset_id FROM samples WHERE id = 900),900,'clip','[1,2,3]')",
+    )
     await db.execute("INSERT INTO embedding_coordinates VALUES(1,'clip',1,1),(2,'clip',2,2)")
     await db.execute(REBUILD)
     await db.execute(
@@ -175,10 +178,15 @@ def test_rebuild_does_not_queue_behind_maintenance(registry_database, holder):
             else:
                 # An open write keeps the concurrent build in its wait phase, holding SHARE UPDATE
                 # EXCLUSIVE on embeddings (a real HNSW build holds it for ~30 min on large datasets).
-                await maintenance.execute("INSERT INTO embeddings(sample_id,field_name) VALUES(900,'other')")
+                await maintenance.execute(
+                    "INSERT INTO embeddings(dataset_id,sample_id,field_name) VALUES("
+                    "(SELECT dataset_id FROM samples WHERE id = 900),900,'other')",
+                )
                 build_pid = await build.fetchval('SELECT pg_backend_pid()')
+                # On the dataset's partition, where the app builds its indexes (0021).
+                partition = 'embeddings_d' + str(await db.fetchval('SELECT dataset_id FROM samples WHERE id = 900'))
                 built = asyncio.create_task(
-                    build.execute('CREATE INDEX CONCURRENTLY test_cic ON embeddings (field_name)'),
+                    build.execute(f'CREATE INDEX CONCURRENTLY test_cic ON {partition} (field_name)'),
                 )
                 await waiting(db, build_pid)
             pid = await rebuild.fetchval('SELECT pg_backend_pid()')
@@ -275,14 +283,16 @@ def random_statement(rng):
     if kind == 'embedding':
         return (
             f"DELETE FROM embeddings WHERE sample_id={sid} AND field_name='clip'; "
-            f"INSERT INTO embeddings(sample_id,field_name,vector) SELECT {sid},'clip','[1,2,3]' "
+            f"INSERT INTO embeddings(dataset_id,sample_id,field_name,vector) "
+            f"SELECT (SELECT dataset_id FROM samples WHERE id = {sid}),{sid},'clip','[1,2,3]' "
             f'WHERE EXISTS (SELECT 1 FROM samples WHERE id={sid})'
         )
     if kind == 'sample_delete':  # as the delete endpoints: lifecycle lock exclusive first
         return (
             f'SELECT pg_advisory_xact_lock(20261016, {ds}); DELETE FROM samples WHERE id={sid}; '
             f"INSERT INTO samples(id,dataset_id,filepath,media_type) VALUES({sid},{ds},'re{sid}','image'); "
-            f"INSERT INTO embeddings(sample_id,field_name,vector) VALUES({sid},'clip','[1,2,3]')"
+            f"INSERT INTO embeddings(dataset_id,sample_id,field_name,vector) VALUES("
+            f"(SELECT dataset_id FROM samples WHERE id = {sid}),{sid},'clip','[1,2,3]')"
         )
     return f"SELECT recompute_viz_rank({ds},'clip',{kind == 'full'})"
 
@@ -299,7 +309,8 @@ def test_counter_and_cache_exact_under_random_concurrency(registry_database, see
                 N,
             )
             await db.execute(
-                "INSERT INTO embeddings(sample_id,field_name,vector) SELECT $1+i,'clip','[1,2,3]' "
+                "INSERT INTO embeddings(dataset_id,sample_id,field_name,vector) "
+                "SELECT (SELECT dataset_id FROM samples WHERE id = $1+i),$1+i,'clip','[1,2,3]' "
                 'FROM generate_series(1,$2::int) i',
                 base,
                 N,

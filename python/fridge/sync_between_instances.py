@@ -103,6 +103,12 @@ def sync(
             if name not in existing:
                 target.create_array_field(target_id, name)
 
+    # A mirror's own fields (`@local.`, docs/FOLLOWERS.md) are the source server's alone: the target isn't a mirror of
+    # it, so it couldn't take them under those names. They're left out, and the run says so.
+    own = sorted(f['name'] for f in source.get_schema(source_id) if f.get('origin') == 'local')
+    if own:
+        print(f"Left out, {len(own)} field(s) of the source server's own: {', '.join(own)}")
+
     # An object's metadata.parent_id is its image's sample id here; the target numbers its samples itself. Each
     # object is sent with its parent's target id when the parent is already there, and given it afterwards
     # otherwise (a parent paged after its objects); on a re-sync, existing objects get it the same way.

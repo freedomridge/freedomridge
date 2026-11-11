@@ -15,7 +15,7 @@ from typing import Any, Optional
 import asyncpg
 
 from . import job_queue
-from .database import init_connection
+from .database import PLANNING, application_name, init_connection
 from .job_heartbeat import (
     Connector,
     LeaseMonitor,
@@ -375,6 +375,7 @@ async def local_runner(
 ):
     """Explicit worker connection budget, independent of the API's pool settings. The co-located runner
     also takes compute work (map re-fits) unless a deployment leaves that to separate compute workers."""
+    server_settings = {'application_name': application_name(), **PLANNING, **(server_settings or {})}
     count = int(os.getenv('JOB_WORKER_SLOTS', '3')) if slots is None else slots
     maximum = int(os.getenv('JOB_POOL_MAX_SIZE', str(count * 2)))
     if not 1 <= count <= 32 or maximum < count or maximum > 64:

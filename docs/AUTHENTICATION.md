@@ -34,12 +34,15 @@ docker compose -f docker-compose.prod.yml exec backend python /app/reset_admin.p
 ```
 
 With no argument this applies `FRIDGE_ADMIN_PASSWORD` from the container's environment; pass
-`--password` to choose another one. It also reactivates the account and signs out its sessions.
+`--password` to choose another one. It also reactivates the account, signs out its sessions and revokes its API
+tokens, follower and worker tokens included: it prints how many, and followers that used one need a new token.
 
 ## Roles
 
 Each user has one role. Admins create users and set roles in **Settings → User Management**. New
-users, and users whose password an admin resets, must choose a new password at their next login.
+users, and users whose password an admin resets, must choose a new password at their next login. A reset also
+signs the user out and revokes their API tokens, the follower and worker tokens they issued included: a follower
+that connects with one stops syncing until it is given a new token (Settings → Followers).
 
 | Action | guest | power_user | admin |
 |---|---|---|---|
@@ -98,7 +101,8 @@ Details:
   creates a token that never expires.
 - **Revoke** on the tokens page, `client.revoke_token(token_id)` or `DELETE /api/tokens/{id}`
   disables a token immediately. Users can list and revoke only their own tokens
-  (`client.list_tokens()`, `GET /api/tokens`).
+  (`client.list_tokens()`, `GET /api/tokens`). An admin can revoke all of another user's tokens with
+  `DELETE /api/users/{id}/tokens`.
 - A deactivated user's tokens stop working (403).
 - A **worker token** (on the tokens page, **Used by: a compute worker**; `"scope": "worker"`;
   `client.create_token(name, scope="worker")`) is for a compute
@@ -202,11 +206,12 @@ the variable.
 | `/api/tokens` | POST | power_user, admin | Create a token |
 | `/api/tokens` | GET | signed in | List your tokens (never their values) |
 | `/api/tokens/{id}` | DELETE | owner | Revoke one of your tokens |
+| `/api/users/{id}/tokens` | DELETE | admin | Revoke all of a user's tokens |
 | `/api/workers/register` | POST | worker token of a power_user or admin | Register a compute worker |
 | `/api/workers/{id}/heartbeat` | POST | its owner's worker token | Keep a compute worker online |
 | `/api/workers/{id}/claim` | POST | its owner's worker token | Claim compute work (long poll; only datasets its owner can access) |
-| `/api/workers/{id}/jobs/{job_id}/heartbeat`, `.../complete`, `.../fail`, `.../release` | POST | its owner's worker token, with the job's lease | Renew, finish, fail or give back a claimed job |
-| `/api/workers/{id}/jobs/{job_id}/files/{name}` | GET, PUT | its owner's worker token, with the job's lease (`X-Fridge-Lease`) | Download a job's inputs, upload its outputs |
+| `/api/workers/{id}/jobs/{job_id}/heartbeat`, `.../complete`, `.../fail`, `.../release` | POST | its owner's worker token, with the job's lease (heartbeat and complete: while its owner can access the job's dataset) | Renew, finish, fail or give back a claimed job |
+| `/api/workers/{id}/jobs/{job_id}/files/{name}` | GET, PUT | its owner's worker token, with the job's lease (`X-Fridge-Lease`), while its owner can access the job's dataset | Download a job's inputs, upload its outputs |
 | `/api/workers` | GET | power_user (own workers), admin (all) | List compute workers and job runners |
 | `/api/followers` | POST, GET | admin | Add a follower (its token is returned once); list followers and what they follow |
 | `/api/followers/{id}` | DELETE | admin | Remove a follower and everything kept for it |

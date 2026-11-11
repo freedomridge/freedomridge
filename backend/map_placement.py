@@ -56,13 +56,13 @@ CROSS JOIN LATERAL (
     SELECT e.vector::vector({dimension}) <=> q.vector::vector({dimension}) AS distance, c.x, c.y
     FROM embeddings e
     JOIN embedding_coordinates c ON c.sample_id = e.sample_id AND c.field_name = e.field_name
-    JOIN samples s ON s.id = e.sample_id
+    JOIN samples s ON s.dataset_id = e.dataset_id AND s.id = e.sample_id
     WHERE e.field_name = $2 AND s.dataset_id = $3 AND e.sample_id <> q.sample_id
       AND c.x IS NOT NULL AND c.y IS NOT NULL
     ORDER BY {order}
     LIMIT {neighbours}
 ) n
-WHERE q.field_name = $2 AND q.sample_id = ANY($1::int[])
+WHERE q.dataset_id = $3 AND q.field_name = $2 AND q.sample_id = ANY($1::int[])
 """
 # The index serves an ORDER BY on the distance alone, one search per sample (LATERAL). The exact form orders
 # by an expression the index can't serve: the dataset's own mapped samples, scanned and sorted.
@@ -176,7 +176,7 @@ async def _measure(pool, job, lookups):
         dimension = checkpoint.get('dimension') or await connection.fetchval(
             """SELECT vector_dims(e.vector) FROM samples s
                JOIN embedding_coordinates c ON c.sample_id = s.id AND c.field_name = $2
-               JOIN embeddings e ON e.sample_id = s.id AND e.field_name = $2
+               JOIN embeddings e ON e.dataset_id = s.dataset_id AND e.sample_id = s.id AND e.field_name = $2
                WHERE s.dataset_id = $1 LIMIT 1""",
             dataset_id,
             field,
@@ -184,7 +184,8 @@ async def _measure(pool, job, lookups):
         waiting = await connection.fetch(
             """SELECT p.sample_id, e.xmin::text AS vector_version, vector_dims(e.vector) AS dimension
                FROM embedding_projection_pending p
-               JOIN embeddings e ON e.sample_id = p.sample_id AND e.field_name = p.field_name
+               JOIN embeddings e ON e.dataset_id = p.dataset_id AND e.sample_id = p.sample_id
+                                AND e.field_name = p.field_name
                WHERE p.dataset_id = $1 AND p.field_name = $2 AND p.sample_id > $3 AND p.sample_id <= $4
                ORDER BY p.sample_id LIMIT $5""",
             dataset_id,

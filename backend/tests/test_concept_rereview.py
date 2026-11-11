@@ -22,8 +22,8 @@ def test_incremental_unit_keeps_a_lower_block_delivered_after_measurement(regist
         await database.execute(
             """INSERT INTO samples(id,dataset_id,filepath,media_type)
                VALUES(2100,1,'low','image'),(102500,1,'high','image');
-               INSERT INTO embeddings(sample_id,field_name,vector)
-               SELECT id,'clip','[1,0]' FROM samples""",
+               INSERT INTO embeddings(dataset_id,sample_id,field_name,vector)
+               SELECT dataset_id,id,'clip','[1,0]' FROM samples""",
         )
         await finish(database, cid)
         await database.execute("UPDATE embeddings SET vector='[-1,0]' WHERE sample_id=102500")
@@ -78,8 +78,9 @@ def test_empty_embedding_transition_never_locks_the_pending_table(registry_datab
         async with database.pool.acquire() as holder, holder.transaction():
             await holder.execute('LOCK TABLE concept_embedding_pending IN ACCESS EXCLUSIVE MODE')
             if operation == 'upsert':
-                query = """INSERT INTO embeddings(sample_id,field_name,vector) VALUES($1,'clip','[1,0]')
-                           ON CONFLICT(sample_id,field_name) DO UPDATE SET vector=EXCLUDED.vector"""
+                query = """INSERT INTO embeddings(dataset_id,sample_id,field_name,vector)
+                           VALUES((SELECT dataset_id FROM samples WHERE id = $1),$1,'clip','[1,0]')
+                           ON CONFLICT(dataset_id, sample_id,field_name) DO UPDATE SET vector=EXCLUDED.vector"""
             else:
                 query = 'DELETE FROM embeddings WHERE sample_id=$1 AND FALSE'
             await asyncio.wait_for(database.execute(query, sid), 1)

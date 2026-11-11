@@ -115,6 +115,17 @@ if [ -n "$UNKNOWN" ]; then
     exit 1
 fi
 
+# A long migration's progress, as it comes: its notices that start with its own number
+# ("NOTICE:  0021: copied ..."), matched on the number so a server in another language shows them too.
+progress() {
+    local line
+    while IFS= read -r line; do
+        case "$line" in
+            *" $1: "*) printf '  %s\n' "${line#*" $1: "}" ;;
+        esac
+    done
+}
+
 APPLIED=()
 SKIPPED=0
 for migration in backend/db/migrations/*.sql; do
@@ -126,13 +137,18 @@ for migration in backend/db/migrations/*.sql; do
     echo "Applying $filename..."
     # The file and its ledger row commit TOGETHER (one psql, one transaction): if any statement
     # fails, Postgres rolls back the whole file and the row with it, so a half-applied or
-    # rolled-back file can never be recorded as applied.
-    if err=$({ cat "$migration"; printf "\nINSERT INTO schema_migrations (filename) VALUES ('%s') ON CONFLICT (filename) DO NOTHING;\n" "$filename"; } \
-             | psql_ --single-transaction -v ON_ERROR_STOP=1 -q 2>&1); then
+    # rolled-back file can never be recorded as applied. Its output is kept for the error.
+    output=$(mktemp)
+    { cat "$migration"; printf "\nINSERT INTO schema_migrations (filename) VALUES ('%s') ON CONFLICT (filename) DO NOTHING;\n" "$filename"; } \
+        | psql_ --single-transaction -v ON_ERROR_STOP=1 -q 2>&1 | tee "$output" | progress "${filename%%_*}"
+    status=${PIPESTATUS[1]}
+    if [ "$status" -eq 0 ]; then
         APPLIED+=("$filename")
+        rm -f "$output"
     else
         echo "  ERROR applying $filename — the file was rolled back and is NOT recorded as applied:" >&2
-        echo "$err" >&2
+        cat "$output" >&2
+        rm -f "$output"
         exit 1
     fi
 done
@@ -143,6 +159,9 @@ done
 echo "Re-applying function definitions from backend/db/functions.sql..."
 psql_ --single-transaction -v ON_ERROR_STOP=1 -q \
     < backend/db/functions.sql || { echo "  ERROR re-applying backend/db/functions.sql" >&2; exit 1; }
+# The database's own settings, which a restored backup doesn't carry (backend/db/database_settings.sql).
+psql_ -v ON_ERROR_STOP=1 -q < backend/db/database_settings.sql \
+    || { echo "  ERROR applying backend/db/database_settings.sql" >&2; exit 1; }
 [ ${#APPLIED[@]} -gt 0 ] && echo "Recorded ${#APPLIED[@]} migration file(s) in schema_migrations"
 [ "$SKIPPED" -gt 0 ] && echo "Skipped $SKIPPED file(s) already recorded in schema_migrations"
 echo "✅ All migrations applied successfully"

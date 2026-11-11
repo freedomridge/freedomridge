@@ -5,15 +5,15 @@ import json
 # Last occurrence wins within a retried batch; PostgreSQL upsert cannot touch
 # the same key twice. The joins preserve the existing cross-dataset/missing-key guard.
 SAVE_COORDINATES = """
-INSERT INTO embedding_coordinates AS c (sample_id, field_name, x, y)
-SELECT e.sample_id, e.field_name, v.x, v.y
+INSERT INTO embedding_coordinates AS c (sample_id, field_name, x, y, dataset_id)
+SELECT e.sample_id, e.field_name, v.x, v.y, $4
 FROM (
     SELECT DISTINCT ON (sample_id) sample_id, x, y
     FROM unnest($1::int[], $2::float8[], $3::float8[]) WITH ORDINALITY AS u(sample_id, x, y, ord)
     ORDER BY sample_id, ord DESC
 ) v
 JOIN samples s ON s.id = v.sample_id AND s.dataset_id = $4
-JOIN embeddings e ON e.sample_id = v.sample_id AND e.field_name = $5
+JOIN embeddings e ON e.dataset_id = $4 AND e.sample_id = v.sample_id AND e.field_name = $5
 ON CONFLICT (sample_id, field_name) DO UPDATE SET x = EXCLUDED.x, y = EXCLUDED.y
 WHERE (c.x, c.y) IS DISTINCT FROM (EXCLUDED.x, EXCLUDED.y)
 """
@@ -32,12 +32,12 @@ WITH candidates AS MATERIALIZED (
         ORDER BY sample_id, ord DESC
     ) v
     JOIN samples s ON s.id = v.sample_id AND s.dataset_id = $4
-    JOIN embeddings e ON e.sample_id = v.sample_id AND e.field_name = $5
+    JOIN embeddings e ON e.dataset_id = $4 AND e.sample_id = v.sample_id AND e.field_name = $5
     ORDER BY e.sample_id
     FOR SHARE OF e
 )
-INSERT INTO embedding_coordinates AS c (sample_id, field_name, x, y)
-SELECT sample_id, field_name, x, y FROM candidates
+INSERT INTO embedding_coordinates AS c (sample_id, field_name, x, y, dataset_id)
+SELECT sample_id, field_name, x, y, $4 FROM candidates
 WHERE expected_version IS NULL OR vector_version = expected_version
 ON CONFLICT (sample_id, field_name) DO UPDATE SET x = EXCLUDED.x, y = EXCLUDED.y
 WHERE (c.x, c.y) IS DISTINCT FROM (EXCLUDED.x, EXCLUDED.y)

@@ -5,6 +5,8 @@ import { Cross2Icon } from '@radix-ui/react-icons';
 import { useQueryClient } from '@tanstack/react-query';
 import { useToast } from '@/contexts/ToastContext';
 import { useFilters } from '@/contexts/FilterContext';
+import type { DatasetMirror } from '@/lib/api';
+import { LOCAL_TAGS } from '@/lib/local-fields';
 
 // From the tag registry. created_at/created_by null = unknown: the tag predates
 // the registry or arrived through a path that doesn't register (ingest, SDK field writes).
@@ -27,6 +29,8 @@ interface TagManagementModalProps {
     selectionCount?: number;
     datasetId: number;
     fieldName?: string;  // Which array field to manage (default: 'tags')
+    // On a mirror: its own tags (`@local.tags`) beside the primary's, which it may edit only with tags both ways.
+    mirror?: DatasetMirror | null;
     onClose: () => void;
     onUpdate: () => void;
 }
@@ -38,9 +42,19 @@ export function TagManagementModal({
     selectionCount,
     datasetId,
     fieldName = 'tags',
+    mirror = null,
     onClose,
     onUpdate
 }: TagManagementModalProps) {
+    // A mirror's tags are its primary's, edited here only when they go back both ways; its own tags (`@local.tags`)
+    // are always its own. Worked out on every render, so a dataset's mirror answer that arrives after the dialog
+    // opened still decides it; the user's choice counts only while it's allowed.
+    const primaryTagsAllowed = !mirror || (mirror.tags === 'both' && mirror.state === 'following');
+    const offersOwnTags = !!mirror && fieldName === 'tags';  // other array fields are the primary's alone
+    const [choice, setChoice] = useState<string | null>(null);
+    const field = !offersOwnTags ? fieldName
+        : choice === LOCAL_TAGS || !primaryTagsAllowed ? LOCAL_TAGS
+        : 'tags';
     const queryClient = useQueryClient();
     const { addToast } = useToast();
     const [tags, setTags] = useState<TagState[]>([]);
@@ -70,7 +84,7 @@ export function TagManagementModal({
             const res = await fetch(`/api/datasets/${datasetId}/samples/tag-counts`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ ...selectionPayload, field_name: fieldName })
+                body: JSON.stringify({ ...selectionPayload, field_name: field })
             });
 
             if (!res.ok) {
@@ -106,7 +120,7 @@ export function TagManagementModal({
         // eslint-disable-next-line react-hooks/set-state-in-effect -- reset request state when the tag target changes
         loadTagCounts();
         // eslint-disable-next-line react-hooks/exhaustive-deps -- reload tag counts only when the target samples/dataset change; loadTagCounts is recreated every render and adding it would refetch on every render
-    }, [sampleKey, selectionToken, excludedKey, datasetId]);
+    }, [sampleKey, selectionToken, excludedKey, datasetId, field]);
 
     // Stage tag change (don't apply yet)
     function handleTagToggle(tag: string, newChecked: boolean) {
@@ -181,7 +195,7 @@ export function TagManagementModal({
                     ...selectionPayload,
                     add_tags: tagsToAdd,
                     remove_tags: tagsToRemove,
-                    field_name: fieldName
+                    field_name: field
                 })
             });
 
@@ -246,7 +260,7 @@ export function TagManagementModal({
                 {/* Header */}
                 <div className="flex items-center justify-between p-4 border-b border-gray-200 dark:border-gray-700">
                     <h2 className="text-lg font-semibold text-gray-900 dark:text-gray-100">
-                        {fieldName === 'tags' ? 'Tag' : fieldName} — {effectiveCount.toLocaleString()} Sample{effectiveCount !== 1 ? 's' : ''}
+                        {field === 'tags' ? 'Tag' : field === LOCAL_TAGS ? "This server's tags" : field} — {effectiveCount.toLocaleString()} Sample{effectiveCount !== 1 ? 's' : ''}
                     </h2>
                     <button
                         onClick={onClose}
@@ -256,6 +270,31 @@ export function TagManagementModal({
                         <Cross2Icon className="w-5 h-5" />
                     </button>
                 </div>
+
+                {/* On a mirror: the primary's tags or this server's own (`@local.tags`, docs/FOLLOWERS.md). */}
+                {offersOwnTags && (
+                    <div className="flex gap-2 px-4 pt-3" role="group" aria-label="Which tags">
+                        {([['tags', "The primary's tags"], [LOCAL_TAGS, "This server's tags"]] as const).map(([value, label]) => (
+                            <button
+                                key={value}
+                                type="button"
+                                aria-pressed={field === value}
+                                disabled={saving || (value === 'tags' && !primaryTagsAllowed)}
+                                title={value === 'tags' && !primaryTagsAllowed ? "This mirror's tags come from its primary only" : undefined}
+                                onClick={() => {
+                                    setPendingAdd(new Set());
+                                    setPendingRemove(new Set());
+                                    setChoice(value);
+                                }}
+                                className={`text-xs px-2 py-1 rounded border ${field === value
+                                    ? 'border-cyan-500 text-cyan-600 dark:text-cyan-300'
+                                    : 'border-gray-300 dark:border-gray-600 text-gray-600 dark:text-gray-300'} disabled:opacity-50`}
+                            >
+                                {label}
+                            </button>
+                        ))}
+                    </div>
+                )}
 
                 {/* Content */}
                 <div className="flex-1 overflow-y-auto p-4">

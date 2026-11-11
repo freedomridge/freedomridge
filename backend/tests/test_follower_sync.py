@@ -107,8 +107,9 @@ def test_a_follower_copies_a_dataset_and_then_follows_its_changes(monkeypatch, r
         child = await database.fetchval("SELECT id FROM samples WHERE metadata->>'label' = 'weed'")
         await database.execute("UPDATE samples SET tags = '{reviewed}' WHERE id = $1", corn)
         await database.execute(
-            "INSERT INTO embeddings (sample_id, field_name, vector) VALUES ($1, 'clip', '[0.5,0.25]'), "
-            "($2, 'clip', '[1,0]')",
+            "INSERT INTO embeddings (dataset_id, sample_id, field_name, vector) VALUES ("
+            "(SELECT dataset_id FROM samples WHERE id = $1), $1, 'clip', '[0.5,0.25]'), "
+            "((SELECT dataset_id FROM samples WHERE id = $2), $2, 'clip', '[1,0]')",
             corn,
             soy,
         )
@@ -158,13 +159,21 @@ def test_a_follower_copies_a_dataset_and_then_follows_its_changes(monkeypatch, r
             )
             == 'ff00'
         )
-        assert {
-            row['field_name']
+        registered = {
+            row['field_name']: row['owner']
             for row in await database.fetch(
-                'SELECT field_name FROM dataset_fields WHERE dataset_id = $1',
+                'SELECT field_name, owner FROM dataset_fields WHERE dataset_id = $1',
                 mirror['dataset_id'],
             )
-        } >= {'crop', 'label', 'parent_id'}
+        }
+        assert set(registered) >= {'crop', 'label', 'parent_id'}
+        # A first copy's fields are the primary's (its mirrors row comes first), and the primary's own are its own.
+        assert set(registered.values()) == {'primary'}
+        assert {
+            row['owner'] for row in await database.fetch('SELECT owner FROM dataset_fields WHERE dataset_id = 1')
+        } == {
+            'self',
+        }
         views = await database.fetch('SELECT * FROM views WHERE dataset_id = $1', mirror['dataset_id'])
         assert [view['name'] for view in views] == ['Corn']  # shared only, and the concept view stays there
         assert views[0]['content']['filters']['filters'][0]['value'] == [samples[corn]['id']]
@@ -301,7 +310,8 @@ def test_a_mirror_copies_the_primary_maps_and_re_ranks_when_the_primary_does(mon
         ids = [row['id'] for row in await database.fetch('SELECT id FROM samples WHERE dataset_id = 1 ORDER BY id')]
         for index, sample_id in enumerate(ids):
             await database.execute(
-                "INSERT INTO embeddings (sample_id, field_name, vector) VALUES ($1, 'clip', $2::vector)",
+                "INSERT INTO embeddings (dataset_id, sample_id, field_name, vector) VALUES ("
+                "(SELECT dataset_id FROM samples WHERE id = $1), $1, 'clip', $2::vector)",
                 sample_id,
                 f'[{index},1]',
             )
@@ -343,7 +353,8 @@ def test_a_mirror_copies_the_primary_maps_and_re_ranks_when_the_primary_does(mon
         await ingest([{'crop': 'rye'}], dataset_id=1, prefix='s3://images/b')
         rye = await database.fetchval("SELECT id FROM samples WHERE metadata->>'crop' = 'rye'")
         await database.execute(
-            "INSERT INTO embeddings (sample_id, field_name, vector) VALUES ($1, 'clip', '[5,1]')",
+            "INSERT INTO embeddings (dataset_id, sample_id, field_name, vector) VALUES ("
+            "(SELECT dataset_id FROM samples WHERE id = $1), $1, 'clip', '[5,1]')",
             rye,
         )
         await sync(database, link_id)
@@ -897,8 +908,9 @@ def test_a_primary_field_replaces_all_of_a_same_named_field_the_mirror_had(monke
         local = {row['origin_id']: row['id'] for row in (await copied(database, {'dataset_id': mirror})).values()}
         # This instance's own vectors and map, on both samples, under a name the primary doesn't have yet.
         await database.execute(
-            "INSERT INTO embeddings (sample_id, field_name, vector) "
-            "VALUES ($1, 'dino', '[9,9]'), ($2, 'dino', '[8,8]'), ($2, 'dino_patch_2x2_r0c0', '[7,7]')",
+            "INSERT INTO embeddings (dataset_id, sample_id, field_name, vector) "
+            "SELECT s.dataset_id, s.id, t.f, t.v::vector FROM samples s JOIN (VALUES ($1::int, 'dino', '[9,9]'), "
+            "($2::int, 'dino', '[8,8]'), ($2::int, 'dino_patch_2x2_r0c0', '[7,7]')) AS t(id, f, v) ON t.id = s.id",
             local[corn],
             local[soy],
         )
@@ -911,8 +923,10 @@ def test_a_primary_field_replaces_all_of_a_same_named_field_the_mirror_had(monke
 
         # The primary makes a field of that name, on one sample: all of the mirror's own goes, its map too.
         await database.execute(
-            "INSERT INTO embeddings (sample_id, field_name, vector) "
-            "VALUES ($1, 'dino', '[1,0]'), ($1, 'dino_patch_2x2_r0c0', '[0,1]')",
+            "INSERT INTO embeddings (dataset_id, sample_id, field_name, vector) "
+            "SELECT dataset_id, id, f, v::vector FROM samples, "
+            "(VALUES ('dino', '[1,0]'), ('dino_patch_2x2_r0c0', '[0,1]')) "
+            "AS t(f, v) WHERE id = $1",
             corn,
         )
         await sync(database, link_id)
@@ -941,7 +955,8 @@ def test_a_mirror_s_own_vectors_can_be_deleted_and_the_primary_s_cannot(monkeypa
         await ingest([{'crop': 'corn'}], dataset_id=1, prefix='s3://images/a')
         corn = await database.fetchval('SELECT id FROM samples WHERE dataset_id = 1')
         await database.execute(
-            "INSERT INTO embeddings (sample_id, field_name, vector) VALUES ($1, 'clip', '[1,0]')",
+            "INSERT INTO embeddings (dataset_id, sample_id, field_name, vector) VALUES ("
+            "(SELECT dataset_id FROM samples WHERE id = $1), $1, 'clip', '[1,0]')",
             corn,
         )
         follower = await database.fetchval('SELECT id FROM followers')
@@ -950,7 +965,8 @@ def test_a_mirror_s_own_vectors_can_be_deleted_and_the_primary_s_cannot(monkeypa
         mirror = (await mirror_of(database))['dataset_id']
         local = await database.fetchval('SELECT id FROM samples WHERE dataset_id = $1', mirror)
         await database.execute(
-            "INSERT INTO embeddings (sample_id, field_name, vector) VALUES ($1, 'patches', '[0,1]')",
+            "INSERT INTO embeddings (dataset_id, sample_id, field_name, vector) VALUES ("
+            "(SELECT dataset_id FROM samples WHERE id = $1), $1, 'patches', '[0,1]')",
             local,
         )
         everything = datasets.BulkTargetRequest(filters={})
@@ -1045,7 +1061,8 @@ def test_the_feed_fetches_vectors_only_for_new_samples_and_keeps_the_id_sequence
         await ingest([{'crop': 'corn'}], dataset_id=1, prefix='s3://images/a')
         corn = await database.fetchval('SELECT id FROM samples WHERE dataset_id = 1')
         await database.execute(
-            "INSERT INTO embeddings (sample_id, field_name, vector) VALUES ($1, 'clip', '[1,0]')",
+            "INSERT INTO embeddings (dataset_id, sample_id, field_name, vector) VALUES ("
+            "(SELECT dataset_id FROM samples WHERE id = $1), $1, 'clip', '[1,0]')",
             corn,
         )
         follower = await database.fetchval('SELECT id FROM followers')
@@ -1064,7 +1081,8 @@ def test_the_feed_fetches_vectors_only_for_new_samples_and_keeps_the_id_sequence
         await ingest([{'crop': 'soy'}], dataset_id=1, prefix='s3://images/b')
         soy = await database.fetchval("SELECT id FROM samples WHERE metadata->>'crop' = 'soy'")
         await database.execute(
-            "INSERT INTO embeddings (sample_id, field_name, vector) VALUES ($1, 'clip', '[0,1]')",
+            "INSERT INTO embeddings (dataset_id, sample_id, field_name, vector) VALUES ("
+            "(SELECT dataset_id FROM samples WHERE id = $1), $1, 'clip', '[0,1]')",
             soy,
         )
         await sync(database, link_id)
@@ -1103,7 +1121,8 @@ def test_a_follower_can_ask_for_feed_pages_bounded_by_vector_changes(monkeypatch
         cursor = (await mirror_of(database))['feed_cursor']
         for sample_id in ids:  # three transactions, one vector change each
             await database.execute(
-                "INSERT INTO embeddings (sample_id, field_name, vector) VALUES ($1, 'clip', '[1,1]')",
+                "INSERT INTO embeddings (dataset_id, sample_id, field_name, vector) VALUES ("
+                "(SELECT dataset_id FROM samples WHERE id = $1), $1, 'clip', '[1,1]')",
                 sample_id,
             )
         sub = dict(await database.fetchrow('SELECT * FROM followers WHERE id = $1', follower))
@@ -1128,7 +1147,8 @@ def test_a_follower_reports_the_patch_scales_it_holds_itself(monkeypatch, regist
         await ingest([{'crop': 'corn'}, {'crop': 'soy'}], dataset_id=1, prefix='s3://images/a')
         corn = await database.fetchval("SELECT id FROM samples WHERE dataset_id = 1 AND metadata->>'crop' = 'corn'")
         await database.execute(
-            "INSERT INTO embeddings (sample_id, field_name, vector) VALUES ($1, 'clip', '[1,0]')",
+            "INSERT INTO embeddings (dataset_id, sample_id, field_name, vector) VALUES ("
+            "(SELECT dataset_id FROM samples WHERE id = $1), $1, 'clip', '[1,0]')",
             corn,
         )
         follower = await database.fetchval('SELECT id FROM followers')
@@ -1148,7 +1168,8 @@ def test_a_follower_reports_the_patch_scales_it_holds_itself(monkeypatch, regist
         for sample_id in local:
             for tile in ('r0c0', 'r0c1', 'r1c0', 'r1c1'):
                 await database.execute(
-                    "INSERT INTO embeddings (sample_id, field_name, vector) VALUES ($1, $2, '[0.5,0.5,0.5]')",
+                    "INSERT INTO embeddings (dataset_id, sample_id, field_name, vector) VALUES ("
+                    "(SELECT dataset_id FROM samples WHERE id = $1), $1, $2, '[0.5,0.5,0.5]')",
                     sample_id,
                     f'clip_patch_2x2_{tile}',
                 )
@@ -1236,7 +1257,8 @@ async def mirror_with_own_patches(monkeypatch, database):
         for tile, (row, col) in enumerate(((0, 0), (0, 1), (1, 0), (1, 1))):
             vector = f'[{1 + index},{tile + 1},{(index * 3 + tile) % 5 + 1}]'
             await database.execute(
-                'INSERT INTO embeddings (sample_id, field_name, vector) VALUES ($1, $2, $3::text::vector)',
+                'INSERT INTO embeddings (dataset_id, sample_id, field_name, vector) VALUES ('
+                '(SELECT dataset_id FROM samples WHERE id = $1), $1, $2, $3::text::vector)',
                 sample_id,
                 f'clip_patch_2x2_r{row}c{col}',
                 vector,
@@ -1501,7 +1523,8 @@ def test_patch_search_relays_only_when_the_seed_s_scale_isn_t_held_here(monkeypa
         # A scale this dataset holds itself, on other samples: a seed lacking its tile isn't sent to the follower.
         other = await database.fetchval('SELECT max(id) FROM samples WHERE dataset_id = 1')
         await database.execute(
-            "INSERT INTO embeddings (sample_id, field_name, vector) VALUES ($1, 'clip_patch_2x2_r0c0', '[1,1,1]')",
+            "INSERT INTO embeddings (dataset_id, sample_id, field_name, vector) VALUES ("
+            "(SELECT dataset_id FROM samples WHERE id = $1), $1, 'clip_patch_2x2_r0c0', '[1,1,1]')",
             other,
         )
         follower_search._held_here.clear()
@@ -1595,7 +1618,8 @@ async def mirror_with_own_field(monkeypatch, database):
     mirror = await mirror_of(database)
     for row in (await copied(database, mirror)).values():
         await database.execute(
-            "INSERT INTO embeddings (sample_id, field_name, vector) VALUES ($1, 'mine', '[1,2]')",
+            "INSERT INTO embeddings (dataset_id, sample_id, field_name, vector) VALUES ("
+            "(SELECT dataset_id FROM samples WHERE id = $1), $1, 'mine', '[1,2]')",
             row['id'],
         )
     return created, link_id, follower, mirror
@@ -1717,11 +1741,22 @@ def test_after_a_primary_restore_the_copy_is_held_asks_and_resumes_into_itself(m
         _, link_id, _, mirror = await mirror_with_own_field(monkeypatch, database)
         monkeypatch.setattr(primaries, 'db', database)
         monkeypatch.setattr(follower_sync, 'queue_sync', AsyncMock())
+        # A field of this instance's own on both samples: soy's goes with soy if the copy resumes, and the question
+        # says so; corn's stays.
+        by_crop = {row['metadata']['crop']: row['id'] for row in (await copied(database, mirror)).values()}
+        for sample_id in by_crop.values():
+            await datasets.update_sample(
+                mirror['dataset_id'],
+                sample_id,
+                datasets.SampleUpdate(metadata={'@local.weeds': 3}),
+                user=USER,
+            )
         await restore_primary(database)
         await sync(database, link_id)
         # Held, compared, and asking: nothing changed on the copy, and no new copy was made.
         held = dict(await database.fetchrow('SELECT * FROM mirror_restores'))
         assert (held['total'], held['matched'], held['only_here'], held['phase']) == (2, 1, 1, 'ask')
+        assert held['only_here_local'] == 1
         assert await database.fetchval('SELECT count(*) FROM mirrors') == 1
         stopped = await mirror_of(database)
         assert stopped['state'] == 'stopped' and 'Primaries page' in stopped['last_error']
@@ -1729,6 +1764,7 @@ def test_after_a_primary_restore_the_copy_is_held_asks_and_resumes_into_itself(m
         listed = await primaries.list_primaries(user=USER)
         [entry] = listed['primaries'][0]['mirrors']
         assert entry['restore']['compared'] and entry['restore']['matched'] == 1 and not entry['resumable']
+        assert entry['restore']['only_here_local'] == 1
 
         # Its admin resumes into it: the matched sample keeps what was added here, soy goes, rice is copied.
         await primaries.decide_restore(mirror['dataset_id'], primaries.RestoreDecision(decision='resume'), user=USER)
@@ -1742,6 +1778,9 @@ def test_after_a_primary_restore_the_copy_is_held_asks_and_resumes_into_itself(m
         assert await database.fetchval('SELECT count(*) FROM mirror_restore_map') == 0
         assert sorted(r['metadata']['crop'] for r in (await copied(database, resumed)).values()) == ['corn', 'rice']
         assert await crops_with_own_field(database, mirror['dataset_id']) == ['corn']
+        assert await database.fetchval('SELECT local_metadata FROM samples WHERE id = $1', by_crop['corn']) == {
+            'weeds': 3,
+        }
 
     registry_database(scenario)
 
@@ -2365,8 +2404,8 @@ def test_a_sample_changed_in_more_fields_than_one_request_takes_still_syncs(monk
         # 4x4 and 8x8 patch tiles are 80 fields on one sample: more than a vectors request takes.
         fields = [f'tile_{index:02d}' for index in range(followers.VECTOR_FIELDS + 6)]
         await database.execute(
-            "INSERT INTO embeddings (sample_id, field_name, vector) "
-            "SELECT $1, name, '[1,0]' FROM unnest($2::text[]) name",
+            "INSERT INTO embeddings (dataset_id, sample_id, field_name, vector) "
+            "SELECT (SELECT dataset_id FROM samples WHERE id = $1), $1, name, '[1,0]' FROM unnest($2::text[]) name",
             corn,
             fields,
         )
@@ -2393,7 +2432,8 @@ def test_coordinates_of_a_vector_added_to_a_mirrored_sample_arrive_with_it(monke
         # map. The block is applied before the vector is here, so its coordinates must be applied after.
         await database.execute("UPDATE samples SET tags = '{reviewed}' WHERE id = $1", corn)
         await database.execute(
-            "INSERT INTO embeddings (sample_id, field_name, vector) VALUES ($1, 'clip', '[1,0]')",
+            "INSERT INTO embeddings (dataset_id, sample_id, field_name, vector) "
+            "SELECT dataset_id, id, 'clip', '[1,0]' FROM samples WHERE id = $1",
             corn,
         )
         await database.execute(
@@ -2415,8 +2455,9 @@ def test_samples_that_swap_filepaths_keep_their_vectors_and_what_was_added_here(
             row['id'] for row in await database.fetch('SELECT id FROM samples WHERE dataset_id = 1 ORDER BY id')
         ]
         await database.execute(
-            "INSERT INTO embeddings (sample_id, field_name, vector) "
-            "VALUES ($1, 'clip', '[1,0]'), ($2, 'clip', '[0,1]')",
+            "INSERT INTO embeddings (dataset_id, sample_id, field_name, vector) "
+            "SELECT dataset_id, id, 'clip', CASE id WHEN $1 THEN '[1,0]' ELSE '[0,1]' END::vector "
+            "FROM samples WHERE id IN ($1, $2)",
             corn,
             soy,
         )
@@ -2427,7 +2468,8 @@ def test_samples_that_swap_filepaths_keep_their_vectors_and_what_was_added_here(
         before = await copied(database, mirror)
         # A vector field of this instance's own, on the mirror's copy of corn.
         await database.execute(
-            "INSERT INTO embeddings (sample_id, field_name, vector) VALUES ($1, 'mine', '[5,5]')",
+            "INSERT INTO embeddings (dataset_id, sample_id, field_name, vector) "
+            "SELECT dataset_id, id, 'mine', '[5,5]' FROM samples WHERE id = $1",
             before[corn]['id'],
         )
 

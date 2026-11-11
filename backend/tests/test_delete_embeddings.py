@@ -8,7 +8,7 @@ import asyncpg
 import pytest
 from fastapi import HTTPException
 
-from backend import bulk_jobs, job_queue
+from backend import bulk_jobs, index_jobs, job_queue
 from backend.routers import datasets, embeddings
 from backend.tests import test_field_registry_postgres
 from backend.tests.test_bulk_jobs import claim, finish, step, submitted
@@ -18,6 +18,7 @@ registry_database = test_field_registry_postgres.registry_database
 pytestmark = pytest.mark.skipif(not os.getenv('FRIDGE_TEST_POSTGRES_DSN'), reason='Requires disposable PostgreSQL')
 
 FIELD = 'embeddings_model_a'
+INDEX = index_jobs.ann_index_name(1, FIELD)
 OTHER_FIELD = 'embeddings_model_b'
 
 
@@ -26,8 +27,8 @@ async def seed(db, count=7):
     ids = (await ingest([{'uniqueness_model_a': index / 10} for index in range(count)]))['ids']
     for field in (FIELD, OTHER_FIELD):
         await db.execute(
-            'INSERT INTO embeddings(sample_id,field_name,vector) SELECT id,$2,ARRAY[id,1,2]::real[]::vector '
-            'FROM unnest($1::int[]) id',
+            'INSERT INTO embeddings(dataset_id,sample_id,field_name,vector) '
+            'SELECT s.dataset_id,s.id,$2,ARRAY[s.id,1,2]::real[]::vector FROM samples s WHERE s.id = ANY($1::int[])',
             ids,
             field,
         )
@@ -160,7 +161,8 @@ def test_explicit_ids_in_other_datasets_and_unknown_fields_delete_nothing(regist
         ids = await seed(db, 2)
         foreign = (await ingest([{}], dataset_id=2, prefix='other'))['ids']
         await db.execute(
-            "INSERT INTO embeddings(sample_id,field_name,vector) SELECT unnest($1::int[]),$2,'[1,2,3]'",
+            "INSERT INTO embeddings(dataset_id,sample_id,field_name,vector) "
+            "SELECT dataset_id,id,$2,'[1,2,3]' FROM samples WHERE id = ANY($1::int[])",
             foreign,
             FIELD,
         )
@@ -210,22 +212,28 @@ def test_emptied_field_with_an_ann_index_refuses_another_dimension_with_a_clear_
     async def scenario(db):
         await seed(db, 3)
         await db.execute(
-            f"CREATE INDEX hnsw_emb_{FIELD} ON embeddings USING hnsw ((vector::vector(3)) vector_cosine_ops) "
+            f"CREATE INDEX {INDEX} ON embeddings_d1 USING hnsw ((vector::vector(3)) vector_cosine_ops) "
             f"WHERE field_name = '{FIELD}'",
         )
         await delete_request(sample_ids=[1, 2, 3])
         await finish(db)
         # PostgreSQL itself rejects the other dimension on insert (a bare 500 for the caller).
         with pytest.raises(asyncpg.PostgresError, match='expected 3 dimensions'):
-            await db.execute("INSERT INTO embeddings(sample_id,field_name,vector) VALUES(1,$1,'[1,2,3,4]')", FIELD)
+            await db.execute(
+                "INSERT INTO embeddings(dataset_id,sample_id,field_name,vector) VALUES("
+                "(SELECT dataset_id FROM samples WHERE id = 1),1,$1,'[1,2,3,4]')",
+                FIELD,
+            )
         with pytest.raises(HTTPException) as refused:
-            await embeddings.validate_embedding_dims({FIELD: {4}})
+            await embeddings.validate_embedding_dims(1, {FIELD: {4}})
         assert refused.value.status_code == 422
-        assert f'hnsw_emb_{FIELD}' in refused.value.detail and '3-d' in refused.value.detail
-        await embeddings.validate_embedding_dims({FIELD: {3}})
+        assert INDEX in refused.value.detail and '3-d' in refused.value.detail
+        await embeddings.validate_embedding_dims(1, {FIELD: {3}})
+        # Another dataset's dimension is its own.
+        await embeddings.validate_embedding_dims(2, {FIELD: {4}})
         # Without an index the dimension is free once no vector remains.
-        await db.execute(f'DROP INDEX hnsw_emb_{FIELD}')
-        await embeddings.validate_embedding_dims({FIELD: {4}})
+        await db.execute(f'DROP INDEX {INDEX}')
+        await embeddings.validate_embedding_dims(1, {FIELD: {4}})
 
     registry_database(scenario)
 
@@ -236,7 +244,7 @@ def test_ann_index_returns_only_the_refilled_vectors_without_a_rebuild(registry_
     async def scenario(db):
         ids = await seed(db, 40)
         await db.execute(
-            f"CREATE INDEX hnsw_emb_{FIELD} ON embeddings USING hnsw ((vector::vector(3)) vector_cosine_ops) "
+            f"CREATE INDEX {INDEX} ON embeddings_d1 USING hnsw ((vector::vector(3)) vector_cosine_ops) "
             f"WHERE field_name = '{FIELD}'",
         )
         chosen = ids[:10]
@@ -256,11 +264,11 @@ def test_ann_index_returns_only_the_refilled_vectors_without_a_rebuild(registry_
                 await connection.execute('SET LOCAL enable_seqscan=off')
                 await connection.execute('SET LOCAL enable_indexscan=on')
                 query = (
-                    'SELECT sample_id FROM embeddings WHERE field_name=$1 '
+                    'SELECT sample_id FROM embeddings WHERE dataset_id=1 AND field_name=$1 '
                     'ORDER BY vector::vector(3) <=> $2::vector(3) LIMIT $3'
                 )
                 plan = '\n'.join(r[0] for r in await connection.fetch('EXPLAIN ' + query, FIELD, vector, limit))
-                assert f'hnsw_emb_{FIELD}' in plan, plan
+                assert INDEX in plan, plan
                 return sorted(r['sample_id'] for r in await connection.fetch(query, FIELD, vector, limit))
 
         assert await nearest('[-5,3,1]', 10) == chosen

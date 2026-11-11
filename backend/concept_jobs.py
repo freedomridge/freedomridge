@@ -312,7 +312,8 @@ async def _score_values(connection, dataset_id, definition, sample_ids, *, previ
                   concept_score_value($3,embedding.vector,$4::text::vector,$5) AS score{existing[0]}
            FROM unnest($1::int[]) target(sample_id)
            LEFT JOIN samples sample ON sample.id=target.sample_id AND sample.dataset_id=$2
-           LEFT JOIN embeddings embedding ON embedding.sample_id=sample.id AND embedding.field_name=$6
+           LEFT JOIN embeddings embedding ON embedding.dataset_id=$2 AND embedding.sample_id=sample.id
+                                            AND embedding.field_name=$6
            {existing[1]}
            ORDER BY target.sample_id""",
         sample_ids,
@@ -536,7 +537,8 @@ def _matrix(texts):
 
 async def _vector_texts(connection, dataset_id, field, ids):
     rows = await connection.fetch(
-        """SELECT e.vector::text AS v FROM embeddings e JOIN samples s ON e.sample_id = s.id
+        """SELECT e.vector::text AS v FROM embeddings e
+               JOIN samples s ON s.dataset_id = e.dataset_id AND s.id = e.sample_id
            WHERE s.dataset_id = $1 AND e.field_name = $2 AND e.sample_id = ANY($3::int[])
              AND e.vector IS NOT NULL""",
         dataset_id,
@@ -549,13 +551,13 @@ async def _vector_texts(connection, dataset_id, field, ids):
 # Training samples cast to text only after the random LIMIT: casting below the sort converts every
 # candidate vector of the field (measured 18.8 s vs 0.72 s for 200 of 1.2M 512-d vectors).
 BACKGROUND_SQL = """SELECT sampled.v::text AS v FROM (
-        SELECT e.vector AS v FROM embeddings e JOIN samples s ON e.sample_id = s.id
+        SELECT e.vector AS v FROM embeddings e JOIN samples s ON s.dataset_id = e.dataset_id AND s.id = e.sample_id
         WHERE s.dataset_id = $1 AND e.field_name = $2 AND e.vector IS NOT NULL
           AND NOT (e.sample_id = ANY($3::int[])) ORDER BY random() LIMIT $4) sampled"""
 SCORED_SQL = """SELECT sampled.v::text AS v FROM (
         SELECT e.vector AS v FROM embedding_concept_scores cs
         JOIN samples s ON s.id = cs.sample_id
-        JOIN embeddings e ON e.sample_id = cs.sample_id AND e.field_name = $2
+        JOIN embeddings e ON e.dataset_id = $1 AND e.sample_id = cs.sample_id AND e.field_name = $2
         WHERE cs.concept_id = $5 AND s.dataset_id = $1 AND cs.score {op} $3
           AND NOT (cs.sample_id = ANY($6::int[])) AND e.vector IS NOT NULL
         ORDER BY random() LIMIT $4) sampled"""
@@ -601,7 +603,7 @@ async def _bounds(connection, dataset_id, concept_id):
                    COALESCE((SELECT id FROM samples WHERE dataset_id=$1 ORDER BY id DESC LIMIT 1),0),
                    COALESCE((SELECT sample_id FROM embedding_concept_scores WHERE concept_id=$2
                              ORDER BY sample_id DESC LIMIT 1),0)) AS upper_id,
-                   COALESCE((SELECT max(id) FROM embeddings),0) AS watermark""",
+                   COALESCE((SELECT max(id) FROM embeddings WHERE dataset_id=$1),0) AS watermark""",
             dataset_id,
             concept_id,
         ),
@@ -996,8 +998,8 @@ async def _measure_explicit(pool, job, size):
             stop = min(barrier['watermark'], start + APPEND_SPAN)
             rows = await connection.fetch(
                 """SELECT embedding.id,embedding.sample_id FROM embeddings embedding
-                   JOIN samples sample ON sample.id=embedding.sample_id
-                   WHERE embedding.id>$1 AND embedding.id<=$2 AND embedding.field_name=$3 AND sample.dataset_id=$4
+                   JOIN samples sample ON sample.dataset_id=embedding.dataset_id AND sample.id=embedding.sample_id
+                   WHERE embedding.dataset_id=$4 AND embedding.id>$1 AND embedding.id<=$2 AND embedding.field_name=$3
                    ORDER BY embedding.id LIMIT $5""",
                 start,
                 stop,

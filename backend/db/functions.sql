@@ -85,6 +85,46 @@ LANGUAGE SQL IMMUTABLE PARALLEL SAFE AS $$
     END FROM normalized
 $$;
 
+CREATE OR REPLACE FUNCTION create_embeddings_partition(p_schema TEXT, p_dataset_id INTEGER) RETURNS void
+SET lock_timeout = '500ms' AS $$
+DECLARE
+    partition TEXT := format('%I.%I', p_schema, 'embeddings_d' || p_dataset_id);
+BEGIN
+    IF to_regclass(partition) IS NULL THEN
+        EXECUTE format('CREATE TABLE %s (LIKE %I.embeddings)', partition, p_schema);
+    ELSIF EXISTS (SELECT 1 FROM pg_inherits WHERE inhrelid = to_regclass(partition)) THEN
+        RETURN;
+    END IF;
+    -- ATTACH locks the parent and the tables its foreign keys tie the partition to (samples, which it references;
+    -- coordinates and pending rows, which reference it). They are taken first, in one order, each waiting in the
+    -- queue (so writers that keep overlapping can't starve it) for at most lock_timeout, which is under
+    -- deadlock_timeout. Whoever waits on a lock held here started waiting after this did, so this times out first in
+    -- any cycle (a writer taking them in the other order, an index build on samples waiting for this transaction): it
+    -- fails with lock_not_available, its transaction rolls back holding nothing, and the caller tries again.
+    EXECUTE format('LOCK TABLE %I.embeddings IN SHARE UPDATE EXCLUSIVE MODE', p_schema);
+    EXECUTE format('LOCK TABLE %1$I.samples, %1$I.embedding_coordinates, %1$I.embedding_projection_pending '
+                   'IN SHARE ROW EXCLUSIVE MODE', p_schema);
+    EXECUTE format('ALTER TABLE %I.embeddings ATTACH PARTITION %s FOR VALUES IN (%s)', p_schema, partition, p_dataset_id);
+    -- A TRUNCATE of one partition fires only that partition's triggers, so each carries the follower guard (0019).
+    EXECUTE format('CREATE OR REPLACE TRIGGER follower_truncate_guard BEFORE TRUNCATE ON %s '
+                   'FOR EACH STATEMENT EXECUTE FUNCTION %I.refuse_followed_truncate()', partition, p_schema);
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION datasets_create_embeddings_partition() RETURNS trigger AS $$
+BEGIN
+    PERFORM create_embeddings_partition(TG_TABLE_SCHEMA, NEW.id);
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION embedding_coordinates_fill_dataset() RETURNS trigger AS $$
+BEGIN
+    SELECT dataset_id INTO NEW.dataset_id FROM samples WHERE id = NEW.sample_id;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
 CREATE OR REPLACE FUNCTION recompute_viz_rank(
     p_dataset_id INTEGER, p_field TEXT, p_full BOOLEAN DEFAULT TRUE
 ) RETURNS INTEGER AS $$
@@ -275,6 +315,8 @@ END;
 $$ LANGUAGE plpgsql;
 
 CREATE OR REPLACE FUNCTION coordinates_delete_viz_rank() RETURNS trigger AS $$
+DECLARE
+    deleted_dataset INTEGER;
 BEGIN
     IF NULLIF(current_setting('fridge.deletion_dataset', TRUE), '') IS NOT NULL THEN
         RETURN NULL;
@@ -287,23 +329,32 @@ BEGIN
        FROM (SELECT s.dataset_id FROM coordinate_old o JOIN samples s ON s.id = o.sample_id
              UNION SELECT r.dataset_id FROM coordinate_old o JOIN embedding_viz_rank r
                    ON r.sample_id = o.sample_id AND r.field_name = o.field_name ORDER BY 1) d;
-    EXECUTE $q$
-        UPDATE embedding_viz_meta m SET rank_stale = TRUE
-          FROM coordinate_old o JOIN embeddings e USING (sample_id, field_name)
-          JOIN samples s ON s.id = o.sample_id
-         WHERE m.dataset_id = s.dataset_id AND m.field_name = o.field_name AND NOT m.rank_stale$q$;
+    -- Statements that read embeddings run once per dataset with its id as a value, so each reads that dataset's
+    -- partition only: a join on o.dataset_id plans and locks every partition (0021).
+    FOR deleted_dataset IN SELECT DISTINCT dataset_id FROM coordinate_old ORDER BY 1 LOOP
+        EXECUTE $q$
+            UPDATE embedding_viz_meta m SET rank_stale = TRUE
+              FROM coordinate_old o JOIN embeddings e
+                ON e.dataset_id = $1 AND e.sample_id = o.sample_id AND e.field_name = o.field_name
+              JOIN samples s ON s.id = o.sample_id
+             WHERE o.dataset_id = $1 AND m.dataset_id = s.dataset_id AND m.field_name = o.field_name
+               AND NOT m.rank_stale$q$ USING deleted_dataset;
+    END LOOP;
     EXECUTE $q$
         DELETE FROM embedding_viz_rank r USING coordinate_old o
          WHERE r.sample_id = o.sample_id AND r.field_name = o.field_name$q$;
     -- Explicit clearing schedules re-projection; cascades cannot resurrect work
     -- because the embedding/sample no longer exists in this transaction.
-    EXECUTE $q$
-        INSERT INTO embedding_projection_pending (sample_id, field_name, dataset_id)
-        SELECT e.sample_id, e.field_name, s.dataset_id
-          FROM coordinate_old o JOIN embeddings e USING (sample_id, field_name)
-          JOIN samples s ON s.id = e.sample_id
-         WHERE e.vector IS NOT NULL
-        ON CONFLICT DO NOTHING$q$;
+    FOR deleted_dataset IN SELECT DISTINCT dataset_id FROM coordinate_old ORDER BY 1 LOOP
+        EXECUTE $q$
+            INSERT INTO embedding_projection_pending (sample_id, field_name, dataset_id)
+            SELECT e.sample_id, e.field_name, s.dataset_id
+              FROM coordinate_old o JOIN embeddings e
+                ON e.dataset_id = $1 AND e.sample_id = o.sample_id AND e.field_name = o.field_name
+              JOIN samples s ON s.id = e.sample_id
+             WHERE o.dataset_id = $1 AND e.vector IS NOT NULL
+            ON CONFLICT DO NOTHING$q$ USING deleted_dataset;
+    END LOOP;
     RETURN NULL;
 END;
 $$ LANGUAGE plpgsql;
@@ -366,7 +417,10 @@ BEGIN
                 covered := (COALESCE(OLD.metadata,'{}'::jsonb)-recorded)
                         IS NOT DISTINCT FROM (COALESCE(NEW.metadata,'{}'::jsonb)-recorded)
                     AND (OLD.tags IS NOT DISTINCT FROM NEW.tags OR 'tags'=ANY(recorded))
-                    AND (OLD.media_type IS NOT DISTINCT FROM NEW.media_type OR 'media_type'=ANY(recorded));
+                    AND (OLD.media_type IS NOT DISTINCT FROM NEW.media_type OR 'media_type'=ANY(recorded))
+                    -- A mirror's own fields (0022): a change to them is recorded below, never assumed covered.
+                    AND OLD.local_metadata IS NOT DISTINCT FROM NEW.local_metadata
+                    AND OLD.local_tags IS NOT DISTINCT FROM NEW.local_tags;
             END IF;
             IF covered AND (TG_OP = 'INSERT' OR (OLD.dataset_id,OLD.id::bigint/4096)
                 IS NOT DISTINCT FROM (NEW.dataset_id,NEW.id::bigint/4096)) THEN
@@ -384,6 +438,12 @@ BEGIN
                         COALESCE(OLD.metadata,'{}'::jsonb) || COALESCE(NEW.metadata,'{}'::jsonb)) key
                     WHERE OLD.metadata->key IS DISTINCT FROM NEW.metadata->key);
             END IF;
+            IF OLD.local_metadata IS DISTINCT FROM NEW.local_metadata THEN
+                affected := affected || ARRAY(
+                    SELECT '@local.' || key FROM jsonb_object_keys(OLD.local_metadata || NEW.local_metadata) key
+                    WHERE OLD.local_metadata->key IS DISTINCT FROM NEW.local_metadata->key);
+            END IF;
+            IF OLD.local_tags IS DISTINCT FROM NEW.local_tags THEN affected := affected || ARRAY['@local.tags']; END IF;
             IF OLD.tags IS DISTINCT FROM NEW.tags THEN affected := affected || ARRAY['tags']; END IF;
             IF OLD.media_type IS DISTINCT FROM NEW.media_type THEN affected := affected || ARRAY['media_type']; END IF;
         END IF;
@@ -631,8 +691,8 @@ BEGIN
     END IF;
     observed_snapshot := txid_current_snapshot()::text;
     EXECUTE $q$SELECT embedding.id FROM embeddings embedding
-        JOIN samples sample ON sample.id=embedding.sample_id
-        WHERE embedding.id>$1 AND embedding.field_name=$2 AND sample.dataset_id=$3
+        JOIN samples sample ON sample.dataset_id=embedding.dataset_id AND sample.id=embedding.sample_id
+        WHERE embedding.dataset_id=$3 AND embedding.id>$1 AND embedding.field_name=$2
         ORDER BY embedding.id DESC LIMIT 1$q$
     INTO new_watermark USING definition.last_scored_embedding_id,
         definition.embedding_field,definition.dataset_id;
@@ -642,8 +702,9 @@ BEGIN
         INSERT INTO embedding_concept_scores(concept_id, sample_id, score)
         SELECT p_concept_id, embedding.sample_id,
                concept_score_value(definition.kind, embedding.vector, definition.weight::vector, definition.bias)
-        FROM embeddings embedding JOIN samples sample ON sample.id = embedding.sample_id
-        WHERE sample.dataset_id = definition.dataset_id
+        FROM embeddings embedding
+        JOIN samples sample ON sample.dataset_id = embedding.dataset_id AND sample.id = embedding.sample_id
+        WHERE embedding.dataset_id = definition.dataset_id
           AND embedding.field_name = definition.embedding_field AND embedding.vector IS NOT NULL;
         GET DIAGNOSTICS scored = ROW_COUNT;
         UPDATE embedding_concepts SET scored_count = scored,
@@ -655,9 +716,10 @@ BEGIN
             -- "Score new" on a manual concept keeps the indexed append-only contract.
             -- Replan with the current watermark rather than caching a broad ID-range plan.
             EXECUTE $q$SELECT array_agg(embedding.sample_id)
-                FROM embeddings embedding JOIN samples sample ON sample.id=embedding.sample_id
-                WHERE embedding.id>$1 AND embedding.id<=$4
-                  AND embedding.field_name=$2 AND sample.dataset_id=$3$q$
+                FROM embeddings embedding
+                JOIN samples sample ON sample.dataset_id=embedding.dataset_id AND sample.id=embedding.sample_id
+                WHERE embedding.dataset_id=$3 AND embedding.id>$1 AND embedding.id<=$4
+                  AND embedding.field_name=$2$q$
             INTO target_ids USING definition.last_scored_embedding_id,
                 definition.embedding_field,definition.dataset_id,new_watermark;
         ELSE
@@ -684,7 +746,8 @@ BEGIN
                concept_score_value(definition.kind, embedding.vector, definition.weight::vector, definition.bias)
         FROM unnest(target_ids) target(sample_id)
         JOIN samples sample ON sample.id = target.sample_id AND sample.dataset_id = definition.dataset_id
-        JOIN embeddings embedding ON embedding.sample_id = target.sample_id
+        JOIN embeddings embedding ON embedding.dataset_id = definition.dataset_id
+          AND embedding.sample_id = target.sample_id
           AND embedding.field_name = definition.embedding_field AND embedding.vector IS NOT NULL
         ON CONFLICT (concept_id, sample_id) DO UPDATE SET score = EXCLUDED.score
         WHERE embedding_concept_scores.score IS DISTINCT FROM EXCLUDED.score;
@@ -692,8 +755,10 @@ BEGIN
         DELETE FROM embedding_concept_scores existing
         WHERE existing.concept_id = p_concept_id AND existing.sample_id = ANY(target_ids)
           AND NOT EXISTS (
-              SELECT 1 FROM embeddings embedding JOIN samples sample ON sample.id = embedding.sample_id
-              WHERE sample.id = existing.sample_id AND sample.dataset_id = definition.dataset_id
+              SELECT 1 FROM embeddings embedding
+              JOIN samples sample ON sample.dataset_id = embedding.dataset_id AND sample.id = embedding.sample_id
+              WHERE embedding.dataset_id = definition.dataset_id AND embedding.sample_id = existing.sample_id
+                AND sample.id = existing.sample_id AND sample.dataset_id = definition.dataset_id
                 AND embedding.field_name = definition.embedding_field AND embedding.vector IS NOT NULL
           );
         LOOP
@@ -1198,8 +1263,11 @@ BEGIN
     IF current_setting('fridge.deletion_dataset', TRUE) = target_dataset::text THEN
         RETURN;
     END IF;
-    -- A mirror's samples change only through its sync (0009).
-    PERFORM require_mirror_sync(target_dataset);
+    -- A mirror's samples change only through its sync (0009), or, for this instance's own fields, under
+    -- fridge.mirror_local, which samples_mirror_local_guard holds to the two local columns (0022).
+    IF current_setting('fridge.mirror_local', TRUE) IS DISTINCT FROM target_dataset::text THEN
+        PERFORM require_mirror_sync(target_dataset);
+    END IF;
     INSERT INTO sample_block_changes (dataset_id, block_id)
     SELECT target_dataset, target_block FROM datasets WHERE id = target_dataset AND followed
     ON CONFLICT DO NOTHING;
@@ -1298,11 +1366,35 @@ BEGIN
     IF TG_OP <> 'INSERT' AND current_setting('fridge.deletion_dataset', TRUE) = OLD.dataset_id::text THEN
         RETURN NULL;
     END IF;
-    IF TG_OP <> 'INSERT' THEN
+    IF TG_OP <> 'INSERT' AND NOT starts_with(OLD.field_name, '@local.') THEN
         PERFORM require_mirror_sync(OLD.dataset_id);
     END IF;
-    IF TG_OP <> 'DELETE' THEN
+    IF TG_OP <> 'DELETE' AND NOT starts_with(NEW.field_name, '@local.') THEN
         PERFORM require_mirror_sync(NEW.dataset_id);
+    END IF;
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION set_field_owner() RETURNS trigger AS $$
+BEGIN
+    NEW.owner := CASE
+        WHEN NOT starts_with(NEW.field_name, '@local.')
+             AND EXISTS (SELECT 1 FROM mirrors WHERE dataset_id = NEW.dataset_id) THEN 'primary'
+        ELSE 'self'
+    END;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION guard_mirror_local() RETURNS trigger AS $$
+BEGIN
+    IF TG_OP <> 'UPDATE'
+       OR NEW.dataset_id::text IS DISTINCT FROM current_setting('fridge.mirror_local', TRUE)
+       OR to_jsonb(OLD) - 'local_metadata' - 'local_tags' IS DISTINCT FROM to_jsonb(NEW) - 'local_metadata' - 'local_tags'
+    THEN
+        RAISE EXCEPTION 'A write of this instance''s own fields (@local.) changes only those fields'
+            USING ERRCODE = '55000';
     END IF;
     RETURN NULL;
 END;

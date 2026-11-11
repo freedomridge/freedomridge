@@ -1,11 +1,14 @@
 'use client';
 
 import React, { createContext, useContext, useState, useCallback, useMemo, useEffect, useRef } from 'react';
+import { useSearchParams } from 'next/navigation';
 import type { Feature, Polygon } from 'geojson';
 import { ComplexFilter, MAP_REFITTED_EVENT, type MapRefitted, ViewStage } from '@/lib/api';
 import { useToast } from '@/contexts/ToastContext';
 import { convertSimpleFiltersToComplex, describeFilter } from '@/lib/filter-utils';
 import { type DefaultView, defaultViewStages, isDefaultViewStage, opensOnDefaultView } from '@/lib/default-view';
+import { type DatasetLink, linkSetsFilters, readLink, withoutLinkParameters } from '@/lib/links';
+import { filterHasInSelection } from '@/lib/filter-query';
 
 // The map lasso selection — a GeoJSON polygon feature (or none).
 type MapPolygon = Feature<Polygon> | null;
@@ -54,12 +57,6 @@ function loadFilterState(datasetId: number | undefined): PersistedFilterState | 
 
 const MAX_PERSISTED_IDS = 50_000;  // Skip persisting transient selections larger than this
 const MAX_STORAGE_BYTES = 2 * 1024 * 1024;  // 2MB hard cap per dataset
-
-export function filterHasInSelection(f: ComplexFilter | undefined): boolean {
-    if (!f) return false;
-    if (f.operator === 'in_selection') return true;
-    return (f.filters || []).some(filterHasInSelection);
-}
 
 // A selection stage that must NOT be written to history state or localStorage, because it
 // wouldn't survive being restored:
@@ -147,6 +144,15 @@ interface FilterContextType {
     clearSelection: () => void;
     showResultsAsView: (stage: ViewStage) => void;
     hasUnappliedChanges: boolean;
+
+    // The link the page was opened with (lib/links.ts), read once as it opened; null without one. The page opens
+    // it and hands its filter stages to settleLink (null when the link sets none or can't be opened), which puts
+    // them in place of the restored filters and removes the link from the address.
+    link: DatasetLink | null;
+    settleLink: (stages: ViewStage[] | null) => void;
+    // A link that sets the filters is still being opened: the page holds its panels back, so the restored filters
+    // aren't queried (and shown) only to be replaced.
+    linkPending: boolean;
 
     // Selection state (from embeddings/map - part of staged filters)
     selectedIds: number[];
@@ -299,6 +305,16 @@ function holdsStaleLasso(node: ComplexFilter | undefined, field: string, modelId
 export function FilterProvider({ children, datasetId }: { children: React.ReactNode; datasetId?: number }): React.ReactNode {
     // Load persisted state (runs once per datasetId)
     const savedState = useMemo(() => loadFilterState(datasetId), [datasetId]);
+
+    // A link to this dataset, read once as the page opens and kept: the address loses it when the page has opened
+    // it (settleLink), so nothing reads it from the address later. Read from the router, not window.location: after
+    // login the app navigates here, and the address still shows the login page while this page first renders.
+    const searchParams = useSearchParams();
+    const [link] = useState<DatasetLink | null>(() => readLink(searchParams));
+    // While a link that sets the filters is opened, the default view waits: it isn't put on top of the link's
+    // filters, and a link that can't be opened leaves the dataset as it would open without it.
+    const [linkPending, setLinkPending] = useState(() => linkSetsFilters(link));
+    const linkAppliedRef = useRef(false);
 
     // View Stages - The source of truth for global filters
     const [viewStages, setViewStages] = useState<ViewStage[]>(savedState?.viewStages ?? []);
@@ -686,17 +702,36 @@ export function FilterProvider({ children, datasetId }: { children: React.ReactN
         if (defaultView) setDismissedDefaultViewId(defaultView.id);
     }, [defaultView]);
 
-    // Open on the default view once the dataset's answer says which it is (see opensOnDefaultView).
+    // Open on the default view once the dataset's answer says which it is (see opensOnDefaultView), and once a link
+    // that sets the filters has settled: never on top of the link's filters.
     const openedRef = useRef(false);
     useEffect(() => {
-        if (defaultView === undefined || openedRef.current) return;
+        if (defaultView === undefined || openedRef.current || linkPending) return;
         openedRef.current = true;
+        if (linkAppliedRef.current) return;
         if (opensOnDefaultView(viewStages, dismissedDefaultViewId, defaultView)) {
             replaceHistoryRef.current = true;
             // eslint-disable-next-line react-hooks/set-state-in-effect -- once per visit, when the dataset's answer arrives
             setViewStages(defaultViewStages(defaultView));
         }
-    }, [defaultView]); // eslint-disable-line react-hooks/exhaustive-deps -- once, with the filters this visit opened with
+    }, [defaultView, linkPending]); // eslint-disable-line react-hooks/exhaustive-deps -- once, with the filters this visit opened with
+
+    // The link's stages replace the restored ones; the history push that follows (debounced, like any filter change)
+    // leaves the restored filters one Back away. The parameters leave the address in the same step, before that
+    // push: the entry Back returns to gets the clean address, the pushed one inherits it, and a reload there doesn't
+    // open the link again. The state goes in without the router's own mark (__NA): Next's replaceState then takes
+    // the new address as its own and copies its keys back beside our snapshot. With the mark it would pass the call
+    // through unseen, keep the address with the link, and write that back at its next state change.
+    const settleLink = useCallback((stages: ViewStage[] | null) => {
+        if (stages) {
+            linkAppliedRef.current = true;
+            setViewStages(stages);
+        }
+        const state = { ...window.history.state };
+        delete state.__NA;
+        window.history.replaceState(state, '', withoutLinkParameters(window.location.href));
+        setLinkPending(false);
+    }, []);
 
     // A search's result set becomes THE view. It replaces the applied stages AND every other
     // input the grid would otherwise AND with it: draft sidebar / Query Builder filters, the
@@ -794,6 +829,9 @@ export function FilterProvider({ children, datasetId }: { children: React.ReactN
         selectionSource,
         setSelectionSource,
         showResultsAsView,
+        link,
+        settleLink,
+        linkPending,
     };
 
     return (

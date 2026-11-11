@@ -270,10 +270,10 @@ def test_dimension_mismatch_rejects_whole_batch(registry_database, monkeypatch):
         samples = batch()
         samples[-1]['embeddings']['clip'] = [1, 0, 0]
         async with http_client() as client:
-            response = await client.post('/api/datasets/1/samples', json={'samples': samples})
+            response = await client.post('/api/datasets/2/samples', json={'samples': samples})
             assert response.status_code == 422
-            # Consistent inside the request but different from the established field dimension.
-            response = await client.post('/api/datasets/1/samples', json={'samples': samples[-1:]})
+            # Consistent inside the request but different from the field's dimension in this dataset.
+            response = await client.post('/api/datasets/2/samples', json={'samples': samples[-1:]})
             assert response.status_code == 422
         assert await snapshot(database) == before
 

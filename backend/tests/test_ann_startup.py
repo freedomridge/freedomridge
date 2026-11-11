@@ -32,21 +32,22 @@ def test_startup_ann_check_is_bounded_and_warns_for_unusable_indexes(monkeypatch
                        PERFORM nextval('dimension_reads');
                        RETURN public.vector_dims($1);
                    END $$;
-                   INSERT INTO embeddings(sample_id, field_name, vector, x, y)
-                   SELECT g, field, '[1,2,3]'::vector, NULL, NULL
+                   INSERT INTO embeddings(dataset_id, sample_id, field_name, vector, x, y)
+                   SELECT (SELECT dataset_id FROM samples WHERE id = g), g, field, '[1,2,3]'::vector, NULL, NULL
                    FROM generate_series(1, 10050) g, unnest(ARRAY['clip', 'unregistered']) field;
-                   INSERT INTO embeddings(sample_id, field_name, vector, x, y)
-                   SELECT g, 'null_prefix', CASE WHEN g > 10001 THEN '[1,2,3]'::vector END, NULL, NULL
+                   INSERT INTO embeddings(dataset_id, sample_id, field_name, vector, x, y)
+                   SELECT (SELECT dataset_id FROM samples WHERE id = g), g, 'null_prefix',
+                          CASE WHEN g > 10001 THEN '[1,2,3]'::vector END, NULL, NULL
                    FROM generate_series(1, 20002) g;
-                   INSERT INTO embeddings(sample_id, field_name, vector, x, y)
-                   VALUES (1, 'small', '[1,2,3]', NULL, NULL);""",
+                   INSERT INTO embeddings(dataset_id, sample_id, field_name, vector, x, y)
+                   VALUES ((SELECT dataset_id FROM samples WHERE id = 1), 1, 'small', '[1,2,3]', NULL, NULL);""",
             )
             # A wrong-dimension index can only exist with no matching rows. Use a null
             # expression so Postgres can build it; it still must not satisfy the check.
             expression = 'NULL::vector(4)' if index_state == 'wrong_dimension' else 'vector::vector(3)'
             operator = 'vector_l2_ops' if index_state == 'wrong_operator' else 'vector_cosine_ops'
             await conn.execute(
-                f"CREATE INDEX hnsw_clip ON embeddings USING hnsw (({expression}) {operator}) "
+                f"CREATE INDEX hnsw_clip ON embeddings_d1 USING hnsw (({expression}) {operator}) "
                 "WHERE field_name = 'clip'",
             )
             if index_state in ('invalid', 'not_ready'):
@@ -95,8 +96,8 @@ def test_startup_uses_bounded_primary_key_windows_and_catalog_for_toasted_middle
                 """INSERT INTO datasets(name, owner_id) VALUES ('ann', 1);
                    INSERT INTO samples(dataset_id, filepath, media_type)
                    SELECT 1, 'ann-' || g, 'image' FROM generate_series(1, 132000) g;
-                   INSERT INTO embeddings(sample_id, field_name, vector)
-                   SELECT g, CASE WHEN g <= 60000 THEN 'first'
+                   INSERT INTO embeddings(dataset_id, sample_id, field_name, vector)
+                   SELECT 1, g, CASE WHEN g <= 60000 THEN 'first'
                                   WHEN g <= 72000 THEN 'middle' ELSE 'last' END,
                           CASE WHEN g BETWEEN 60001 AND 72000
                                THEN array_fill(0.1::real, ARRAY[512])::vector ELSE '[1]'::vector END
@@ -106,7 +107,7 @@ def test_startup_uses_bounded_primary_key_windows_and_catalog_for_toasted_middle
                    ANALYZE embeddings;""",
             )
             assert await conn.fetchval(
-                "SELECT pg_relation_size(reltoastrelid) > 0 FROM pg_class WHERE oid='embeddings'::regclass",
+                "SELECT pg_relation_size(reltoastrelid) > 0 FROM pg_class WHERE oid='embeddings_d1'::regclass",
             )
             monkeypatch.setattr(database, 'db', RecordingDB())
             await database._warn_missing_ann_indexes()
@@ -118,11 +119,13 @@ def test_startup_uses_bounded_primary_key_windows_and_catalog_for_toasted_middle
             scans = []
             while pending:
                 node = pending.pop()
-                if node.get('Relation Name') == 'embeddings':
+                if node.get('Relation Name') == 'embeddings_d1':
                     scans.append(node)
                 pending.extend(node.get('Plans', []))
-            assert len(scans) == 2
-            assert all(node['Index Name'] == 'embeddings_pkey' for node in scans)
+            # A partition changed since its last ANALYZE is also read at both ends of its key, bounded; once the
+            # statistics show the ANALYZE, pg_stats alone covers it (0021).
+            assert len(scans) in (0, 2)
+            assert all(node['Index Name'] == 'embeddings_d1_pkey' for node in scans)
             assert all(node['Actual Rows'] <= 50001 and node['Actual Loops'] == 1 for node in scans)
         finally:
             await conn.execute('SET search_path TO public')

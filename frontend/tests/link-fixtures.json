@@ -1,0 +1,462 @@
+{
+  "about": [
+    "Links that must keep opening (frontend/lib/links.ts). A change that breaks one either keeps reading the old",
+    "form or drops it on purpose: remove its fixtures in the same change and say so in the CHANGELOG.",
+    "q: query-language text; it opens on one chip per entry of filters (backend/tests/test_link_fixtures.py).",
+    "f: encoded stages; it opens on stages (tests/links.test.cjs). Every filter here must still compile.",
+    "fields: the field kinds the q links are parsed against. count: the samples a link opens on in the e2e",
+    "fixture dataset (e2e/open-links.spec.ts)."
+  ],
+  "fields": {
+    "id": "number",
+    "filepath": "text",
+    "split": "text",
+    "idx": "number",
+    "score": "number",
+    "note": "text",
+    "tags": "list",
+    "sampled_at": "datetime",
+    "ok": "boolean",
+    "in": "text"
+  },
+  "q": [
+    {
+      "name": "= and !=",
+      "q": "split = train AND idx != 3",
+      "filters": [
+        {
+          "field": "split",
+          "operator": "=",
+          "value": "train"
+        },
+        {
+          "field": "idx",
+          "operator": "!=",
+          "value": 3
+        }
+      ]
+    },
+    {
+      "name": "> >= < <=",
+      "q": "idx > 2 AND idx <= 8 AND score >= 1.5 AND score < 4",
+      "filters": [
+        {
+          "field": "idx",
+          "operator": ">",
+          "value": 2
+        },
+        {
+          "field": "idx",
+          "operator": "<=",
+          "value": 8
+        },
+        {
+          "field": "score",
+          "operator": ">=",
+          "value": 1.5
+        },
+        {
+          "field": "score",
+          "operator": "<",
+          "value": 4
+        }
+      ]
+    },
+    {
+      "name": "in and not in",
+      "q": "split in (train val) AND idx not in (0, 1, 2)",
+      "filters": [
+        {
+          "field": "split",
+          "operator": "in",
+          "value": [
+            "train",
+            "val"
+          ]
+        },
+        {
+          "field": "idx",
+          "operator": "not in",
+          "value": [
+            0,
+            1,
+            2
+          ]
+        }
+      ]
+    },
+    {
+      "name": "between",
+      "q": "idx between 2 and 5",
+      "filters": [
+        {
+          "logic": "AND",
+          "filters": [
+            {
+              "field": "idx",
+              "operator": ">=",
+              "value": 2
+            },
+            {
+              "field": "idx",
+              "operator": "<=",
+              "value": 5
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "contains and like",
+      "q": "filepath contains \"img_0\" AND tags like \"%mod3_1%\"",
+      "filters": [
+        {
+          "field": "filepath",
+          "operator": "contains",
+          "value": "img_0"
+        },
+        {
+          "field": "tags",
+          "operator": "contains",
+          "value": "mod3_1"
+        }
+      ]
+    },
+    {
+      "name": "exists and not exists",
+      "q": "split exists AND note not exists",
+      "filters": [
+        {
+          "field": "split",
+          "operator": "exists",
+          "value": null
+        },
+        {
+          "field": "note",
+          "operator": "not_exists",
+          "value": null
+        }
+      ]
+    },
+    {
+      "name": "is null and is not null",
+      "q": "note is null AND idx is not null",
+      "filters": [
+        {
+          "field": "note",
+          "operator": "is_null",
+          "value": null
+        },
+        {
+          "field": "idx",
+          "operator": "is_not_null",
+          "value": null
+        }
+      ]
+    },
+    {
+      "name": "AND, OR, NOT and brackets",
+      "q": "split = val AND NOT (idx >= 9 OR note exists)",
+      "count": 3,
+      "filters": [
+        {
+          "field": "split",
+          "operator": "=",
+          "value": "val"
+        },
+        {
+          "logic": "NOT",
+          "filters": [
+            {
+              "logic": "OR",
+              "filters": [
+                {
+                  "field": "idx",
+                  "operator": ">=",
+                  "value": 9
+                },
+                {
+                  "field": "note",
+                  "operator": "exists",
+                  "value": null
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "OR binds looser than AND: one chip",
+      "q": "split = train AND idx < 2 OR idx > 10",
+      "filters": [
+        {
+          "logic": "OR",
+          "filters": [
+            {
+              "logic": "AND",
+              "filters": [
+                {
+                  "field": "split",
+                  "operator": "=",
+                  "value": "train"
+                },
+                {
+                  "field": "idx",
+                  "operator": "<",
+                  "value": 2
+                }
+              ]
+            },
+            {
+              "field": "idx",
+              "operator": ">",
+              "value": 10
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "dates",
+      "q": "sampled_at >= 2024-01-05T00:00:00 AND sampled_at < \"2024-01-09\"",
+      "filters": [
+        {
+          "field": "sampled_at",
+          "operator": ">=",
+          "value": "2024-01-05T00:00:00"
+        },
+        {
+          "field": "sampled_at",
+          "operator": "<",
+          "value": "2024-01-09"
+        }
+      ]
+    },
+    {
+      "name": "booleans",
+      "q": "ok = true AND ok != false",
+      "filters": [
+        {
+          "field": "ok",
+          "operator": "=",
+          "value": true
+        },
+        {
+          "field": "ok",
+          "operator": "!=",
+          "value": false
+        }
+      ]
+    },
+    {
+      "name": "other spellings and value forms",
+      "q": "split == \"train\" AND idx <> 3 AND `in` = 'A \"b\"' AND idx in [1, 2]  # a comment",
+      "filters": [
+        {
+          "field": "split",
+          "operator": "=",
+          "value": "train"
+        },
+        {
+          "field": "idx",
+          "operator": "!=",
+          "value": 3
+        },
+        {
+          "field": "in",
+          "operator": "=",
+          "value": "A \"b\""
+        },
+        {
+          "field": "idx",
+          "operator": "in",
+          "value": [
+            1,
+            2
+          ]
+        }
+      ]
+    }
+  ],
+  "f": [
+    {
+      "name": "plain filter",
+      "f": "1.NcrBCQIxEEDRVpZ_znkPA9qIeAhmVgaCCckoSkgBFmJjVrIH8fzeoHu8akdOA39VRdgsuzYCSfulWXUrNwRLz-X7_iwr4V9ksJnm9FMCpWqLXhrC8UDgEfNdkXXO89wB",
+      "count": 6,
+      "stages": [
+        {
+          "type": "filter",
+          "description": "idx ≥ 6",
+          "filter": {
+            "field": "idx",
+            "operator": ">=",
+            "value": 6
+          }
+        }
+      ]
+    },
+    {
+      "name": "map region, with a plain filter",
+      "f": "1.bY1BCsIwFESvUmYdS2ytkIDewI3bUkqw3xKIJqRRlJIDeBAv5knEakXU7byZeT26oFrqIMse4ewIElttAnkwNNRtvHZB2z0kdHNKbpdrkoGNFdljq8k0TwoG68irYD0klgswHJU5EGQWI3vf75SrPbWP02_FSrlkPaJfh7EbFZ7wQ9SSrZ0153YAL2NZTqacp5wXLBepEEXFyokQqZj_CWY85fkQjJvf5DWqYqziHQ",
+      "count": 2,
+      "stages": [
+        {
+          "type": "filter",
+          "description": "idx ≥ 2",
+          "filter": {
+            "field": "idx",
+            "operator": ">=",
+            "value": 2
+          }
+        },
+        {
+          "type": "map_region",
+          "description": "Map Region",
+          "filter": {
+            "field": "location",
+            "operator": "geo_polygon",
+            "value": [
+              [
+                -100.005,
+                39.995
+              ],
+              [
+                -99.965,
+                39.995
+              ],
+              [
+                -99.965,
+                40.035
+              ],
+              [
+                -100.005,
+                40.035
+              ],
+              [
+                -100.005,
+                39.995
+              ]
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "lasso on an embeddings map",
+      "f": "1.RYvBCoMwEAV_pbxzPLTgZe_9gV6DiDVrWFhNSGJBgv9eUpCeBoaZilwmzxlkK8oRGYRFtHCCgeM8J4lFwgbCc32zc7L5fHuxb85cKVUswupA4AePs0qEQYicphJSs9c7xqCH_72fSXcGWdv1pusHY-9_NnQNg8EaHOsoDrTtquc5nF8",
+      "stages": [
+        {
+          "type": "filter",
+          "description": "Embeddings Region",
+          "filter": {
+            "field": "e2e_clip",
+            "operator": "embedding_polygon",
+            "value": [
+              [
+                -5,
+                -5
+              ],
+              [
+                15,
+                -5
+              ],
+              [
+                15,
+                5
+              ],
+              [
+                -5,
+                5
+              ]
+            ],
+            "model_id": null
+          }
+        }
+      ]
+    },
+    {
+      "name": "picked samples",
+      "f": "1.LY1BCsMgEEWvEv6qBRem7uYCPUCXIQvRSRFsFJ0Ugnj3Yujmw4PPew1V7JsraGmQMzMIlSM7CWmHgufqSsgXEZ4l-Olmptf1YH-HwhaicAE1bIGjByF4KKTMxUoqg4foa-PBoGXW2qhZ63nMY-0KHxbrrdihcOnYBWQUajqK438Tva_9Bw",
+      "stages": [
+        {
+          "type": "selection",
+          "description": "Grid (3 Selected)",
+          "filter": {
+            "field": "id",
+            "operator": "in",
+            "value": [
+              1003,
+              1001,
+              1002
+            ]
+          },
+          "metadata": {
+            "count": 3,
+            "source": "Grid"
+          }
+        }
+      ]
+    },
+    {
+      "name": "similarity search results, in rank order",
+      "f": "1.bY5BasMwFESvImatgi0MBe0KXfcCwYsf6yf5IFtG-ikEI8hB2nN0n6PkJEEEsuruzSzmzYaidOQCv9ugl5XhUWSWSFn0AovAZcqyqqQFHvfrD5nMwewpL_frr7n9GU2rGWBxkKic4TfEdJQJHh9fn6_-aTgIxwAPCbBIK2fSlFteYPFN8czwO-e6d-tc11vn-q7RMNaxWsysFEipOQpTnk6NpA0-41sPi0h7jv98bVfSeQnwg0WUWRR-qLWO9QE",
+      "stages": [
+        {
+          "type": "similarity",
+          "description": "“a red barn” · top 4",
+          "filter": {
+            "logic": "AND",
+            "filters": [
+              {
+                "field": "id",
+                "operator": "in",
+                "value": [
+                  2207,
+                  2201,
+                  2210,
+                  2204
+                ]
+              }
+            ]
+          },
+          "metadata": {
+            "search": {
+              "id": "search-1",
+              "label": "“a red barn”",
+              "found": 4,
+              "limit": 4
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "concept filter",
+      "f": "1.dY_BCsIwEER_ReYcRDwo7MGbBy_-gEiJydYG0qakW7GU_LuENuLF4-zOPGZmDKKfPIBuM2TqGYTaeeEIBcuDia4XFzoQzm_jR8u0efgxxgmqGGlG7dhbECoTOsO9QCH0HLWECMJ6rHghQOGl_cg5WF7Ogo45BMIJCtJEHpqQobvtYZ-SQsuirRb9EwNJHFkVeVkgq7rqNq_5tv3HVmiDzc5SL6V7-gA",
+      "stages": [
+        {
+          "type": "filter",
+          "description": "Exclude: blurry",
+          "filter": {
+            "field": "_concept",
+            "operator": "concept_exclude",
+            "value": {
+              "concept_id": 7,
+              "op": ">",
+              "threshold": 0.62
+            }
+          },
+          "metadata": {
+            "concept": true,
+            "conceptId": 7,
+            "conceptName": "blurry",
+            "op": ">",
+            "threshold": 0.62,
+            "mode": "exclude"
+          }
+        }
+      ]
+    }
+  ]
+}

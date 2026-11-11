@@ -16,6 +16,8 @@ Once a minute, the job runner:
    worker has been silent for 10 minutes. Each machine's worker token is revoked when it ends.
 2. **Starts one machine** when a compute job has waited at least the wait time, no connected worker is free to take
    it, no started machine is still connecting, and the limits allow it. The job says "Starting a compute worker".
+   A free worker counts only for the jobs it can take: an admin's worker takes any, a power user's only jobs on
+   datasets that user can access.
 
 A machine is a spot instance of the configured type, launched on-demand only when AWS has no spot capacity for it.
 It boots AWS's current Amazon Linux 2023 (read from AWS's public SSM parameter, so there is no image to maintain),
@@ -41,6 +43,13 @@ All are times, set on the settings page:
 - **Idle exit** (10 minutes): how long a machine's worker waits for more work before it exits.
 
 When a limit holds a job back, the job says which.
+
+Two more stops, shown as the page's error until an admin saves the settings again:
+
+- **Machines that never connect:** after two machines in a row ended without their worker connecting (the image
+  didn't start, or the machine couldn't reach the server's URL), no more start: the next would fail the same way.
+- **The admin who saved the settings** is deactivated or no longer an admin: the machines' workers use that admin's
+  token, so no machine starts until an admin saves the settings.
 
 ## Setting it up
 
@@ -85,6 +94,9 @@ When a limit holds a job back, the job says which.
 
    **Check with AWS** asks AWS whether it would start a machine with the saved settings, as a dry run: nothing
    starts. Then turn it on.
+
+   The region and the AWS keys can't change while a machine runs: each machine is looked at and ended with the
+   region and account it started in. Turn it off and wait for the machines to end first.
 
 The machines started, their type, state, hours and why each ended, are listed on the same page. A worker started on
 demand also shows among the compute workers while it runs, as `on-demand-<n>`.

@@ -48,7 +48,7 @@ class _Conn:
 
 def _index(field, dim, ops='vector_cosine_ops'):
     return (
-        f'CREATE INDEX hnsw_emb_{field} ON public.embeddings USING hnsw '
+        f'CREATE INDEX hnsw_emb_d1_{field} ON public.embeddings_d1 USING hnsw '
         f"(((vector)::vector({dim})) {ops}) WHERE (field_name = '{field}'::text)"
     )
 
@@ -62,7 +62,7 @@ def test_only_cosine_indexes_at_the_searched_dimension_count():
             _index('clip_patch_2x2_r1c1', 5120),  # vector(5120) must not pass for 512
         ],
     )
-    assert asyncio.run(index_jobs.cosine_hnsw_fields(conn, 512)) == {'clip_patch_2x2_r0c0'}
+    assert asyncio.run(index_jobs.cosine_hnsw_fields(conn, 1, 512)) == {'clip_patch_2x2_r0c0'}
 
 
 class _Recording:
@@ -95,14 +95,15 @@ def test_each_position_query_can_use_its_index_and_matches_the_exact_scan(regist
             for field in GRID:
                 vector = '[' + ','.join(str(round(rng.uniform(-1, 1), 3)) for _ in range(3)) + ']'
                 await database.execute(
-                    'INSERT INTO embeddings(sample_id,field_name,vector) VALUES($1,$2,$3::text::vector)',
+                    'INSERT INTO embeddings(dataset_id,sample_id,field_name,vector) VALUES('
+                    '(SELECT dataset_id FROM samples WHERE id = $1),$1,$2,$3::text::vector)',
                     sample_id,
                     field,
                     vector,
                 )
-        for field in GRID:  # the definition ann_index_build uses
+        for field in GRID:  # the definition ann_index_build uses, on the dataset's partition
             await database.execute(
-                f'CREATE INDEX "{index_jobs.ann_index_name(field)}" ON embeddings '
+                f'CREATE INDEX "{index_jobs.ann_index_name(1, field)}" ON embeddings_d1 '
                 f"USING hnsw ((vector::vector(3)) vector_cosine_ops) WHERE field_name = '{field}'",
             )
         seed_id, seed = await database.fetchrow(
@@ -119,7 +120,7 @@ def test_each_position_query_can_use_its_index_and_matches_the_exact_scan(regist
             exclude=(seed_id, 'clip_patch_2x2_r0c0'),
         )
         async with database.pool.acquire() as connection:
-            fields = _indexed_grid('clip', '2x2', await index_jobs.cosine_hnsw_fields(connection, 3))
+            fields = _indexed_grid('clip', '2x2', await index_jobs.cosine_hnsw_fields(connection, 1, 3))
             assert fields == GRID
             recording = _Recording(connection)
             indexed = await patch_search.nearest_patches(recording, fields=fields, **common)
@@ -134,6 +135,6 @@ def test_each_position_query_can_use_its_index_and_matches_the_exact_scan(regist
                 await connection.execute('SET LOCAL enable_seqscan = off')
                 plan = '\n'.join(r[0] for r in await connection.fetch('EXPLAIN ' + query, *query_args))
         for field in GRID:
-            assert f'Index Scan using {index_jobs.ann_index_name(field)} on embeddings' in plan, plan
+            assert f'Index Scan using {index_jobs.ann_index_name(1, field)} on embeddings_d1' in plan, plan
 
     registry_database(scenario)

@@ -30,7 +30,7 @@ CALLS = [
     ('refine_concept', (7, 3), {'exclude_ids': [9]}, CONCEPT),
     ('rebuild_concept', (7, 3), {'seed_ids': [4]}, CONCEPT),
     ('promote_field', (7, 'score'), {}, {'message': 'Field score promoted successfully'}),
-    ('build_ann_index', (7, 'clip'), {}, {'field': 'clip', 'dim': 512, 'index': 'hnsw_emb_clip', 'built': True}),
+    ('build_ann_index', (7, 'clip'), {}, {'field': 'clip', 'dim': 512, 'index': 'hnsw_emb_d7_clip', 'built': True}),
 ]
 
 

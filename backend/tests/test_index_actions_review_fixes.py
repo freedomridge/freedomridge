@@ -585,7 +585,8 @@ def test_an_ann_build_during_another_embeddings_build_defers_instead_of_deadlock
                     f'{field}-{index}',
                 )
                 await database.execute(
-                    'INSERT INTO embeddings (sample_id, field_name, vector) VALUES ($1, $2, $3::text::vector)',
+                    'INSERT INTO embeddings (dataset_id, sample_id, field_name, vector) VALUES ('
+                    '(SELECT dataset_id FROM samples WHERE id = $1), $1, $2, $3::text::vector)',
                     sample_id,
                     field,
                     value,

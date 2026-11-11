@@ -6,6 +6,7 @@ import { UserProvider } from '@/contexts/UserContext';
 import { ToastProvider, useToast } from '@/contexts/ToastContext';
 import { isRescoringRefusal, rescoringRetryPeriod } from '@/lib/api';
 import { coalesceQueryNotifications } from '@/lib/query-notify';
+import { loginPath } from '@/lib/links';
 
 // Query results that arrive together render together (the sidebar's streamed fields).
 coalesceQueryNotifications();
@@ -110,8 +111,9 @@ export function Providers({ children }: { children: React.ReactNode }) {
             if (redirecting || window.location.pathname === '/login') return;
             redirecting = true;
             queryClient.clear();
-            // eslint-disable-next-line @next/next/no-location-assign-relative-destination -- An expired session must unmount every authenticated panel and clear its local state.
-            window.location.href = '/login?expired=true';
+            // A full load: an expired session must unmount every authenticated panel and clear its local state.
+            // Signing in again comes back to this page.
+            window.location.href = loginPath(window.location, true);
         }
 
         const unsubQuery = queryClient.getQueryCache().subscribe((event) => {

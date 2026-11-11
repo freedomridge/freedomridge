@@ -123,7 +123,9 @@ field. Scalar previews use a 100-value cap, tags/labels/native arrays 200, with 
 queries detecting overflow. Numeric enums preserve PostgreSQL's JSONB text representation,
 so displayed choices use the same equality representation as filtering.
 Promoted numeric choices retain index-based numeric equality across grid, scatter, lasso,
-similarity search and filtered facets. The existing 300 ms autocomplete debounce is retained;
+similarity search and filtered facets, and the same matching (a numeric string compares as a
+number) in hash duplicates, sampling, bulk jobs, mirror tag forwarding and version queries, which
+read the promoted fields from the dataset's array context. The existing 300 ms autocomplete debounce is retained;
 superseded requests are aborted, and filter changes restart rather than strand the search.
 
 Cold label/array caches use optimistic publication. A missing row is first committed under

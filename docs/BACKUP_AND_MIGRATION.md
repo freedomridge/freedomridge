@@ -97,7 +97,8 @@ container; it is not the automatically named production Compose DB.
    FRIDGE_DB_CONTAINER=freedomridge-restore ./scripts/apply_migrations.sh
    ```
    Set `FRIDGE_DB_NAME` and `FRIDGE_DB_USER` too if they differ from `freedomridge`.
-   This applies pending migrations and re-applies `functions.sql`. Never re-apply `schema.sql`
+   This applies pending migrations, re-applies `functions.sql`, and sets the database's own settings
+   (`database_settings.sql`), which a dump doesn't carry. Never re-apply `schema.sql`
    to a restored database. If a migration fails, fix the reported problem and rerun the runner;
    its ledger records only completed migrations.
 7. **Return to normal database settings on the restored data.** Use **Compose v2** (`docker compose`),

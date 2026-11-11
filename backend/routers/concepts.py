@@ -91,7 +91,8 @@ async def _build_seed_weight(dataset_id: int, field: str, seed_ids: List[int]) -
     unit-length to match the documented contract (and in case w is ever used with a dot).
     """
     rows = await db.fetch(
-        "SELECT e.vector::text AS v FROM embeddings e JOIN samples s ON e.sample_id = s.id "
+        "SELECT e.vector::text AS v FROM embeddings e "
+        "JOIN samples s ON s.dataset_id = e.dataset_id AND s.id = e.sample_id "
         "WHERE s.dataset_id = $1 AND e.field_name = $2 AND e.sample_id = ANY($3::int[]) "
         "AND e.vector IS NOT NULL",
         dataset_id,
@@ -120,7 +121,7 @@ async def _build_seed_weight(dataset_id: int, field: str, seed_ids: List[int]) -
 async def _require_vectors(dataset_id: int, field: str, ids: List[int], detail: str) -> None:
     """Bounded existence check, so missing examples still answer 400 synchronously."""
     found = await db.fetchval(
-        "SELECT EXISTS(SELECT 1 FROM embeddings e JOIN samples s ON e.sample_id = s.id "
+        "SELECT EXISTS(SELECT 1 FROM embeddings e JOIN samples s ON s.dataset_id = e.dataset_id AND s.id = e.sample_id "
         "WHERE s.dataset_id = $1 AND e.field_name = $2 AND e.sample_id = ANY($3::int[]) "
         "AND e.vector IS NOT NULL)",
         dataset_id,
@@ -134,7 +135,8 @@ async def _require_vectors(dataset_id: int, field: str, ids: List[int], detail: 
 async def _require_weight_dims(dataset_id: int, field: str, dims: int) -> None:
     """A raw weight must match the field's vectors; checked before anything is submitted (400)."""
     field_dim = await db.fetchval(
-        "SELECT vector_dims(vector) FROM embeddings e JOIN samples s ON e.sample_id = s.id "
+        "SELECT vector_dims(vector) FROM embeddings e "
+        "JOIN samples s ON s.dataset_id = e.dataset_id AND s.id = e.sample_id "
         "WHERE s.dataset_id = $1 AND e.field_name = $2 AND e.vector IS NOT NULL LIMIT 1",
         dataset_id,
         field,
@@ -301,7 +303,8 @@ async def create_concept(
         # Dim-check BEFORE submitting: a mismatched vector would create the concept and
         # then fail scoring — leaving a permanently broken concept whose name 409s on retry.
         field_dim = await db.fetchval(
-            "SELECT vector_dims(vector) FROM embeddings e JOIN samples s ON e.sample_id = s.id "
+            "SELECT vector_dims(vector) FROM embeddings e "
+            "JOIN samples s ON s.dataset_id = e.dataset_id AND s.id = e.sample_id "
             "WHERE s.dataset_id = $1 AND e.field_name = $2 AND e.vector IS NOT NULL LIMIT 1",
             id,
             body.embedding_field,

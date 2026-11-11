@@ -1,13 +1,17 @@
 """Delete a sealed dataset in fenced, bounded units, retaining its job and resume cursor."""
 
 import asyncio
+import logging
 import time
 
+import asyncpg
 from fastapi import HTTPException
 
 from . import job_queue
 from .job_runner import StepResult
 from .job_tasks import run_isolated
+
+logger = logging.getLogger(__name__)
 
 KIND = 'dataset_deletion'
 BATCH_SIZE = 1000
@@ -54,7 +58,8 @@ CONCEPT_TABLES = (
 SAMPLE_TABLES = (
     ('embedding_coordinates', ('sample_id', 'field_name')),
     ('embedding_projection_pending', ('sample_id', 'field_name')),
-    ('embeddings', ('sample_id', 'field_name')),
+    # By dataset first, so each batch reads and deletes in the dataset's own partition (0021).
+    ('embeddings', ('dataset_id', 'sample_id', 'field_name')),
     ('sample_hashes', ('sample_id', 'field_name')),
 )
 
@@ -114,8 +119,13 @@ async def _submit(pool, dataset_id, user_id, *, resume):
         if resume:
             raise HTTPException(409, 'Dataset deletion has not started')
         job = await job_queue.enqueue_job(connection, KIND, dataset_id=dataset_id, lane='user', created_by=user_id)
+        # The default view goes with the seal: once sealed, the dataset row refuses the update its foreign key
+        # makes when the view's row is removed, and the deletion failed there at every resume. A mirror's settings
+        # are its primary's, so clearing its default view is allowed as its sync's changes are, for this
+        # transaction and this dataset only.
+        await connection.execute("SELECT set_config('fridge.mirror_sync', $1, TRUE)", str(dataset_id))
         await connection.execute(
-            'UPDATE datasets SET deleting=TRUE,deletion_job_id=$2 WHERE id=$1',
+            'UPDATE datasets SET deleting=TRUE,deletion_job_id=$2,default_view_id=NULL WHERE id=$1',
             dataset_id,
             job['id'],
         )
@@ -183,9 +193,14 @@ def _delete_step(job, checkpoint, table, keys, rows, size, scope=None):
     async def publish(connection):
         await connection.execute("SELECT set_config('fridge.deletion_dataset',$1,TRUE)", str(job['dataset_id']))
         matches = ' AND '.join(f't.{key}=target.{key}' for key in keys)
+        args = [rows]
+        if 'dataset_id' in keys:
+            # Named as a value too, so the delete is planned on the dataset's partition alone.
+            matches += ' AND t.dataset_id=$2'
+            args.append(job['dataset_id'])
         status = await connection.execute(
             f'DELETE FROM {table} t USING jsonb_populate_recordset(NULL::{table},$1::jsonb) target WHERE {matches}',
-            rows,
+            *args,
         )
         if int(status.split()[-1]) != len(rows):
             raise job_queue.QueueContended('Deletion targets changed; remeasure this unit')
@@ -202,6 +217,7 @@ async def _drop_index(pool, job):
     async with pool.acquire(timeout=1) as connection:
 
         async def drop():
+            from .index_actions import _wait_for_backup
             from .index_jobs import TABLE_LOCK, try_lock, unlock
 
             if not await connection.fetchval('SELECT pg_try_advisory_lock(20261017,$1)', job['dataset_id']):
@@ -227,9 +243,19 @@ async def _drop_index(pool, job):
                 )
                 if index is None:
                     return False
+                # A backup holds every table for the whole dump, which the drop would wait behind: as index removal
+                # does (index_actions), wait for it without spending the failure budget.
+                await _wait_for_backup(pool)
                 await connection.execute("SET lock_timeout='100ms'; SET statement_timeout='5s'")
                 quoted = index.replace('"', '""')
-                await connection.execute(f'DROP INDEX CONCURRENTLY IF EXISTS "{quoted}"', timeout=5)
+                try:
+                    await connection.execute(f'DROP INDEX CONCURRENTLY IF EXISTS "{quoted}"', timeout=5)
+                except asyncpg.LockNotAvailableError as error:
+                    # The drop waits for every transaction holding samples (a long read, a map re-fit's export):
+                    # contention, retried with backoff until they end, not a failure.
+                    raise job_queue.QueueContended(
+                        'Waiting for transactions on samples to end before removing the dataset index',
+                    ) from error
                 return True
             finally:
                 if not connection.is_closed():
@@ -338,15 +364,10 @@ def handler(pool):
                 sample_ids = [row['id'] for row in rows]
                 checkpoint['sample_ids'] = sample_ids
             for table, keys in SAMPLE_TABLES:
-                rows, size = await _batch(
-                    pool,
-                    table,
-                    keys,
-                    't.sample_id=ANY($1::int[])',
-                    [sample_ids],
-                    batch_size,
-                    checkpoint,
-                )
+                where, args = 't.sample_id=ANY($1::int[])', [sample_ids]
+                if 'dataset_id' in keys:
+                    where, args = f'{where} AND t.dataset_id=$2', [sample_ids, dataset_id]
+                rows, size = await _batch(pool, table, keys, where, args, batch_size, checkpoint)
                 if rows:
                     return _delete_step(job, checkpoint, table, keys, rows, size)
             rows, size = await _batch(
@@ -389,3 +410,54 @@ def handler(pool):
         raise ValueError(f'Unknown dataset deletion phase: {phase}')
 
     return measure
+
+
+# A deleted dataset's embeddings partition, emptied by its deletion job, is dropped by this sweep beside the job
+# service's other cleanups. The DETACH takes ACCESS EXCLUSIVE on embeddings and the DROP takes it on samples (the
+# partition's FK), so each wait gives up after 100 ms: at most about 200 ms of queued queries per attempt, and the next
+# sweep tries again (a running backup holds both until it ends). Keep lock_timeout below deadlock_timeout (1 s): an
+# ingest that holds samples and then writes vectors takes the two locks in the other order, and this side must be the
+# one that just fails and retries.
+_ORPHAN_PARTITIONS = r"""
+    SELECT c.relname FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid
+    WHERE i.inhparent = to_regclass('embeddings') AND c.relname ~ '^embeddings_d[0-9]+$'
+      AND NOT EXISTS (SELECT 1 FROM datasets d WHERE c.relname = 'embeddings_d' || d.id)
+    ORDER BY c.relname LIMIT $1"""
+
+
+async def sweep_partitions(pool, limit=2):
+    """Drop the empty embeddings partitions of datasets that are gone. Returns the names dropped."""
+    async with pool.acquire(timeout=1) as connection:
+        names = [row['relname'] for row in await connection.fetch(_ORPHAN_PARTITIONS, limit, timeout=5)]
+    dropped = []
+    for name in names:
+        dataset_id = int(name.removeprefix('embeddings_d'))  # the query matches ^embeddings_d[0-9]+$
+        async with pool.acquire(timeout=1) as connection:
+            transaction = connection.transaction()
+            await transaction.start()
+            try:
+                await connection.execute("SET LOCAL lock_timeout = '100ms'", timeout=5)
+                await connection.execute(f'ALTER TABLE embeddings DETACH PARTITION "{name}"', timeout=5)
+                # Checked again under the lock: a partition is made again for a dataset with its id (the trigger
+                # attaches one that's there), and vectors are never dropped here.
+                if await connection.fetchval('SELECT 1 FROM datasets WHERE id = $1', dataset_id, timeout=5):
+                    await transaction.rollback()
+                    continue
+                if await connection.fetchval(f'SELECT 1 FROM "{name}" LIMIT 1', timeout=5):
+                    logger.warning(
+                        '%s outlived dataset %s but still holds vectors; it was left in place',
+                        name,
+                        dataset_id,
+                    )
+                    await transaction.rollback()
+                    continue
+                await connection.execute(f'DROP TABLE "{name}"', timeout=5)
+                await transaction.commit()
+                dropped.append(name)
+            except (asyncpg.LockNotAvailableError, asyncio.TimeoutError, TimeoutError) as error:
+                await transaction.rollback()
+                logger.info('%s is busy; the next sweep drops it: %s', name, error)
+            except BaseException:
+                await transaction.rollback()
+                raise
+    return dropped

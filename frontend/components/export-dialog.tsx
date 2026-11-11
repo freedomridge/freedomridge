@@ -9,6 +9,7 @@ import { useState, useMemo, useCallback, useRef, useEffect } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { useFilters, withGrain } from '@/contexts/FilterContext';
 import { getSamples, type ComplexFilter, type SchemaField, type Dataset } from '@/lib/api';
+import { isLocalField, localValue, type LocalFieldsHolder } from '@/lib/local-fields';
 
 const SYSTEM_FIELDS = ['filepath', 'id', 'media_type', 'tags', 'created_at', 'last_modified_at'] as const;
 const SYSTEM_FIELDS_SET = new Set<string>(SYSTEM_FIELDS);
@@ -53,6 +54,7 @@ type ExportItem = { id: number; metadata?: Record<string, unknown> } & Record<st
 
 function getFieldValue(item: ExportItem, field: string): unknown {
     if (SYSTEM_FIELDS_SET.has(field)) return item[field];
+    if (isLocalField(field)) return localValue(item as LocalFieldsHolder, field);  // a mirror's own field
     // Metadata fields live under item.metadata, but native array columns
     // (e.g. inferred_tags) are top-level. Check both.
     return item.metadata?.[field] ?? item[field];
@@ -222,7 +224,8 @@ export function ExportDialog({ datasetId, schema, dataset, appliedCount, hasObje
         abortRef.current = false;
 
         // Build API fields list — system fields pass through, metadata fields get `metadata.` prefix
-        const apiFields = fields.map(f => SYSTEM_FIELDS_SET.has(f) ? f : `metadata.${f}`);
+        // A mirror's own `@local.` fields are asked for by their names.
+        const apiFields = fields.map(f => SYSTEM_FIELDS_SET.has(f) || isLocalField(f) ? f : `metadata.${f}`);
 
         // CSV header
         const header = fields.map(escapeCsvField).join(',');

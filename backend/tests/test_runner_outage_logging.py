@@ -14,6 +14,7 @@ from backend import (
     auth_cleanup,
     compute_launcher,
     concept_jobs,
+    dataset_deletion,
     dataset_schedules,
     duplicate_jobs,
     follower_search,
@@ -158,6 +159,8 @@ def test_service_logs_migration_and_outage_transitions_only(monkeypatch, caplog)
         monkeypatch.setattr(concept_jobs, 'dispatch_changes', dispatch_concepts)
         monkeypatch.setattr(duplicate_jobs, 'schedule_duplicates', schedule_statistics)
         monkeypatch.setattr(index_jobs, 'sweep_invalid_indexes', schedule_statistics)
+        monkeypatch.setattr(dataset_deletion, 'sweep_partitions', schedule_statistics)
+        monkeypatch.setattr(index_jobs, 'queue_rebuilds', schedule_statistics)
         monkeypatch.setattr(dataset_schedules, 'schedule_dataset_jobs', schedule_statistics)
         monkeypatch.setattr(map_refit, 'sweep', schedule_statistics)
         monkeypatch.setattr(map_refit, 'heal_unranked_maps', schedule_statistics)

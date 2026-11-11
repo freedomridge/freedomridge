@@ -46,7 +46,8 @@ async def vectors(database, field, values):
             f'{field}-{index}',
         )
         await database.execute(
-            'INSERT INTO embeddings(sample_id,field_name,vector) VALUES($1,$2,$3::text::vector)',
+            'INSERT INTO embeddings(dataset_id,sample_id,field_name,vector) VALUES('
+            '(SELECT dataset_id FROM samples WHERE id = $1),$1,$2,$3::text::vector)',
             sample_id,
             field,
             value,
@@ -77,7 +78,7 @@ def test_no_embeddings_mixed_dimensions_and_existing_index(registry_database, mo
             built = await quality.build_ann_index(1, quality.AnnIndexRequest(field='clip'), user=USER)
             assert set(built) == {'field', 'dim', 'index', 'built', 'seconds'}
             assert built['field'] == 'clip' and built['dim'] == 2 and built['built'] is True
-            assert await index_state(database, 'hnsw_emb_clip') is True
+            assert await index_state(database, 'hnsw_emb_d1_clip') is True
             again = await quality.build_ann_index(1, quality.AnnIndexRequest(field='clip'), user=USER)
             assert again == {'field': 'clip', 'dim': 2, 'built': False, 'detail': 'index already exists'}
         # The session that built the index left no lock or settings behind.
@@ -106,7 +107,7 @@ def test_slow_build_answers_202_and_leaves_no_invalid_index_when_cancelled(regis
                 job_id = json.loads(response.body)['job_id']
 
                 async def building():
-                    while await index_state(database, 'hnsw_emb_clip') is not False:
+                    while await index_state(database, 'hnsw_emb_d1_clip') is not False:
                         await asyncio.sleep(0.05)
 
                 await asyncio.wait_for(building(), 20)
@@ -121,7 +122,7 @@ def test_slow_build_answers_202_and_leaves_no_invalid_index_when_cancelled(regis
             await transaction.rollback()
             await database.pool.release(blocker)
         assert await database.fetchval('SELECT state FROM jobs WHERE id=$1::uuid', job_id) == 'cancelled'
-        assert await index_state(database, 'hnsw_emb_clip') is None
+        assert await index_state(database, 'hnsw_emb_d1_clip') is None
 
     registry_database(scenario)
 
@@ -144,7 +145,7 @@ def test_a_cancelled_hnsw_build_blocked_by_a_reader_is_swept_later(registry_data
                 job_id = json.loads(response.body)['job_id']
 
                 async def building():
-                    while await index_state(database, 'hnsw_emb_clip') is not False:
+                    while await index_state(database, 'hnsw_emb_d1_clip') is not False:
                         await asyncio.sleep(0.05)
 
                 await asyncio.wait_for(building(), 20)
@@ -155,7 +156,7 @@ def test_a_cancelled_hnsw_build_blocked_by_a_reader_is_swept_later(registry_data
                         await asyncio.sleep(0.1)
 
                 await asyncio.wait_for(ended(), 60)
-            assert await index_state(database, 'hnsw_emb_clip') is False
+            assert await index_state(database, 'hnsw_emb_d1_clip') is False
             started = time.monotonic()
             assert await index_jobs.sweep_invalid_indexes(database.pool) == []
             # A busy table must not stall the job service's scheduling loop (previously 5 s each).
@@ -163,7 +164,7 @@ def test_a_cancelled_hnsw_build_blocked_by_a_reader_is_swept_later(registry_data
         finally:
             await transaction.rollback()
             await database.pool.release(reader)
-        assert await index_jobs.sweep_invalid_indexes(database.pool) == ['hnsw_emb_clip']
-        assert await index_state(database, 'hnsw_emb_clip') is None
+        assert await index_jobs.sweep_invalid_indexes(database.pool) == ['hnsw_emb_d1_clip']
+        assert await index_state(database, 'hnsw_emb_d1_clip') is None
 
     registry_database(scenario)

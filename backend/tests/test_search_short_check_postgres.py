@@ -30,8 +30,8 @@ def test_a_check_past_its_budget_answers_with_the_index_s_rows(registry_database
         request = Request({'type': 'http', 'method': 'POST', 'path': '/search', 'headers': []})
         sample_ids = (await ingest([{'level': 1.0}, {'level': 2.0}, {'level': 3.0}]))['ids']
         await database.execute(
-            "INSERT INTO embeddings (sample_id, field_name, vector) "
-            "SELECT sample_id, 'clip', '[1,0]'::vector FROM unnest($1::integer[]) sample_id",
+            "INSERT INTO embeddings (dataset_id, sample_id, field_name, vector) "
+            "SELECT dataset_id, id, 'clip', '[1,0]'::vector FROM samples WHERE id = ANY($1::integer[])",
             sample_ids,
         )
         ask = SearchRequest(dataset_id=1, vector=[1, 0], limit=50)

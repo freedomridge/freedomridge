@@ -3,13 +3,14 @@
 import pytest
 
 from backend.routers import datasets
-from backend.tests.test_field_registry_postgres import registry_database  # noqa: F401
+from backend.tests.test_field_registry_postgres import bulk_setup, registry_database  # noqa: F401
 
 FILTER = {'field': 'batch', 'operator': '=', 'value': 'late'}
 
 
 async def seed(database, count=100_010):
-    await database.execute(f"""
+    async with bulk_setup(database) as connection:
+        await connection.execute(f"""
         INSERT INTO samples (dataset_id, filepath, media_type, metadata)
         SELECT 1, 'sample-' || n, 'image',
                jsonb_build_object('batch', CASE WHEN n > {count - 10} THEN 'late' ELSE 'early' END,

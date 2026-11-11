@@ -143,8 +143,8 @@ def lock_key(kind: str, table: str, dataset_id: Optional[int], field: Optional[s
     table's TABLE_LOCK is added by index_jobs._build_session."""
     if kind == 'field' and dataset_id is not None:
         return index_jobs.INDEX_LOCK, int(dataset_id)
-    if kind == 'ann' and field:
-        return index_jobs.ANN_LOCK, field
+    if kind == 'ann' and field and dataset_id is not None:
+        return index_jobs.ANN_LOCK, index_jobs.ann_lock_value(dataset_id, field)
     return CORE_LOCK, table
 
 

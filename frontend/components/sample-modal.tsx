@@ -10,6 +10,7 @@ import { AnnotationOverlay } from './annotations/AnnotationOverlay';
 import { ClassRuleEditor } from './annotations/ClassRuleEditor';
 import { defaultRule, type ClassProbabilities, type ClassRule, type ProbabilityView } from '@/lib/class-rules';
 import { PatchGridOverlay } from './annotations/PatchGridOverlay';
+import { localEntries } from '@/lib/local-fields';
 
 interface Props {
     sample: Sample;
@@ -35,6 +36,7 @@ interface Props {
     // Find Similar from the sample on screen (the modal had no actions).
     onFindSimilar?: () => void;
     onTag?: () => void;  // tag THIS sample (the one shown) without leaving the view
+    onCopyLink?: () => void;  // a link that opens this sample on the applied filters
     // A dialog layered over this view (the tag dialog). Rendered INSIDE the Radix content so it is
     // inside its focus trap and click-outside boundary; while it is open, Escape closes it (not the
     // view) and the view's arrow/Space shortcuts pause.
@@ -48,7 +50,7 @@ interface Props {
     highlightBox?: [number, number, number, number] | null;
 }
 
-export function SampleModal({ sample, activeMediaField = 'filepath', availableMediaFields = ['filepath'], activeOverlayFields: initialOverlayFields = [], overlayConfigs, segmentationConfig, onMediaFieldChange, onClose, availablePatchScales = [], patchScaleLabels, patchFieldName = 'clip', onPatchSearch, patchScale: externalPatchScale, onPatchScaleChange, onNext, onPrevious, hasNext = false, hasPrevious = false, isSelected = false, onToggleSelection, onFindSimilar, onTag, overlay, onCloseOverlay, highlightBox, highlightCuboidId, highlightCuboidField, onSaveClassRule }: Props) {
+export function SampleModal({ sample, activeMediaField = 'filepath', availableMediaFields = ['filepath'], activeOverlayFields: initialOverlayFields = [], overlayConfigs, segmentationConfig, onMediaFieldChange, onClose, availablePatchScales = [], patchScaleLabels, patchFieldName = 'clip', onPatchSearch, patchScale: externalPatchScale, onPatchScaleChange, onNext, onPrevious, hasNext = false, hasPrevious = false, isSelected = false, onToggleSelection, onFindSimilar, onTag, onCopyLink, overlay, onCloseOverlay, highlightBox, highlightCuboidId, highlightCuboidField, onSaveClassRule }: Props) {
     // How each class-probability field is shown while the modal is open: edited rules redraw at once, write nothing,
     // and stay while stepping through samples.
     const [probabilityViews, setProbabilityViews] = useState<Record<string, ProbabilityView>>({});
@@ -120,6 +122,14 @@ export function SampleModal({ sample, activeMediaField = 'filepath', availableMe
 
     // Annotation state is sample-local; declare it before the reset effects.
     const [hiddenAnnotations, setHiddenAnnotations] = useState<Record<string, Set<number>>>({});
+    // On a mirror, its own fields (`@local.<name>`) are listed apart from the primary's, by their full names.
+    const ownFields = useMemo(() => localEntries(sample), [sample]);
+    const primaryFields = useMemo(() => {
+        const rest: Partial<typeof sample> = { ...sample };
+        delete rest.local_metadata;
+        delete rest.local_tags;
+        return rest;
+    }, [sample]);
     const [selectedAnnotation, setSelectedAnnotation] = useState<{ key: string; index: number } | null>(null);
     const [selectedPatch, setSelectedPatch] = useState<{ row: number; col: number } | null>(null);
 
@@ -352,6 +362,16 @@ export function SampleModal({ sample, activeMediaField = 'filepath', availableMe
                                     data-testid="modal-copy-path"
                                 >
                                     Copy path
+                                </button>
+                            )}
+                            {onCopyLink && (
+                                <button
+                                    onClick={onCopyLink}
+                                    className="text-xs text-zinc-400 hover:text-white border border-zinc-700 rounded px-2 py-1"
+                                    title="Copy a link that opens this sample on the applied filters"
+                                    data-testid="modal-copy-link"
+                                >
+                                    Copy link
                                 </button>
                             )}
                             {onTag && (
@@ -595,9 +615,17 @@ export function SampleModal({ sample, activeMediaField = 'filepath', availableMe
 
                         <div className="w-80 border-l border-zinc-800 overflow-y-auto p-6">
                             <h3 className="text-sm font-semibold mb-4 text-zinc-400">Properties</h3>
+                            {Object.keys(ownFields).length > 0 && (
+                                <div data-testid="own-fields" className="mb-4 pb-4 border-b border-zinc-800">
+                                    <h4 className="text-xs font-semibold mb-2 text-zinc-500 uppercase tracking-wider">On this server</h4>
+                                    <dl className="space-y-3">
+                                        <PropertyViewer data={ownFields} />
+                                    </dl>
+                                </div>
+                            )}
                             <dl className="space-y-3">
                                 <PropertyViewer
-                                    data={sample}
+                                    data={primaryFields}
                                     hiddenAnnotations={hiddenAnnotations}
                                     selectedAnnotation={selectedAnnotation}
                                     onToggleVisibility={toggleAnnotationVisibility}

@@ -165,7 +165,8 @@ def test_broad_page_keeps_custom_plan_after_deep_pages(registry_database, monkey
         )
         _, sql, args = next(q for q in queries if q[0] == 'fetch' and 'ORDER BY' in q[1])
         async with database.pool.acquire() as conn:
-            assert await conn.fetchval('SHOW plan_cache_mode') == 'auto'
+            # The app's connections plan every statement anyway (database.PLANNING); this checks the query on its own.
+            await conn.execute('SET plan_cache_mode = auto')
             stmt = await conn.prepare(sql)
             for _ in range(5):
                 await stmt.fetch(*args[:-1], 50000)
@@ -177,5 +178,6 @@ def test_broad_page_keeps_custom_plan_after_deep_pages(registry_database, monkey
                 stmt.get_name(),
             )
             assert counters['generic_plans'] == 0, dict(counters)
+            await conn.execute('RESET plan_cache_mode')
 
     registry_database(scenario)

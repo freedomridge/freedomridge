@@ -17,6 +17,7 @@ import secrets
 import shlex
 from datetime import datetime, timedelta, timezone
 
+from .access import filter_datasets_for_user
 from .crypto import decrypt_secret, hash_token
 from .version import VERSION
 
@@ -43,6 +44,14 @@ NO_SPOT_CAPACITY = (
 )
 # botocore errors raised before a request is sent (by class name: botocore is imported only when a client is made).
 NEVER_SENT = ('ParamValidationError', 'NoCredentialsError', 'PartialCredentialsError')
+# A machine ended without its worker ever connecting. After UNCONNECTED_IN_A_ROW of them since the settings were saved,
+# no machine starts until an admin saves them again: whatever stopped those would stop the next one too.
+POWERED_OFF_UNCONNECTED = (
+    "the machine powered off before its worker connected: Docker or the image didn't start "
+    "(the instance's console output in AWS says why)"
+)
+NEVER_CONNECTED = f'its worker never connected within {BOOT_MINUTES} minutes'
+UNCONNECTED_IN_A_ROW = 2
 # AWS's reason for an instance ending, in words.
 END_REASONS = {
     'Client.InstanceInitiatedShutdown': 'its worker finished and the machine powered off',
@@ -264,10 +273,7 @@ async def reap(pool, ec2, settings, live: list, identity: str) -> None:
             code = (instance or {}).get('StateReason', {}).get('Code', '')
             reason = END_REASONS.get(code, f'the machine ended ({code or state or "gone"})')
             if code == 'Client.InstanceInitiatedShutdown' and worker is None and launch['connected_at'] is None:
-                reason = (
-                    "the machine powered off before its worker connected: Docker or the image didn't start "
-                    "(the instance's console output in AWS says why)"
-                )
+                reason = POWERED_OFF_UNCONNECTED
             await end_launch(pool, launch['id'], reason)
             continue
         age = now - launch['launched_at']
@@ -279,7 +285,7 @@ async def reap(pool, ec2, settings, live: list, identity: str) -> None:
                 f"reached the {settings['max_hours_per_machine']:g}-hour limit per machine",
             )
         elif worker is None and age > timedelta(minutes=BOOT_MINUTES):
-            await terminate(pool, ec2, launch, f'its worker never connected within {BOOT_MINUTES} minutes')
+            await terminate(pool, ec2, launch, NEVER_CONNECTED)
         elif worker is not None and now - worker['heartbeat_at'] > timedelta(minutes=SILENT_MINUTES):
             await terminate(pool, ec2, launch, f'its worker went silent for {SILENT_MINUTES} minutes')
         elif worker is not None and launch['state'] == 'starting':
@@ -302,7 +308,7 @@ async def hours_this_month(source) -> float:
 async def waiting_jobs(pool, settings) -> list:
     """Compute jobs a launched worker would take that have waited at least wait_minutes."""
     return await pool.fetch(
-        """SELECT id FROM jobs
+        """SELECT id, dataset_id FROM jobs
            WHERE state = 'queued' AND placement = 'compute' AND kind = ANY($1::text[])
              AND GREATEST(available_at, updated_at) < now() - make_interval(mins => $2)
            ORDER BY created_at""",
@@ -311,17 +317,42 @@ async def waiting_jobs(pool, settings) -> list:
     )
 
 
+async def free_workers(pool, waiting: list) -> int:
+    """Online compute workers without a job that could claim one of the `waiting` jobs, by the claim route's rules
+    (routers/workers.py): an active admin's worker takes any job, a power user's only a job on a dataset its owner
+    can access. A power user's own worker mustn't hold back a machine for a job it can never take."""
+    workers = await pool.fetch(
+        """SELECT w.user_id, u.role FROM workers w JOIN users u ON u.id = w.user_id
+           WHERE w.placement = 'compute' AND w.current_job_id IS NULL
+             AND w.heartbeat_at > clock_timestamp() - interval '60 seconds'
+             AND (NOT w.capabilities ? 'kinds' OR w.capabilities->'kinds' ?| $1::text[])
+             AND u.is_active AND u.role IN ('admin', 'power_user')""",
+        list(WORKER_KINDS),
+    )
+    dataset_ids = sorted({row['dataset_id'] for row in waiting if row['dataset_id'] is not None})
+    free = 0
+    for worker in workers:
+        if worker['role'] == 'admin':
+            free += 1
+            continue
+        if not dataset_ids:  # a job on no dataset is for an admin's worker only
+            continue
+        where, args = await filter_datasets_for_user({'id': worker['user_id'], 'role': worker['role']})
+        if await pool.fetchval(
+            f'SELECT EXISTS (SELECT 1 FROM datasets WHERE id = ANY(${len(args) + 1}::int[]) AND {where})',
+            *args,
+            dataset_ids,
+        ):
+            free += 1
+    return free
+
+
 async def launch_if_needed(pool, ec2, settings, identity: str) -> None:
     waiting = await waiting_jobs(pool, settings)
     if not waiting:
         return
     # A free worker takes the next one; a machine already starting takes one when it connects.
-    free = await pool.fetchval(
-        """SELECT count(*) FROM workers WHERE placement = 'compute' AND current_job_id IS NULL
-             AND heartbeat_at > clock_timestamp() - interval '60 seconds'
-             AND (NOT capabilities ? 'kinds' OR capabilities->'kinds' ?| $1::text[])""",
-        list(WORKER_KINDS),
-    )
+    free = await free_workers(pool, waiting)
     starting = await pool.fetchval("SELECT count(*) FROM compute_launches WHERE state = 'starting'")
     if len(waiting) <= free + starting:
         return
@@ -345,6 +376,34 @@ async def launch_if_needed(pool, ec2, settings, identity: str) -> None:
         return
     if not settings['server_url'] or not settings['region'] or settings['updated_by'] is None:
         await record_error(pool, 'Turned on but not set up: it needs a region, the server URL and an admin who set it')
+        return
+    stopped = 'Waiting for a compute worker: on-demand machines are stopped (Settings → Compute Workers says why)'
+    # The machines' worker tokens are the saving admin's: a deactivated or demoted one's couldn't claim the job.
+    if not await pool.fetchval("SELECT is_active AND role = 'admin' FROM users WHERE id = $1", settings['updated_by']):
+        await note_waiting(pool, ids, stopped)
+        await record_error(
+            pool,
+            "Not starting machines: the admin who saved these settings is no longer an active admin, and the "
+            "machines' workers would use their token. An admin saves the settings again to start machines.",
+        )
+        return
+    # The latest launches since the settings were saved that connected or ended (a live one that connected counts).
+    recent = await pool.fetch(
+        """SELECT end_reason FROM compute_launches
+           WHERE launched_at >= $1 AND (state = 'ended' OR connected_at IS NOT NULL)
+           ORDER BY id DESC LIMIT $2""",
+        settings['updated_at'],
+        UNCONNECTED_IN_A_ROW,
+    )
+    if len(recent) == UNCONNECTED_IN_A_ROW and all(
+        row['end_reason'] in (POWERED_OFF_UNCONNECTED, NEVER_CONNECTED) for row in recent
+    ):
+        await note_waiting(pool, ids, stopped)
+        await record_error(
+            pool,
+            f"Stopped starting machines: the last {UNCONNECTED_IN_A_ROW} never connected ({recent[0]['end_reason']}). "
+            'Fix the settings and save them to start machines again.',
+        )
         return
     await launch(pool, ec2, settings, ids[0], identity)
 
@@ -455,15 +514,29 @@ async def _schedule(pool, client_factory) -> None:
     live = await pool.fetch("SELECT * FROM compute_launches WHERE state <> 'ended' ORDER BY id")
     if settings is None or (not settings['enabled'] and not live):
         return
-    try:
-        ec2 = client_factory(settings)
-    except Exception as error:
-        await record_error(pool, f'No AWS client: {error}')
-        return
+    clients: dict = {}
+
+    def client(region: str):
+        if region not in clients:
+            clients[region] = client_factory({**dict(settings), 'region': region})
+        return clients[region]
+
     identity = await pool.fetchval('SELECT system_identifier::text FROM pg_control_system()')
-    if live:
-        await reap(pool, ec2, settings, live, identity)
+    # Each machine is looked at, and ended, in the region it was started in: AWS doesn't know its id in another, so
+    # asked in the region saved since, it would look gone and be left running.
+    for region in sorted({launch['region'] for launch in live}):
+        try:
+            ec2 = client(region)
+        except Exception as error:
+            await record_error(pool, f'No AWS client for {region}: {error}')
+            continue
+        await reap(pool, ec2, settings, [launch for launch in live if launch['region'] == region], identity)
     if settings['enabled']:
+        try:
+            ec2 = client(settings['region'])
+        except Exception as error:
+            await record_error(pool, f'No AWS client: {error}')
+            return
         await launch_if_needed(pool, ec2, settings, identity)
 
 

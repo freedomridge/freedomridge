@@ -94,9 +94,9 @@ async def copy_samples(conn: asyncpg.Connection, src: int, dest: int, batch_size
 
 
 async def run(args) -> None:
-    from backend.database import init_connection
+    from backend.database import PLANNING, init_connection
 
-    conn = await asyncpg.connect(DATABASE_URL)
+    conn = await asyncpg.connect(DATABASE_URL, server_settings=PLANNING)
     try:
         await init_connection(conn)
         src = await _dataset_id(conn, args.src_dataset)
@@ -132,13 +132,13 @@ async def run(args) -> None:
         emb = await conn.fetchval(
             """
             WITH ins AS (
-                INSERT INTO embeddings (sample_id, field_name, vector)
-                SELECT newobj.id, $3, e.vector
+                INSERT INTO embeddings (dataset_id, sample_id, field_name, vector)
+                SELECT $2, newobj.id, $3, e.vector
                 FROM samples newobj
                 JOIN samples crop ON crop.dataset_id = $1 AND crop.filepath = newobj.filepath
-                JOIN embeddings e ON e.sample_id = crop.id AND e.field_name = $3
+                JOIN embeddings e ON e.dataset_id = $1 AND e.sample_id = crop.id AND e.field_name = $3
                 WHERE newobj.dataset_id = $2 AND newobj.media_type = 'object'
-                ON CONFLICT (sample_id, field_name) DO NOTHING
+                ON CONFLICT (dataset_id, sample_id, field_name) DO NOTHING
                 RETURNING 1
             )
             SELECT count(*) FROM ins

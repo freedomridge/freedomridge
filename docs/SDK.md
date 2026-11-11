@@ -486,9 +486,10 @@ dataset.compute_embeddings(
 )
 ```
 
-An embedding field's dimension is fixed server-wide by its first vectors, across
-every dataset, so name fields after the model (`clip` for ViT-B/32, `clip_large`
-for ViT-L/14) and never reuse a name for a different model.
+An embedding field's dimension is fixed in a dataset by its first vectors. Name fields
+after the model (`clip` for ViT-B/32, `clip_large` for ViT-L/14) and never reuse a name
+for a different model: a field's text model (`embeddings/field-model`) is still recorded
+per field name, for every dataset.
 
 ##### Deleting a dataset
 
@@ -1395,7 +1396,7 @@ while True:                                    # fill-in: page the cleared sampl
   scatter rank row, and the field's map point count follows. Vectors uploaded later are queued for projection
   like new ones and no stale position remains. The field's map state and model are kept, so with a scheduled
   re-fit the new vectors are placed with the field's current map model.
-- The field's ANN index (`hnsw_emb_<field>`, hashed when the name is long) is maintained by the delete and the later uploads: similarity
+- The field's ANN index (`hnsw_emb_d<dataset>_<field>`, hashed when the name is long) is maintained by the delete and the later uploads: similarity
   search and `compute_uniqueness` see only the current vectors, with no rebuild.
 - Concept scores of the field are rescored by the background upkeep (the delete queues it): a sample
   without a vector loses its score there, not in the delete.
@@ -1420,12 +1421,11 @@ delete: the dataset's map state, map point count, the field's model record (`emb
 shared by every dataset using the field name), any scheduled re-fit and the ANN index all stay. If the
 field is refilled by a different model under the same name, re-fit the map or use a new field name.
 
-**Dimension.** A field's dimension is fixed per field name across every dataset on the server, and its
-ANN index is built for one dimension. While any dataset still holds vectors of the field the dimension
-is known from them. Once none remain anywhere, a new dimension is refused with 422 if the field's ANN
-index exists, because the index would reject the vectors on insert; the message names the index. Remove
-the index (Indexes panel, admin) first, or use a new field name. With no index, any dimension is accepted
-again.
+**Dimension.** A field's dimension is fixed per field name within a dataset, and the dataset's ANN index
+of the field is built for one dimension. While the dataset still holds vectors of the field the dimension
+is known from them. Once none remain, a new dimension is refused with 422 if the field's ANN index exists,
+because the index would reject the vectors on insert; the message names the index. Remove the index
+(Indexes panel, admin) first, or use a new field name. With no index, any dimension is accepted again.
 
 To compute the same metrics for one PIL image yourself (for example before upload), use
 `fridge.compute_image_metrics(img)`. It returns the dict of eight floats that `compute_metrics()`
@@ -2316,7 +2316,7 @@ Patch search compares the selected patch with every patch at that scale. To make
 search, give each tile position its own HNSW index, once per scale (16 for `4x4`). Patch search
 and find-unlabeled use them once every position of the scale has one; until then they rank every
 patch exactly, which takes seconds on a large dataset. Each index takes about as much disk as its
-vectors, and covers every dataset with that field.
+vectors, and covers the dataset it was built on.
 
 ```python
 for r in range(4):

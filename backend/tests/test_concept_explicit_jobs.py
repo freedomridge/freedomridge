@@ -53,7 +53,8 @@ async def add_samples(database, count, *, dataset_id=1, start=0, vector=None):
         )
         value = vector or f'[{1 + index % 7},{(index * 3) % 11 - 5}]'
         await database.execute(
-            "INSERT INTO embeddings(sample_id,field_name,vector) VALUES($1,'clip',$2::text::vector)",
+            "INSERT INTO embeddings(dataset_id,sample_id,field_name,vector) VALUES("
+            "(SELECT dataset_id FROM samples WHERE id = $1),$1,'clip',$2::text::vector)",
             sample_id,
             value,
         )
