@@ -37,6 +37,7 @@ interface Restore {
     matched: number;
     matched_hash: number;
     only_here: number | null;
+    only_here_local: number | null;  // of those, the ones with fields of this instance's own (`@local.`)
     phase: string;
     decision: 'resume' | 'new' | 'drop' | 'redo' | null;
     compared: boolean;
@@ -82,6 +83,7 @@ function RestoreQuestion({ mirror, restore }: { mirror: Mirror; restore: Restore
     });
     const [confirming, setConfirming] = useState(false);
     const fresh = restore.total - restore.matched;
+    const ownGo = restore.only_here_local ?? 0;  // samples a resume deletes that carry fields of this instance's own
     const failed = restore.last_error && (
         <p data-testid="mirror-restore-error" className="text-xs text-red-300">
             {restore.last_error}
@@ -120,17 +122,19 @@ function RestoreQuestion({ mirror, restore }: { mirror: Mirror; restore: Restore
                     {restore.origin_name ? ` in “${restore.origin_name}”` : ''} match it by file path
                     {restore.hash_field ? ` (${restore.matched_hash.toLocaleString()} also by image hash)` : ''}.
                 </span>{' '}
-                Resuming keeps this instance&apos;s own data on the matched ones: its own vector fields, views and
-                concepts.
+                Resuming keeps this instance&apos;s own data on the matched ones: its own fields, vector fields, views
+                and concepts.
                 {fresh > 0 ? ` ${fresh.toLocaleString()} don't match: they're copied fresh.` : ''}
                 {restore.only_here ? ` ${restore.only_here.toLocaleString()} here that the primary no longer has go.` : ''}
+                {ownGo ? ` ${ownGo.toLocaleString()} of them have fields of this instance's own, which go with them.` : ''}
             </p>
             {failed}
             {confirming && restore.only_here ? (
                 <div data-testid="mirror-restore-confirm" className="flex flex-wrap items-center gap-2">
                     <span>
                         Resuming deletes {restore.only_here.toLocaleString()} samples here that the primary doesn&apos;t have,
-                        with what this instance added to them.
+                        with what this instance added to them
+                        {ownGo ? `, including the fields of its own on ${ownGo.toLocaleString()} of them` : ''}.
                     </span>
                     <button
                         data-testid="mirror-restore-confirm-resume"

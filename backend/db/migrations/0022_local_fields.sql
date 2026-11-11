@@ -26,6 +26,9 @@ $$;
 ALTER TABLE samples ADD COLUMN local_metadata JSONB NOT NULL DEFAULT '{}'::jsonb;
 ALTER TABLE samples ADD COLUMN local_tags TEXT[] DEFAULT '{}';
 
+-- A held copy's question counts, of the samples a resume deletes, those with fields of this instance's own.
+ALTER TABLE mirror_restores ADD COLUMN only_here_local BIGINT;
+
 -- origin is where a field is stored, owner who may change it: 'primary' on a mirror for the primary's fields, 'self'
 -- for this instance's. The `@local.` names are always origin 'local', and only they are.
 ALTER TABLE dataset_fields DROP CONSTRAINT dataset_fields_origin_check;

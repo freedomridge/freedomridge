@@ -291,13 +291,13 @@ the primary's other datasets keep syncing:
    own (`img.jpg#o0`), so objects match the same way. Where both sides have an image hash (the lowest field name both
    have), the hashes must agree too. These are perceptual hashes, so two different files can share one.
 2. The copy's row on the Primaries page then asks, with the counts: how many of the primary's samples match by file
-   path (and by image hash), how many don't and would be copied fresh, and how many here the primary no longer has.
-   Its badge reads **On hold**, and it waits until an admin here answers
+   path (and by image hash), how many don't and would be copied fresh, and how many here the primary no longer has
+   (and of those, how many have [fields of its own](#fields-of-its-own)). Its badge reads **On hold**, and it waits until an admin here answers
    (`POST /api/primaries/mirrors/{id}/restore-decision`).
 3. **Resume into this copy:** first it says how many samples here will be deleted, and asks again. It's refused when
    nothing matches. Then the copy's samples the primary no longer has go, with what this instance added to
-   them. The matched ones take the primary's new ids, keeping this instance's own vector fields, indexes, concepts and
-   views on them. The copies of the primary's shared views are made again. Then every block is read again, as for a
+   them. The matched ones take the primary's new ids, keeping this instance's own fields, vector fields, indexes,
+   concepts and views on them. The copies of the primary's shared views are made again. Then every block is read again, as for a
    resumed copy. All of it runs in bounded steps of the sync job, so a large copy is resumed over several of them.
 4. **Make a new copy:** a new dataset is copied, and the held one is kept as a separate copy.
 

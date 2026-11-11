@@ -1741,11 +1741,22 @@ def test_after_a_primary_restore_the_copy_is_held_asks_and_resumes_into_itself(m
         _, link_id, _, mirror = await mirror_with_own_field(monkeypatch, database)
         monkeypatch.setattr(primaries, 'db', database)
         monkeypatch.setattr(follower_sync, 'queue_sync', AsyncMock())
+        # A field of this instance's own on both samples: soy's goes with soy if the copy resumes, and the question
+        # says so; corn's stays.
+        by_crop = {row['metadata']['crop']: row['id'] for row in (await copied(database, mirror)).values()}
+        for sample_id in by_crop.values():
+            await datasets.update_sample(
+                mirror['dataset_id'],
+                sample_id,
+                datasets.SampleUpdate(metadata={'@local.weeds': 3}),
+                user=USER,
+            )
         await restore_primary(database)
         await sync(database, link_id)
         # Held, compared, and asking: nothing changed on the copy, and no new copy was made.
         held = dict(await database.fetchrow('SELECT * FROM mirror_restores'))
         assert (held['total'], held['matched'], held['only_here'], held['phase']) == (2, 1, 1, 'ask')
+        assert held['only_here_local'] == 1
         assert await database.fetchval('SELECT count(*) FROM mirrors') == 1
         stopped = await mirror_of(database)
         assert stopped['state'] == 'stopped' and 'Primaries page' in stopped['last_error']
@@ -1753,6 +1764,7 @@ def test_after_a_primary_restore_the_copy_is_held_asks_and_resumes_into_itself(m
         listed = await primaries.list_primaries(user=USER)
         [entry] = listed['primaries'][0]['mirrors']
         assert entry['restore']['compared'] and entry['restore']['matched'] == 1 and not entry['resumable']
+        assert entry['restore']['only_here_local'] == 1
 
         # Its admin resumes into it: the matched sample keeps what was added here, soy goes, rice is copied.
         await primaries.decide_restore(mirror['dataset_id'], primaries.RestoreDecision(decision='resume'), user=USER)
@@ -1766,6 +1778,9 @@ def test_after_a_primary_restore_the_copy_is_held_asks_and_resumes_into_itself(m
         assert await database.fetchval('SELECT count(*) FROM mirror_restore_map') == 0
         assert sorted(r['metadata']['crop'] for r in (await copied(database, resumed)).values()) == ['corn', 'rice']
         assert await crops_with_own_field(database, mirror['dataset_id']) == ['corn']
+        assert await database.fetchval('SELECT local_metadata FROM samples WHERE id = $1', by_crop['corn']) == {
+            'weeds': 3,
+        }
 
     registry_database(scenario)
 

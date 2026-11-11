@@ -56,7 +56,8 @@ it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
   (`@local.weeds`, and `@local.tags` for its own tags), and can never change or remove the primary's. They filter,
   sort, colour a map, show on the grid and in a sample's view, and export like any field. The sidebar lists them
   under **On this server**, and the tag dialog offers **This server's tags**. The primary never sees them, and a
-  re-read or resumed copy keeps them. They're written through bulk-set, bulk-tag and the sample edit, or the SDK
+  re-read or resumed copy keeps them; after a primary restore, the question before resuming says how many of the
+  samples it would delete have them. They're written through bulk-set, bulk-tag and the sample edit, or the SDK
   (`client.bulk_set_metadata(dataset_id, sample_ids=[...], metadata={'@local.weeds': 3})`), and read with
   `sample['@local.weeds']`.
 

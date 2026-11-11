@@ -2851,7 +2851,9 @@ CREATE TABLE IF NOT EXISTS mirror_restores (
     last_error TEXT,
     failures INTEGER NOT NULL DEFAULT 0,
     retry_after TIMESTAMPTZ,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    -- of only_here, the samples with fields of this instance's own (`@local.`, 0022)
+    only_here_local BIGINT
 );
 CREATE INDEX IF NOT EXISTS mirror_restores_link ON mirror_restores (link_id);
 

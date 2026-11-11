@@ -814,7 +814,8 @@ async def return_if_linked(pool, link, client) -> bool:
 # A held copy compared afresh: the primary was restored again before it was resumed.
 COMPARE_AGAIN = """UPDATE mirror_restores SET phase = 'compare', decision = NULL, decided_by = NULL, decided_at = NULL,
                           compare_after = 0, total = 0, matched = 0, matched_hash = 0, only_here = NULL,
-                          computed_at = NULL, hash_field = NULL, primary_identity = COALESCE($2, primary_identity)
+                          only_here_local = NULL, computed_at = NULL, hash_field = NULL,
+                          primary_identity = COALESCE($2, primary_identity)
                    WHERE dataset_id = $1"""
 
 
@@ -1102,7 +1103,18 @@ async def compare_step(pool, client, row: dict, checkpoint: dict) -> StepResult:
         if done:
             await connection.execute(
                 """UPDATE mirror_restores SET phase = 'ask', computed_at = now(),
-                          only_here = (SELECT count(*) FROM samples WHERE dataset_id = $1) - matched
+                          only_here = (SELECT count(*) FROM samples WHERE dataset_id = $1) - matched,
+                          -- what this instance added there that a resume deletes with them: read only when it has
+                          -- a field of its own, so a copy without one isn't scanned
+                          only_here_local = CASE
+                              WHEN NOT EXISTS (SELECT 1 FROM dataset_fields
+                                               WHERE dataset_id = $1 AND origin = 'local') THEN 0
+                              ELSE (SELECT count(*) FROM samples s
+                                    WHERE s.dataset_id = $1
+                                      AND (s.local_metadata <> '{}'::jsonb OR cardinality(s.local_tags) > 0)
+                                      AND NOT EXISTS (SELECT 1 FROM mirror_restore_map m
+                                                      WHERE m.dataset_id = $1 AND m.sample_id = s.id))
+                          END
                    WHERE dataset_id = $1""",
                 dataset_id,
             )

@@ -105,8 +105,8 @@ async def list_primaries(user: dict = Depends(require_role('admin'))):
     held = {
         row['dataset_id']: dict(row)
         for row in await db.fetch(
-            """SELECT dataset_id, origin_name, hash_field, total, matched, matched_hash, only_here, phase,
-                      decision, computed_at IS NOT NULL AS compared, last_error, retry_after
+            """SELECT dataset_id, origin_name, hash_field, total, matched, matched_hash, only_here, only_here_local,
+                      phase, decision, computed_at IS NOT NULL AS compared, last_error, retry_after
                FROM mirror_restores""",
         )
     }
