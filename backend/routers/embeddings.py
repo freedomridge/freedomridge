@@ -29,6 +29,7 @@ from ..database import db
 from ..diskspace import COORDINATE_ROW_BYTES, INGEST_ROW_BYTES, estimate_viz_rank_bytes, require_free_space
 from ..field_registry import lock_field_lifecycle, map_swap_holder, map_swap_refusal
 from ..index_jobs import ann_index_name
+from ..local_fields import local_field
 from ..map_artifacts import LocalArtifactStore
 from ..request_limits import guest_heavy
 from .auth import require_role
@@ -92,7 +93,19 @@ def _build_include_fields(
     unqualified = []
     if include_fields:
         for fn in include_fields:
-            if '.' in fn:
+            try:
+                local = local_field(fn)  # a mirror's own field: local_metadata, or the local_tags array
+            except ValueError:
+                continue  # a name no query can use, as below
+            if local is not None:
+                # Aliased as dotted names are ("@local.weeds" → "@local_weeds"), quoted for the `@`.
+                alias = fn.replace('.', '_')
+                expr = (
+                    f"{table_prefix}.local_tags" if local.array else f"{table_prefix}.local_metadata->>'{local.name}'"
+                )
+                qualified.append(f'{expr} as "{alias}"')
+                unqualified.append(f'"{alias}"')
+            elif '.' in fn:
                 # Dotted path like "detections.label"
                 # Handles both nested objects (metadata->'detections'->>'label')
                 # and arrays of objects (metadata->'detections'->0->>'label')

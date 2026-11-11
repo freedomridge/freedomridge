@@ -65,6 +65,9 @@ class Sample:
         self.heading = heading
         self.hashes = hashes or {}
         self.array_fields = array_fields or {}  # {field_name: [values]}
+        # On a mirror, this server's own fields (`@local.<name>`, docs/FOLLOWERS.md) by name without the prefix,
+        # `tags` for `@local.tags`. Read with `sample['@local.weeds']`; write with Dataset.bulk_set_metadata.
+        self.local: Dict[str, Any] = {}
         self.created_at = None
         self.last_modified_at = None
         self.distance = None
@@ -113,6 +116,9 @@ class Sample:
         sample.last_modified_at = item.get("last_modified_at")
         sample._snapshot_version_id = item.get("version_id")
         sample.array_fields = dict(item.get("array_fields") or {})
+        sample.local = dict(item.get("local_metadata") or {})
+        if item.get("local_tags") is not None:
+            sample.local["tags"] = list(item["local_tags"])
         if item.get("distance") is not None:
             sample.distance = item["distance"]
         if item.get("location"):
@@ -133,6 +139,16 @@ class Sample:
         # defaulted [] would erase every tag the sample had. See save().
         sample._loaded_fields = set(item)
         return sample
+
+    def __getitem__(self, name: str) -> Any:
+        """A field's value: `sample['@local.weeds']` is this server's own field on a mirror (in `local`), any other
+        name a metadata key. A field the sample doesn't have raises KeyError. A Sample isn't a sequence: `for x in
+        sample` and `list(sample)` stay a TypeError, as before this method existed."""
+        if not isinstance(name, str):
+            raise TypeError(f"Sample fields are read by name, not {type(name).__name__}")
+        if name.startswith('@local.'):
+            return self.local[name[len('@local.') :]]
+        return self.metadata[name]
 
     def _compute_media_type(self, filepath: str) -> str:
         """Automatically determine media type from file extension."""
@@ -159,6 +175,7 @@ class Sample:
             'embeddings',
             'hashes',
             'array_fields',
+            'local',
             'created_at',
             'last_modified_at',
             '_custom_fields',

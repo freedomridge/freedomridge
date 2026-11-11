@@ -535,8 +535,8 @@ async def cached_distinct_values(
 def presentation_type(field: Mapping[str, Any]) -> str:
     """The single mapping from declared type + display override + completeness to UI type."""
     declared = canonical_type(field['field_type'])
-    if field.get('origin') == 'native_array':
-        return 'array'
+    if field.get('origin') == 'native_array' or field.get('field_name') == LOCAL_PREFIX + 'tags':
+        return 'array'  # `@local.tags`, a mirror's own tags, is a native array too
     if field.get('display_type'):
         return field['display_type']
     if declared == 'string' and (
@@ -553,19 +553,22 @@ async def field_stats(connection: Any, dataset_id: int) -> list[dict[str, Any]]:
                   s.sample_count,
                   CASE WHEN field_type_canonical(s.field_type) = f.field_type THEN s.min_value END AS min_value,
                   CASE WHEN field_type_canonical(s.field_type) = f.field_type THEN s.max_value END AS max_value,
-                  CASE WHEN f.origin = 'native_array' OR field_type_canonical(s.field_type) = f.field_type
+                  CASE WHEN f.origin = 'native_array' OR f.field_name = '@local.tags'
+                            OR field_type_canonical(s.field_type) = f.field_type
                        THEN s.unique_values END AS unique_values,
-                  COALESCE(s.values_complete AND (f.origin = 'native_array'
+                  COALESCE(s.values_complete AND (f.origin = 'native_array' OR f.field_name = '@local.tags'
                       OR field_type_canonical(s.field_type) = f.field_type), FALSE)
                       AS values_complete,
-                  (s.id IS NULL OR s.last_updated IS NULL) AND f.origin = 'metadata' AS stats_pending
+                  (s.id IS NULL OR s.last_updated IS NULL) AND f.origin IN ('metadata', 'local') AS stats_pending,
+                  f.owner
            FROM dataset_fields f LEFT JOIN dataset_field_stats s
              ON s.dataset_id = f.dataset_id AND s.field_name = f.field_name
            WHERE f.dataset_id = $1 AND f.origin <> 'system'
            UNION ALL
            SELECT s.field_name, field_type_canonical(s.field_type), 'system', FALSE,
                   CASE WHEN s.field_type = 'enum' THEN 'enum' END,
-                  s.sample_count, s.min_value, s.max_value, s.unique_values, s.values_complete, FALSE
+                  s.sample_count, s.min_value, s.max_value, s.unique_values, s.values_complete, FALSE,
+                  CASE WHEN EXISTS (SELECT 1 FROM mirrors WHERE dataset_id = $1) THEN 'primary' ELSE 'self' END
            FROM dataset_field_stats s WHERE s.dataset_id = $1
              AND NOT EXISTS (SELECT 1 FROM dataset_fields own WHERE own.dataset_id=s.dataset_id
                              AND own.field_name=s.field_name AND own.origin<>'system')

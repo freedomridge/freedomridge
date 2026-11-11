@@ -49,6 +49,9 @@ class FakeClient:
     def get_samples(self, dataset_id, limit, offset):
         return {'total': len(SOURCE)}
 
+    def get_schema(self, dataset_id, filters=None, lightning_mode=True):
+        return []  # no fields of the source server's own (@local.)
+
     def list_array_fields(self, dataset_id):
         return [{'name': 'tags'}]
 

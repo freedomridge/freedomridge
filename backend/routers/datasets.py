@@ -2327,6 +2327,7 @@ async def _get_dataset_field_stats_impl(
             "display_type": display_type,
             "declared_type": original_type,
             "origin": stat.get("origin", "metadata"),
+            "owner": stat.get("owner", "self"),
             "stats_pending": stat.get("stats_pending", False),
             "values_complete": stat.get("values_complete", False),
         }
@@ -3301,6 +3302,7 @@ async def get_dataset_schema(id: int, filters: Optional[str] = None, lightning_m
             "is_promoted": stat['is_promoted'] or False,
             "declared_type": stat['field_type'],
             "origin": stat.get('origin', 'metadata'),
+            "owner": stat.get('owner', 'self'),
             "display_type": stat.get('display_type'),
             "stats_pending": stat.get('stats_pending', False),
             "values_complete": stat.get('values_complete', False),
@@ -5339,11 +5341,12 @@ async def list_samples_post(id: int, request: SamplesRequest):
         return await _list_samples_post(id, request)
 
 
-def _slim_metadata_select(keys_param: int) -> str:
-    """Select clause for the slim path's requested metadata keys, bound as one text[] parameter."""
+def _slim_metadata_select(keys_param: int, source: str = 'metadata') -> str:
+    """Select clause for the slim path's requested metadata keys, bound as one text[] parameter. `source` is the
+    JSON column, and the name it comes back under: a mirror's own fields are in local_metadata."""
     return (
-        f"COALESCE((SELECT jsonb_object_agg(key, metadata->key) FROM unnest(${keys_param}::text[]) AS key "
-        f"WHERE metadata ? key), '{{}}'::jsonb) AS metadata"
+        f"COALESCE((SELECT jsonb_object_agg(key, {source}->key) FROM unnest(${keys_param}::text[]) AS key "
+        f"WHERE {source} ? key), '{{}}'::jsonb) AS {source}"
     )
 
 
@@ -5490,6 +5493,7 @@ async def _list_samples_post(id: int, request: SamplesRequest):
     if request.slim and selected_fields:
         select_parts = ['id']
         metadata_subfields = []
+        local_subfields: list = []
         array_cols = await get_dataset_array_columns(id)
 
         for field in selected_fields:
@@ -5506,6 +5510,16 @@ async def _list_samples_post(id: int, request: SamplesRequest):
                     select_parts.append(subfield)
                 elif subfield:
                     metadata_subfields.append(subfield)
+            elif field.startswith(LOCAL_PREFIX):
+                # A mirror's own field: `@local.tags` is the local_tags column, any other a key of local_metadata.
+                try:
+                    local = local_field(field)
+                except ValueError as error:
+                    raise HTTPException(status_code=400, detail=str(error)) from None
+                if local is not None and local.array:
+                    select_parts.append('local_tags')
+                elif local is not None:
+                    local_subfields.append(local.name)
 
         # Build minimal metadata extraction. The keys are one bound text[] parameter, so any key
         # works (including ones with ':' like 'percent_CROP:CORN', which used to be silently
@@ -5515,6 +5529,9 @@ async def _list_samples_post(id: int, request: SamplesRequest):
         if metadata_subfields and 'metadata' not in select_parts:
             select_parts.append(_slim_metadata_select(arg_idx))
             select_args = [metadata_subfields]
+        if local_subfields:
+            select_parts.append(_slim_metadata_select(arg_idx + len(select_args), 'local_metadata'))
+            select_args.append(sorted(set(local_subfields)))
         limit_idx = arg_idx + len(select_args)
 
         select_clause = ', '.join(select_parts)
@@ -5540,15 +5557,18 @@ async def _list_samples_post(id: int, request: SamplesRequest):
 
         # Parse metadata if it's jsonb (from jsonb_build_object or full metadata)
         for item in items:
-            if 'metadata' in item and item['metadata']:
-                if isinstance(item['metadata'], str):
-                    item['metadata'] = json.loads(item['metadata'])
+            for column in ('metadata', 'local_metadata'):
+                if isinstance(item.get(column), str):
+                    item[column] = json.loads(item[column])
 
         return {"items": items, "total": total}
 
     # NORMAL PATH: UI — full sample data including dynamic array fields
     extra_array_cols = sorted(await get_dataset_array_columns(id) - {'tags'})
     extra_array_select = (', ' + ', '.join(extra_array_cols)) if extra_array_cols else ''
+    # A mirror's rows also carry its own fields (`@local.`); any other dataset's rows are as they were.
+    if await db.fetchval('SELECT 1 FROM mirrors WHERE dataset_id = $1', id):
+        extra_array_select += ', local_metadata, local_tags'
     select_clause = f"""id, filepath, media_type, tags, metadata,
            ST_X(location::geometry) as lon, ST_Y(location::geometry) as lat, heading,
            created_at, last_modified_at{extra_array_select}"""
@@ -5587,6 +5607,8 @@ async def _list_samples_post(id: int, request: SamplesRequest):
         # Handle metadata if present
         if 'metadata' in data and data['metadata']:
             data['metadata'] = json.loads(data['metadata']) if isinstance(data['metadata'], str) else data['metadata']
+        if isinstance(data.get('local_metadata'), str):
+            data['local_metadata'] = json.loads(data['local_metadata'])
 
         # Construct location object from lat/lon/heading if present
         if 'lon' in data and 'lat' in data:
@@ -7536,6 +7558,16 @@ async def _carry_segmentation_entries(
         await connection.execute('UPDATE datasets SET segmentation_config = $2 WHERE id = $1', dataset_id, config)
 
 
+def _refuse_local_field_operation(*names: str) -> None:
+    """Rename, clone and clear work on metadata fields; a mirror's own (`@local.`) fields aren't taken yet."""
+    if any(name.startswith(LOCAL_PREFIX) for name in names):
+        raise HTTPException(
+            status_code=400,
+            detail="Rename, clone and clear don't take this server's own (@local.) fields yet: "
+            'set and remove them with bulk-set',
+        )
+
+
 async def _check_field_target(
     dataset_id: int,
     field_name: str,
@@ -7544,6 +7576,7 @@ async def _check_field_target(
     connection=None,
 ) -> bool:
     """Validate a rename/clone target; True when it already holds values (and overwrite allowed)."""
+    _refuse_local_field_operation(field_name, new_name)
     _validate_field_name(field_name)
     _validate_field_name(new_name)
     if new_name == field_name:
@@ -7805,6 +7838,7 @@ async def clear_field(
     and promoted index, which used to linger as an empty schema/export column."""
     if background or await _large_bulk_target(id):
         return await _bulk_response(id, user, 'clear', {'field_name': field_name})
+    _refuse_local_field_operation(field_name)
     _validate_field_name(field_name)
     promoted = await _is_promoted(id, field_name)
     async with db.pool.acquire() as conn, _field_index_operation(conn, id, index_ddl=promoted):
