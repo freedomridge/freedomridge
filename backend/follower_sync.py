@@ -23,7 +23,7 @@ from fastapi import HTTPException
 from . import job_queue, patch_search
 from .crypto import decrypt_secret
 from .diskspace import INGEST_ROW_BYTES, require_free_space
-from .field_registry import lock_field_lifecycle
+from .field_registry import LOCAL_PREFIX, lock_field_lifecycle
 from .job_runner import StepResult
 from .routers import datasets as datasets_router
 from .routers import followers
@@ -611,9 +611,12 @@ async def write_coordinates(connection, dataset_id: int, blocks: list, coordinat
 
 
 async def write_fields(connection, dataset_id: int, fields: list) -> None:
-    """The primary's field registry. is_promoted stays this instance's: it stands for an index here."""
+    """The primary's field registry. is_promoted stays this instance's: it stands for an index here, and so do this
+    instance's own `@local.` fields. An older primary's metadata key by such a name, unreachable there, is skipped."""
+    fields = [field for field in fields if not field['field_name'].startswith(LOCAL_PREFIX)]
     await connection.execute(
-        'DELETE FROM dataset_fields WHERE dataset_id = $1 AND NOT (field_name = ANY($2::text[]))',
+        """DELETE FROM dataset_fields
+           WHERE dataset_id = $1 AND owner = 'primary' AND NOT (field_name = ANY($2::text[]))""",
         dataset_id,
         [field['field_name'] for field in fields],
     )

@@ -78,6 +78,10 @@ CREATE TABLE IF NOT EXISTS samples (
     last_modified_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     created_by_user_id INTEGER REFERENCES users(id),
     modified_by_user_id INTEGER REFERENCES users(id),
+    -- A mirror's own fields, beside the primary's (0022): `@local.weeds` is local_metadata->'weeds', `@local.tags` is
+    -- local_tags. The sync never writes them; samples_mirror_local_guard holds a local write to them.
+    local_metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    local_tags TEXT[] DEFAULT '{}',
     -- Named explicitly so add_samples' duplicate handler
     -- — which checks for 'samples_dataset_filepath_unique' in the violation text —
     -- works on a fresh schema.sql-initialised prod DB too. With the auto-generated
@@ -189,12 +193,16 @@ CREATE TABLE IF NOT EXISTS dataset_fields (
     dataset_id INTEGER REFERENCES datasets(id) ON DELETE CASCADE,
     field_name TEXT NOT NULL,
     field_type TEXT NOT NULL CONSTRAINT dataset_fields_type_check CHECK (field_type IN ('unknown', 'boolean', 'number', 'string', 'datetime', 'list', 'object')),
-    origin TEXT NOT NULL DEFAULT 'metadata' CONSTRAINT dataset_fields_origin_check CHECK (origin IN ('metadata', 'native_array', 'system')),
+    origin TEXT NOT NULL DEFAULT 'metadata' CONSTRAINT dataset_fields_origin_check CHECK (origin IN ('metadata', 'native_array', 'system', 'local')),
     CONSTRAINT dataset_fields_native_type_check CHECK (origin <> 'native_array' OR field_type = 'list'),
+    -- origin is where a field is stored, owner who may change it (0022). The `@local.` names are origin 'local'.
+    CONSTRAINT dataset_fields_local_check CHECK (starts_with(field_name, '@local.') = (origin = 'local')),
     is_promoted BOOLEAN DEFAULT FALSE,
     display_type TEXT,       -- Override: 'enum' to show dropdown instead of slider for numbers
     overlay_config JSONB,    -- Per-field overlay display config: heatmap colormap/range/opacity
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    -- 'primary' on a mirror for the primary's fields, 'self' for this instance's: set by dataset_fields_owner (0022).
+    owner TEXT NOT NULL DEFAULT 'self' CONSTRAINT dataset_fields_owner_check CHECK (owner IN ('self', 'primary')),
     UNIQUE(dataset_id, field_name)
 );
 
@@ -2543,8 +2551,11 @@ BEGIN
     IF current_setting('fridge.deletion_dataset', TRUE) = target_dataset::text THEN
         RETURN;
     END IF;
-    -- A mirror's samples change only through its sync (0009).
-    PERFORM require_mirror_sync(target_dataset);
+    -- A mirror's samples change only through its sync (0009), or, for this instance's own fields, under
+    -- fridge.mirror_local, which samples_mirror_local_guard holds to the two local columns (0022).
+    IF current_setting('fridge.mirror_local', TRUE) IS DISTINCT FROM target_dataset::text THEN
+        PERFORM require_mirror_sync(target_dataset);
+    END IF;
     INSERT INTO sample_block_changes (dataset_id, block_id)
     SELECT target_dataset, target_block FROM datasets WHERE id = target_dataset AND followed
     ON CONFLICT DO NOTHING;
@@ -2855,7 +2866,8 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
--- The field registry of a mirror is the primary's. is_promoted stays local: it stands for an index here.
+-- The field registry of a mirror is the primary's, except this instance's own `@local.` fields (0022). is_promoted
+-- and owner (set by dataset_fields_owner) stay local: is_promoted stands for an index here.
 CREATE OR REPLACE FUNCTION guard_mirror_fields() RETURNS trigger AS $$
 BEGIN
     IF TG_OP = 'UPDATE' AND (OLD.dataset_id, OLD.field_name, OLD.field_type, OLD.origin, OLD.display_type,
@@ -2867,11 +2879,40 @@ BEGIN
     IF TG_OP <> 'INSERT' AND current_setting('fridge.deletion_dataset', TRUE) = OLD.dataset_id::text THEN
         RETURN NULL;
     END IF;
-    IF TG_OP <> 'INSERT' THEN
+    IF TG_OP <> 'INSERT' AND NOT starts_with(OLD.field_name, '@local.') THEN
         PERFORM require_mirror_sync(OLD.dataset_id);
     END IF;
-    IF TG_OP <> 'DELETE' THEN
+    IF TG_OP <> 'DELETE' AND NOT starts_with(NEW.field_name, '@local.') THEN
         PERFORM require_mirror_sync(NEW.dataset_id);
+    END IF;
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Fields are registered in several places (discovery, the sync, bulk jobs, versions, promote, create), so none of
+-- them decides the owner: on a mirror, every field but this instance's own `@local.` ones is the primary's (0022).
+CREATE OR REPLACE FUNCTION set_field_owner() RETURNS trigger AS $$
+BEGIN
+    NEW.owner := CASE
+        WHEN NOT starts_with(NEW.field_name, '@local.')
+             AND EXISTS (SELECT 1 FROM mirrors WHERE dataset_id = NEW.dataset_id) THEN 'primary'
+        ELSE 'self'
+    END;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Under fridge.mirror_local (a dataset id), a write may change local_metadata and local_tags of that dataset's
+-- samples and nothing else: no insert, no delete, no other column, including array columns added later. AFTER, so it
+-- sees each row as stored, whatever a BEFORE trigger changed (0022).
+CREATE OR REPLACE FUNCTION guard_mirror_local() RETURNS trigger AS $$
+BEGIN
+    IF TG_OP <> 'UPDATE'
+       OR NEW.dataset_id::text IS DISTINCT FROM current_setting('fridge.mirror_local', TRUE)
+       OR to_jsonb(OLD) - 'local_metadata' - 'local_tags' IS DISTINCT FROM to_jsonb(NEW) - 'local_metadata' - 'local_tags'
+    THEN
+        RAISE EXCEPTION 'A write of this instance''s own fields (@local.) changes only those fields'
+            USING ERRCODE = '55000';
     END IF;
     RETURN NULL;
 END;
@@ -2893,6 +2934,11 @@ $$ LANGUAGE plpgsql;
 
 CREATE TRIGGER dataset_fields_mirror_guard AFTER INSERT OR UPDATE OR DELETE ON dataset_fields
     FOR EACH ROW EXECUTE FUNCTION guard_mirror_fields();
+CREATE TRIGGER dataset_fields_owner BEFORE INSERT OR UPDATE ON dataset_fields
+    FOR EACH ROW EXECUTE FUNCTION set_field_owner();
+CREATE TRIGGER samples_mirror_local_guard AFTER INSERT OR UPDATE OR DELETE ON samples
+    FOR EACH ROW WHEN (NULLIF(current_setting('fridge.mirror_local', TRUE), '') IS NOT NULL)
+    EXECUTE FUNCTION guard_mirror_local();
 CREATE TRIGGER views_mirror_guard BEFORE UPDATE OR DELETE ON views
     FOR EACH ROW EXECUTE FUNCTION guard_mirror_views();
 
@@ -3056,5 +3102,6 @@ INSERT INTO schema_migrations (filename) VALUES
     ('0018_follower_leave.sql'),
     ('0019_follower_truncate_guard.sql'),
     ('0020_mirror_restores.sql'),
-    ('0021_embeddings_partitioned.sql')
+    ('0021_embeddings_partitioned.sql'),
+    ('0022_local_fields.sql')
 ON CONFLICT (filename) DO NOTHING;

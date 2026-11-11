@@ -109,6 +109,8 @@ async def seed(database):
         INSERT INTO embedding_concept_scores (concept_id,sample_id,score) VALUES
             (4,1,0.9),(4,2,0.1),(4,3,0.1),(9,1,0.1),(9,2,0.9),(9,3,0.1);
     """)
+    # Measured, so the plans below rest on these rows, not on the width the planner guesses for samples' columns.
+    await database.execute('ANALYZE samples, embedding_concepts, embedding_concept_scores')
 
 
 @needs_postgres

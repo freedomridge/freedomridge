@@ -159,13 +159,21 @@ def test_a_follower_copies_a_dataset_and_then_follows_its_changes(monkeypatch, r
             )
             == 'ff00'
         )
-        assert {
-            row['field_name']
+        registered = {
+            row['field_name']: row['owner']
             for row in await database.fetch(
-                'SELECT field_name FROM dataset_fields WHERE dataset_id = $1',
+                'SELECT field_name, owner FROM dataset_fields WHERE dataset_id = $1',
                 mirror['dataset_id'],
             )
-        } >= {'crop', 'label', 'parent_id'}
+        }
+        assert set(registered) >= {'crop', 'label', 'parent_id'}
+        # A first copy's fields are the primary's (its mirrors row comes first), and the primary's own are its own.
+        assert set(registered.values()) == {'primary'}
+        assert {
+            row['owner'] for row in await database.fetch('SELECT owner FROM dataset_fields WHERE dataset_id = 1')
+        } == {
+            'self',
+        }
         views = await database.fetch('SELECT * FROM views WHERE dataset_id = $1', mirror['dataset_id'])
         assert [view['name'] for view in views] == ['Corn']  # shared only, and the concept view stays there
         assert views[0]['content']['filters']['filters'][0]['value'] == [samples[corn]['id']]

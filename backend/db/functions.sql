@@ -1254,8 +1254,11 @@ BEGIN
     IF current_setting('fridge.deletion_dataset', TRUE) = target_dataset::text THEN
         RETURN;
     END IF;
-    -- A mirror's samples change only through its sync (0009).
-    PERFORM require_mirror_sync(target_dataset);
+    -- A mirror's samples change only through its sync (0009), or, for this instance's own fields, under
+    -- fridge.mirror_local, which samples_mirror_local_guard holds to the two local columns (0022).
+    IF current_setting('fridge.mirror_local', TRUE) IS DISTINCT FROM target_dataset::text THEN
+        PERFORM require_mirror_sync(target_dataset);
+    END IF;
     INSERT INTO sample_block_changes (dataset_id, block_id)
     SELECT target_dataset, target_block FROM datasets WHERE id = target_dataset AND followed
     ON CONFLICT DO NOTHING;
@@ -1354,11 +1357,35 @@ BEGIN
     IF TG_OP <> 'INSERT' AND current_setting('fridge.deletion_dataset', TRUE) = OLD.dataset_id::text THEN
         RETURN NULL;
     END IF;
-    IF TG_OP <> 'INSERT' THEN
+    IF TG_OP <> 'INSERT' AND NOT starts_with(OLD.field_name, '@local.') THEN
         PERFORM require_mirror_sync(OLD.dataset_id);
     END IF;
-    IF TG_OP <> 'DELETE' THEN
+    IF TG_OP <> 'DELETE' AND NOT starts_with(NEW.field_name, '@local.') THEN
         PERFORM require_mirror_sync(NEW.dataset_id);
+    END IF;
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION set_field_owner() RETURNS trigger AS $$
+BEGIN
+    NEW.owner := CASE
+        WHEN NOT starts_with(NEW.field_name, '@local.')
+             AND EXISTS (SELECT 1 FROM mirrors WHERE dataset_id = NEW.dataset_id) THEN 'primary'
+        ELSE 'self'
+    END;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION guard_mirror_local() RETURNS trigger AS $$
+BEGIN
+    IF TG_OP <> 'UPDATE'
+       OR NEW.dataset_id::text IS DISTINCT FROM current_setting('fridge.mirror_local', TRUE)
+       OR to_jsonb(OLD) - 'local_metadata' - 'local_tags' IS DISTINCT FROM to_jsonb(NEW) - 'local_metadata' - 'local_tags'
+    THEN
+        RAISE EXCEPTION 'A write of this instance''s own fields (@local.) changes only those fields'
+            USING ERRCODE = '55000';
     END IF;
     RETURN NULL;
 END;

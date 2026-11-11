@@ -33,6 +33,9 @@ SYSTEM_FIELDS = frozenset(
         '__classification_fields__',
     },
 )
+# A mirror's own fields (docs/FOLLOWERS.md), stored in samples.local_metadata and local_tags, never in metadata: a
+# metadata key with this prefix is refused, and the registry's `@local.` names are origin 'local' only.
+LOCAL_PREFIX = '@local.'
 _ISO_DATE = re.compile(r'^\d{4}-\d{2}-\d{2}(?:$|[T ])')
 
 
@@ -50,7 +53,11 @@ def canonical_type(field_type: str) -> str:
 
 
 def validate_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
-    """Reject non-finite/out-of-float8-range numbers before JSON can silently turn them into null."""
+    """Reject non-finite/out-of-float8-range numbers before JSON can silently turn them into null, and keys that name
+    a mirror's own fields."""
+    reserved = sorted(key for key in metadata if key.startswith(LOCAL_PREFIX))
+    if reserved:
+        raise ValueError(f"metadata key(s) {reserved}: names starting with {LOCAL_PREFIX} are a mirror's own fields")
 
     def visit(value: Any, path: str) -> None:
         if isinstance(value, (float, int)) and not isinstance(value, bool):
@@ -96,7 +103,7 @@ def infer_fields(metadata: Iterable[Mapping[str, Any]]) -> dict[str, str]:
     fields: dict[str, str] = {}
     for item in metadata:
         for name, value in item.items():
-            if name in SYSTEM_FIELDS:
+            if name in SYSTEM_FIELDS or name.startswith(LOCAL_PREFIX):
                 continue
             inferred = value_type(value)
             previous = fields.get(name, 'unknown')

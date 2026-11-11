@@ -77,6 +77,9 @@ _RESERVED_COLUMNS = frozenset(
         'created_at',
         'last_modified_at',
         'source_id',
+        # A mirror's own fields (0022): never an array field, so the sync never writes them.
+        'local_metadata',
+        'local_tags',
     ],
 )
 _SAFE_COLUMN_RE = re.compile(r'^[a-z][a-z0-9_]{0,62}$')
