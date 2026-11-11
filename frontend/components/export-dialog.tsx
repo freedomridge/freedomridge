@@ -29,6 +29,8 @@ interface ExportDialogProps {
      * contained image rows PLUS every matching `media_type='object'` patch row.
      */
     hasObjects?: boolean;
+    /** False when the grid it was opened from doesn't show the selection (one of the other grain). */
+    offerSelection?: boolean;
     onClose: () => void;
 }
 
@@ -60,7 +62,7 @@ function getFieldValue(item: ExportItem, field: string): unknown {
     return item.metadata?.[field] ?? item[field];
 }
 
-export function ExportDialog({ datasetId, schema, dataset, appliedCount, hasObjects = false, onClose }: ExportDialogProps) {
+export function ExportDialog({ datasetId, schema, dataset, appliedCount, hasObjects = false, offerSelection = true, onClose }: ExportDialogProps) {
     const {
         globalFilters,
         stagedFilters,
@@ -84,7 +86,7 @@ export function ExportDialog({ datasetId, schema, dataset, appliedCount, hasObje
         currentPolygon !== null;
     // A Select-All over a large view is a server-side token, not an id list: the dialog offered
     // only "Applied filters", which silently put the deselected tiles back.
-    const hasSelection = selectionCount > 0;
+    const hasSelection = offerSelection && selectionCount > 0;
 
     // Prioritize scope: selection > draft > applied (most specific first)
     const initialScope: ExportScope = hasSelection

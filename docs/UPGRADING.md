@@ -37,15 +37,16 @@ From the checkout the server runs, with `docker-compose.prod.yml`:
 4. Stop the app, apply the migrations with it stopped, then recreate the containers. Crossing 2.9.0, read
    [Upgrading across 2.9.0](#upgrading-across-290) first: its migration takes longer.
    ```bash
-   docker compose -f docker-compose.prod.yml stop backend job-runner backup frontend
+   docker compose -f docker-compose.prod.yml stop backend job-runner worker backup frontend
    FRIDGE_DB_CONTAINER=$(docker compose -f docker-compose.prod.yml ps -q db) \
      bash scripts/apply_migrations.sh
    docker compose -f docker-compose.prod.yml up -d
    ```
    Running, the old version would go on serving requests and running jobs against the changed schema until it is
-   replaced: its API checks the schema only in `/api/health`, and its job runner only when it starts. The `backup`
-   service is stopped too: a scheduled dump that ran during the migrations would make them wait behind it, or fail.
-   `up -d` starts all four again. The server is down from the `stop` until the new version answers in step 5.
+   replaced: its API checks the schema only in `/api/health`, and its job runner only when it starts. That is
+   every service but the database and nginx: a migration may refuse to run while anything else is connected, and
+   a scheduled dump that ran during the migrations would make them wait behind it, or fail. `up -d` starts all
+   five again. The server is down from the `stop` until the new version answers in step 5.
 5. Check `https://YOUR_DOMAIN/api/health`. It answers `"status": "ok"` with the new `version`.
    While it answers 503 (and the backend container reports unhealthy), its lists say why:
    `pending_migrations` or `stale_functions` (run step 4 again), or `unknown_migrations` (the
@@ -82,8 +83,9 @@ its own migrations, and they talk only through the follower API. So:
 
 2.9.0's migration `0021_embeddings_partitioned.sql` copies every vector into a table with one partition per
 dataset. Nothing else may write meanwhile, so it refuses to run while anything else is connected to the
-database, and names what is. Step 4 stops the backend, the job runner, the backup service and the frontend;
-stop anything else that connects too (a compute worker, a script, a `psql` session). A backup's dump started
+database, and names what is. Step 4 stops the backend, the job runner, the `worker` and `backup` services and
+the frontend, which is every service of `docker-compose.prod.yml` but the database and nginx; stop anything else
+that connects too (a compute worker on another machine, a script, a `psql` session). A backup's dump started
 first makes the migration refuse to start, and one started during the copy waits for it and then fails (its
 snapshot is older than the new tables) until its next run. The launcher (`npx freedomridge`) stops the app itself
 before it migrates. In a development checkout, stop the backend, the job runner and any workers.

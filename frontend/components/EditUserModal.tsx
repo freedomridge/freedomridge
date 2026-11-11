@@ -4,7 +4,14 @@ import React, { useState, useEffect } from 'react';
 import * as Dialog from '@radix-ui/react-dialog';
 import { Cross2Icon } from '@radix-ui/react-icons';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
-import { passwordResetMessage, RESET_PASSWORD_HINT, type RevokedTokens } from '@/lib/password-reset';
+import {
+    DEACTIVATE_HINT,
+    deactivationMessage,
+    passwordResetMessage,
+    RESET_PASSWORD_HINT,
+    RESET_PASSWORD_KEEP_TOKENS_HINT,
+    type RevokedTokens,
+} from '@/lib/password-reset';
 
 interface User {
     id: number;
@@ -25,6 +32,7 @@ export function EditUserModal({ user, onClose }: EditUserModalProps) {
     const [isActive, setIsActive] = useState(true);
     const [error, setError] = useState('');
     const [resetPassword, setResetPassword] = useState('');
+    const [revokeTokens, setRevokeTokens] = useState(true);
     const [successMessage, setSuccessMessage] = useState('');
 
     useEffect(() => {
@@ -33,6 +41,7 @@ export function EditUserModal({ user, onClose }: EditUserModalProps) {
             setRole(user.role);
             setIsActive(user.is_active);
             setResetPassword('');
+            setRevokeTokens(true);
             setSuccessMessage('');
             setError('');
         }
@@ -51,9 +60,16 @@ export function EditUserModal({ user, onClose }: EditUserModalProps) {
                 const data = await res.json();
                 throw new Error(data.detail || 'Failed to update user');
             }
+            return (await res.json()) as { revoked_tokens?: RevokedTokens };
         },
-        onSuccess: () => {
+        onSuccess: (answer) => {
             queryClient.invalidateQueries({ queryKey: ['users'] });
+            // Deactivating revoked the account's API tokens: stay open to say how many.
+            const revoked = answer?.revoked_tokens;
+            if (revoked && (user?.is_active || Object.values(revoked).some(n => n))) {
+                setSuccessMessage(deactivationMessage(revoked));
+                return;
+            }
             onClose();
         },
         onError: (err: Error) => {
@@ -62,12 +78,12 @@ export function EditUserModal({ user, onClose }: EditUserModalProps) {
     });
 
     const resetPasswordMutation = useMutation({
-        mutationFn: async () => {
+        mutationFn: async (revoke: boolean) => {
             if (!user || !resetPassword) return;
             const res = await fetch(`/api/users/${user.id}/reset-password`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ password: resetPassword })
+                body: JSON.stringify({ password: resetPassword, revoke_tokens: revoke })
             });
 
             if (!res.ok) {
@@ -76,8 +92,8 @@ export function EditUserModal({ user, onClose }: EditUserModalProps) {
             }
             return (await res.json()) as { revoked_tokens?: RevokedTokens };
         },
-        onSuccess: (answer) => {
-            setSuccessMessage(passwordResetMessage(answer?.revoked_tokens));
+        onSuccess: (answer, revoke) => {
+            setSuccessMessage(passwordResetMessage(answer?.revoked_tokens, revoke));
             setResetPassword('');
         },
         onError: (err: Error) => {
@@ -143,11 +159,16 @@ export function EditUserModal({ user, onClose }: EditUserModalProps) {
                                 />
                                 <label htmlFor="is_active" className="text-sm font-medium text-zinc-300">Active Account</label>
                             </div>
+                            {user.is_active && (
+                                <p data-testid="deactivate-hint" className="text-xs text-zinc-500 -mt-2">{DEACTIVATE_HINT}</p>
+                            )}
                         </div>
 
                         <div className="border-t border-zinc-800 pt-4">
                             <h3 className="text-sm font-medium text-zinc-400 mb-1">Reset Password</h3>
-                            <p data-testid="reset-password-hint" className="text-xs text-zinc-500 mb-3">{RESET_PASSWORD_HINT}</p>
+                            <p data-testid="reset-password-hint" className="text-xs text-zinc-500 mb-3">
+                                {revokeTokens ? RESET_PASSWORD_HINT : RESET_PASSWORD_KEEP_TOKENS_HINT}
+                            </p>
                             <div className="flex gap-2">
                                 <input
                                     type="password"
@@ -158,12 +179,22 @@ export function EditUserModal({ user, onClose }: EditUserModalProps) {
                                 />
                                 <button
                                     type="button"
-                                    onClick={() => resetPasswordMutation.mutate()}
+                                    onClick={() => resetPasswordMutation.mutate(revokeTokens)}
                                     disabled={!resetPassword || resetPasswordMutation.isPending}
                                     className="px-3 py-2 bg-zinc-800 hover:bg-zinc-700 text-white rounded text-sm font-medium transition-colors disabled:opacity-50"
                                 >
                                     Reset
                                 </button>
+                            </div>
+                            <div className="flex items-center gap-2 mt-2">
+                                <input
+                                    type="checkbox"
+                                    id="reset_revoke_tokens"
+                                    checked={revokeTokens}
+                                    onChange={(e) => setRevokeTokens(e.target.checked)}
+                                    className="rounded bg-zinc-800 border-zinc-700 text-cyan-600 focus:ring-cyan-500"
+                                />
+                                <label htmlFor="reset_revoke_tokens" className="text-sm text-zinc-300">Also revoke their API tokens</label>
                             </div>
                         </div>
 

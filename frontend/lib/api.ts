@@ -54,6 +54,8 @@ export interface DatasetMirror {
     views: 'primary' | 'both';
     // Shared views on the primary that use a concept: concepts belong to each instance, so they stay there.
     concept_views: string[];
+    // How many versions the primary keeps of the dataset. They stay there too. null: it hasn't said.
+    primary_versions?: number | null;
 }
 
 export interface ActiveDatasetJob {
@@ -101,6 +103,7 @@ export interface JobRecord {
     started_at: string | null;
     finished_at: string | null;
     attempt: number;
+    field?: string | null; // an index build's field
     cancel_requested: boolean;
     result?: unknown; // only sent to admins and the job's submitter
     error?: unknown; // only sent to admins and the job's submitter
@@ -351,6 +354,18 @@ function advisorPath(datasetId?: number) {
 export async function getIndexAdvisor(datasetId?: number): Promise<IndexAdvisorState> {
     const response = await fetch(`${API_BASE}${advisorPath(datasetId)}`, { credentials: 'include' });
     await ensureOk(response, 'Could not read the index review');
+    return response.json();
+}
+
+// Start a field's vector index build and answer at once: the Jobs list shows it (a power user's or admin's).
+export async function buildAnnIndex(datasetId: number, field: string): Promise<unknown> {
+    const response = await fetch(`${API_BASE}/datasets/${datasetId}/quality/ann-index?wait=false`, {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ field }),
+    });
+    await ensureOk(response, 'Could not start the index build');
     return response.json();
 }
 

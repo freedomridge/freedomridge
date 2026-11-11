@@ -63,7 +63,8 @@ Every call takes the follower token (`Authorization: Bearer <token>`) and record
    takes the follower's own patch scales; absent from older ones), the primary's `database_identity` (its
    cluster's system identifier and its database's oid; `identity` is the cluster's alone, as followers before
    2.6.1 read it), and whether each dataset is `ready`. A dataset becomes ready once every transaction that might have written to it without
-   being logged has ended. Those are writes already in flight when it became followed.
+   being logged has ended. Those are writes already in flight when it became followed. Each dataset also says how
+   many `versions` the primary keeps of it (absent from a primary before it counted them).
 2. **Copy a ready dataset:**
    - `GET .../blocks` lists every block and its sample count.
    - `POST .../blocks/samples {"blocks": [...]}` returns those blocks' samples, with every column, the array
@@ -162,6 +163,10 @@ up from the change log when it's back. Images the primary serves (**Serve images
 - **Views that use a concept, or a range on sample ids** (`id > 15`, a `parent_id` range), stay on the primary:
   concepts belong to each instance, and each numbers its samples in its own order. The views panel lists them.
   Sample ids named outright (`id in [...]`, an object's `parent_id`) are translated.
+- **Versions stay on the primary.** A mirror follows the dataset as it is now, not its history: the versions made
+  on the primary aren't copied, and a mirror can't browse them or revert to one. When the primary has versions, the
+  mirror's Versions tab says how many it keeps. Versions made on the mirror are its own, of what it holds
+  ([Dataset Versioning](SDK.md#dataset-versioning)).
 - **Images:** the mirror reads the same media paths. When this instance can read them (the same disk path, or a
   storage configuration with read access to the bucket), it serves them itself. When it can't, and the primary
   has the dataset's `images` option on, it asks the primary for the image, thumbnail, crop or overlay and keeps

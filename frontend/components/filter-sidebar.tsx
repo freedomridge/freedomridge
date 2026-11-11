@@ -4,7 +4,7 @@ import { isOverlayActive, isDerivedLabelField } from '@/lib/labels';
 
 import { type SchemaField, type Filters, type ComplexFilter, getFieldFacet, isRescoringRefusal, promoteField, rescoringRetryTurn } from '@/lib/api';
 import { SearchableSelect } from './searchable-select';
-import { convertSimpleFiltersToComplex, describeFilter, isTextFilter, type TextFilter } from '@/lib/filter-utils';
+import { convertSimpleFiltersToComplex, describeFilter, excludeKeyFor, isTextFilter, type TextFilter } from '@/lib/filter-utils';
 import { filteredFieldNames, readCollapsedFields, readExpandedFields, storeFieldExpanded } from '@/lib/sidebar-sections';
 import { EyeOpenIcon, EyeNoneIcon, MixerHorizontalIcon } from '@radix-ui/react-icons';
 import { Rocket } from 'lucide-react';
@@ -122,7 +122,7 @@ function SidebarValuePicker({ datasetId, field, filters, globalFilters, onChange
     onChange: (filters: Filters) => void;
     showCachedValues?: boolean;
 }) {
-    const excludeKey = `exclude_${field.name}`;
+    const excludeKey = excludeKeyFor(field.name);
     const current = filters[field.name];
     const allowContains = supportsContains(field);
     const selection: TextFilter = isTextFilter(current) ? current : {
@@ -531,7 +531,7 @@ export function FilterSidebar({
         body?: () => ReactNode;
     }) => {
         const name = schemaField.name;
-        const excludeKey = `exclude_${name}`;
+        const excludeKey = excludeKeyFor(name);
         const open = body !== undefined && isExpanded(schemaField);
         const bodyId = `${sectionIdPrefix}-field-${index}`;
         const filtered = filteredFields.has(name);
@@ -781,12 +781,12 @@ export function FilterSidebar({
                                         <>
                                             {renderPromoteButton(field)}
                                             {renderOverlayToggle(field.name)}
-                                            {(filters[field.name] || filters[`exclude_${field.name}`]) && (
+                                            {(filters[field.name] || filters[excludeKeyFor(field.name)]) && (
                                                 <button
                                                     onClick={() => {
                                                         const newFilters = { ...filters };
                                                         delete newFilters[field.name];
-                                                        delete newFilters[`exclude_${field.name}`];
+                                                        delete newFilters[excludeKeyFor(field.name)];
                                                         onChange(newFilters);
                                                         keepFocus(field.name);
                                                     }}

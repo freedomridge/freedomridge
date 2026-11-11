@@ -394,7 +394,8 @@ async def run_service(dsn=DATABASE_URL):
                 ),
                 (lambda: index_jobs.sweep_invalid_indexes(pool), 60, 'Invalid index cleanup', False),
                 (lambda: dataset_deletion.sweep_partitions(pool), 60, 'Vector partition cleanup', False),
-                (lambda: index_jobs.queue_rebuilds(pool), 60, 'Vector index rebuilds', False),
+                # One build queued at a time, so the next starts within seconds of the last.
+                (lambda: index_jobs.queue_rebuilds(pool), 10, 'Vector index rebuilds', False),
                 (lambda: dataset_schedules.schedule_dataset_jobs(pool), 60, 'Dataset schedules', False),
                 (lambda: map_refit.sweep(pool), 600, 'Map artifact cleanup', False),
                 (lambda: map_refit.heal_unranked_maps(pool), 600, 'Unranked map heal', False),

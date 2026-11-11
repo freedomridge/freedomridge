@@ -612,7 +612,8 @@ class Client:
             samples: List of sample dicts
             on_duplicate: 'error' (add new samples and return duplicate conflicts with ids + existing),
                          'skip' (silently skip duplicates),
-                         'update' (overwrite existing samples)
+                         'update' (replace an existing sample's metadata, location, heading and array
+                         fields; tags are merged, and embeddings and hashes replace only those of the same name)
         """
         payload = {"samples": samples, "on_duplicate": on_duplicate}
         resp = self.session.post(f"{self.base_url}/datasets/{dataset_id}/samples", json=payload)
@@ -1810,11 +1811,25 @@ class Client:
         _raise_for_status(resp)
         return resp.json()
 
-    def create_version(self, dataset_id, name, description=None, include_metadata=True) -> dict:
-        """Create a new dataset version snapshot."""
+    def create_version(
+        self,
+        dataset_id,
+        name,
+        description=None,
+        include_metadata=True,
+        created_at=None,
+        created_by=None,
+    ) -> dict:
+        """Create a new dataset version snapshot. For history brought in from another system: ``created_at``, an
+        ISO 8601 time with a UTC offset to date the version from instead of now, and ``created_by``, who made it
+        instead of you."""
         payload = {"name": name, "include_metadata": include_metadata}
         if description:
             payload["description"] = description
+        if created_at is not None:
+            payload["created_at"] = created_at
+        if created_by is not None:
+            payload["created_by"] = created_by
         resp = self.session.post(f"{self.base_url}/datasets/{dataset_id}/versions", json=payload)
         _raise_for_status(resp)
         return resp.json()
@@ -1831,8 +1846,15 @@ class Client:
         _raise_for_status(resp)
         return resp.json()
 
+    def get_version_views(self, dataset_id, version_id) -> Optional[list]:
+        """The saved views a version recorded, each with its name, description and content; None when it
+        recorded none (it was made before versions recorded views, or is hash-only)."""
+        resp = self.session.get(f"{self.base_url}/datasets/{dataset_id}/versions/{version_id}/views")
+        _raise_for_status(resp)
+        return resp.json()["views"]
+
     def delete_version(self, dataset_id, version_id) -> dict:
-        """Delete a dataset version."""
+        """Delete a dataset version. Takes an admin: it can't be brought back."""
         resp = self.session.delete(f"{self.base_url}/datasets/{dataset_id}/versions/{version_id}")
         _raise_for_status(resp)
         return resp.json()
@@ -1858,15 +1880,27 @@ class Client:
         _raise_for_status(resp)
         return resp.json()
 
-    def revert_version(self, dataset_id, version_id, restore_deleted=False, exact_membership=False) -> dict:
-        """Revert dataset to a specific version.
+    def revert_version(
+        self,
+        dataset_id,
+        version_id,
+        restore_deleted=False,
+        exact_membership=False,
+        restore_settings=False,
+    ) -> dict:
+        """Revert dataset to a specific version. Takes an admin.
 
         restore_deleted=True also re-creates samples deleted since the version
         (from snapshot; embeddings/hashes must be backfilled — see get_missing).
+        restore_settings=True also puts the dataset's settings back as the version recorded them.
         """
         resp = self.session.post(
             f"{self.base_url}/datasets/{dataset_id}/versions/{version_id}/revert",
-            params={"restore_deleted": restore_deleted, "exact_membership": exact_membership},
+            params={
+                "restore_deleted": restore_deleted,
+                "exact_membership": exact_membership,
+                "restore_settings": restore_settings,
+            },
         )
         _raise_for_status(resp)
         return resp.json()

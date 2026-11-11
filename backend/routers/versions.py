@@ -4,12 +4,14 @@ import asyncio
 import contextlib
 import copy
 import json
+import re
 import secrets
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 import asyncpg
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
+from pydantic import AwareDatetime, BaseModel
 
 from ..access import require_dataset_access
 from ..database import db
@@ -42,6 +44,13 @@ class CreateVersionRequest(BaseModel):
     name: str
     description: Optional[str] = None
     include_metadata: bool = True  # False = hash-only (lightweight), True = full snapshot
+    # When the version dates from, for history brought in from another system: it is listed, and counted as
+    # the latest or not, by this date. With a UTC offset, and not in the future. Default: now.
+    created_at: Optional[AwareDatetime] = None
+    # Who made the version, for history brought in from another system: its author there. Default: the user
+    # making the request; or, for a version given a created_at, no one, since its maker is then unknown.
+    # A version given either is recorded as imported by the user making the request (imported_by).
+    created_by: Optional[str] = None
 
 
 async def get_array_columns():
@@ -115,6 +124,75 @@ def _dataset_snapshot_sql(dataset_param: str) -> str:
             ), '[]'::jsonb)
         ) FROM datasets d WHERE d.id = {dataset_param}
     """
+
+
+# A view's content as an object: a legacy row stored the JSON text of one (views._decode_content).
+_VIEW_CONTENT_SQL = "CASE WHEN jsonb_typeof(w.content) = 'string' THEN (w.content #>> '{}')::jsonb ELSE w.content END"
+
+
+def _saved_views_sql(dataset_param: str) -> str:
+    """The dataset's public saved views as a version records them, by name: [{name, description, content, slug,
+    user_id, is_default}].
+
+    A private view is its owner's, and everyone with the dataset can read a version, so only public views are
+    recorded. Their names are unique in a dataset. The name, description and content are the view; the slug (its
+    link) and owner are kept so a restore can bring back a view that was deleted as it was. is_default marks the
+    view the dataset opens on (datasets.default_view_id): a view made again has a new id, so the default is
+    recorded with its view, by name.
+    """
+    return f"""
+        SELECT COALESCE(jsonb_agg(jsonb_build_object(
+            'name', w.name, 'description', w.description, 'content', {_VIEW_CONTENT_SQL},
+            'slug', w.slug, 'user_id', w.user_id,
+            'is_default', COALESCE(w.id = (SELECT default_view_id FROM datasets WHERE id = {dataset_param}), FALSE)
+        ) ORDER BY w.name), '[]'::jsonb)
+        FROM views w WHERE w.dataset_id = {dataset_param} AND w.is_public
+    """
+
+
+def _version_views_sql(version_param: str) -> str:
+    """The saved views a version recorded; NULL when it recorded none (see _view_changes_sql)."""
+    return f"SELECT saved_views FROM dataset_versions WHERE id = {version_param}"
+
+
+def _view_changes_sql(before: str, after: str) -> str:
+    """A query for how the saved views of ``after`` differ from those of ``before`` (two queries for recorded
+    views): {added, removed, filters_changed}, each the views' names. A view is the same view while it keeps
+    its name, and what can differ is its content, the filters.
+
+    NULL when either side recorded no views (a version made before versions recorded them, or a hash-only one):
+    nothing is known about its views, so nothing is reported as changed.
+    """
+    return f"""
+        SELECT CASE WHEN b.views IS NULL OR a.views IS NULL THEN NULL ELSE jsonb_build_object(
+            'added', (
+                SELECT COALESCE(jsonb_agg(new.value->>'name' ORDER BY new.value->>'name'), '[]'::jsonb)
+                FROM jsonb_array_elements(a.views) new
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM jsonb_array_elements(b.views) old WHERE old.value->>'name' = new.value->>'name'
+                )
+            ),
+            'removed', (
+                SELECT COALESCE(jsonb_agg(old.value->>'name' ORDER BY old.value->>'name'), '[]'::jsonb)
+                FROM jsonb_array_elements(b.views) old
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM jsonb_array_elements(a.views) new WHERE new.value->>'name' = old.value->>'name'
+                )
+            ),
+            'filters_changed', (
+                SELECT COALESCE(jsonb_agg(old.value->>'name' ORDER BY old.value->>'name'), '[]'::jsonb)
+                FROM jsonb_array_elements(b.views) old
+                JOIN jsonb_array_elements(a.views) new ON new.value->>'name' = old.value->>'name'
+                WHERE new.value->'content' IS DISTINCT FROM old.value->'content'
+            )
+        ) END
+        FROM (SELECT ({before}) AS views) b, (SELECT ({after}) AS views) a
+    """
+
+
+def _views_differ(changes: Optional[dict]) -> bool:
+    """Whether a _view_changes_sql result names any change. Unknown (None) is not a change."""
+    return changes is not None and any(changes.values())
 
 
 # The dataset's row ($1) without the stats_ columns: those are statistics bookkeeping, written by every refresh
@@ -208,6 +286,128 @@ async def _restore_field_registry(conn, dataset_id: int, version):
             dataset_id,
             version['id'],
         )
+
+
+# The dataset columns a revert can restore from a version's dataset_snapshot, and the cast each one's value takes.
+_RESTORED_SETTINGS = {
+    'description': '',
+    'media_fields': '::text[]',
+    'grid_media_field': '',
+    'modal_media_field': '',
+    'segmentation_config': '',
+}
+
+
+async def _restore_dataset_settings(conn, dataset_id: int, snapshot: dict) -> None:
+    """Put the dataset's own settings back as the version recorded them: its description, its media fields and
+    which one the grid and a sample's view show, and the segmentation classes and colours.
+
+    Not its name: another dataset may have it now, and links and scripts use the name it has. The fields' types
+    and display settings aren't these: every revert restores them (_restore_field_registry). A setting the
+    snapshot never recorded stays as it is.
+    """
+    recorded = [setting for setting in _RESTORED_SETTINGS if setting in snapshot]
+    if recorded:
+        assignments = ', '.join(
+            f'{setting} = ${position}{_RESTORED_SETTINGS[setting]}' for position, setting in enumerate(recorded, 2)
+        )
+        await conn.execute(
+            f'UPDATE datasets SET {assignments} WHERE id = $1',
+            dataset_id,
+            *(snapshot[setting] for setting in recorded),
+        )
+
+
+async def _restore_default_view(conn, dataset_id: int, version_id: int) -> None:
+    """Make the dataset open on the view it opened on when the version was made, or on none if it had none then.
+    By name, after _restore_saved_views has put the recorded views back: a view made again has a new id.
+
+    A version that recorded no views says nothing about the default, so it stays as it is.
+    """
+    recorded = await conn.fetchval(_version_views_sql('$1'), version_id)
+    if recorded is None:
+        return
+    default_name = next((view['name'] for view in recorded if view.get('is_default')), None)
+    await conn.execute(
+        """UPDATE datasets SET default_view_id = (
+               SELECT id FROM views WHERE dataset_id = $1 AND is_public AND name = $2
+           ) WHERE id = $1""",
+        dataset_id,
+        default_name,
+    )
+
+
+async def _restore_saved_views(conn, dataset_id: int, version_id: int, user: dict, exact: bool) -> tuple[int, int]:
+    """Put the dataset's public saved views back as the version recorded them; (views restored, views removed).
+
+    A recorded view comes back under its name with its filters and description: a public view of that name is
+    given them, and a missing one is made again, with the link and owner it had when the link is still free and
+    the owner still a user. ``exact`` also removes the public views the version doesn't have. A version that
+    recorded no views leaves the views as they are.
+
+    Private views are never touched. One that holds a recorded view's name therefore stops the restore (409),
+    before anything is changed: names are unique in a dataset, and it isn't this restore's to rename or replace.
+    """
+    recorded = await conn.fetchval(_version_views_sql('$1'), version_id)
+    if recorded is None:
+        return 0, 0
+    rows = await conn.fetch(
+        f"""SELECT w.id, w.name, w.description, w.is_public, {_VIEW_CONTENT_SQL} AS content
+            FROM views w WHERE w.dataset_id = $1 AND (w.is_public OR w.name_scope = 0)""",
+        dataset_id,
+    )
+    current = {row['name']: row for row in rows}
+    private = sorted(
+        view['name'] for view in recorded if view['name'] in current and not current[view['name']]['is_public']
+    )
+    if private:
+        raise HTTPException(
+            status_code=409,
+            detail=f"The version has saved views named {private}, and private views now have those names. "
+            "Rename or delete the private ones, then restore again; nothing was changed.",
+        )
+    owners = {view['user_id'] for view in recorded} | {user['id']}
+    known_users = {
+        row['id'] for row in await conn.fetch('SELECT id FROM users WHERE id = ANY($1::int[])', list(owners - {None}))
+    }
+    restored = 0
+    for view in recorded:
+        existing = current.get(view['name'])
+        if existing is None:
+            slug = view.get('slug')
+            if slug is None or await conn.fetchval('SELECT 1 FROM views WHERE slug = $1', slug):
+                slug = secrets.token_urlsafe(8)  # as views.generate_slug
+            owner = next(
+                (candidate for candidate in (view.get('user_id'), user['id']) if candidate in known_users),
+                None,
+            )
+            await conn.execute(
+                """INSERT INTO views (dataset_id, user_id, name, description, slug, content, is_public, name_scope)
+                   VALUES ($1, $2, $3, $4, $5, $6, TRUE, 0)""",
+                dataset_id,
+                owner,
+                view['name'],
+                view['description'],
+                slug,
+                view['content'],
+            )
+            restored += 1
+        elif existing['content'] != view['content'] or existing['description'] != view['description']:
+            await conn.execute(
+                'UPDATE views SET content = $2, description = $3 WHERE id = $1',
+                existing['id'],
+                view['content'],
+                view['description'],
+            )
+            restored += 1
+    removed = 0
+    if exact:
+        names = {view['name'] for view in recorded}
+        added_since = [row['id'] for row in rows if row['is_public'] and row['name'] not in names]
+        if added_since:
+            await conn.execute('DELETE FROM views WHERE id = ANY($1::int[])', added_since)
+        removed = len(added_since)
+    return restored, removed
 
 
 async def _changed_restore_fields(conn, version_id: int, dataset_id: int, arr_cols, changed_sql: str) -> set:
@@ -409,6 +609,7 @@ async def _version_status(conn, id: int):
 
     current_count = await conn.fetchval("SELECT count(*) FROM samples WHERE dataset_id = $1", id)
     current_settings = await conn.fetchval(_dataset_snapshot_sql('$1'), id)
+    current_views = _saved_views_sql('$2')
     arr_cols, _ = await _snapshot_arrays(conn)
     for v in versions:
         if v['sample_count'] != current_count:
@@ -420,6 +621,9 @@ async def _version_status(conn, id: int):
             v['dataset_snapshot'],
             current_settings,
         ):
+            continue
+        # A public view added, removed or given other filters since the version is a change too.
+        if _views_differ(await conn.fetchval(_view_changes_sql(_version_views_sql('$1'), current_views), v['id'], id)):
             continue
         geo_diff, _ = _geo_compare_sql((v['snapshot_format'] or 1) >= EXACT_GEO_FORMAT)
         media_diff, _ = _media_compare_sql()
@@ -464,6 +668,12 @@ async def _version_status(conn, id: int):
         "current_version": None,
         "latest_version": {"id": latest['id'], "name": latest['name']} if latest else None,
         "has_changes": True,
+        # What changed about the saved views since the latest version; null when it recorded none.
+        "view_changes": await conn.fetchval(
+            _view_changes_sql(_version_views_sql('$1'), current_views),
+            versions[0]['id'],
+            id,
+        ),
     }
 
 
@@ -472,7 +682,8 @@ async def list_versions(id: int):
     """List all versions for a dataset, newest first."""
     rows = await db.fetch(
         """
-        SELECT id, name, description, sample_count, include_metadata, created_at, snapshot_format
+        SELECT id, name, description, sample_count, include_metadata, created_at, snapshot_format, created_by,
+               imported_by
         FROM dataset_versions
         WHERE dataset_id = $1
         ORDER BY created_at DESC
@@ -488,12 +699,18 @@ async def list_versions(id: int):
 _CREATE_RETRY_DELAYS = (0.1, 0.2)
 
 
-@router.post("", dependencies=[Depends(require_role("power_user"))])
-async def create_version(id: int, request: CreateVersionRequest):
-    """Capture a consistent snapshot, or report a retryable concurrent-write conflict."""
+@router.post("")
+async def post_version(id: int, request: CreateVersionRequest, user: dict = Depends(require_role("power_user"))):
+    """Create a version, made by the requesting user unless the request says who made it."""
+    return await create_version(id, request, user.get('username'))
+
+
+async def create_version(id: int, request: CreateVersionRequest, made_by: Optional[str] = None):
+    """Capture a consistent snapshot, or report a retryable concurrent-write conflict. ``made_by`` is recorded
+    as who made it, unless the request says who did."""
     for delay in (*_CREATE_RETRY_DELAYS, None):
         try:
-            return await _create_version(id, request)
+            return await _create_version(id, request, made_by)
         except asyncpg.SerializationError:
             if delay is None:
                 # Rolled back, nothing kept: a retryable refusal, marked with Retry-After like the others.
@@ -505,7 +722,7 @@ async def create_version(id: int, request: CreateVersionRequest):
             await asyncio.sleep(delay)
 
 
-async def _create_version(id: int, request: CreateVersionRequest):
+async def _create_version(id: int, request: CreateVersionRequest, made_by: Optional[str] = None):
     """Create a new version snapshot of the current dataset state.
 
     Full snapshots capture sample data and dataset display settings atomically.
@@ -513,6 +730,15 @@ async def _create_version(id: int, request: CreateVersionRequest):
     """
     # "" and "   " used to be accepted.
     request.name = clean_name(request.name, "Version name")
+    if request.created_at is not None and request.created_at > datetime.now(timezone.utc):
+        raise HTTPException(status_code=400, detail="created_at is in the future; a version dates from now or before")
+    # A date or an author that the request states is a claim; who made the request is recorded beside it.
+    imported_by = made_by if request.created_at is not None or request.created_by is not None else None
+    if request.created_by is not None:
+        made_by = clean_name(request.created_by, "created_by")
+    elif request.created_at is not None:
+        # History from another system that names no author: who made it is unknown, not whoever brings it in.
+        made_by = None
 
     # Check dataset exists
     ds = await db.fetchrow("SELECT id FROM datasets WHERE id = $1", id)
@@ -538,10 +764,14 @@ async def _create_version(id: int, request: CreateVersionRequest):
                 version = await conn.fetchrow(
                     f"""
                     INSERT INTO dataset_versions (dataset_id, name, description, sample_count, include_metadata,
-                                                  snapshot_format, dataset_snapshot)
+                                                  snapshot_format, dataset_snapshot, saved_views, created_at,
+                                                  created_by, imported_by)
                     VALUES ($1, $2, $3, $4, $5, CASE WHEN $5 THEN $6::smallint ELSE 1::smallint END,
-                            CASE WHEN $5 THEN ({_dataset_snapshot_sql('$1')}) ELSE NULL END)
-                    RETURNING id, name, description, sample_count, include_metadata, created_at
+                            CASE WHEN $5 THEN ({_dataset_snapshot_sql('$1')}) ELSE NULL END,
+                            CASE WHEN $5 THEN ({_saved_views_sql('$1')}) ELSE NULL END,
+                            COALESCE($7::timestamptz, CURRENT_TIMESTAMP), $8, $9)
+                    RETURNING id, name, description, sample_count, include_metadata, created_at, created_by,
+                              imported_by, jsonb_array_length(saved_views) AS saved_view_count
                 """,
                     id,
                     request.name,
@@ -549,6 +779,9 @@ async def _create_version(id: int, request: CreateVersionRequest):
                     count,
                     request.include_metadata,
                     SNAPSHOT_FORMAT,
+                    request.created_at,
+                    made_by,
+                    imported_by,
                 )
             except asyncpg.UniqueViolationError:
                 raise HTTPException(
@@ -603,7 +836,8 @@ async def get_version(id: int, version_id: int):
     """Get details of a specific version."""
     row = await db.fetchrow(
         """
-        SELECT id, name, description, sample_count, include_metadata, created_at, snapshot_format, dataset_snapshot
+        SELECT id, name, description, sample_count, include_metadata, created_at, snapshot_format, dataset_snapshot,
+               created_by, imported_by
         FROM dataset_versions
         WHERE id = $1 AND dataset_id = $2
     """,
@@ -620,6 +854,47 @@ async def get_version(id: int, version_id: int):
         ]
         result['dataset_snapshot'] = snapshot
     return result
+
+
+@router.get("/{version_id}/views")
+async def get_version_views(id: int, version_id: int):
+    """The saved views a version recorded: the name, description and content of each of the dataset's public
+    views when it was made. A view's filters run on the version through the version's sample queries.
+
+    ``views`` is null for a version that recorded none: one made before versions recorded views, or a hash-only
+    one. That is not the same as a version of a dataset that had no public views, which has an empty list.
+    """
+    row = await db.fetchrow(
+        "SELECT saved_views FROM dataset_versions WHERE id = $1 AND dataset_id = $2",
+        version_id,
+        id,
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="Version not found")
+    return {"views": row['saved_views']}
+
+
+async def _recorded_view_filter(id: int, version_id: int, name: str) -> Optional[dict]:
+    """The filter of a saved view the version recorded, as the app applies a view: the AND of its stages' filters,
+    or the compiled filters of a view saved before views had stages. None for a view of every sample.
+
+    404 when the version recorded no view of that name; 400 for a view that holds no usable filter.
+    """
+    recorded = (await get_version_views(id, version_id))['views'] or []
+    content = next((view['content'] for view in recorded if view['name'] == name), None)
+    if content is None:
+        raise HTTPException(status_code=404, detail=f"This version recorded no saved view named {name!r}")
+    stages = content.get('viewStages') if isinstance(content, dict) else None
+    if isinstance(stages, list):
+        filters = [stage.get('filter') if isinstance(stage, dict) else None for stage in stages]
+        if all(isinstance(stage_filter, dict) and stage_filter for stage_filter in filters):
+            return {'logic': 'AND', 'filters': filters} if filters else None
+    elif isinstance(content, dict) and isinstance(content.get('filters'), dict):
+        return content['filters'] or None
+    raise HTTPException(
+        status_code=400,
+        detail=f"Saved view {name!r} has a stage without a filter, so it can't be shown on a version",
+    )
 
 
 def _attach_location(data: dict) -> None:
@@ -659,6 +934,7 @@ async def get_version_samples(
     change_type: Optional[str] = None,
     diff_base: Optional[int] = None,
     diff_target: Optional[int] = None,
+    view: Optional[str] = None,
 ):
     """Get samples from this version.
 
@@ -666,6 +942,7 @@ async def get_version_samples(
     full=True: returns samples in the same format as the main samples
     endpoint, but with snapshotted metadata/tags from version time.
     Filepaths are resolved through the storage backend.
+    view: only the samples of this saved view, one the version recorded (GET .../views), as it held them then.
     """
     # IDOR guard: the version must belong to THIS dataset. Every sibling endpoint
     # verifies this; without it a caller with access to any (e.g. global) dataset
@@ -678,7 +955,7 @@ async def get_version_samples(
         raise HTTPException(status_code=400, detail="Search must be at most 1000 characters")
     if full and version['include_metadata'] is False:
         raise HTTPException(status_code=400, detail="Hash-only versions have no historical sample data")
-    args: list[int | str] = [version_id]
+    args: list[Any] = [version_id]
     conditions = ["v.version_id = $1"]
     if change_type is not None:
         base = diff_base if diff_base is not None else version_id
@@ -692,6 +969,15 @@ async def get_version_samples(
             args.extend([base, id])
         selection = selection.replace('$2', '$3').replace('$1', '$2')
         conditions.append(f"v.sample_id IN ({selection})")
+    if view is not None:
+        view_filter = await _recorded_view_filter(id, version_id, view)
+        if view_filter is not None:
+            # The view's own query on the version (its CTE and filter), with its parameters after this one's.
+            with_clause, view_where, view_args, _, _ = await _version_query(id, version_id, view_filter)
+            shift = len(args)
+            view_where = re.sub(r'\$(\d+)', lambda match: f'${int(match.group(1)) + shift}', view_where)
+            conditions.append(f"v.sample_id IN ({with_clause}SELECT id FROM samples {view_where})")
+            args.extend(view_args)
     if q:
         args.append('%' + q.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_') + '%')
         conditions.append(
@@ -700,7 +986,7 @@ async def get_version_samples(
         )
     where = ' AND '.join(conditions)
     total = version['sample_count']
-    if q or change_type is not None:
+    if q or change_type is not None or view is not None:
         total = await db.fetchval(f"SELECT count(*) FROM version_snapshots v WHERE {where}", *args)
     if after_id is not None:
         args.append(after_id)
@@ -926,7 +1212,8 @@ async def query_version_samples(id: int, version_id: int, request: VersionSample
     return {"items": items}
 
 
-@router.delete("/{version_id}", dependencies=[Depends(require_role("power_user"))])
+# An admin: a deleted version can't be brought back, and it is the record of what the dataset was.
+@router.delete("/{version_id}", dependencies=[Depends(require_role("admin"))])
 async def delete_version(id: int, version_id: int):
     """Delete a version and its snapshot data."""
     row = await db.fetchrow(
@@ -1025,6 +1312,11 @@ async def _diff_versions(conn, id: int, version_a: int, version_b: int):
         version_a,
         version_b,
     )
+    view_changes = await conn.fetchval(
+        _view_changes_sql(_version_views_sql('$1'), _version_views_sql('$2')),
+        version_a,
+        version_b,
+    )
     return {
         "version_a": version_a,
         "version_b": version_b,
@@ -1033,6 +1325,7 @@ async def _diff_versions(conn, id: int, version_a: int, version_b: int):
         "modified": modified,
         "unchanged": unchanged,
         "dataset_changed": dataset_changed,
+        "view_changes": view_changes,
     }
 
 
@@ -1209,6 +1502,11 @@ async def _diff_current(conn, id: int, version_id: int):
         version_id,
         id,
     )
+    view_changes = await conn.fetchval(
+        _view_changes_sql(_version_views_sql('$1'), _saved_views_sql('$2')),
+        version_id,
+        id,
+    )
 
     return {
         "version_id": version_id,
@@ -1219,6 +1517,7 @@ async def _diff_current(conn, id: int, version_id: int):
         "unchanged": unchanged,
         "current_sample_count": current_count,
         "dataset_changed": dataset_changed,
+        "view_changes": view_changes,
     }
 
 
@@ -1233,12 +1532,16 @@ async def revert_to_version(
     id: int,
     version_id: int,
     restore_deleted: bool = False,
-    user: dict = Depends(require_role("power_user")),
+    # An admin: a revert can do what only an admin may do one at a time. It deletes the samples added since
+    # (exact_membership), rewrites or removes public views whoever owns them, and can change the dataset's
+    # settings (restore_settings).
+    user: dict = Depends(require_role("admin")),
     exact_membership: bool = False,
+    restore_settings: bool = False,
 ):
     for delay in (*_RESTORE_RETRY_DELAYS, None):
         try:
-            return await _restore_version(id, version_id, restore_deleted, user, exact_membership)
+            return await _restore_version(id, version_id, restore_deleted, user, exact_membership, restore_settings)
         except asyncpg.SerializationError:
             if delay is None:
                 raise HTTPException(status_code=409, detail="Dataset changed during restore; retry the operation")
@@ -1256,12 +1559,17 @@ async def _restore_version(
     restore_deleted: bool,
     user: dict,
     exact_membership: bool,
+    restore_settings: bool = False,
 ):
     """Revert the dataset to a specific version's state.
 
     Automatically creates a snapshot of the current state before reverting
     so you can undo. Restores metadata, tags for all samples in the version.
     Samples added after the version are kept unless exact_membership=True.
+
+    restore_settings=True also puts the dataset's own settings back as the version
+    recorded them (_restore_dataset_settings) and the view it opens on (_restore_default_view);
+    otherwise they stay as they are.
 
     restore_deleted=True additionally re-creates samples that were deleted
     since the version, from their snapshot (original id, filepath, metadata,
@@ -1282,6 +1590,12 @@ async def _restore_version(
         raise HTTPException(status_code=404, detail="Version not found")
     if version['include_metadata'] is False:
         raise HTTPException(status_code=400, detail="Cannot revert to a hash-only version (no metadata stored)")
+    if restore_settings and version['dataset_snapshot'] is None:
+        raise HTTPException(
+            status_code=400,
+            detail="This version did not record the dataset's settings, so they can't be restored. "
+            "Revert without restoring settings.",
+        )
 
     # Verify the snapshot actually has metadata (older versions may not)
     has_metadata = await db.fetchval(
@@ -1334,8 +1648,8 @@ async def _restore_version(
             auto_version = await conn.fetchrow(
                 f"""
                 INSERT INTO dataset_versions (dataset_id, name, description, sample_count, include_metadata,
-                                              snapshot_format, dataset_snapshot)
-                VALUES ($1, $2, $3, $4, TRUE, $5, ({_dataset_snapshot_sql('$1')}))
+                                              snapshot_format, dataset_snapshot, saved_views, created_by)
+                VALUES ($1, $2, $3, $4, TRUE, $5, ({_dataset_snapshot_sql('$1')}), ({_saved_views_sql('$1')}), $6)
                 RETURNING id
             """,
                 id,
@@ -1343,8 +1657,12 @@ async def _restore_version(
                 f"Auto-snapshot before reverting to {version['name']}",
                 current_count,
                 SNAPSHOT_FORMAT,
+                user.get('username'),
             )
             auto_snapshot_id = auto_version['id']
+            # The undo point has recorded the views as they are; now put the version's back. First, since a
+            # private view in the way stops the restore: before the samples are copied and rewritten.
+            views_restored, views_removed = await _restore_saved_views(conn, id, version_id, user, exact_membership)
 
             arr_cols, auto_af_expr = await _snapshot_arrays(conn)
 
@@ -1487,6 +1805,9 @@ async def _restore_version(
             )
             definitions_before = {tuple(row) for row in await conn.fetch(definitions_query, id)}
             await _restore_field_registry(conn, id, version)
+            if restore_settings:
+                await _restore_dataset_settings(conn, id, version['dataset_snapshot'])
+                await _restore_default_view(conn, id, version_id)
             definitions_after = {tuple(row) for row in await conn.fetch(definitions_query, id)}
             if affected is not None:
                 affected |= {row[0] for row in definitions_before ^ definitions_after}
@@ -1505,6 +1826,11 @@ async def _restore_version(
         "samples_reverted": int(update_status.split()[-1]) if update_status else 0,
         "samples_restored": restored,
         "samples_removed": removed,
+        # Public saved views given back their recorded filters or made again, and (exact_membership) those
+        # removed because the version doesn't have them. Both 0 for a version that recorded no views.
+        "views_restored": views_restored,
+        "views_removed": views_removed,
+        "settings_restored": restore_settings,
     }
 
 

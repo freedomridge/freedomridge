@@ -8,6 +8,28 @@ export function filterHasInSelection(f: ComplexFilter | undefined): boolean {
     return (f.filters || []).some(filterHasInSelection);
 }
 
+/**
+ * An applied selection that couldn't be kept across a reload or Back (a big Select All's token, which the server
+ * forgets after 2 hours, or an id list too long to save): its chip stays, greyed and marked expired, and applies
+ * nothing, so the count changing is explained. It keeps the chip's words and count, never the ids or the token, and
+ * the app keeps it apart from the stages: it never reaches the server, a saved view or a link.
+ */
+export interface ExpiredSelection {
+    expired: true;
+    description: string;
+    count: number | null;
+}
+
+export const EXPIRED_SELECTION_TITLE =
+    "This selection couldn't be kept across a reload or Back, so it no longer filters the images. "
+    + 'Select the samples again, or remove it.';
+
+/** The expired chip a selection stage leaves behind. */
+export function expiredSelection(stage: ViewStage): ExpiredSelection {
+    const count = stage.metadata?.count;
+    return { expired: true, description: stage.description, count: typeof count === 'number' ? count : null };
+}
+
 /** An embeddings lasso, included or excluded: a polygon on one field's map, with no form to edit it in. */
 export function isLassoStage(stage: ViewStage): boolean {
     return stage.filter?.operator === 'embedding_polygon' || stage.filter?.operator === 'embedding_polygon_exclude';

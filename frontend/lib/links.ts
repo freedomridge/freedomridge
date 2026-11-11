@@ -1,5 +1,5 @@
 import type { ViewStage } from './api';
-import { filterHasInSelection, isReadOnlyStage } from './filter-query';
+import { type ExpiredSelection, filterHasInSelection, isReadOnlyStage } from './filter-query';
 
 // A link that opens a dataset: /datasets/<id>?<parameters>, each optional.
 //   view=<slug>          a saved view, as choosing it in Saved Views does
@@ -157,12 +157,14 @@ export function joinQueryParts(parts: string[]): string {
  * sample. `parts` holds each stage's filter as query text, null for one the language can't write (or null when
  * they weren't asked for): `q=` when every stage may be text and has its part (empty with no stages: "no
  * filters"), else `f=` with every stage. Throws a
- * LinkError, saying why, for a stage the server forgets (a big Select All) and for a link over MAX_LINK_LENGTH.
+ * LinkError, saying why, for a stage the server forgets (a big Select All), for an expired selection's chip in the
+ * bar (`expired`: the link couldn't hold the selection it names) and for a link over MAX_LINK_LENGTH.
  */
-export async function datasetLink({ origin, datasetId, stages, parts, sort, sample }: {
+export async function datasetLink({ origin, datasetId, stages, expired = [], parts, sort, sample }: {
     origin: string;
     datasetId: number;
     stages: ViewStage[];
+    expired?: ExpiredSelection[];
     parts: (string | null)[] | null;
     sort?: { by?: string; order?: 'asc' | 'desc' };
     sample?: number;
@@ -172,6 +174,11 @@ export async function datasetLink({ origin, datasetId, stages, parts, sort, samp
         const names = temporary.map(stage => `“${stage.description}”`).join(', ');
         throw new LinkError(`Can't copy a link: ${names} ${temporary.length === 1 ? 'is a temporary selection' : 'are temporary selections'}, `
             + 'kept for 2 hours only. Save a view and copy its link instead.');
+    }
+    if (expired.length) {
+        const names = expired.map(selection => `“${selection.description}”`).join(', ');
+        throw new LinkError(`Can't copy a link: ${names} ${expired.length === 1 ? 'is an expired selection' : 'are expired selections'}. `
+            + `Select the samples again, or remove ${expired.length === 1 ? 'it' : 'them'}.`);
     }
     const params = new URLSearchParams();  // `+` in a value is written %2B: a raw + reads as a space
     if (mayBeText(stages) && parts?.length === stages.length && parts.every(part => part)) {

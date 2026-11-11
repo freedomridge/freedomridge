@@ -1,4 +1,5 @@
 import type { View, ViewStage } from './api';
+import type { ExpiredSelection } from './filter-query';
 
 // A dataset's default view (GET /datasets/{id} `default_view`): the public saved view the app opens the
 // dataset on, and goes back to when the filters are cleared. Only the app applies it: the API and the SDK
@@ -29,12 +30,16 @@ export function isDefaultViewStage(stage: ViewStage | undefined, view: DefaultVi
 
 /**
  * Whether the dataset opens on its default view: only when this browser kept no filters from an earlier
- * visit, and the viewer didn't choose to see every image while this view was the default.
+ * visit, and the viewer didn't choose to see every image while this view was the default. A selection that
+ * expired (`expired`, its chip shown greyed) counts as a kept filter: the dataset opens without the default
+ * view, so the count is the dataset's and the chip says why it changed.
  */
 export function opensOnDefaultView(
     restored: ViewStage[],
     dismissedViewId: number | null | undefined,
     view: DefaultView | null | undefined,
+    expired: ExpiredSelection[] = [],
 ): boolean {
-    return !!view && restored.length === 0 && dismissedViewId !== view.id && defaultViewStages(view).length > 0;
+    return !!view && restored.length === 0 && expired.length === 0 && dismissedViewId !== view.id
+        && defaultViewStages(view).length > 0;
 }

@@ -342,13 +342,18 @@ async def write_samples(connection, dataset_id: int, blocks: list, data: dict) -
     )
     source = f"""
         incoming AS (
-            SELECT r.*, CASE WHEN r.metadata->>'parent_id' ~ '^-?[0-9]+$'
-                             THEN (r.metadata->>'parent_id')::int END AS origin_parent
+            -- A numeric parent_id is the primary's sample id: translated, or null when no sample here has it. Only
+            -- one an id can be (1 to 2^31 - 1) is cast: a longer number, which ingest accepts, would fail the cast.
+            SELECT r.*, COALESCE(r.metadata->>'parent_id' ~ '^-?[0-9]+$', FALSE) AS numeric_parent,
+                   CASE WHEN r.metadata->>'parent_id' ~ '^[0-9]{{1,10}}$'
+                        THEN CASE WHEN (r.metadata->>'parent_id')::bigint BETWEEN 1 AND 2147483647
+                                  THEN (r.metadata->>'parent_id')::int END
+                   END AS origin_parent
             FROM jsonb_to_recordset($2::jsonb) AS r({_record_type(arrays)})
         ),
         translated AS (
             SELECT i.*,
-                   CASE WHEN i.origin_parent IS NULL THEN COALESCE(i.metadata, '{{}}'::jsonb)
+                   CASE WHEN NOT i.numeric_parent THEN COALESCE(i.metadata, '{{}}'::jsonb)
                         ELSE jsonb_set(i.metadata, '{{parent_id}}', COALESCE(to_jsonb(p.sample_id), 'null'::jsonb))
                    END AS local_metadata,
                    CASE WHEN i.lon IS NULL OR i.lat IS NULL THEN NULL
@@ -1342,6 +1347,17 @@ async def configure(pool, link, client, checkpoint: dict) -> StepResult:
                 len(blocks),
                 entry['start_txid'] - 1,
                 current,
+            )
+        # How many versions the primary keeps of each dataset. They stay there (docs/FOLLOWERS.md), and the mirror's
+        # Versions tab says so. A primary from before it counted them doesn't say: unknown.
+        for origin, entry in assigned.items():
+            await connection.execute(
+                """UPDATE mirrors SET primary_versions = $3
+                   WHERE link_id = $1 AND origin_dataset_id = $2 AND state <> 'stopped'
+                     AND primary_versions IS DISTINCT FROM $3""",
+                link['id'],
+                origin,
+                entry.get('versions'),
             )
         await connection.execute(
             'UPDATE primary_links SET identity = $2, follower_name = $3, last_error = NULL WHERE id = $1',

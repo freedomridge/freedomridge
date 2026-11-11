@@ -122,6 +122,36 @@ def write_cache(path: str, body: bytes, roots: tuple[str, ...], budget: int) -> 
         temporary.unlink(missing_ok=True)
 
 
+class CacheFill:
+    """A cache file written as a body streams past, for one too big to hold in memory. The chunks go to a temporary
+    file beside the target, which replaces it only on commit, once every byte has arrived. The caller checks the
+    body's size against the budget first, as write_cache does."""
+
+    def __init__(self, path: str, roots: tuple[str, ...], budget: int):
+        self.roots = tuple(dict.fromkeys(os.path.realpath(root) for root in roots))
+        self.budget = budget
+        self.target = Path(path)
+        if not any(self.target.resolve().is_relative_to(root) for root in self.roots):
+            raise ValueError("Cache target must be inside a cache root")
+        self.target.parent.mkdir(parents=True, exist_ok=True)
+        self.temporary = self.target.with_name(f'{self.target.name}.{uuid.uuid4().hex}.tmp')
+        self.output = self.temporary.open('wb')
+        self.size = 0
+
+    def write(self, chunk: bytes) -> None:
+        self.output.write(chunk)
+        self.size += len(chunk)
+
+    def commit(self) -> None:
+        self.output.close()
+        os.replace(self.temporary, self.target)
+        _track_write(self.roots, self.budget, self.size)
+
+    def discard(self) -> None:
+        self.output.close()
+        self.temporary.unlink(missing_ok=True)
+
+
 def read_cache(path: str) -> bytes | None:
     """Open before returning bytes so eviction cannot race a deferred FileResponse."""
     try:

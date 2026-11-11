@@ -41,6 +41,7 @@ def snapshot_database(monkeypatch):
                 for table in (
                     'users',
                     'datasets',
+                    'views',
                     'samples',
                     'dataset_fields',
                     'dataset_field_stats',

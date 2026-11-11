@@ -1,7 +1,7 @@
 import { test, expect, type Page } from '@playwright/test';
 import { adminLogin, apiFetch } from './api';
 import { AUTH_STATE, expectTotal, expandField, expandAllFields } from './helpers';
-import { convertSimpleFiltersToComplex, describeFilter, getSimpleFilterStages, isTextFilter, type TextFilter } from '../lib/filter-utils';
+import { boundKeyFor, convertSimpleFiltersToComplex, describeFilter, excludeKeyFor, getSimpleFilterStages, isTextFilter, upgradeDraftKeys, type TextFilter } from '../lib/filter-utils';
 import type { ComplexFilter, Filters } from '../lib/api';
 
 test.use({ storageState: AUTH_STATE, viewport: { width: 1600, height: 1100 } });
@@ -25,6 +25,7 @@ async function expectPersistedFilters(page: Page, datasetId: number, simpleFilte
 async function restoreDraft(page: Page, datasetId: number, simpleFilters: Filters) {
     // Written before the reloaded app starts, once: written into the live page instead, the app's
     // debounced save of its current (empty) draft could land after it and reload unfiltered.
+    // Saved as drafts were before their keys were marked with ':', so `exclude_color` is an exclusion.
     const marker = `e2e-restored-draft-${datasetId}-${Date.now()}`;
     await page.addInitScript(({ id, filters, marker }) => {
         if (sessionStorage.getItem(marker)) return;
@@ -44,10 +45,10 @@ test('text drafts compile to one OR, exclusion negates the union, and chip label
     const included = convertSimpleFiltersToComplex({ color: selection });
     expect(included).toEqual(expected);
     expect(describeFilter(included)).toBe('color: red, blue or contains "dar" or contains "%_"');
-    const excluded = convertSimpleFiltersToComplex({ exclude_color: selection });
+    const excluded = convertSimpleFiltersToComplex({ [excludeKeyFor('color')]: selection });
     expect(excluded).toEqual({ logic: 'NOT', filters: [expected] });
     expect(describeFilter(excluded)).toBe('not (color: red, blue or contains "dar" or contains "%_")');
-    expect(getSimpleFilterStages({ exclude_color: selection })).toEqual([
+    expect(getSimpleFilterStages({ [excludeKeyFor('color')]: selection })).toEqual([
         { type: 'filter', description: describeFilter(excluded), filter: excluded },
     ]);
     expect(convertSimpleFiltersToComplex({ color: { _op: 'text', values: [], contains: [] } }))
@@ -57,8 +58,8 @@ test('text drafts compile to one OR, exclusion negates the union, and chip label
     expect(convertSimpleFiltersToComplex({ color: ['red'] })).toEqual({ field: 'color', operator: 'in', value: ['red'] });
     expect(isTextFilter({ _op: 'text' })).toBe(false);
     expect(isTextFilter({ _op: 'text', values: [1], contains: [] })).toBe(false);
-    expect(convertSimpleFiltersToComplex({ brightness_min: 5 })).toEqual({ field: 'brightness', operator: '>=', value: 5 });
-    expect(convertSimpleFiltersToComplex({ exclude_color: ['red'] })).toEqual({ field: 'color', operator: 'not in', value: ['red'] });
+    expect(convertSimpleFiltersToComplex({ [boundKeyFor('brightness', 'min')]: 5 })).toEqual({ field: 'brightness', operator: '>=', value: 5 });
+    expect(convertSimpleFiltersToComplex({ [excludeKeyFor('color')]: ['red'] })).toEqual({ field: 'color', operator: 'not in', value: ['red'] });
 });
 
 test.describe('Full categorical fixture', () => {
@@ -158,7 +159,7 @@ test.describe('sidebar text combinations', () => {
                 await picker.press('Enter');
             }
             await expectPreview(page, excluded ? 4 : 6);
-            await expectPersistedFilters(page, datasetId, draft, []);
+            await expectPersistedFilters(page, datasetId, upgradeDraftKeys(draft), []);
             await page.reload();
             await expectPreview(page, excluded ? 4 : 6);
             if (excluded) {
@@ -177,7 +178,7 @@ test.describe('sidebar text combinations', () => {
             if (excluded) await expect(editor.getByRole('button', { name: 'NOT', exact: true }).first()).toHaveClass(/bg-zinc-700/);
             await editor.getByRole('button', { name: 'Apply', exact: true }).click();
             await expectTotal(page, excluded ? 4 : 6);
-            await expectPersistedFilters(page, datasetId, {}, [convertSimpleFiltersToComplex(draft)]);
+            await expectPersistedFilters(page, datasetId, {}, [convertSimpleFiltersToComplex(upgradeDraftKeys(draft))]);
             await page.reload();
             await expectTotal(page, excluded ? 4 : 6);
             await expect(chip).toContainText(excluded ? `not (${label})` : label);
@@ -199,7 +200,7 @@ test.describe('sidebar text combinations', () => {
         await expandField(page, 'color');
         await sidebar.getByRole('checkbox', { name: 'red', exact: true }).check();
         await expectPreview(page, 0);
-        await expectPersistedFilters(page, datasetId, { exclude_color: ['red'], color: ['red'] }, []);
+        await expectPersistedFilters(page, datasetId, { [excludeKeyFor('color')]: ['red'], color: ['red'] }, []);
         await page.reload();
         await expectPreview(page, 0);
         await expect(line).toBeVisible();
@@ -292,12 +293,12 @@ test.describe('sidebar text combinations', () => {
         const color = sidebar.getByTestId('field-section-color');
         await color.getByRole('checkbox', { name: '(no value)', exact: true }).check();
         await expectPreview(page, 2);
-        await expectPersistedFilters(page, datasetId, { exclude_color: ['green'], color: { _op: 'is_null' } }, []);
+        await expectPersistedFilters(page, datasetId, { [excludeKeyFor('color')]: ['green'], color: { _op: 'is_null' } }, []);
         await color.getByPlaceholder(/color/i).fill('red');
         await color.getByPlaceholder(/color/i).press('Enter');
         await expect(sidebar.getByText('Additional filter: color: not green', { exact: true })).toBeVisible();
         await expectPreview(page, 4);
-        await expectPersistedFilters(page, datasetId, { exclude_color: ['green'], color: { _op: 'text', values: [], contains: ['red'] } }, []);
+        await expectPersistedFilters(page, datasetId, { [excludeKeyFor('color')]: ['green'], color: { _op: 'text', values: [], contains: ['red'] } }, []);
     });
 
     test('numeric enums, native arrays and derived label lists do not offer contains', async ({ page }) => {

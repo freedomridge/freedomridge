@@ -213,7 +213,8 @@ _DATASET_SELECT = (
     "default_view_id, "
     # A mirror of a dataset on another instance (docs/FOLLOWERS.md): read-only here.
     "(SELECT jsonb_build_object('state', m.state, 'primary_url', l.url, 'origin_dataset_id', m.origin_dataset_id, "
-    "'tags', m.tags, 'views', m.views, 'concept_views', m.concept_views) "
+    "'tags', m.tags, 'views', m.views, 'concept_views', m.concept_views, "
+    "'primary_versions', m.primary_versions) "
     "FROM mirrors m LEFT JOIN primary_links l ON l.id = m.link_id WHERE m.dataset_id = datasets.id) AS mirror"
 )
 
@@ -4875,7 +4876,7 @@ def build_sample_query_parts(
 class MapPointsRequest(BaseModel):
     filters: Optional[Dict[str, Any]] = None
     zoom: Optional[float] = None  # the map's zoom: server-side clusters below _MAP_POINT_ZOOM, points from it on
-    bbox: Optional[List[float]] = None  # [west, south, east, north] viewport (GiST-indexed)
+    bbox: Optional[List[float]] = None  # [west, south, east, north] viewport, longitudes unwrapped or not
     points: bool = False  # force ALL points (manual de-cluster)
 
 
@@ -5026,6 +5027,20 @@ def _map_bubble_radius_px(count: int) -> int:
     return 52
 
 
+def _map_lon_window(west: float, east: float) -> tuple[float, float]:
+    """A viewport's longitudes as one window: west in [-180, 180), east above it, under 360 degrees on. mapbox-gl
+    reports them unwrapped: a view across the antimeridian is 170 to 190, the same view on a repeated world copy
+    530 to 550, and a view wider than the world spans 360 degrees or more (the whole world, -180 to 180). An east
+    below the west, as in an RFC 7946 bbox, crosses the antimeridian too. An east past 180 means the window
+    crosses it: it holds lon >= west and lon <= east - 360."""
+    if east < west:
+        east += 360.0
+    if east - west >= 360.0:
+        return -180.0, 180.0
+    shift = math.floor((west + 180.0) / 360.0) * 360.0
+    return west - shift, east - shift
+
+
 def _map_screen_px(lon: float, lat: float, zoom: float) -> tuple[float, float]:
     """Where mapbox-gl draws (lon, lat) at `zoom`, in pixels of its Web Mercator world (512 px tiles)."""
     world = 512.0 * 2.0 ** max(0.0, min(22.0, float(zoom)))
@@ -5072,6 +5087,10 @@ async def _get_dataset_map_points_impl(
             vis = tuple(float(v) for v in bbox)  # (w, s, e, n)
         except (TypeError, ValueError):
             raise HTTPException(status_code=400, detail="bbox must be [west, south, east, north] numbers")
+        if not all(math.isfinite(v) for v in vis):
+            raise HTTPException(status_code=400, detail="bbox must be [west, south, east, north] numbers")
+        west, east = _map_lon_window(vis[0], vis[2])
+        vis = (west, vis[1], east, vis[3])
 
     def _bbox_sql(i):  # bbox via the stored lon/lat columns (covering index); params w,s,e,n
         # Exact double-precision and faster than `location && ST_MakeEnvelope`, whose
@@ -5079,23 +5098,36 @@ async def _get_dataset_map_points_impl(
         # do it everywhere (matches _hybrid_items / map_extent). See docs/MAP_REQUIREMENTS.md.
         return f"lon >= ${i} AND lon <= ${i + 2} AND lat >= ${i + 1} AND lat <= ${i + 3}"
 
-    pt_select = "SELECT id, lon, lat, heading, media_type FROM samples"
+    pt_select = "SELECT id, lon, lat, heading, media_type FROM"
 
-    # Per-query WHERE + args (base + optional bbox envelope), fresh each call.
+    # Per-query source (`FROM {source}`: base + optional bbox window) + args, fresh each call. A window across
+    # the antimeridian reads both sides of it and puts the samples east of it 360 degrees further east, so its
+    # answer is one stretch of map: the cell on the antimeridian groups the samples on both sides, and a
+    # bubble's position and extent lie in the window. mapbox-gl draws every item on every world copy.
     def _wa(padded=False):
         where, a = base_where, list(base_args)
-        if vis:
-            w, s, e, n = vis
-            if padded:
-                px, py = (e - w) * 0.25, (n - s) * 0.25
-                w, s, e, n = max(-180.0, w - px), max(-85.0, s - py), min(180.0, e + px), min(85.0, n + py)
-            where += " AND " + _bbox_sql(nb + 1)
-            a = a + [w, s, e, n]
-        return where, a
+        if not vis:
+            return f"samples WHERE {where}", a
+        w, s, e, n = vis
+        if padded:
+            px, py = (e - w) * 0.25, (n - s) * 0.25
+            w, e = _map_lon_window(w - px, e + px)
+            s, n = max(-85.0, s - py), min(85.0, n + py)
+        if e <= 180.0:
+            return f"samples WHERE {where} AND {_bbox_sql(nb + 1)}", a + [w, s, e, n]
+        # Across the antimeridian: each side is a range scan of the covering index, the east side's longitudes 360
+        # degrees on. One `lon >= w OR lon <= e - 360` is not a range: it read every index entry of the dataset, or
+        # went to the heap (#11).
+        columns = "lat, heading, media_type"
+        return (
+            f"(SELECT id, lon, {columns} FROM samples WHERE {where} AND {_bbox_sql(nb + 1)} UNION ALL "
+            f"SELECT id, lon + 360, {columns} FROM samples WHERE {where} AND {_bbox_sql(nb + 5)}) AS across",
+            a + [w, s, 180.0, n, -180.0, s, e - 360.0, n],
+        )
 
     POINT_CAP = 65000
 
-    async def _hybrid_items(where, a, cell, zoom):
+    async def _hybrid_items(source, a, cell, zoom):
         """The ONE per-cell rule shared by every clustered view: a grid cell with
         >= _MAP_CLUSTER_MIN_POINTS samples becomes a single cluster bubble; a sparser
         cell yields its INDIVIDUAL points. Returns (items, loose_point_count). Because
@@ -5133,7 +5165,7 @@ async def _get_dataset_map_points_impl(
                            MIN(lon) AS w, MIN(lat) AS s, MAX(lon) AS e, MAX(lat) AS n,
                            array_agg(id) AS ids, array_agg(lon) AS xs, array_agg(lat) AS ys,
                            array_agg(heading::double precision) AS hs
-                    FROM samples WHERE {where}
+                    FROM {source}
                     GROUP BY round(lon / ${cell_p}::float8), round(lat / ${cell_p}::float8)
                 )
                 SELECT gx, gy, NULL::int AS id, lon, lat, cc AS count, NULL::double precision AS heading,
@@ -5197,9 +5229,9 @@ async def _get_dataset_map_points_impl(
     # a >=100 bubble) and flag capped so the UI can prompt "zoom in".
     auto_points = zoom is not None and zoom >= _MAP_POINT_ZOOM
     if points or auto_points:
-        where, a = _wa(padded=True)
+        source, a = _wa(padded=True)
         a.append(POINT_CAP + 1)
-        rows = await db.fetch(f"{pt_select} WHERE {where} LIMIT ${len(a)}", *a)
+        rows = await db.fetch(f"{pt_select} {source} LIMIT ${len(a)}", *a)
         if len(rows) <= POINT_CAP:
             return {"mode": "points", "items": [dict(r) for r in rows], "capped": False}
         # else: too many to show individually -> fall through to the hybrid (capped)
@@ -5210,10 +5242,10 @@ async def _get_dataset_map_points_impl(
     # points into bubbles) until under the cap, NEVER by dropping the floor — so tiny
     # "1"/"12" bubbles can't appear in any path.
     if zoom is not None:
-        where, base = _wa()
+        source, base = _wa()
         cell = _cluster_cell_deg(zoom)
         for _ in range(6):
-            items, loose = await _hybrid_items(where, base, cell, zoom)
+            items, loose = await _hybrid_items(source, base, cell, zoom)
             if loose <= POINT_CAP:
                 break
             cell *= 2.0

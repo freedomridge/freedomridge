@@ -38,7 +38,8 @@ def test_a_user_without_access_learns_nothing_of_a_sample_s_fields(monkeypatch):
     )
     with pytest.raises(HTTPException) as exc:
         asyncio.run(main.serve_media(7, MagicMock(), field='secret_label'))
-    assert exc.value.status_code == 403  # was 404 "has no value for field 'secret_label'"
+    # was 404 "has no value for field 'secret_label'"; then 403, which said the sample exists
+    assert (exc.value.status_code, exc.value.detail) == (404, 'Sample not found')
 
 
 def test_a_follower_s_authorized_request_is_not_asked_who_it_is(monkeypatch):

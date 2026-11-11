@@ -4,12 +4,15 @@ import { Cross2Icon, PlusIcon, MagnifyingGlassIcon } from '@radix-ui/react-icons
 import { FilterStageEditor, FilterModeSwitch } from './filter-stage-editor';
 import { describeFilter, isAutoFilterLabel } from '@/lib/filter-utils';
 import { type DefaultView, defaultViewStages, isDefaultViewStage } from '@/lib/default-view';
-import { isLassoStage, isReadOnlyStage } from '@/lib/filter-query';
+import { EXPIRED_SELECTION_TITLE, type ExpiredSelection, isLassoStage, isReadOnlyStage } from '@/lib/filter-query';
 import { SEARCH_LIMIT_CHOICES, SEARCH_LIMIT_TITLE } from './find-similar';
 import * as Popover from '@radix-ui/react-popover';
 
 interface QueryBuilderBarProps {
     stages: ViewStage[];
+    // Selections that couldn't be kept across a reload or Back: greyed chips that apply nothing, until removed.
+    expiredSelections?: ExpiredSelection[];
+    onRemoveExpired?: (index: number) => void;
     onRemoveStage: (index: number) => void;
     onUpdateStage: (index: number, stage: ViewStage) => void;
     onAddStage: (stage: ViewStage) => void;
@@ -50,6 +53,8 @@ function canExcludeIds(filter: ComplexFilter | undefined): boolean {
 
 export function QueryBuilderBar({
     stages,
+    expiredSelections = [],
+    onRemoveExpired,
     onRemoveStage,
     onUpdateStage,
     onAddStage,
@@ -233,7 +238,7 @@ export function QueryBuilderBar({
 
             {/* --- Existing Filters (Pipeline) --- */}
             <div className="flex items-center flex-1 self-stretch overflow-x-auto no-scrollbar gap-1">
-                {stages.length === 0 && (
+                {stages.length === 0 && expiredSelections.length === 0 && (
                     <span data-testid="no-filters" className="flex-1 truncate px-2 text-xs text-zinc-600">
                         No filters: showing every image.
                     </span>
@@ -385,6 +390,26 @@ export function QueryBuilderBar({
                         </Popover.Root>
                     );
                 })}
+
+                {/* Expired selections: no toggle, no editor, only the words and a remove button */}
+                {expiredSelections.map((selection, index) => (
+                    <div
+                        key={`expired-${index}`}
+                        data-testid="expired-selection-chip"
+                        title={EXPIRED_SELECTION_TITLE}
+                        className="flex items-center gap-2 px-3 py-2 text-xs font-medium rounded-md border border-dashed border-zinc-700 text-zinc-600 min-w-fit group cursor-default"
+                    >
+                        <span className="whitespace-nowrap truncate max-w-[200px]">{selection.description}</span>
+                        <span className="text-[10px] uppercase tracking-wider text-amber-600/80">expired</span>
+                        <button
+                            onClick={() => onRemoveExpired?.(index)}
+                            title="Remove"
+                            className="opacity-0 group-hover:opacity-100 text-zinc-500 hover:text-red-400 p-0.5 rounded-full hover:bg-zinc-950 transition-all"
+                        >
+                            <Cross2Icon className="w-3 h-3" />
+                        </button>
+                    </div>
+                ))}
 
                 {/* End of stages map */}
             </div>

@@ -110,7 +110,7 @@ def test_historical_media_checks_current_dataset_access(monkeypatch):
     monkeypatch.setattr(main, 'check_dataset_access', access)
     with pytest.raises(HTTPException) as error:
         asyncio.run(main.serve_sample_media(7, Mock(), version_id=3))
-    assert error.value.status_code == 403
+    assert error.value.status_code == 404  # as for a missing sample
     access.assert_awaited_once_with(42, {'id': 9})
     assert database.fetchrow.call_args.args[1:] == (7, 3)
 

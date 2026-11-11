@@ -5,10 +5,10 @@ import { useSearchParams } from 'next/navigation';
 import type { Feature, Polygon } from 'geojson';
 import { ComplexFilter, MAP_REFITTED_EVENT, type MapRefitted, ViewStage } from '@/lib/api';
 import { useToast } from '@/contexts/ToastContext';
-import { convertSimpleFiltersToComplex, describeFilter } from '@/lib/filter-utils';
+import { convertSimpleFiltersToComplex, describeFilter, upgradeDraftKeys } from '@/lib/filter-utils';
 import { type DefaultView, defaultViewStages, isDefaultViewStage, opensOnDefaultView } from '@/lib/default-view';
 import { type DatasetLink, linkSetsFilters, readLink, withoutLinkParameters } from '@/lib/links';
-import { filterHasInSelection } from '@/lib/filter-query';
+import { type ExpiredSelection, expiredSelection, filterHasInSelection } from '@/lib/filter-query';
 
 // The map lasso selection — a GeoJSON polygon feature (or none).
 type MapPolygon = Feature<Polygon> | null;
@@ -25,20 +25,29 @@ const STORAGE_PREFIX = 'fridge-filters-';
 // A lasso on a sampled scatter: the polygon is the selection, and brushedIds holds only its visible points.
 type EmbeddingRegion = { field: string; polygon: number[][]; token: string; total: number; modelId?: string | null };
 
+// The spelling of simpleFilters' keys a saved state uses: 2 marks exclusions and bounds with ':' (filter-utils); a
+// state saved without it used `exclude_` and `_min` / `_max`, and is read through upgradeDraftKeys.
+const DRAFT_KEYS_VERSION = 2;
+
 interface PersistedFilterState {
     viewStages: ViewStage[];
     filterMode: 'simple' | 'advanced';
     simpleFilters: SimpleFilters;
+    draftKeysVersion?: number;
     advancedFilters: ComplexFilter;
     brushedIds: number[];
     // Kept with brushedIds or not at all: the ids alone would come back as a selection of the visible points only.
     currentEmbeddingRegion?: EmbeddingRegion | null;
     selectedIds: number[];
+    // Kept with selectedIds (see selectionGrain). Absent in a state saved before it was.
+    selectionGrain?: Grain | null;
     currentPolygon: MapPolygon;
     selectionSource: string;
     // The default view this browser's viewer chose to see past (Show all images, or removing its filters):
     // the dataset doesn't open on it again until they clear the filters.
     dismissedDefaultViewId?: number | null;
+    // The chips of applied selections that couldn't be saved (isEphemeralSelectionStage), shown expired.
+    expiredSelections?: ExpiredSelection[];
 }
 
 function loadFilterState(datasetId: number | undefined): PersistedFilterState | null {
@@ -49,6 +58,10 @@ function loadFilterState(datasetId: number | undefined): PersistedFilterState | 
         const parsed = JSON.parse(raw);
         // Basic validation
         if (!Array.isArray(parsed.viewStages)) return null;
+        if (parsed.draftKeysVersion !== DRAFT_KEYS_VERSION && parsed.simpleFilters && typeof parsed.simpleFilters === 'object') {
+            parsed.simpleFilters = upgradeDraftKeys(parsed.simpleFilters);
+        }
+        if (!Array.isArray(parsed.expiredSelections)) parsed.expiredSelections = [];
         return parsed as PersistedFilterState;
     } catch {
         return null;
@@ -64,11 +77,17 @@ const MAX_STORAGE_BYTES = 2 * 1024 * 1024;  // 2MB hard cap per dataset
 //     2M-id stage overflows it and pushState throws); or
 //   - a server-side in_selection token — region_selections tokens are TTL-pruned after 2h
 //     (create_selection_token), so a restored stage referencing an expired token silently
-//     returns 0 rows. Better to keep these session-only than to persist a stub / a stage that
-//     later matches nothing with no signal.
+//     returns 0 rows.
+// It stays live for the rest of the page session. What is saved instead is its chip, expired
+// (ExpiredSelection): restored, it filters nothing and says so, rather than vanish silently.
 function isEphemeralSelectionStage(s: ViewStage): boolean {
     if (s.type === 'selection' && Array.isArray(s.filter?.value) && s.filter.value.length > MAX_PERSISTED_IDS) return true;
     return filterHasInSelection(s.filter);
+}
+
+// The expired chips to save: those already shown, then one for each applied stage that can't be saved.
+function withExpired(expired: ExpiredSelection[], stages: ViewStage[]): ExpiredSelection[] {
+    return [...expired, ...stages.filter(isEphemeralSelectionStage).map(expiredSelection)];
 }
 
 function saveFilterState(datasetId: number | undefined, state: PersistedFilterState) {
@@ -76,12 +95,14 @@ function saveFilterState(datasetId: number | undefined, state: PersistedFilterSt
     try {
         const toSave: PersistedFilterState = {
             ...state,
+            draftKeysVersion: DRAFT_KEYS_VERSION,
             // Cap transient selections — large lasso/brush selections don't persist
             brushedIds: state.brushedIds.length <= MAX_PERSISTED_IDS ? state.brushedIds : [],
             currentEmbeddingRegion: state.brushedIds.length <= MAX_PERSISTED_IDS ? state.currentEmbeddingRegion ?? null : null,
             selectedIds: state.selectedIds.length <= MAX_PERSISTED_IDS ? state.selectedIds : [],
-            // Drop applied selection stages with too many IDs (rather than save a broken stub)
+            // Applied selection stages that can't be saved are kept as their expired chips
             viewStages: state.viewStages.filter(s => !isEphemeralSelectionStage(s)),
+            expiredSelections: withExpired(state.expiredSelections ?? [], state.viewStages),
         };
 
         const json = JSON.stringify(toSave);
@@ -99,8 +120,9 @@ function saveFilterState(datasetId: number | undefined, state: PersistedFilterSt
 function historyStateSig(s: {
     viewStages: ViewStage[]; brushedIds: number[]; selectedIds: number[];
     currentPolygon: MapPolygon; selectionSource: string; currentEmbeddingRegion?: EmbeddingRegion | null;
+    expiredSelections?: ExpiredSelection[];
 }): string {
-    return JSON.stringify([s.viewStages, s.brushedIds, s.selectedIds, s.currentPolygon, s.selectionSource, s.currentEmbeddingRegion ?? null]);
+    return JSON.stringify([s.viewStages, s.brushedIds, s.selectedIds, s.currentPolygon, s.selectionSource, s.currentEmbeddingRegion ?? null, s.expiredSelections ?? []]);
 }
 
 interface FilterContextType {
@@ -115,6 +137,10 @@ interface FilterContextType {
     // View Stages
     viewStages: ViewStage[];
     setViewStages: React.Dispatch<React.SetStateAction<ViewStage[]>>;
+    // Chips of applied selections that couldn't be kept across a reload or Back: shown expired, applying nothing.
+    // Kept apart from viewStages, so nothing that reads the stages (the queries, saved views, links) sees them.
+    expiredSelections: ExpiredSelection[];
+    setExpiredSelections: React.Dispatch<React.SetStateAction<ExpiredSelection[]>>;
     addStage: (stage: ViewStage) => void;
     removeStage: (index: number) => void;
     updateStage: (index: number, stage: ViewStage) => void;
@@ -169,6 +195,10 @@ interface FilterContextType {
     isSampleSelected: (id: number) => boolean;
     selectionCount: number;
     toggleSampleSelected: (id: number) => void;
+    // The grain of the grid the selection (ids or Select All) was made in: its rows are that grain's.
+    // null with no selection made yet, or for a selection saved before this was kept.
+    selectionGrain: Grain | null;
+    setSelectionGrain: (grain: Grain | null) => void;
 
     // Embedding/Map Brush Selection
     brushedIds: number[];
@@ -318,6 +348,7 @@ export function FilterProvider({ children, datasetId }: { children: React.ReactN
 
     // View Stages - The source of truth for global filters
     const [viewStages, setViewStages] = useState<ViewStage[]>(savedState?.viewStages ?? []);
+    const [expiredSelections, setExpiredSelections] = useState<ExpiredSelection[]>(savedState?.expiredSelections ?? []);
 
     // Grain-less view-stage filters. The grain predicate (image vs object) is applied
     // PER-PANEL by each consumer (see grainPredicate/withGrain), so an image grid and an
@@ -368,6 +399,7 @@ export function FilterProvider({ children, datasetId }: { children: React.ReactN
 
     // Grid Selection (Checkboxes)
     const [selectedIds, setSelectedIds] = useState<number[]>(savedState?.selectedIds ?? []);
+    const [selectionGrain, setSelectionGrain] = useState<Grain | null>(savedState?.selectionGrain ?? null);
 
     // Select-All mode (transient — a 2h server token, never persisted, like the embeddings region).
     const [selectAll, setSelectAll] = useState<{ token: string; count: number } | null>(null);
@@ -397,11 +429,12 @@ export function FilterProvider({ children, datasetId }: { children: React.ReactN
         saveTimerRef.current = setTimeout(() => {
             saveFilterState(datasetId, {
                 viewStages, filterMode, simpleFilters, advancedFilters,
-                brushedIds, currentEmbeddingRegion, selectedIds, currentPolygon, selectionSource, dismissedDefaultViewId,
+                brushedIds, currentEmbeddingRegion, selectedIds, selectionGrain, currentPolygon, selectionSource, dismissedDefaultViewId,
+                expiredSelections,
             });
         }, 300);
         return () => { if (saveTimerRef.current) clearTimeout(saveTimerRef.current); };
-    }, [datasetId, viewStages, filterMode, simpleFilters, advancedFilters, brushedIds, currentEmbeddingRegion, selectedIds, currentPolygon, selectionSource, dismissedDefaultViewId]);
+    }, [datasetId, viewStages, filterMode, simpleFilters, advancedFilters, brushedIds, currentEmbeddingRegion, selectedIds, selectionGrain, currentPolygon, selectionSource, dismissedDefaultViewId, expiredSelections]);
 
     // --- Browser history (back/forward) for filter state ---
     // Each settled filter change pushes a history entry; Back/Forward restores that
@@ -419,14 +452,17 @@ export function FilterProvider({ children, datasetId }: { children: React.ReactN
     const buildHistorySnapshot = useCallback(() => ({
         _fridge: true,  // marker to distinguish our entries from Next.js'
         // Exclude oversized id-list selection stages — a raw 2M-id stage overflows the
-        // browser history.state limit and makes pushState throw (mirrors persistence).
+        // browser history.state limit and makes pushState throw — and token stages, keeping
+        // their chips expired instead (mirrors persistence).
         viewStages: viewStages.filter(s => !isEphemeralSelectionStage(s)),
+        expiredSelections: withExpired(expiredSelections, viewStages),
         brushedIds: brushedIds.length <= MAX_PERSISTED_IDS ? brushedIds : [],
         currentEmbeddingRegion: brushedIds.length <= MAX_PERSISTED_IDS ? currentEmbeddingRegion : null,
         selectedIds: selectedIds.length <= MAX_PERSISTED_IDS ? selectedIds : [],
+        selectionGrain,
         currentPolygon,
         selectionSource,
-    }), [viewStages, brushedIds, currentEmbeddingRegion, selectedIds, currentPolygon, selectionSource]);
+    }), [viewStages, expiredSelections, brushedIds, currentEmbeddingRegion, selectedIds, selectionGrain, currentPolygon, selectionSource]);
 
     // Every entry we write KEEPS the app router's own keys (__NA + its tree). Next reloads the page
     // on Back/Forward to an entry without them, and ours never had them: the router stamps the entry
@@ -471,7 +507,7 @@ export function FilterProvider({ children, datasetId }: { children: React.ReactN
             }
         }, 400);
         return () => { if (historyTimerRef.current) clearTimeout(historyTimerRef.current); };
-    }, [viewStages, brushedIds, currentEmbeddingRegion, selectedIds, currentPolygon, selectionSource, buildHistorySnapshot]);
+    }, [viewStages, expiredSelections, brushedIds, currentEmbeddingRegion, selectedIds, currentPolygon, selectionSource, buildHistorySnapshot]);
 
     // Listen for popstate (back/forward)
     useEffect(() => {
@@ -483,9 +519,11 @@ export function FilterProvider({ children, datasetId }: { children: React.ReactN
             // don't re-push the restored state and clobber the forward history.
             suppressPushUntilRef.current = Date.now() + 600;
             setViewStages(state.viewStages ?? []);
+            setExpiredSelections(state.expiredSelections ?? []);
             setBrushedIds(state.brushedIds ?? []);
             setCurrentEmbeddingRegion(state.currentEmbeddingRegion ?? null);
             setSelectedIds(state.selectedIds ?? []);
+            setSelectionGrain(state.selectionGrain ?? null);
             setCurrentPolygon(state.currentPolygon ?? null);
             setSelectionSource(state.selectionSource ?? 'Manual');
         };
@@ -686,6 +724,7 @@ export function FilterProvider({ children, datasetId }: { children: React.ReactN
         // grid keeps showing "all selected" and re-applying double-stacks the stage.
         setSelectAll(null);
         setDeselectedIds([]);
+        setSelectionGrain(null);
         setSelectionSource('Manual');
 
     }, [simpleFilters, advancedFilters, filterMode, brushedIds, selectedIds, currentPolygon, currentEmbeddingRegion, selectionSource, addStage, selectAll, deselectedIds, selectionCount]);
@@ -694,22 +733,25 @@ export function FilterProvider({ children, datasetId }: { children: React.ReactN
         // Clear only global filters (view stages), back to the dataset's default view.
         // Preserve draft sidebar filters and selections
         setViewStages(defaultViewStages(defaultView));
+        setExpiredSelections([]);
         setDismissedDefaultViewId(null);
     }, [defaultView]);
 
     const showAllImages = useCallback(() => {
         setViewStages([]);
+        setExpiredSelections([]);
         if (defaultView) setDismissedDefaultViewId(defaultView.id);
     }, [defaultView]);
 
     // Open on the default view once the dataset's answer says which it is (see opensOnDefaultView), and once a link
-    // that sets the filters has settled: never on top of the link's filters.
+    // that sets the filters has settled: never on top of the link's filters, nor under an expired selection's chip.
+    // Decided once per visit: removing that chip later, or Back/Forward (which restore their entry), never applies it.
     const openedRef = useRef(false);
     useEffect(() => {
         if (defaultView === undefined || openedRef.current || linkPending) return;
         openedRef.current = true;
         if (linkAppliedRef.current) return;
-        if (opensOnDefaultView(viewStages, dismissedDefaultViewId, defaultView)) {
+        if (opensOnDefaultView(viewStages, dismissedDefaultViewId, defaultView, expiredSelections)) {
             replaceHistoryRef.current = true;
             // eslint-disable-next-line react-hooks/set-state-in-effect -- once per visit, when the dataset's answer arrives
             setViewStages(defaultViewStages(defaultView));
@@ -726,6 +768,7 @@ export function FilterProvider({ children, datasetId }: { children: React.ReactN
         if (stages) {
             linkAppliedRef.current = true;
             setViewStages(stages);
+            setExpiredSelections([]);
         }
         const state = { ...window.history.state };
         delete state.__NA;
@@ -740,6 +783,7 @@ export function FilterProvider({ children, datasetId }: { children: React.ReactN
     // images while the chip still said the search had succeeded.
     const showResultsAsView = useCallback((stage: ViewStage) => {
         setViewStages([stage]);
+        setExpiredSelections([]);
         setSimpleFilters({});
         setAdvancedFilters({ logic: 'AND', filters: [] });
         setBrushedIds([]);
@@ -748,12 +792,14 @@ export function FilterProvider({ children, datasetId }: { children: React.ReactN
         setSelectedIds([]);
         setSelectAll(null);
         setDeselectedIds([]);
+        setSelectionGrain(null);
     }, []);
 
     const clearSelection = useCallback(() => {
         setSelectedIds([]);
         setSelectAll(null);
         setDeselectedIds([]);
+        setSelectionGrain(null);
         // Do not reset source here as it might be used for re-selection
     }, []);
 
@@ -792,6 +838,8 @@ export function FilterProvider({ children, datasetId }: { children: React.ReactN
         userFilters,
         viewStages,
         setViewStages,
+        expiredSelections,
+        setExpiredSelections,
         addStage,
 
         removeStage,
@@ -826,6 +874,8 @@ export function FilterProvider({ children, datasetId }: { children: React.ReactN
         isSampleSelected,
         selectionCount,
         toggleSampleSelected,
+        selectionGrain,
+        setSelectionGrain,
         selectionSource,
         setSelectionSource,
         showResultsAsView,

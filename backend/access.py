@@ -18,7 +18,8 @@ Endpoints should use the `require_dataset_access` FastAPI dependency — one lin
 declaration, hard to forget, impossible to skip by accident.
 """
 
-from typing import Optional
+from contextlib import contextmanager
+from typing import Iterator, Optional
 
 from fastapi import HTTPException, Request
 
@@ -98,6 +99,19 @@ async def check_dataset_access(dataset_id: int, user: Optional[dict]) -> dict:
         return dict(dataset)
 
     raise HTTPException(status_code=403, detail="Access denied for this dataset")
+
+
+@contextmanager
+def missing_unless_allowed(detail: str) -> Iterator[None]:
+    """Around check_dataset_access for a row looked up by its own id (a sample, a view, a job): when the caller may
+    not open the row's dataset (403), or it is gone (404), answer 404 `detail`, as for an id that doesn't exist.
+    A 403 told a signed-in user which ids exist in datasets they can't open. A dataset's own id keeps its 403."""
+    try:
+        yield
+    except HTTPException as error:
+        if error.status_code not in (403, 404):
+            raise
+        raise HTTPException(status_code=404, detail=detail) from None
 
 
 async def require_dataset_access(request: Request) -> dict:

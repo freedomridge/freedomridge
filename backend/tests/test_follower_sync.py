@@ -15,10 +15,10 @@ import numpy as np
 import pytest
 from fastapi import HTTPException, Request
 
-from backend import follower_sync, sample_ids
+from backend import access, follower_sync, sample_ids
 from backend.crypto import decrypt_secret, encrypt_secret
 from backend.models import ViewCreate
-from backend.routers import auth, datasets, followers, primaries, schedules, views
+from backend.routers import auth, datasets, followers, primaries, schedules, versions, views
 from backend.tests import test_bulk_jobs
 from backend.tests import test_field_registry_postgres as registry_helpers
 
@@ -459,9 +459,10 @@ def test_tags_and_shared_views_made_on_a_mirror_go_to_the_primary_when_they_sync
         other = await database.fetchval(
             "INSERT INTO users (username, role, password_hash) VALUES ('viewer', 'power_user', 'x') RETURNING id",
         )
+        monkeypatch.setattr(access, 'db', database)
         with pytest.raises(HTTPException) as not_theirs:
             await views.delete_view(view['id'], user={'id': other, 'role': 'power_user'})
-        assert not_theirs.value.status_code == 403
+        assert not_theirs.value.status_code == 404  # they can't open the mirror: as for a missing view
         assert await database.fetchval("SELECT 1 FROM views WHERE dataset_id = 1 AND name = 'Soy'")  # still there
         with pytest.raises(HTTPException) as refused:
             await views.delete_view(made_there, user=USER)
@@ -789,6 +790,33 @@ def test_only_a_final_refusal_stops_the_mirrors(monkeypatch, registry_database):
     registry_database(scenario)
 
 
+def test_a_mirror_says_how_many_versions_its_primary_keeps_and_holds_none_of_them(monkeypatch, registry_database):
+    async def scenario(database):
+        _, link_id = await setup(monkeypatch, database)
+        await ingest([{'crop': 'corn'}], dataset_id=1, prefix='s3://images/a')
+        follower = await database.fetchval('SELECT id FROM followers')
+        await followers.follow_dataset(follower, 1, followers.FollowOptions(), user=USER)
+        await versions.create_version(1, versions.CreateVersionRequest(name='v1'))
+
+        # From its first sync: the count comes with the primary's config, the versions themselves don't come.
+        await sync(database, link_id)
+        mirror = await mirror_of(database)
+        assert mirror['primary_versions'] == 1
+        held = 'SELECT count(*) FROM dataset_versions WHERE dataset_id = $1'
+        assert await database.fetchval(held, mirror['dataset_id']) == 0
+
+        await versions.create_version(1, versions.CreateVersionRequest(name='v2'))
+        await sync(database, link_id)
+        shown = await database.fetchval(
+            f'SELECT mirror FROM (SELECT {datasets._DATASET_SELECT} FROM datasets) d WHERE id = $1',
+            mirror['dataset_id'],
+        )
+        assert shown['primary_versions'] == 2
+        assert await database.fetchval(held, mirror['dataset_id']) == 0
+
+    registry_database(scenario)
+
+
 def test_the_tags_option_covers_tags_only_and_a_concept_view_stays_where_it_was_made(monkeypatch, registry_database):
     async def scenario(database):
         _, link_id = await setup(monkeypatch, database)
@@ -824,6 +852,34 @@ def test_the_tags_option_covers_tags_only_and_a_concept_view_stays_where_it_was_
         assert not await database.fetchval("SELECT 1 FROM views WHERE dataset_id = 1 AND name = 'Weedy'")
         await sync(database, link_id)
         assert await database.fetchval("SELECT 1 FROM views WHERE dataset_id = $1 AND name = 'Weedy'", mirror)
+
+    registry_database(scenario)
+
+
+def test_a_parent_id_no_sample_can_have_is_copied_as_no_parent(monkeypatch, registry_database):
+    """Ingest takes any parent_id. A number no sample id can be (past 2^31 - 1, zero, negative) failed the copy's
+    cast at every retry; now every number is translated, to null when no sample here has it, and text stays text."""
+
+    async def scenario(database):
+        _, link_id = await setup(monkeypatch, database)
+        await ingest([{'crop': 'corn'}], dataset_id=1, prefix='s3://images/a')
+        corn = await database.fetchval('SELECT id FROM samples WHERE dataset_id = 1')
+        values = [corn, 99999999999, 0, -3, 'abc']
+        await ingest(
+            [{'parent_id': value, 'n': index} for index, value in enumerate(values)],
+            dataset_id=1,
+            prefix='s3://images/objects',
+        )
+        follower = await database.fetchval('SELECT id FROM followers')
+        await followers.follow_dataset(follower, 1, followers.FollowOptions(), user=USER)
+        await sync(database, link_id)
+        mirror = await mirror_of(database)
+        assert mirror['state'] == 'following', mirror['last_error']
+        samples = await copied(database, mirror)
+        by_n = {
+            row['metadata']['n']: row['metadata'].get('parent_id') for row in samples.values() if 'n' in row['metadata']
+        }
+        assert by_n == {0: samples[corn]['id'], 1: None, 2: None, 3: None, 4: 'abc'}
 
     registry_database(scenario)
 

@@ -71,6 +71,7 @@ def test_fast_promotion_answers_final_message_and_appears_in_history(registry_da
         assert await datasets.promote_field(1, 'score', USER) == {'message': 'Field score is already promoted'}
         page = await jobs_router.list_dataset_jobs(1, limit=10, cursor=None, user=USER)
         assert [(job.kind, job.state, job.result) for job in page.items] == [(KIND, 'succeeded', result)]
+        assert page.items[0].field == 'score'  # the jobs list names an index build's field
         assert await lock_free(database)
 
     registry_database(scenario)

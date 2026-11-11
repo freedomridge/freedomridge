@@ -5,6 +5,7 @@ import re
 import threading
 import time
 import warnings
+from datetime import datetime
 from itertools import islice
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
@@ -14,7 +15,7 @@ import requests
 from .client import get_client
 from .sample import Sample
 from .version_view import VersionView
-from .view import Condition, DatasetView, SampleQuery, filters_from_view_stages
+from .view import Condition, DatasetView, SampleQuery, filters_from_view_content
 
 # `field__op=value` suffixes accepted by Dataset.filter(), mapped to the wire operator that
 # backend/routers/datasets.py's parse_filter_node actually implements.
@@ -710,7 +711,9 @@ class Dataset:
             on_duplicate: How to handle duplicate filepaths:
                 'error' — add new samples and return duplicate conflicts with ids + existing (default)
                 'skip'  — silently skip duplicates
-                'update' — overwrite existing samples with new data
+                'update' — replace an existing sample's metadata, location, heading and array fields; its
+                tags are merged (tags it had stay, so removing one takes untag_samples), and the embeddings
+                and hashes given replace those of the same name, leaving its others
 
         In 'error' mode, a duplicate HTTP 409 is returned as a dictionary, not raised.
         Validation and write failures still raise and roll back the request.
@@ -1132,15 +1135,7 @@ class Dataset:
         if not matches:
             known = sorted(str(v.get("name")) for v in views)
             raise ValueError(f"No saved view named {name!r} on dataset {self.name!r}; saved views: {known}")
-        content = matches[0].get("content") or {}
-        if "viewStages" in content:
-            filters = filters_from_view_stages(name, content["viewStages"])
-        elif isinstance(content.get("filters"), dict):
-            # Views saved before stages existed keep only the compiled filter.
-            filters = content["filters"] or None
-        else:
-            raise ValueError(f"Saved view {name!r} has neither viewStages nor filters")
-        return DatasetView(self, filters)
+        return DatasetView(self, filters_from_view_content(name, matches[0].get("content")))
 
     def delete_view(self, view_id: int) -> dict:
         """Delete a saved view by ID."""
@@ -1152,8 +1147,13 @@ class Dataset:
         version_id: Optional[int] = None,
         restore_deleted: bool = False,
         exact_membership: bool = False,
+        restore_settings: bool = False,
     ) -> dict:
-        """Revert dataset to a specific version.
+        """Revert dataset to a specific version. Takes an admin.
+
+        The public saved views the version recorded come back too, with their
+        filters: a view deleted since is made again, one changed since is given
+        its recorded filters. Private views are never touched.
 
         Args:
             version_name: Version name (e.g., "v1.0")
@@ -1163,8 +1163,16 @@ class Dataset:
                 location, heading, array fields). Embeddings/hashes are NOT
                 restored — backfill via missing()/coverage().
             exact_membership: Restore deleted samples and remove samples added
-                since the version. Defaults to False. Dataset settings are not
-                changed; use checkout() to read the exact historical sample state.
+                since the version, and remove the public saved views added since.
+                Defaults to False.
+            restore_settings: Also put the dataset's settings back as the version
+                recorded them: its description, media fields, segmentation
+                classes and colours, and the view it opens on (not its name).
+                Defaults to False: they stay as they are.
+
+        Raises:
+            ValueError: restore_settings was asked of a server that doesn't do it
+                (the revert itself was done; upgrade the server to restore them).
         """
         if version_id is None:
             versions = self.list_versions()
@@ -1177,8 +1185,14 @@ class Dataset:
             version_id,
             restore_deleted=restore_deleted,
             exact_membership=exact_membership,
+            restore_settings=restore_settings,
         )
         self._dirty = True
+        if restore_settings and not result.get('settings_restored'):
+            raise ValueError(
+                "The dataset was reverted, but its settings were not restored: this server doesn't restore them. "
+                "Upgrade the server and revert again with restore_settings=True.",
+            )
         return result
 
     def get_embedding_fields(self) -> list:
@@ -1368,23 +1382,71 @@ class Dataset:
     # VERSIONING API
     # =========================================================================
 
-    def create_version(self, name: str, description: Optional[str] = None, include_metadata: bool = True) -> dict:
+    def create_version(
+        self,
+        name: str,
+        description: Optional[str] = None,
+        include_metadata: bool = True,
+        created_at: Optional[datetime] = None,
+        created_by: Optional[str] = None,
+    ) -> dict:
         """Create a named snapshot of the current dataset state.
 
         Args:
             name: Version name (e.g., "v1.0")
             description: Optional description
-            include_metadata: If True, stores full metadata per sample
-                and dataset settings for historical browsing and checkout.
+            include_metadata: If True, stores full metadata per sample,
+                dataset settings and the public saved views, for historical
+                browsing and checkout.
                 If False, stores hashes and array fields for limited
                 comparisons; historical checkout and restore are unavailable.
+            created_at: When the version dates from, for history brought in from
+                another system: a datetime with a timezone, not in the future.
+                The version is listed, and is the latest or not, by this date.
+                Default: now.
+            created_by: Who made the version, for history brought in from another
+                system: its author there. Default: you; or, with created_at, no
+                one: the version's maker is then recorded as unknown. A version
+                given a created_at or a created_by also records you as who
+                brought it in (``imported_by``).
+
+        Raises:
+            ValueError: created_at has no timezone; or the server didn't record
+                created_at or created_by as given (a server from before versions
+                took them creates the version dated now and without its maker:
+                delete that version and upgrade the server).
 
         Example:
             dataset.create_version("v1.0", "Initial import")
             dataset.create_version("v2.0", include_metadata=False)  # lightweight
+            dataset.create_version(
+                "v0.9",
+                created_at=datetime(2024, 9, 7, 16, 21, tzinfo=timezone.utc),
+                created_by="ada",
+            )
         """
-        result = self.client.create_version(self._id, name, description, include_metadata)
-        print(f"Created version '{name}' ({result['sample_count']:,} samples)")
+        if created_at is not None and created_at.tzinfo is None:
+            raise ValueError("created_at needs a timezone, e.g. datetime(2024, 9, 7, tzinfo=timezone.utc)")
+        given: Dict[str, str] = {}
+        if created_at is not None:
+            given['created_at'] = created_at.isoformat()
+        if created_by is not None:
+            given['created_by'] = created_by
+        result = self.client.create_version(self._id, name, description, include_metadata, **given)
+        ignored = []
+        if created_at is not None and datetime.fromisoformat(result['created_at']) != created_at:
+            ignored.append('created_at')
+        if created_by is not None and result.get('created_by') != created_by.strip():
+            ignored.append('created_by')
+        if ignored:
+            raise ValueError(
+                f"Version '{name}' was created, but without the {' and '.join(ignored)} given: this server "
+                "doesn't take them. Delete the version and upgrade the server.",
+            )
+        # An older server, and a hash-only version, record no saved views.
+        views = result.get('saved_view_count')
+        recorded = f"{result['sample_count']:,} samples" + ("" if views is None else f", {views} saved views")
+        print(f"Created version '{name}' ({recorded})")
         return result
 
     def list_versions(self) -> list:

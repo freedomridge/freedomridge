@@ -118,9 +118,9 @@ export async function expectTotal(page: Page, n: number) {
 
 /**
  * A Select All over 50,000 samples, applied as a server token. The 12-row fixture never needs one, so the two
- * responses it gets (its count, its token) are faked.
+ * responses it gets (its count, its token) are faked. `grid`: the grid panel to press it in, when there are several.
  */
-export async function bigSelectAll(page: Page) {
+export async function bigSelectAll(page: Page, grid: Page | Locator = page) {
     await page.route('**/samples/query', async route => {
         if (route.request().postDataJSON()?.limit === 1) {
             await route.fulfill({ json: { items: [], total: 60_000 } });  // Select All's count probe
@@ -129,8 +129,8 @@ export async function bigSelectAll(page: Page) {
         }
     });
     await page.route('**/selection_token', route => route.fulfill({ json: { token: 'e2e-expired-token', count: 60_000 } }));
-    await page.getByTestId('grid-select-all').click();
-    await expect(page.getByTestId('grid-selection-count')).toContainText('60,000', { timeout: 10_000 });
+    await grid.getByTestId('grid-select-all').click();
+    await expect(grid.getByTestId('grid-selection-count')).toContainText('60,000', { timeout: 10_000 });
     await page.unroute('**/samples/query');
     await page.unroute('**/selection_token');
 }

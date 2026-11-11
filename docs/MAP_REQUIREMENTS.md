@@ -8,8 +8,9 @@ re-read this file and verify every item below still holds afterward.**
 
 Key code:
 - Backend: `_get_dataset_map_points_impl`, constants `_MAP_POINT_ZOOM`,
-  `_MAP_CLUSTER_MIN_POINTS`, `_cluster_cell_deg` in `backend/routers/datasets.py`.
-- Frontend: `frontend/components/map-panel.tsx`, `getMapPoints` in `frontend/lib/api.ts`.
+  `_MAP_CLUSTER_MIN_POINTS`, `_cluster_cell_deg`, `_map_lon_window` in `backend/routers/datasets.py`.
+- Frontend: `frontend/components/map-panel.tsx`, `tileBbox` and `viewBbox` in `frontend/lib/map-bounds.ts`,
+  `getMapPoints` in `frontend/lib/api.ts`.
 
 ---
 
@@ -134,7 +135,7 @@ seconds; it is **not** acceptable to cap the view to make it fast (see #0).
 The clustered query groups on the stored `samples.lon`/`lat` columns (schema.sql,
 trigger-maintained from `location` — never stale) so the whole-world view runs as an
 **index-only scan** over `idx_samples_lonlat_cover` (~750ms vs the old ~2.6s geometry
-scan). Three things this depends on — don't undo them:
+scan). Four things this depends on — don't undo them:
 - `_hybrid_items` must group with `round(lon/cell)` / `round(lat/cell)` (pure arithmetic
   on the columns), NOT `ST_SnapToGrid(location...)` — referencing `location` drops the
   index-only scan back to a full heap scan. `round()` matches the grid `ST_SnapToGrid`
@@ -151,6 +152,11 @@ scan). Three things this depends on — don't undo them:
   and 0.75 s instead of 0.22 s at zoom 7.5. So the map got slow after its first few views on
   each connection. `test_the_clustered_view_never_runs_on_a_generic_plan` checks
   `pg_prepared_statements` after 8 runs.
+- A view across the antimeridian (#13) reads two ranges of the covering index, one for each
+  side, joined by UNION ALL; the clustered view stays index-only. One
+  `lon >= west OR lon <= east - 360` is no range: the planner read every index entry of the
+  dataset with a filter, or the heap through a BitmapOr.
+  `test_a_view_across_the_antimeridian_reads_two_ranges_of_the_covering_index` checks the plan.
 
 ## 12. Selecting samples fits the map to them  ← was undocumented, got dropped
 
@@ -178,6 +184,20 @@ Don't refetch on every pixel of pan, and don't reload a view you've already seen
   tiles recur as you pan, and the whole-world view snaps to one stable tile. Tiling is
   skipped at points zooms (>= `MAP_POINT_ZOOM`) so the fetch region isn't enlarged past
   the point cap (#1/#4).
+- **Across the antimeridian:** mapbox-gl reports a view's longitudes unwrapped (west 170, east 190
+  over Fiji; 530 to 550 on a repeated world copy). `viewBbox` wraps the west into one world copy and
+  keeps the span, so an east past 180 means a view across the antimeridian, and the server answers
+  it for both sides (`_map_lon_window`) in the view's frame: the samples east of the antimeridian
+  come back 360 degrees further east, so the cell on the antimeridian groups both sides and a
+  bubble's extent is on the view's side (#14). Never clamp longitudes to ±180 (that dropped the
+  east side, and emptied a view on another world copy). A view or tile 360 degrees wide or more is
+  the whole world, -180 to 180, still one stable tile. A view that doesn't cross asks for what it
+  did before, and runs the same SQL, with two exceptions. The points view pads its box by a quarter
+  of its size, and that padding used to be clamped at ±180: a points view within a quarter of its
+  width of the antimeridian is now a window across it, and fetches the padding on the other side
+  too. And at zoom 1 and below, where a tile is 360 degrees wide, every view asks for the whole
+  world (it used to ask for one half when it was within it). Tests:
+  `backend/tests/test_map_dateline.py`, `tests/map-bounds.test.cjs`, `e2e/map-dateline.spec.ts`.
 - **Retention:** the map query keeps a long `gcTime` so seen tiles — especially the
   whole-dataset "all samples" view — stay cached for the session and return INSTANTLY
   (react-query re-shows cached data immediately, then background-refreshes after

@@ -6,6 +6,7 @@ import copy
 from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional
 
 from .sample import Sample
+from .view import filters_from_view_content
 
 if TYPE_CHECKING:
     from .dataset import Dataset
@@ -99,6 +100,48 @@ class VersionView:
     def take(self, n: int) -> 'VersionView':
         """Alias for limit()."""
         return self.limit(n)
+
+    # --- Saved views ---
+
+    def list_views(self) -> List[Dict[str, Any]]:
+        """The saved views the version recorded: the dataset's public views when it was made, each with its
+        ``name``, ``description`` and ``content``.
+
+        Raises:
+            ValueError: the version recorded no views: it was made before versions recorded them, or it is
+                hash-only. A version of a dataset that had no public views returns an empty list instead.
+        """
+        views = self._dataset.client.get_version_views(self._dataset._id, self.version_id)
+        if views is None:
+            raise ValueError(
+                f"Version {self.name!r} recorded no saved views: it was made before versions recorded them, "
+                "or it is hash-only",
+            )
+        return views
+
+    def load_view(self, name: str) -> 'VersionView':
+        """The samples a saved view held at this version: the view as the version recorded it, applied to the
+        version's stored samples. Chainable, like ``filter``.
+
+        Raises:
+            ValueError: the version recorded no view of that name, or the view has a stage that can't be
+                reproduced (see ``fridge.core.view.filters_from_view_stages``). A view whose filters read
+                live data a version doesn't store (embeddings, concept scores) is refused by the server
+                when it's queried.
+
+        Example:
+            subset = dataset.version("v1.8").load_view("evaluation subset")
+            subset.count()
+        """
+        views = self.list_views()
+        matches = [view for view in views if view["name"] == name]
+        if not matches:
+            known = sorted(view["name"] for view in views)
+            raise ValueError(f"Version {self.name!r} recorded no saved view named {name!r}; it recorded: {known}")
+        filters = filters_from_view_content(name, matches[0]["content"])
+        if filters is None:
+            return self
+        return self._clone(_filters={"logic": "AND", "filters": [self._filters, filters]} if self._filters else filters)
 
     # --- Reading ---
 

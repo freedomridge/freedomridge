@@ -10,6 +10,7 @@ import { parseAnnotations } from '@/lib/labels';
 import { AnnotationOverlay } from '@/components/annotations/AnnotationOverlay';
 import { SampleModal } from '@/components/sample-modal';
 import { DatasetJobs } from '@/components/dataset-jobs';
+import { versionMaker } from '@/lib/version-revert';
 
 interface SnapshotInfo {
     id: number;
@@ -19,6 +20,11 @@ interface SnapshotInfo {
     include_metadata: boolean;
     snapshot_format: number;
     created_at: string;
+    // Who made it; null when unknown (a version made before versions recorded it, or history brought in
+    // without an author).
+    created_by?: string | null;
+    // Who brought it in, when its date or author was stated by the request that made it; null otherwise.
+    imported_by?: string | null;
     dataset_snapshot?: Pick<Dataset, 'name' | 'description' | 'media_fields' | 'grid_media_field' | 'modal_media_field' | 'segmentation_config'> & {
         fields: { field_name: string; field_type: string; overlay_config?: { colormap?: string; range?: [number, number]; opacity?: number } }[];
     };
@@ -42,13 +48,22 @@ function SnapshotBrowser() {
     const [offset, setOffset] = useState(0);
     const [selectedId, setSelectedId] = useState<number | null>(null);
     const [mediaField, setMediaField] = useState<string | null>(null);
+    // The saved view shown, one the version recorded; '' for every saved sample.
+    const [viewName, setViewName] = useState('');
     const limit = 60;
     const base = `/api/datasets/${id}/versions/${versionId}`;
     const version = useQuery({
         queryKey: ['snapshot', id, versionId],
         queryFn: () => readSnapshot<SnapshotInfo>(base),
     });
+    // The dataset's public saved views when the version was made; null when it recorded none.
+    const views = useQuery({
+        queryKey: ['snapshot-views', id, versionId],
+        queryFn: () => readSnapshot<{ views: { name: string; description?: string | null }[] | null }>(`${base}/views`),
+        enabled: version.data?.include_metadata === true,
+    });
     const params = new URLSearchParams({ full: 'true', limit: String(limit), offset: String(offset), q: query });
+    if (viewName) params.set('view', viewName);
     for (const key of ['change_type', 'diff_base', 'diff_target']) {
         const value = searchParams.get(key);
         if (value) params.set(key, value);
@@ -63,7 +78,8 @@ function SnapshotBrowser() {
     const selectedIndex = items.findIndex(sample => sample.id === selectedId);
     const selected = items[selectedIndex];
     const overlayConfigs = Object.fromEntries((settings?.fields || []).map(field => [field.field_name, field.overlay_config || null]));
-    const error = version.error || samples.error;
+    const error = version.error || views.error || samples.error;
+    const savedViews = views.data?.views;
 
     return (
         <main className="min-h-screen bg-zinc-950 text-zinc-100 p-6 space-y-5">
@@ -72,7 +88,7 @@ function SnapshotBrowser() {
             <div className="rounded border border-cyan-800 bg-cyan-950/30 p-4 space-y-2">
                 <h1 className="text-xl font-semibold">{settings?.name || 'Dataset'} · {version.data?.name || 'Loading snapshot…'}</h1>
                 <p className="text-sm text-cyan-300">Read-only snapshot</p>
-                {version.data && <p className="text-sm text-zinc-400">{version.data.sample_count.toLocaleString()} saved samples · {new Date(version.data.created_at).toLocaleString()}</p>}
+                {version.data && <p className="text-sm text-zinc-400">{version.data.sample_count.toLocaleString()} saved samples · {new Date(version.data.created_at).toLocaleString()} · {versionMaker(version.data)}</p>}
                 {version.data?.description && <p>{version.data.description}</p>}
                 {searchParams.has('change_type') && <p className="text-sm">Showing {searchParams.get('change_type')} samples as they were in this saved version.</p>}
                 {version.data && !settings && <p className="text-sm text-amber-300">This older snapshot did not capture dataset display settings. Unrecorded historical fields remain unknown.</p>}
@@ -84,6 +100,22 @@ function SnapshotBrowser() {
                     <input aria-label="Search snapshot" placeholder="Search saved paths, tags, or metadata" value={draft} maxLength={1000} onChange={event => setDraft(event.target.value)} className="flex-1 rounded border border-zinc-700 bg-zinc-900 px-3 py-2" />
                     <button className="rounded bg-cyan-800 px-4 py-2" type="submit">Search</button>
                 </form>
+                {savedViews && savedViews.length > 0 && (
+                    <label className="flex items-center gap-3 text-sm">
+                        Saved view
+                        <select
+                            aria-label="Saved view of this version"
+                            value={viewName}
+                            onChange={event => { setViewName(event.target.value); setOffset(0); setSelectedId(null); }}
+                            className="rounded border border-zinc-700 bg-zinc-900 px-3 py-2"
+                        >
+                            <option value="">All saved samples</option>
+                            {savedViews.map(view => <option key={view.name} value={view.name} title={view.description || undefined}>{view.name}</option>)}
+                        </select>
+                        <span className="text-zinc-400">as this version recorded it</span>
+                    </label>
+                )}
+                {savedViews === null && <p className="text-sm text-zinc-400">This version did not record the dataset&apos;s saved views.</p>}
                 {samples.isPending && <p role="status">Loading saved samples…</p>}
                 {samples.data && <p>{samples.data.total.toLocaleString()} matching samples</p>}
                 <div className="grid grid-cols-2 md:grid-cols-4 xl:grid-cols-6 gap-3">

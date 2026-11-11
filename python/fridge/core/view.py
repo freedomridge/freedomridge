@@ -256,6 +256,17 @@ def filters_from_view_stages(view_name: str, stages: Any) -> Optional[Dict[str, 
     return {"logic": "AND", "filters": filters} if filters else None
 
 
+def filters_from_view_content(view_name: str, content: Any) -> Optional[Dict[str, Any]]:
+    """The filter a saved view's ``content`` stands for: its ``viewStages`` (see filters_from_view_stages), or
+    the compiled ``filters`` of a view saved before stages existed. ``None`` for every sample."""
+    content = content or {}
+    if "viewStages" in content:
+        return filters_from_view_stages(view_name, content["viewStages"])
+    if isinstance(content.get("filters"), dict):
+        return content["filters"] or None
+    raise ValueError(f"Saved view {view_name!r} has neither viewStages nor filters")
+
+
 class SampleQuery:
     """
     Query builder that provides attribute access for building conditions.

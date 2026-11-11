@@ -20,7 +20,7 @@ from .api_errors import CodedHTTPException
 from .colormaps import COLORMAPS
 from .crypto import assert_secure_encryption_key, warn_insecure_session_cookie
 from .database import lifespan
-from .media_cache import read_cache, write_cache
+from .media_cache import CacheFill, read_cache, write_cache
 from .request_limits import RequestLimitsMiddleware
 from .routers import (
     auth,
@@ -316,7 +316,7 @@ async def get_config():
 
 import mimetypes  # noqa: E402
 
-from fastapi.responses import FileResponse, Response  # noqa: E402
+from fastapi.responses import FileResponse, Response, StreamingResponse  # noqa: E402
 
 # NOTE: the old unauthenticated `GET /files?path=` route was removed. It served
 # any file under FRIDGE_DATA_ROOT with no dataset-access check, bypassing the
@@ -390,6 +390,104 @@ def _queue_media_cache(path: str, body: bytes) -> None:
     task.add_done_callback(_pending_cache_writes.discard)
 
 
+# A raw S3 original goes to the client a chunk at a time and is never held whole in memory: many large requests at
+# once could exhaust the API's memory (SEC-6). Nothing caps its size.
+_MEDIA_CHUNK_BYTES = 1024 * 1024
+
+
+class _S3MediaBody:
+    """A raw S3 object's body, read a chunk at a time, and copied into the media cache as it passes when the copy fits
+    the cache's budget and a cache-write slot is free. Reads hold a lock, so the copy's end, which runs on a cache
+    writer and may come after the client has gone, never overlaps a read still running in a thread."""
+
+    def __init__(self, body):
+        self.body, self.copy, self.lock = body, None, threading.Lock()
+        self.ended = self.finished = False
+
+    def read(self) -> bytes:
+        with self.lock:
+            if self.ended or self.finished:
+                return b""
+            chunk = self.body.read(_MEDIA_CHUNK_BYTES)
+            self.ended = not chunk
+            if chunk and self.copy is not None:
+                self.copy.write(chunk)
+            return chunk
+
+    def start_copy(self, path: str, size: int | None, first: bytes) -> None:
+        if size is None or size > _CACHE_MAX_BYTES or _CACHE_MAX_BYTES <= 0:
+            return
+        with self.lock:
+            # As _cache_media_later: slow cache storage never queues work without bound.
+            if self.finished or not _CACHE_WRITE_SLOTS.acquire(blocking=False):
+                return
+            try:
+                self.copy = CacheFill(path, (CROP_CACHE_PATH, COMPOSITE_CACHE_PATH, S3_LOCAL_PATH), _CACHE_MAX_BYTES)
+                self.copy.write(first)
+            except Exception:
+                if self.copy is not None:
+                    self.copy.discard()
+                self.copy = None
+                _CACHE_WRITE_SLOTS.release()
+                log.exception("Media cache-write failed")
+
+    def finish(self, keep: bool) -> None:
+        """Close the body. With `keep` (the stream ended, or the client left), the bytes not read yet are read into
+        the cache copy, as the whole object was always read before, and the copy is kept; else it is dropped."""
+        with self.lock:
+            copy, self.copy, self.finished = self.copy, None, True
+            try:
+                if copy is not None and keep:
+                    while not self.ended and (chunk := self.body.read(_MEDIA_CHUNK_BYTES)):
+                        copy.write(chunk)
+                    copy.commit()
+            except Exception:
+                log.exception("Media cache-write failed")
+            finally:
+                self.body.close()
+                if copy is not None:
+                    copy.discard()  # nothing left to remove once committed
+                    _CACHE_WRITE_SLOTS.release()
+
+
+async def _s3_media_chunks(stream: _S3MediaBody, first: bytes, cached_path: str, size: int | None):
+    """The response body of a raw S3 object: the chunk read with the response, then a chunk at a time."""
+    keep = False
+    try:
+        await asyncio.to_thread(stream.start_copy, cached_path, size, first)
+        chunk = first
+        while chunk:
+            yield chunk
+            chunk = await asyncio.to_thread(stream.read)
+        keep = True
+    except (GeneratorExit, asyncio.CancelledError):
+        keep = True  # the client left: the cache copy gets the rest
+        raise
+    finally:
+        # On a cache writer, not the event loop: the lock may wait for a read still running.
+        _CACHE_WRITERS.submit(stream.finish, keep)
+
+
+# Thumbnails, crops and overlays decode the whole image, and an overlay holds several float copies of it, so how many
+# render at once is bounded in each API process. A request past the bound waits for a slot; none is refused, and no
+# image size is capped. Decoding is CPU-bound, so more renders than CPUs only add memory; renders run on asyncio's
+# default thread pool (min(32, CPUs + 4) threads), and a slot is held from reading the source to the encoded result,
+# so a fetched source no longer waits in memory for a thread (and slow storage bounds how fast renders go too).
+# Cached derivatives and raw media take no slot.
+# os.process_cpu_count is Python 3.13+ (requires-python is 3.12); either can answer None.
+_MEDIA_RENDERS = max(1, int(os.getenv("FRIDGE_MEDIA_RENDERS") or getattr(os, "process_cpu_count", os.cpu_count)() or 1))
+_render_limit: tuple[asyncio.AbstractEventLoop, asyncio.Semaphore] | None = None
+
+
+def _render_slot() -> asyncio.Semaphore:
+    """The render bound for the running event loop (one per process; tests start a loop each)."""
+    global _render_limit
+    loop = asyncio.get_running_loop()
+    if _render_limit is None or _render_limit[0] is not loop:
+        _render_limit = (loop, asyncio.Semaphore(_MEDIA_RENDERS))
+    return _render_limit[1]
+
+
 def _thumbnail_width(width: int | None) -> int | None:
     if width is None:
         return None
@@ -420,7 +518,7 @@ import uuid  # noqa: E402
 
 from fastapi.responses import RedirectResponse  # noqa: E402
 
-from .access import check_dataset_access  # noqa: E402
+from .access import check_dataset_access, missing_unless_allowed  # noqa: E402
 from .database import db  # noqa: E402
 from .routers.auth import get_optional_user  # noqa: E402
 from .storage import backend_for_route, route_s3_bucket  # noqa: E402
@@ -795,14 +893,68 @@ async def _media_from_primary(source, path: str, params: dict) -> Response:
 _HIGH_BIT_DEPTH_SUFFIXES = (".png", ".tif", ".tiff")
 
 
+class _S3ObjectFile(io.RawIOBase):
+    """An S3 object as a seekable file read by byte ranges, so Pillow reads an image's header without the whole object
+    (a PNG's header is in its first bytes; a TIFF's directory can be anywhere in the file)."""
+
+    def __init__(self, client, bucket: str, key: str):
+        self.client, self.bucket, self.key = client, bucket, key
+        self.position = 0
+        self.size: int | None = None
+
+    def readable(self) -> bool:
+        return True
+
+    def seekable(self) -> bool:
+        return True
+
+    def tell(self) -> int:
+        return self.position
+
+    def seek(self, offset: int, whence: int = io.SEEK_SET) -> int:
+        if whence == io.SEEK_END and self.size is None:
+            raise io.UnsupportedOperation("The object's size isn't known yet")
+        self.position = max(0, offset + (0, self.position, self.size or 0)[whence])
+        return self.position
+
+    def readinto(self, buffer) -> int:
+        if not len(buffer) or (self.size is not None and self.position >= self.size):
+            return 0
+        try:
+            answer = self.client.get_object(
+                Bucket=self.bucket,
+                Key=self.key,
+                Range=f"bytes={self.position}-{self.position + len(buffer) - 1}",
+            )
+            self.size = int(answer["ContentRange"].rsplit("/", 1)[1])
+            body = answer["Body"]
+            try:
+                data = body.read(len(buffer))
+            finally:
+                body.close()
+        except Exception as error:  # a storage error, or no byte range in the answer: the image isn't read
+            raise OSError(f"Couldn't read s3://{self.bucket}/{self.key}: {error}") from error
+        buffer[: len(data)] = data
+        self.position += len(data)
+        return len(data)
+
+
 async def _is_high_bit_depth(dataset_id: int, path: str) -> bool:
-    """Whether a PNG or TIFF holds one channel wider than 8 bits, from its header. An S3 one is fetched into the
-    media cache, which the full view then serves from."""
+    """Whether a PNG or TIFF holds one channel wider than 8 bits, from its header. An S3 one's header is read from
+    its cached copy, or by byte ranges: the whole object isn't fetched for this. A storage error is the full view's
+    to report."""
     if not path.lower().endswith(_HIGH_BIT_DEPTH_SUFFIXES):
         return False
     if path.startswith("s3://"):
-        body, _ = await _fetch_media_bytes(dataset_id, path)
-        source: Any = io.BytesIO(body)
+        await _require_readable_source(dataset_id, path)
+        bucket, key = _parse_s3_path(path)
+        source: Any = os.path.join(S3_LOCAL_PATH, str(dataset_id), bucket, key)
+        if not os.path.exists(source):
+            route = await route_s3_bucket(dataset_id, bucket)
+            backend = None if route is None else await backend_for_route(route)
+            if backend is None or not backend.s3_client:
+                return False  # the full view says what is wrong
+            source = io.BufferedReader(_S3ObjectFile(backend.s3_client, bucket, key), 64 * 1024)
     else:
         source = _resolve_local_path(path)
         if not os.path.exists(source):
@@ -1048,36 +1200,37 @@ async def _serve_composite(
             headers={**composite_headers, "X-Cache": "HIT"},
         )
 
-    # Cache miss — fetch base + overlay bytes and composite.
-    base_bytes, _ = await _fetch_media_bytes(dataset_id, base_path)
-    hm_bytes, _ = await _fetch_media_bytes(dataset_id, map_path)
+    # Cache miss — fetch base + overlay bytes and composite, in a render slot.
+    async with _render_slot():
+        base_bytes, _ = await _fetch_media_bytes(dataset_id, base_path)
+        hm_bytes, _ = await _fetch_media_bytes(dataset_id, map_path)
 
-    # PIL + numpy composite is synchronous; run it off the event loop.
-    from .compositing import composite_heatmap
+        # PIL + numpy composite is synchronous; run it off the event loop.
+        from .compositing import composite_heatmap
 
-    def _composite():
-        out = composite_heatmap(base_bytes, hm_bytes, range_start, range_end, colormap, alpha)
-        if width is None:
-            return out
-        # Tile request: downscale the composited image and re-encode as JPEG (alpha is
-        # already flattened by the composite, so JPEG is lossless-enough for a thumbnail).
-        import io as _io
+        def _composite():
+            out = composite_heatmap(base_bytes, hm_bytes, range_start, range_end, colormap, alpha)
+            if width is None:
+                return out
+            # Tile request: downscale the composited image and re-encode as JPEG (alpha is
+            # already flattened by the composite, so JPEG is lossless-enough for a thumbnail).
+            import io as _io
 
-        from PIL import Image
+            from PIL import Image
 
-        img = Image.open(_io.BytesIO(out)).convert("RGB")
-        if img.width > width:
-            new_height = max(1, round(img.height * width / img.width))
-            img = img.resize((width, new_height), Image.Resampling.LANCZOS)
-        buf = _io.BytesIO()
-        img.save(buf, format="JPEG", quality=85)
-        return buf.getvalue()
+            img = Image.open(_io.BytesIO(out)).convert("RGB")
+            if img.width > width:
+                new_height = max(1, round(img.height * width / img.width))
+                img = img.resize((width, new_height), Image.Resampling.LANCZOS)
+            buf = _io.BytesIO()
+            img.save(buf, format="JPEG", quality=85)
+            return buf.getvalue()
 
-    try:
-        composed = await asyncio.to_thread(_composite)
-    except Exception as e:
-        log.error("Composite failed for sample %s overlay %s: %s", sample_id, overlay_field, e)
-        raise HTTPException(status_code=500, detail=f"Composite failed: {e}")
+        try:
+            composed = await asyncio.to_thread(_composite)
+        except Exception as e:
+            log.error("Composite failed for sample %s overlay %s: %s", sample_id, overlay_field, e)
+            raise HTTPException(status_code=500, detail=f"Composite failed: {e}")
 
     return Response(
         content=composed,
@@ -1208,36 +1361,37 @@ async def _serve_crop_resize(
             headers={**headers, "X-Cache": "HIT"},
         )
 
-    body, _content_type = await _fetch_media_bytes(dataset_id, path)
-    if bbox is not None:
-        bbox = await asyncio.to_thread(_crop_pixels, body, bbox)
-
-    def _render() -> bytes:
-        import io as _io
-
-        from PIL import Image
-
-        from .image_modes import to_rgb
-
-        img = to_rgb(Image.open(_io.BytesIO(body)))
+    async with _render_slot():  # the source and its pixels are in memory until the JPEG is made
+        body, _content_type = await _fetch_media_bytes(dataset_id, path)
         if bbox is not None:
-            img = img.crop(bbox)
-        if width is not None and img.width > width:
-            new_height = max(1, round(img.height * width / img.width))
-            img = img.resize((width, new_height), Image.Resampling.LANCZOS)
-        buf = _io.BytesIO()
-        img.save(buf, format="JPEG", quality=85)
-        return buf.getvalue()
+            bbox = await asyncio.to_thread(_crop_pixels, body, bbox)
 
-    try:
-        rendered = await asyncio.to_thread(_render)
-    except Exception as e:
-        log.error("Crop/resize failed for sample %s (field=%s): %s", sample_id, field, e)
-        if type(e).__name__ == "UnidentifiedImageError":
-            # PIL's message embeds "<_io.BytesIO object at 0x…>" — say what is wrong instead
-            # (a .log registered as a sample's filepath).
-            raise HTTPException(status_code=415, detail="This sample's file is not an image the server can read")
-        raise HTTPException(status_code=400, detail=f"Crop/resize failed: {e}")
+        def _render() -> bytes:
+            import io as _io
+
+            from PIL import Image
+
+            from .image_modes import to_rgb
+
+            img = to_rgb(Image.open(_io.BytesIO(body)))
+            if bbox is not None:
+                img = img.crop(bbox)
+            if width is not None and img.width > width:
+                new_height = max(1, round(img.height * width / img.width))
+                img = img.resize((width, new_height), Image.Resampling.LANCZOS)
+            buf = _io.BytesIO()
+            img.save(buf, format="JPEG", quality=85)
+            return buf.getvalue()
+
+        try:
+            rendered = await asyncio.to_thread(_render)
+        except Exception as e:
+            log.error("Crop/resize failed for sample %s (field=%s): %s", sample_id, field, e)
+            if type(e).__name__ == "UnidentifiedImageError":
+                # PIL's message embeds "<_io.BytesIO object at 0x…>" — say what is wrong instead
+                # (a .log registered as a sample's filepath).
+                raise HTTPException(status_code=415, detail="This sample's file is not an image the server can read")
+            raise HTTPException(status_code=400, detail=f"Crop/resize failed: {e}")
 
     return Response(
         content=rendered,
@@ -1328,8 +1482,10 @@ async def serve_media(
     dataset_id = row['dataset_id']
     path = row['path']
     if check_access:
-        # Before the field's own error, for the same reason: a user without access learns nothing of its fields.
-        await check_dataset_access(dataset_id, user)
+        # Before the field's own error, for the same reason: a user without access learns nothing of its fields, nor
+        # that the sample exists (a sample in a dataset they can't open answers as a missing one does).
+        with missing_unless_allowed("Sample not found"):
+            await check_dataset_access(dataset_id, user)
     if not path:
         raise HTTPException(
             status_code=404,
@@ -1461,14 +1617,20 @@ async def serve_media(
     # request to one-at-a-time. With a grid firing 100+ thumbnails in parallel
     # that produces multi-second latencies on the tail requests. Run the
     # blocking work in the default thread pool so requests actually parallelise.
+    # Only the first chunk is read here (its first bytes decide the type); the rest streams (_s3_media_chunks).
     def _fetch_blocking():
         resp = backend.s3_client.get_object(Bucket=bucket, Key=key)
-        data = resp['Body'].read()
+        stream = _S3MediaBody(resp['Body'])
+        try:
+            first = stream.read()
+        except BaseException:
+            stream.finish(keep=False)
+            raise
         ct = resp.get('ContentType') or mimetypes.guess_type(key)[0] or 'application/octet-stream'
-        return data, ct
+        return stream, first, resp.get('ContentLength'), ct
 
     try:
-        body, content_type = await asyncio.to_thread(_fetch_blocking)
+        stream, first, size, content_type = await asyncio.to_thread(_fetch_blocking)
     except Exception as e:
         # Map S3 / boto3 errors to meaningful HTTP statuses instead of
         # collapsing everything to 404. Admins tailing logs need to
@@ -1494,13 +1656,12 @@ async def serve_media(
         log.error("S3 fetch failed for %s/%s: %s", bucket, key, e)
         raise HTTPException(status_code=502, detail="Storage backend unreachable")
 
-    return Response(
-        content=body,
-        background=BackgroundTask(_cache_media_later, cached_path, body),
-        **_media_response_kwargs(
-            content_type,
-            body[:_MEDIA_HEAD_BYTES],
-            key,
-            **{"X-Cache": "MISS", "Cache-Control": _FULL_MEDIA_CACHE_CONTROL},
-        ),
+    kwargs = _media_response_kwargs(
+        content_type,
+        first[:_MEDIA_HEAD_BYTES],
+        key,
+        **{"X-Cache": "MISS", "Cache-Control": _FULL_MEDIA_CACHE_CONTROL},
     )
+    if size is not None:
+        kwargs["headers"]["Content-Length"] = str(size)
+    return StreamingResponse(_s3_media_chunks(stream, first, cached_path, size), **kwargs)

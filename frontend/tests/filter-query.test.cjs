@@ -23,7 +23,7 @@ for (const extension of ['.ts', '.tsx']) {
     };
 }
 
-const { isLassoStage, isReadOnlyStage, offsetOf } = require('../lib/filter-query.ts');
+const { expiredSelection, isLassoStage, isReadOnlyStage, offsetOf } = require('../lib/filter-query.ts');
 
 const SPLIT = { type: 'filter', description: 'My split', filter: { field: 'split', operator: '==', value: 'train' } };
 const REGION = { type: 'map_region', description: 'Map region', filter: { field: 'location', operator: 'geo_polygon', value: [] } };
@@ -49,4 +49,25 @@ test('a mistake\'s line and column become a cursor position', () => {
     assert.equal(text.slice(offsetOf(text, 2, 5)), 'seriel in (1 2)');
     assert.equal(offsetOf(text, 1, 1), 0);
     assert.equal(offsetOf(text, 9, 9), text.length);
+});
+
+test('an expired selection keeps the chip\'s words and count, never its ids or token', () => {
+    const token = {
+        type: 'selection', description: '60000 Selected',
+        filter: { logic: 'AND', filters: [{ field: 'id', operator: 'in_selection', value: 'tok-123' }] },
+        metadata: { count: 60000, source: 'Manual', token: 'tok-123' },
+    };
+    const ids = Array.from({ length: 50001 }, (_, i) => 900000 + i);
+    const picked = {
+        type: 'selection', description: 'Exclude: Map (50001 Selected)',
+        filter: { field: 'id', operator: 'not in', value: ids }, metadata: { count: 50001, source: 'Map' },
+    };
+    assert.deepEqual(expiredSelection(token), { expired: true, description: '60000 Selected', count: 60000 });
+    assert.deepEqual(expiredSelection(picked), { expired: true, description: 'Exclude: Map (50001 Selected)', count: 50001 });
+    assert.deepEqual(expiredSelection({ ...picked, metadata: undefined }).count, null);
+    for (const stub of [expiredSelection(token), expiredSelection(picked)]) {
+        assert.equal(JSON.stringify(stub).includes('tok-123'), false);
+        assert.equal(JSON.stringify(stub).includes('900000'), false);
+        assert.equal('filter' in stub, false);
+    }
 });

@@ -6,7 +6,7 @@ import { useMemo, useState, useEffect, useCallback } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { getHistogram, getHistogramPreview, type HistogramBucket, type HistogramResponse, type SchemaField, type ComplexFilter } from '@/lib/api';
 import { useFilters } from '@/contexts/FilterContext';
-import { convertSimpleFiltersToComplex, describeFilter, isTextFilter } from '@/lib/filter-utils';
+import { boundKeyFor, convertSimpleFiltersToComplex, describeFilter, excludeKeyFor, isTextFilter } from '@/lib/filter-utils';
 import { EyeOpenIcon, EyeNoneIcon } from '@radix-ui/react-icons';
 
 interface Props {
@@ -172,7 +172,7 @@ export function HistogramPanel({
         );
     };
 
-    const excludeKey = `exclude_${field}`;
+    const excludeKey = excludeKeyFor(field);
 
     // Helper to get array of values (handles single value or array)
     const getValues = useCallback((key: string): (string | number)[] => {
@@ -210,9 +210,9 @@ export function HistogramPanel({
                 if (isDatetime) {
                     const minLabel = bucket.range.min_label;
                     const maxLabel = bucket.range.max_label;
-                    if (prev[`${field}_min`] === minLabel && prev[`${field}_max`] === maxLabel) isIncluded = true;
+                    if (prev[boundKeyFor(field, 'min')] === minLabel && prev[boundKeyFor(field, 'max')] === maxLabel) isIncluded = true;
                     // Excluded check
-                    if (prev[`exclude_${field}_min`] === minLabel && prev[`exclude_${field}_max`] === maxLabel) isExcluded = true;
+                    if (prev[excludeKeyFor(boundKeyFor(field, 'min'))] === minLabel && prev[excludeKeyFor(boundKeyFor(field, 'max'))] === maxLabel) isExcluded = true;
                 } else {
                     const sel = prev[field] as { min?: number; max?: number } | undefined; // { min, max }
                     if (sel && sel.min === bucket.range.min && sel.max === bucket.range.max) isIncluded = true;
@@ -226,15 +226,15 @@ export function HistogramPanel({
                     // Include -> Exclude
                     // Clear include
                     if (isDatetime) {
-                        delete next[`${field}_min`];
-                        delete next[`${field}_max`];
+                        delete next[boundKeyFor(field, 'min')];
+                        delete next[boundKeyFor(field, 'max')];
                     } else {
                         delete next[field];
                     }
                     // Set Exclude
                     if (isDatetime) {
                         // The filter context has no exclude form for a datetime range
-                        // (exclude_<field>_min/_max), so a second click only clears the inclusion.
+                        // (`exclude:<field>:min` / `:max`), so a second click only clears the inclusion.
                     } else {
                         next[excludeKey] = { min: bucket.range.min, max: bucket.range.max };
                     }
@@ -248,8 +248,8 @@ export function HistogramPanel({
                     if (isDatetime) {
                         const minLabel = bucket.range.min_label;
                         const maxLabel = bucket.range.max_label;
-                        next[`${field}_min`] = minLabel;
-                        next[`${field}_max`] = maxLabel;
+                        next[boundKeyFor(field, 'min')] = minLabel;
+                        next[boundKeyFor(field, 'max')] = maxLabel;
                     } else {
                         next[field] = { min: bucket.range.min, max: bucket.range.max };
                     }
@@ -305,8 +305,8 @@ export function HistogramPanel({
             const next = { ...prev };
             delete next[field];
             delete next[excludeKey];
-            delete next[`${field}_min`];
-            delete next[`${field}_max`];
+            delete next[boundKeyFor(field, 'min')];
+            delete next[boundKeyFor(field, 'max')];
             return next;
         });
     };
@@ -320,8 +320,8 @@ export function HistogramPanel({
         if (bucket.range) {
             // Basic range check (only exact match supported for now)
             if (fieldMeta?.type === 'datetime') {
-                const minSel = simpleFilters[`${field}_min`];
-                const maxSel = simpleFilters[`${field}_max`];
+                const minSel = simpleFilters[boundKeyFor(field, 'min')];
+                const maxSel = simpleFilters[boundKeyFor(field, 'max')];
                 if (minSel === bucket.range.min_label && maxSel === bucket.range.max_label) return 'included';
                 // Datetime range exclusion is not fully implemented in context, so no 'excluded' state for datetime ranges here.
                 return 'none';
@@ -355,8 +355,8 @@ export function HistogramPanel({
 
         // Ranges
         if (fieldMeta?.type === 'datetime') {
-            const min = simpleFilters[`${field}_min`];
-            const max = simpleFilters[`${field}_max`];
+            const min = simpleFilters[boundKeyFor(field, 'min')];
+            const max = simpleFilters[boundKeyFor(field, 'max')];
             if (min || max) parts.push(`${min || '...'} - ${max || '...'}`);
             // No explicit datetime range exclusion in context yet.
         } else {
