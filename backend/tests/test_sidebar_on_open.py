@@ -124,9 +124,9 @@ def test_opened_field_fills_in_under_the_unchanged_gates(registry_database, monk
         brightness = await opened(SELECTIVE, 'brightness')
         assert (brightness['min'], brightness['max'], brightness['provenance']) == (180, 200, 'exact')
         captured = await opened(SELECTIVE, 'captured')
-        assert (captured['min'], captured['max'], captured['provenance']) == (
-            '2026-01-18T00:00:00',
-            '2026-01-20T00:00:00',
+        assert (captured['min'], captured['max'], captured['provenance']) == (  # the earliest and latest instants
+            '2026-01-18T00:00:00.000000Z',
+            '2026-01-20T00:00:00.000000Z',
             'exact',
         )
         color = await opened(SELECTIVE, 'color')
@@ -146,7 +146,7 @@ def test_opened_field_fills_in_under_the_unchanged_gates(registry_database, monk
         score = await opened(BROAD, 'score')
         assert (score['min'], score['max'], score['provenance']) == (1, 17, 'exact')
         captured = await opened(BROAD, 'captured')
-        assert (captured['max'], captured['provenance']) == ('2026-01-17T00:00:00', 'exact')
+        assert (captured['max'], captured['provenance']) == ('2026-01-17T00:00:00.000000Z', 'exact')
         brightness = await opened(BROAD, 'brightness')
         assert (brightness['min'], brightness['max'], brightness['provenance']) == (10, 200, 'cached')
         batch = await opened(BROAD, 'batch')

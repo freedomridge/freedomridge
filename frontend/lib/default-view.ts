@@ -9,6 +9,10 @@ export interface DefaultView {
     name: string;
     slug: string;
     content: View['content'];
+    // Who may update it (an admin too) and whether it is a mirror's copy of the primary's: lib/source-view.ts.
+    user_id?: number | null;
+    from_primary?: boolean;
+    updated_at?: string | null;  // when its filters were last replaced: the app takes the new ones
 }
 
 /** The default view's filters as view stages, each marked with the view's id so the filter bar labels it. */

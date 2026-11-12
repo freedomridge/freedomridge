@@ -2,7 +2,10 @@
 
 import { useState, useEffect, useRef, useSyncExternalStore } from 'react';
 import { useQuery } from '@tanstack/react-query';
-import { getDatasetCoverage, missingFieldsStage, type Sample, type ComplexFilter, type SchemaField, type Dataset } from '@/lib/api';
+import {
+    deleteUnlinkedObjects, findUnlinkedObjects, getDatasetCoverage, missingFieldsStage, notifyJobSubmitted, UNLINKED_KIND_LABELS,
+    UNLINKED_KINDS, unlinkedObjectsStage, type Sample, type ComplexFilter, type SchemaField, type Dataset,
+} from '@/lib/api';
 import { useFilters } from '@/contexts/FilterContext';
 import { DatasetGrid, type GridMore } from '@/components/dataset-grid';
 import { Slider } from '@/components/ui/slider';
@@ -83,6 +86,7 @@ interface GridPanelProps {
     gridPatchMode?: string | null;
     onGridPatchModeChange?: (mode: string | null) => void;
     onClearPatches?: () => void;
+    canDeleteObjects?: boolean;  // an admin, not on a mirror: offers deleting the objects whose image is gone
 }
 
 export function GridPanel({
@@ -131,6 +135,7 @@ export function GridPanel({
     gridPatchMode,
     onGridPatchModeChange,
     onClearPatches,
+    canDeleteObjects = false,
 }: GridPanelProps) {
     // Effective selection spanning explicit-id and Select-All (token) modes.
     const effectiveSelectionCount = selectionCount ?? selectedIds.length;
@@ -169,6 +174,38 @@ export function GridPanel({
         if (loc.present > 0 && loc.missing > 0) gaps.push({ kind: 'location', field: 'location', label: 'location', missing: loc.missing });
         return gaps;
     })();
+
+    // Objects with no image (object grain): "N objects have no image", which opens them as a view; an admin can
+    // delete those whose image is gone. Nothing is shown when there are none. idx_samples_unlinked_objects makes
+    // the count cheap.
+    const { data: unlinked } = useQuery({
+        queryKey: ['unlinked-objects', datasetId],
+        queryFn: () => findUnlinkedObjects(datasetId),
+        enabled: !!datasetId && isMixedGrain && grainMode === 'object',
+        staleTime: 60_000,
+        refetchOnWindowFocus: false,
+    });
+    const [deletingUnlinked, setDeletingUnlinked] = useState(false);
+    const deleteGoneObjects = async () => {
+        if (!unlinked) return;
+        const gone = unlinked.kinds.image_gone;
+        const others = unlinked.total - gone;
+        const kept = others > 0
+            ? `\n\n${others.toLocaleString()} other object${others === 1 ? ' with no image stays' : 's with no image stay'} (${UNLINKED_KINDS
+                .filter(kind => kind !== 'image_gone' && unlinked.kinds[kind] > 0)
+                .map(kind => `${unlinked.kinds[kind].toLocaleString()} ${UNLINKED_KIND_LABELS[kind]}`).join(', ')}).`
+            : '';
+        if (!confirm(`Delete the ${gone.toLocaleString()} object${gone === 1 ? '' : 's'} whose image is gone?${kept}`)) return;
+        setDeletingUnlinked(true);
+        try {
+            const result = await deleteUnlinkedObjects(datasetId, ['image_gone']);
+            if (result.job_id) notifyJobSubmitted(datasetId, result.job_id);
+        } catch (error) {
+            alert(error instanceof Error ? error.message : 'Could not delete the objects with no image');
+        } finally {
+            setDeletingUnlinked(false);
+        }
+    };
 
     // Per-instance view settings. The sort is remembered per dataset, like the filters and the
     // selection (a reload went back to "Default (ID)").
@@ -251,6 +288,33 @@ export function GridPanel({
                             >
                                 ✕
                             </button>
+                        </span>
+                    )}
+
+                    {/* Objects with no image (object grain only; see `unlinked` above) */}
+                    {grainMode === 'object' && unlinked && unlinked.total > 0 && (
+                        <span className="flex items-center text-[11px] text-amber-300/90 bg-amber-500/10 border border-amber-500/30 rounded whitespace-nowrap">
+                            <button
+                                data-testid="grid-unlinked-objects"
+                                onClick={() => showResultsAsView(unlinkedObjectsStage(unlinked.filter))}
+                                className="px-2 py-1 hover:bg-amber-500/20 rounded transition-colors"
+                                title={`Objects whose parent_id names no image of this dataset:\n\n${UNLINKED_KINDS
+                                    .filter(kind => unlinked.kinds[kind] > 0)
+                                    .map(kind => `${unlinked.kinds[kind].toLocaleString()} ${UNLINKED_KIND_LABELS[kind]}`).join('\n')}\n\nClick to view them.`}
+                            >
+                                ⚠ {unlinked.total.toLocaleString()} object{unlinked.total === 1 ? '' : 's'} {unlinked.total === 1 ? 'has' : 'have'} no image
+                            </button>
+                            {canDeleteObjects && !unlinked.mirror && unlinked.kinds.image_gone > 0 && (
+                                <button
+                                    data-testid="grid-unlinked-objects-delete"
+                                    onClick={deleteGoneObjects}
+                                    disabled={deletingUnlinked}
+                                    className="px-1.5 py-1 border-l border-amber-500/30 hover:bg-amber-500/20 hover:text-amber-100 rounded-r transition-colors disabled:opacity-50"
+                                    title="Delete the objects whose image is gone (a background job; Job history shows the result)"
+                                >
+                                    Delete…
+                                </button>
+                            )}
                         </span>
                     )}
 

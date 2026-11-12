@@ -10,7 +10,6 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock
 
-import asyncpg
 import numpy as np
 import pytest
 import requests
@@ -245,7 +244,10 @@ def test_a_point_changed_during_the_fit_falls_back_to_an_exact_re_rank(registry_
 # --- a lasso drawn on the previous map ---------------------------------------------------------
 
 
-def test_a_lasso_drawn_on_a_previous_map_is_refused_not_silently_reused(registry_database):
+def test_a_lasso_drawn_on_a_previous_map_keeps_filtering_on_the_current_one(registry_database):
+    """A re-fit no longer refuses a lasso drawn before it: the polygon selects the current map's points, and the app
+    warns that the map was laid out again (embedding_layouts)."""
+
     async def scenario(database):
         await seed(database, n=40)
         polygon = [[-200, -100], [0, -100], [0, 100], [-200, 100]]
@@ -256,7 +258,7 @@ def test_a_lasso_drawn_on_a_previous_map_is_refused_not_silently_reused(registry
             return await database.fetchval(f'SELECT count(*) FROM samples WHERE dataset_id=$1 AND {sql}', *args)
 
         lasso = {'field': FIELD, 'operator': 'embedding_polygon', 'value': polygon}
-        assert await count(lasso) == 40  # a field without a re-fitted map accepts any polygon
+        assert await count(lasso) == 40
         current = uuid.uuid4()
         await database.execute(
             """INSERT INTO embedding_map_state (dataset_id, field_name, model_id, artifact_location, refitted_at)
@@ -265,15 +267,14 @@ def test_a_lasso_drawn_on_a_previous_map_is_refused_not_silently_reused(registry
             current,
             model_key(1, FIELD, current),
         )
-        assert await count({**lasso, 'model_id': str(current)}) == 40
-        for stale in ({**lasso, 'model_id': str(uuid.uuid4())}, lasso):
-            with pytest.raises(asyncpg.ObjectNotInPrerequisiteStateError, match='re-fitted on 2026-10-21 08:58'):
-                await count(stale)
-            # Inside OR/NOT too, and without a known dataset (checked through the sample).
-            with pytest.raises(asyncpg.ObjectNotInPrerequisiteStateError):
-                args: list = [1]
-                sql, _ = datasets.parse_filter_node({'logic': 'NOT', 'filters': [stale]}, args, 2)
-                await database.fetchval(f'SELECT count(*) FROM samples WHERE dataset_id=$1 AND {sql}', *args)
+        for drawn in (lasso, {**lasso, 'model_id': str(current)}, {**lasso, 'model_id': str(uuid.uuid4())}):
+            assert await count(drawn) == 40
+            args: list = [1]
+            sql, _ = datasets.parse_filter_node({'logic': 'NOT', 'filters': [drawn]}, args, 2)
+            assert await database.fetchval(f'SELECT count(*) FROM samples WHERE dataset_id=$1 AND {sql}', *args) == 0
+        # The current map's points are what it selects: those moved out of the polygon leave it.
+        await database.execute("UPDATE embedding_coordinates SET x = x + 1000 WHERE sample_id <= 10")
+        assert await count({**lasso, 'model_id': str(uuid.uuid4())}) == 30
 
     registry_database(scenario)
 

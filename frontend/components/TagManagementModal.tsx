@@ -31,6 +31,9 @@ interface TagManagementModalProps {
     fieldName?: string;  // Which array field to manage (default: 'tags')
     // On a mirror: its own tags (`@local.tags`) beside the primary's, which it may edit only with tags both ways.
     mirror?: DatasetMirror | null;
+    // The map of a lasso drawn on an earlier layout of it, among the filters the selection was picked from: the
+    // dialog says so before the changes are applied (lib/stale-lasso.ts).
+    staleLassoMap?: string | null;
     onClose: () => void;
     onUpdate: () => void;
 }
@@ -43,6 +46,7 @@ export function TagManagementModal({
     datasetId,
     fieldName = 'tags',
     mirror = null,
+    staleLassoMap = null,
     onClose,
     onUpdate
 }: TagManagementModalProps) {
@@ -372,6 +376,18 @@ export function TagManagementModal({
                         </div>
                     )}
                 </div>
+
+                {staleLassoMap && (
+                    <p
+                        data-testid="tag-stale-lasso-warning"
+                        role="alert"
+                        className="mx-4 mt-3 rounded border border-amber-600/60 bg-amber-900/30 p-2 text-xs text-amber-200"
+                    >
+                        ⚠ This selection was made with a lasso drawn on an earlier layout of the {staleLassoMap} map, so it
+                        may hold different samples than the lasso was drawn around. Applying changes{' '}
+                        {effectiveCount.toLocaleString()} sample{effectiveCount !== 1 ? 's' : ''}.
+                    </p>
+                )}
 
                 {/* Footer */}
                 <div className="p-4 border-t border-gray-200 dark:border-gray-700 flex justify-between items-center">

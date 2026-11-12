@@ -221,6 +221,14 @@ async def collect(pool, dataset_id: Optional[int]) -> Dict[str, Any]:
                     dataset_id,
                 )
             ]
+            # Fields whose index is being rebuilt (index_jobs.queue_rebuilds): getting one, never suggested.
+            snapshot['rebuilding'] = {
+                row['field_name']
+                for row in await connection.fetch(
+                    "SELECT field_name FROM ann_index_rebuilds WHERE kind = 'field' AND dataset_id = $1",
+                    dataset_id,
+                )
+            }
             first_day = head['now'].astimezone(timezone.utc).date() - timedelta(days=field_usage.WINDOW_DAYS - 1)
             snapshot['usage'] = [
                 dict(row)
@@ -289,12 +297,23 @@ def fk_supporters(indexes: List[Dict[str, Any]], key: Dict[str, Any]) -> List[Di
     ]
 
 
+# Core indexes a database function needs, which an idle spell would otherwise call unused: the parent_id trigger
+# probes this one only when images are inserted, and without it every image insert would scan the objects (0029);
+# the objects with no image are counted and linked by the other, which is nearly empty and read only by the finder.
+FUNCTION_INDEXES = {
+    ('samples', 'idx_samples_parent_id'): "finds the objects waiting for a new image (samples.parent_id's trigger)",
+    ('samples', 'idx_samples_unlinked_objects'): 'counts and links the objects with no image (the orphan finder)',
+}
+
+
 def needed_reasons(indexes: List[Dict[str, Any]], foreign_keys: List[Dict[str, Any]]) -> Dict[int, List[str]]:
     """oid -> why the index must stay. The only index that can serve a foreign key's lookups is needed:
     without it, deleting or updating a parent row scans the child table."""
     reasons: Dict[int, List[str]] = {}
     for index in indexes:
         own = []
+        if (index['table_name'], index['name']) in FUNCTION_INDEXES:
+            own.append(FUNCTION_INDEXES[(index['table_name'], index['name'])])
         if index['is_primary']:
             own.append('primary key')
         elif index['is_exclusion']:
@@ -489,10 +508,13 @@ def suggestions(snapshot: Dict[str, Any], field_indexes: Dict[str, Dict[str, Any
         uses = sum(entry['uses'] for entry in rows)
         reference[usage] = sum(entry['total_ms'] for entry in rows) / uses if uses else None
     build_seconds = build_estimate(snapshot)
+    rebuilding = snapshot.get('rebuilding') or set()
     found = []
     for name, field in fields.items():
         if field['origin'] != 'metadata' or field['field_type'] not in INDEXABLE_TYPES or name in indexed:
             continue
+        if name in rebuilding:
+            continue  # its index is being rebuilt in the background
         if not promotable_name(name):
             continue  # promote refuses it: nothing to offer
         missing = bool(field['is_promoted'])

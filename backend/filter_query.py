@@ -12,13 +12,14 @@ selections, similarity); those stay chips.
 """
 
 import contextlib
-import datetime
 import difflib
 import json
 import math
 import re
 from dataclasses import dataclass
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
+
+from .datetimes import literal_window
 
 # Field kinds: which operators and values a field takes.
 NUMBER, DATETIME, TEXT, LIST, BOOLEAN, OBJECT = 'number', 'datetime', 'text', 'list', 'boolean', 'object'
@@ -333,14 +334,11 @@ class _Parser:
             if text.lower() not in ('true', 'false'):
                 raise self.fail(f'{field!r} is true or false, not {text!r}', token)
             return text.lower() == 'true'
-        if kind == DATETIME:
-            try:  # as the filter compiler reads a date (datasets._utc_datetime); the text itself is kept
-                datetime.datetime.fromisoformat(text.replace('Z', '+00:00'))
-            except ValueError:
-                raise self.fail(
-                    f'{text!r} is not a date and time; {field!r} takes ISO, such as 2026-01-31 or 2026-01-31T12:00:00Z',
-                    token,
-                ) from None
+        if kind == DATETIME and literal_window(text) is None:  # as the filter compiler reads it; the text is kept
+            raise self.fail(
+                f'{text!r} is not a date and time; {field!r} takes ISO, such as 2026-01-31 or 2026-01-31T12:00:00Z',
+                token,
+            )
         return text
 
 

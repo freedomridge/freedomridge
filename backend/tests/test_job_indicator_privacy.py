@@ -29,6 +29,9 @@ PUBLIC_FIELDS = {
     'stalled',
     'retry_delayed',
     'dataset_lane',
+    # What a queued job that hasn't started waits for (another index build; a rebuild parked for a bulk job, whose
+    # id a private guest isn't shown).
+    'waiting_for',
 }
 
 

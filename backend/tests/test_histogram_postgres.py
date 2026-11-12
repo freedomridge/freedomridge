@@ -202,12 +202,12 @@ def test_opposite_sign_extremes_do_not_underflow(registry_database, values):
     registry_database(scenario)
 
 
-def test_created_at_all_infinity_preserves_error(registry_database):
+def test_created_at_infinity_counts_as_missing(registry_database):
+    # It used to fail the request (an infinite bound written into the SQL as `inf`).
     async def scenario(database):
         await seed(database, [1, 2])
         await database.execute("UPDATE samples SET created_at = 'infinity'")
-        with pytest.raises(asyncpg.UndefinedColumnError, match='column "inf" does not exist'):
-            await histogram('created_at')
+        assert await histogram('created_at') == {'field': 'created_at', 'total': 2, 'missing': 2, 'buckets': []}
 
     registry_database(scenario)
 
@@ -252,7 +252,7 @@ def test_single_native_or_timestamp_value(registry_database, field):
         assert bucket['count'] == 1
         assert bucket['range']['min'] == bucket['range']['max']
         if field != 'id':
-            assert bucket['range']['min_label'] == bucket['range']['max_label'] == '2024-01-01T06:00:00'
+            assert bucket['range']['min_label'] == bucket['range']['max_label'] == '2024-01-01T06:00:00.000000'
 
     registry_database(scenario)
 
@@ -272,6 +272,7 @@ def test_timestamp_offsets_nulls_invalid_text_and_labels(registry_database):
             'datetime',
         )
         result = await histogram(bins=2)
+        # Whole microseconds: each bar's labels are its first and last microsecond, in UTC.
         assert result == {
             'field': 'value',
             'total': 6,
@@ -281,23 +282,23 @@ def test_timestamp_offsets_nulls_invalid_text_and_labels(registry_database):
                 {
                     'key': 1,
                     'count': 2,
-                    'label': '2024-01-01T06:00:00 - 2024-01-01T07:00:00.000004',
+                    'label': '2024-01-01T06:00:00.000000 - 2024-01-01T07:00:00.000000',
                     'range': {
                         'min': 1704088800.0,
-                        'max': 1704092400.0000036,
-                        'min_label': '2024-01-01T06:00:00',
-                        'max_label': '2024-01-01T07:00:00.000004',
+                        'max': 1704092400.0,
+                        'min_label': '2024-01-01T06:00:00.000000',
+                        'max_label': '2024-01-01T07:00:00.000000',
                     },
                 },
                 {
                     'key': 2,
                     'count': 1,
-                    'label': '2024-01-01T07:00:00.000004 - 2024-01-01T08:00:00',
+                    'label': '2024-01-01T07:00:00.000001 - 2024-01-01T08:00:00.000000',
                     'range': {
-                        'min': 1704092400.0000036,
+                        'min': 1704092400.000001,
                         'max': 1704096000.0,
-                        'min_label': '2024-01-01T07:00:00.000004',
-                        'max_label': '2024-01-01T08:00:00',
+                        'min_label': '2024-01-01T07:00:00.000001',
+                        'max_label': '2024-01-01T08:00:00.000000',
                     },
                 },
             ],
@@ -310,8 +311,12 @@ def test_timestamp_degeneracy_is_checked_before_float_rounding(registry_database
     async def scenario(database):
         await seed(database, ['9000-01-01T00:00:00.000001Z', '9000-01-01T00:00:00.000002Z'], 'datetime')
         result = await histogram()
-        assert result['bins'] == 8  # Distinct exact epochs can round to the same float8.
-        assert [b['count'] for b in result['buckets']] == [2] + [0] * 7
+        # Two microseconds apart: two one-microsecond bars (float edges once merged them into one of eight).
+        assert result['bins'] == 2
+        assert [(b['count'], b['range']['min_label'], b['range']['max_label']) for b in result['buckets']] == [
+            (1, '9000-01-01T00:00:00.000001', '9000-01-01T00:00:00.000001'),
+            (1, '9000-01-01T00:00:00.000002', '9000-01-01T00:00:00.000002'),
+        ]
 
     registry_database(scenario)
 
@@ -319,7 +324,6 @@ def test_timestamp_degeneracy_is_checked_before_float_rounding(registry_database
 @pytest.mark.parametrize(
     'kind,value,error',
     [
-        ('datetime', '2024-99-01', asyncpg.DatetimeFieldOverflowError),
         ('number', 10**400, asyncpg.NumericValueOutOfRangeError),
     ],
 )

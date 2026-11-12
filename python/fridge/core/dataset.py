@@ -13,7 +13,7 @@ from typing import Any, Dict, List, Optional
 import requests
 
 from .client import get_client
-from .sample import Sample
+from .sample import Sample, _jsonable
 from .version_view import VersionView
 from .view import Condition, DatasetView, SampleQuery, filters_from_view_content
 
@@ -884,7 +884,9 @@ class Dataset:
         return self.client.resume_dataset_deletion(self._id, wait=wait, timeout=timeout)
 
     def delete_samples(self, sample_ids, *, wait=True, timeout=1800):
-        """Delete IDs or a captured view in resumable chunks (admin only)."""
+        """Delete IDs or a captured view in resumable chunks (admin only). Deleting an image deletes its object
+        samples: the result's ``objects_deleted`` counts those the target didn't include, ``deleted_count`` the
+        samples it did."""
         target = sample_ids._bulk_target() if hasattr(sample_ids, '_bulk_target') else {'sample_ids': sample_ids}
         return self.client.bulk_delete_samples(self._id, wait=wait, timeout=timeout, **target)
 
@@ -916,8 +918,33 @@ class Dataset:
         or the Job with wait=False."""
         return self.client.delete_embeddings(self._id, field, filters={}, wait=wait, timeout=timeout)
 
+    def unlinked_objects(self) -> dict:
+        """The object samples with no image, by kind, as 0029 counts them::
+
+            {'total': 3, 'kinds': {'image_gone': 2, 'other_dataset': 0, 'object': 0, 'not_a_sample_id': 1,
+             'no_parent_id': 0}, 'linkable': 0, 'linked': 0, 'mirror': False, 'filter': {...}}
+
+        For a user who may edit the dataset, objects whose image is there but not linked yet are linked first
+        (``linked``); for anyone else they are ``linkable``. See unlinked_objects_view() to look at them.
+        """
+        return self.client.find_unlinked_objects(self._id)
+
+    def unlinked_objects_view(self, kinds: Optional[List[str]] = None) -> DatasetView:
+        """A view of the object samples with no image, of these kinds (all of them by default): 'image_gone',
+        'other_dataset', 'object', 'not_a_sample_id', 'no_parent_id'."""
+        leaf = {'field': 'parent_id', 'operator': 'unlinked_object', 'value': list(kinds or [])}
+        return DatasetView(self, {'logic': 'AND', 'filters': [leaf]})
+
+    def delete_unlinked_objects(self, kinds=('image_gone',), *, wait=True, timeout=1800):
+        """Delete the object samples with no image of these kinds (admin only), by default only those whose image
+        is gone, as a bulk delete job: the result's ``deleted_count`` says how many. Objects whose image is there are
+        linked first, never deleted. Refused on a mirror: its objects change only through its sync. With none to
+        delete there is no job, and the answer says ``deleted_count: 0``."""
+        return self.client.delete_unlinked_objects(self._id, kinds, wait=wait, timeout=timeout)
+
     def delete_sample(self, sample_id: int) -> dict:
-        """Delete a sample from this dataset."""
+        """Delete a sample from this dataset. Deleting an image deletes its object samples: the answer's
+        ``objects_deleted`` says how many."""
         return self.client.delete_sample(self._id, sample_id)
 
     def get_schema(self, filters=None) -> list:
@@ -1164,7 +1191,8 @@ class Dataset:
                 restored — backfill via missing()/coverage().
             exact_membership: Restore deleted samples and remove samples added
                 since the version, and remove the public saved views added since.
-                Defaults to False.
+                Defaults to False. An image added since goes with its object samples
+                (added since too): ``samples_removed`` in the result counts them all.
             restore_settings: Also put the dataset's settings back as the version
                 recorded them: its description, media fields, segmentation
                 classes and colours, and the view it opens on (not its name).
@@ -1333,7 +1361,7 @@ class Dataset:
                 field = key
                 operator = "="
 
-            all_conditions.append({"field": field, "operator": operator, "value": value})
+            all_conditions.append({"field": field, "operator": operator, "value": _jsonable(value)})
 
         if all_conditions:
             if len(all_conditions) == 1:
@@ -2869,7 +2897,9 @@ class Dataset:
         One-time per embedding field; required by ``compute_uniqueness`` /
         ``find_duplicates`` and what makes similarity search an index scan.
         Those methods call this automatically when the index is missing.
-        The build is a server job; ``wait=False`` returns its Job.
+        The build is a server job; ``wait=False`` returns its Job. One index
+        builds at a time on the server, so it can wait for another build first;
+        ``timeout`` ends this wait, not the job (see ``Client.build_ann_index``).
         """
         return self.client.build_ann_index(self._id, field_name, wait=wait, timeout=timeout)
 

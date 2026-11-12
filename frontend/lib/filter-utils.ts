@@ -50,8 +50,28 @@ export function upgradeDraftKeys(simpleFilters: Record<string, SimpleFilterValue
     return upgraded;
 }
 
+// A datetime bound with a time of day, as its UTC date and time written to the precision it was given (a minute, a
+// second or a fraction mean different things to `=` and `<=`): "2026-01-01 08:00 UTC". One written with an offset is
+// shown at its UTC time; text that isn't such a datetime is shown as written.
+export function describeDatetime(text: string): string {
+    const match = /^(\d{4}-\d{2}-\d{2})[T ](\d{2}):(\d{2})(?::(\d{2})(\.\d+)?)?\s*(Z|[+-]\d{2}(?::?\d{2})?)?$/i.exec(text);
+    if (!match) return text;
+    const [, date, hour, minute, second, fraction, zone] = match;
+    let clock = `${date} ${hour}:${minute}`;
+    if (zone && zone.toUpperCase() !== 'Z') {
+        // An offset moves whole minutes: the date, hour and minute change, the seconds and fraction don't.
+        const digits = zone.slice(1).replace(':', '');
+        const offset = (zone[0] === '-' ? -1 : 1) * (Number(digits.slice(0, 2)) * 60 + Number(digits.slice(2, 4) || 0));
+        const local = Date.UTC(Number(date.slice(0, 4)), Number(date.slice(5, 7)) - 1, Number(date.slice(8, 10)), Number(hour), Number(minute));
+        if (Number.isNaN(local)) return text;
+        const utc = new Date(local - offset * 60_000).toISOString();
+        clock = `${utc.slice(0, 10)} ${utc.slice(11, 16)}`;
+    }
+    return `${clock}${second !== undefined ? `:${second}${fraction ?? ''}` : ''} UTC`;
+}
+
 const describeValue = (v: unknown): string => {
-    if (typeof v === 'string' && /^\d{4}-\d{2}-\d{2}T/.test(v)) return v.slice(0, 10);
+    if (typeof v === 'string' && /^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}/.test(v)) return describeDatetime(v);
     if (typeof v === 'number' && !Number.isInteger(v)) return String(Number(v.toFixed(3)));
     return String(v);
 };

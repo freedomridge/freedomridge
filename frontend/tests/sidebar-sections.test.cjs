@@ -529,32 +529,6 @@ test('a concept being rescored refuses before the stream or in it; each field ge
     assert.equal(options[0].retry(0, new api.ApiError(409, 'The map of clip_img was re-fitted')), false);
 });
 
-test('a lasso refused in the stream reaches the map_refitted path that drops it', async () => {
-    const { calls, fetch } = holdingFetch();
-    const page = new EventTarget();
-    const heard = [];
-    page.addEventListener(api.MAP_REFITTED_EVENT, event => heard.push(event.detail));
-    const hadWindow = 'window' in global;
-    global.window = page;
-    try {
-        await withFetch(fetch, async () => {
-            const answer = api.getFieldFacet(17, LATE, 'brightness').then(() => 'ok', error => error);
-            await tick();
-            calls[0].raw(JSON.stringify({ name: 'brightness', refusal: {
-                status: 409, detail: 'The map of clip_img was re-fitted on 2026-10-21 08:58 UTC after this lasso selection was drawn',
-                code: 'map_refitted', dataset_id: 17, field: 'clip_img', model_id: 'new-model',
-            } }));
-            calls[0].finish();
-            const error = await answer;
-            assert.ok(error instanceof api.ApiError && error.status === 409 && error.code === 'map_refitted');
-            assert.equal(api.isRescoringRefusal(error), false);
-        });
-    } finally {
-        if (hadWindow) global.window = page; else delete global.window;
-    }
-    assert.deepEqual(heard, [{ datasetId: 17, field: 'clip_img', modelId: 'new-model' }]);
-});
-
 test('fields refused at different moments retry together, in one request', async () => {
     const storage = memoryStorage({ 'fridge-sidebar-expanded-1': '["brightness","color"]' });
     const { options } = withStorage(storage, () => render({ appliedFilters: LATE, globalFilters: LATE, filterActive: true }));

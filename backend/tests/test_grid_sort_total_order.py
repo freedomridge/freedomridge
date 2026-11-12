@@ -45,11 +45,12 @@ def test_unknown_field_or_unsupported_type_falls_back_to_the_default_order():
     assert _grid_order_by("tags", "DESC", {"field_type": "array", "is_promoted": False}) == "ORDER BY id"
 
 
-def test_promoted_numeric_keeps_its_index_friendly_null_order_before_the_tiebreaker():
+def test_promoted_numeric_puts_missing_values_last_in_both_directions_before_the_tiebreaker():
+    # The pages still ride the index: _sorted_page_ids answers them in two parts.
     asc = _grid_order_by("brightness", "ASC", {"field_type": "number", "is_promoted": True})
     desc = _grid_order_by("brightness", "DESC", {"field_type": "number", "is_promoted": True})
     assert asc == "ORDER BY (metadata->>'brightness')::float ASC NULLS LAST, id"
-    assert desc == "ORDER BY (metadata->>'brightness')::float DESC NULLS FIRST, id"
+    assert desc == "ORDER BY (metadata->>'brightness')::float DESC NULLS LAST, id"
 
 
 def test_native_columns_are_exactly_the_four_the_handlers_accept():

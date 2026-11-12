@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState, useMemo, useCallback } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { getEmbeddings, getEmbeddingFields, reduceEmbeddings, selectEmbeddingRegion, lookupEmbeddingCoordinates, lookupPatchCoordinates, MAP_REFITTED_EVENT, type MapRefitted, type SchemaField, type ComplexFilter, type EmbeddingsResponse } from '@/lib/api';
+import { getEmbeddings, getEmbeddingFields, reduceEmbeddings, selectEmbeddingRegion, lookupEmbeddingCoordinates, lookupPatchCoordinates, type Dataset, type SchemaField, type ComplexFilter, type EmbeddingsResponse } from '@/lib/api';
 import { crashedBefore, currentPageLoad, loadMarker } from '@/lib/load-marker';
 import { useUser } from '@/contexts/UserContext';
 import { withGrain } from '@/contexts/FilterContext';
@@ -11,8 +11,9 @@ interface Props {
     datasetId: number;
     schema: SchemaField[];
     // ids = visible points for immediate highlight; region = the FULL lasso as a
-    // server-side filter (object to set, null to clear, omitted = highlight only).
-    onSelection: (ids: number[], region?: { field: string; polygon: number[][]; token: string; total: number; modelId?: string | null } | null) => void;
+    // server-side filter (object to set, null to clear, omitted = highlight only), with the layout of the map it was
+    // drawn on (layoutId: the scatter's layout_id) and, until 2.12, its model (lib/stale-lasso.ts lassoFilter).
+    onSelection: (ids: number[], region?: { field: string; polygon: number[][]; token: string; total: number; layoutId?: string | null; modelId?: string | null } | null) => void;
     selectedIds: number[];
     filters?: ComplexFilter;
     hasObjects?: boolean;  // dataset has object rows -> cross-grain link applies to the scatter
@@ -167,6 +168,7 @@ export function EmbeddingsPanel({ datasetId, schema, onSelection, selectedIds, f
     const rankStale = embeddingsData?.rank_stale === true;
     const refittedAt = embeddingsData?.map_state?.refitted_at;
     const mapModel = embeddingsData?.map_state?.model_id;
+    const mapLayout = embeddingsData?.layout_id ?? null;
 
 
     // Extra points fetched for IDs not in the base sample (e.g., grid selections)
@@ -206,39 +208,22 @@ export function EmbeddingsPanel({ datasetId, schema, onSelection, selectedIds, f
     // Clear extra points and patch selection when embedding field changes
     // eslint-disable-next-line react-hooks/set-state-in-effect -- synchronize existing per-view UI state after a prop or client-mount change
     useEffect(() => { setExtraPoints([]); setSelectedPatchKeys(new Set()); }, [embeddingField]);
-    // A re-fitted map moves every point: drop extra points looked up on the previous map, and a lasso
-    // drawn on it (its polygon would now select other samples; the server refuses it too).
+    // A new layout of the map (a re-fit, a reduce, an upload) moves its points: drop extra points looked up on the
+    // previous one. A lasso drawn on it is kept: its chip warns (lib/stale-lasso.ts).
     // eslint-disable-next-line react-hooks/set-state-in-effect -- synchronize existing per-view UI state after a prop or client-mount change
-    useEffect(() => { setExtraPoints([]); }, [mapModel]);
-    // The map model each field was last shown with, so a re-fit is noticed even across a field switch.
-    const shownModels = useRef<Record<string, string | null>>({});
-    const lassoMap = useRef<{ field: string; model: string | null } | null>(null);  // the draft lasso this panel drew
-    const [mapChangedNotice, setMapChangedNotice] = useState(false);
-    // A cleared or applied lasso is no longer this panel's draft (an applied one is a view stage, which
-    // FilterContext drops when the server refuses it): only a live draft is cleared below.
-    useEffect(() => { if (selectedIds.length === 0) lassoMap.current = null; }, [selectedIds]);
+    useEffect(() => { setExtraPoints([]); }, [mapModel, mapLayout]);
+    // The scatter reads the map's layout with its points. When it isn't the one the dataset's answer gave
+    // (map_layouts), that answer is asked again, so the chips of lassos drawn on an earlier layout warn. Once per
+    // layout seen: a newer answer than the scatter's doesn't ask again.
+    const askedForLayout = useRef<string | null>(null);
     useEffect(() => {
         if (!embeddingsData || isPlaceholderData) return;  // placeholder data may belong to another field
-        const model = mapModel ?? null;
-        const seen = embeddingField in shownModels.current;
-        const previous = shownModels.current[embeddingField];
-        shownModels.current[embeddingField] = model;
-        const lasso = lassoMap.current;
-        if (seen && previous !== model && lasso && lasso.field === embeddingField && lasso.model !== model) {
-            lassoMap.current = null;
-            onSelection([], null);
-            setMapChangedNotice(true);
-        }
-    }, [embeddingsData, isPlaceholderData, embeddingField, mapModel, onSelection]);
-    // An applied lasso stage (or a saved view's) on a re-fitted map was refused and dropped: say so here,
-    // where the selection is drawn again.
-    useEffect(() => {
-        const onRefitted = (event: Event) => {
-            if ((event as CustomEvent<MapRefitted>).detail.datasetId === datasetId) setMapChangedNotice(true);
-        };
-        window.addEventListener(MAP_REFITTED_EVENT, onRefitted);
-        return () => window.removeEventListener(MAP_REFITTED_EVENT, onRefitted);
-    }, [datasetId]);
+        const known = queryClient.getQueryData<Dataset>(['dataset', datasetId])?.map_layouts;
+        const shown = JSON.stringify([datasetId, embeddingField, mapLayout]);
+        if (!known || (known[embeddingField] ?? null) === mapLayout || askedForLayout.current === shown) return;
+        askedForLayout.current = shown;
+        queryClient.invalidateQueries({ queryKey: ['dataset', datasetId] });
+    }, [embeddingsData, isPlaceholderData, embeddingField, mapLayout, datasetId, queryClient]);
 
     // Fetch coordinates for selected/highlighted patches not in the base sample
     useEffect(() => {
@@ -801,13 +786,12 @@ export function EmbeddingsPanel({ datasetId, schema, onSelection, selectedIds, f
                     // Whole-image: the live `embedding_polygon` filter does all the work at
                     // query time, so there's NO server round-trip — the lasso completes
                     // instantly. (token/total unused; the polygon itself is the filter.)
-                    lassoMap.current = { field: embeddingField, model: mapModel ?? null };
-                    onSelection(dedupVisibleIds, { field: embeddingField, polygon: umapPolygon, token: '', total: 0, modelId: mapModel ?? null });
+                    onSelection(dedupVisibleIds, { field: embeddingField, polygon: umapPolygon, token: '', total: 0, layoutId: mapLayout, modelId: mapModel ?? null });
                 } else {
                     // Patch fields still need the server to enumerate the matched patches.
                     try {
                         const result = await selectEmbeddingRegion(datasetId, embeddingField, umapPolygon, scatterFilters);
-                        onSelection(dedupVisibleIds, { field: embeddingField, polygon: umapPolygon, token: result.token ?? '', total: result.total });
+                        onSelection(dedupVisibleIds, { field: embeddingField, polygon: umapPolygon, token: result.token ?? '', total: result.total, layoutId: mapLayout });
                         if (result.patches && onPatchSelection) {
                             const fullPatchMap = new Map<number, Array<{ row: number; col: number; scale: string }>>();
                             const rcRe = /_patch_(\d+x\d+)_r(\d+)c(\d+)$/;
@@ -955,17 +939,6 @@ export function EmbeddingsPanel({ datasetId, schema, onSelection, selectedIds, f
                                     title="Coordinates were re-projected after the coverage ranks were built. Every point is drawn at its current position; the even-coverage sampling is approximate until the next re-rank."
                                 >
                                     coverage stale
-                                </span>
-                            )}
-                            {mapChangedNotice && (
-                                <span
-                                    data-testid="map-changed-notice"
-                                    className="text-[10px] text-amber-400 whitespace-nowrap"
-                                    role="status"
-                                    title="The map was re-fitted, so a lasso selection drawn on the old map was removed. Draw your lasso selection again."
-                                >
-                                    Map re-fitted: draw the lasso again
-                                    <button className="ml-1 underline" onClick={() => setMapChangedNotice(false)}>OK</button>
                                 </span>
                             )}
                             {refittedAt && (

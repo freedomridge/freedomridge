@@ -42,6 +42,9 @@ export interface Dataset {
     // (PATCH default_view_id; null removes it). `default_view` is GET /datasets/{id} only.
     default_view_id?: number | null;
     default_view?: DefaultView | null;
+    // GET /datasets/{id} only: each embeddings map's current layout id, by map (a whole-image field or a patch
+    // scale). A map not listed has layout id null: not laid out again since the upgrade that added layout ids.
+    map_layouts?: Record<string, string> | null;
     // Set when the dataset is a read-only mirror of one on a primary instance (docs/FOLLOWERS.md).
     mirror?: DatasetMirror | null;
 }
@@ -72,6 +75,8 @@ export interface ActiveDatasetJob {
     retry_delayed: boolean;
     // false: a job about this dataset that owns no dataset lane (an index review)
     dataset_lane?: boolean;
+    // a queued job not started yet: what it waits for ("for another index build to finish ...")
+    waiting_for?: string | null;
 }
 
 export interface ActiveDatasetJobs {
@@ -105,6 +110,7 @@ export interface JobRecord {
     attempt: number;
     field?: string | null; // an index build's field
     cancel_requested: boolean;
+    waiting_for?: string | null; // a queued job not started yet: what it waits for
     result?: unknown; // only sent to admins and the job's submitter
     error?: unknown; // only sent to admins and the job's submitter
 }
@@ -338,6 +344,8 @@ export interface IndexAdvisorState {
     removed?: AdvisorRemoval[];
     // Indexes with a removal or restore queued or running (a removal is recorded by its first step).
     pending_actions?: string[];
+    // A dataset's fields whose index is being rebuilt in the background (after an upgrade): not indexed until it is.
+    rebuilding?: string[];
     review: IndexReview | null;
     review_job: { id: string; finished_at: string | null } | null;
     active_job: { id: string; state: 'queued' | 'running'; created_at: string } | null;
@@ -487,6 +495,7 @@ export interface View {
     shared_with_user_ids: number[];
     created_at: string;
     from_primary?: boolean; // On a mirror: this view is the copy of one on its primary
+    updated_at?: string | null; // When its filters last changed (stamped by the database); null: not since 2.11
 }
 
 export interface ComplexFilter {
@@ -496,7 +505,7 @@ export interface ComplexFilter {
 
     // Leaf Node
     field?: string;
-    operator?: '=' | '!=' | '>' | '<' | '>=' | '<=' | 'in' | 'not in' | 'contains' | 'geo_polygon' | 'geo_polygon_exclude' | 'embedding_polygon' | 'embedding_polygon_exclude' | 'in_selection' | 'is_null' | 'is_not_null' | 'exists' | 'not_exists' | 'concept_select' | 'concept_exclude' | 'parent_matches' | 'has_matching_object' | 'cg_self';
+    operator?: '=' | '!=' | '>' | '<' | '>=' | '<=' | 'in' | 'not in' | 'contains' | 'geo_polygon' | 'geo_polygon_exclude' | 'embedding_polygon' | 'embedding_polygon_exclude' | 'in_selection' | 'is_null' | 'is_not_null' | 'exists' | 'not_exists' | 'concept_select' | 'concept_exclude' | 'parent_matches' | 'has_matching_object' | 'cg_self' | 'unlinked_object';
     // Leaf value shape depends on the operator: scalar for comparisons, an array
     // for in/not-in, a ring of [lon,lat]/[x,y] points for geo_/embedding_polygon, a
     // string token for in_selection, an object {concept_id, op, threshold} for
@@ -505,7 +514,12 @@ export interface ComplexFilter {
     // the leaf value stays `any`.
     // eslint-disable-next-line @typescript-eslint/no-explicit-any -- operator-dependent leaf value bound into untyped form controls
     value?: any;
-    // embedding_polygon: the map (model) the polygon was drawn on; the server refuses it after a re-fit.
+    // embedding_polygon: the layout of the map the polygon was drawn on (the scatter's layout_id; none for one drawn
+    // before 2.11, or on a map not laid out again since). The app compares it with the map's current one
+    // (lib/stale-lasso.ts) to warn; the server keeps it and never filters by it.
+    layout_id?: string | null;
+    // embedding_polygon: the re-fitted map's model the polygon was drawn on. 2.11 ignores it, and writes it beside
+    // layout_id until 2.12, for followers on 2.10 or earlier (lib/stale-lasso.ts lassoFilter).
     model_id?: string | null;
 }
 
@@ -529,8 +543,14 @@ export interface SchemaField {
     max?: number | string;
     values?: string[];
     is_promoted?: boolean;
+    // Its index is being rebuilt in the background (after an upgrade): not indexed until it is, results stay right.
+    index_rebuilding?: boolean;
+    index_rebuild_waiting?: string;  // why the rebuild hasn't started (a stopped bulk job), when it waits
     // false: the field's name cannot be used in a query, so it keeps its dataset values for every filter.
     filterable?: boolean;
+    // false: not listed in the filter sidebar (parent_id, which names each object's image); still in the schema for
+    // the stage editor, the query editor and the sample modal.
+    sidebar?: boolean;
     display_type?: string | null;
     null_count?: number;  // samples with no value for this field (drives the "(no value)" filter)
     sortable?: boolean;  // false for native array columns (tags, ...): the grid sort can't order by them
@@ -621,9 +641,13 @@ function jobFailure(job: JobRecord, fallbackMsg: string): string {
 }
 
 // Follows a job to its end. Leaving the page stops nothing: the job keeps running on the server.
-export async function waitForJob<T>(jobId: string, fallbackMsg: string, intervalMs = 1000): Promise<T> {
+// `onWaiting` hears what the job waits for before it starts (another index build, say), or null once it doesn't.
+export async function waitForJob<T>(
+    jobId: string, fallbackMsg: string, intervalMs = 1000, onWaiting?: (waitingFor: string | null) => void,
+): Promise<T> {
     for (;;) {
         const job = await getJob(jobId);
+        onWaiting?.(job.waiting_for ?? null);
         if (job.state === 'succeeded') return job.result as T;
         if (job.state === 'failed' || job.state === 'cancelled') {
             throw new ApiError(job.state === 'cancelled' ? 409 : 500, jobFailure(job, fallbackMsg));
@@ -678,40 +702,26 @@ export function rescoringRetryTurn(attempt: number, signal?: AbortSignal): Promi
     });
 }
 
-async function jobResult<T>(res: Response, datasetId: number, fallbackMsg: string): Promise<T> {
+async function jobResult<T>(
+    res: Response, datasetId: number, fallbackMsg: string, onWaiting?: (waitingFor: string | null) => void,
+): Promise<T> {
     await ensureOk(res, fallbackMsg);
     if (res.status !== 202) return res.json();
     const { job_id: jobId } = await res.json();
     notifyJobSubmitted(datasetId, jobId);
-    return waitForJob<T>(jobId, fallbackMsg);
+    return waitForJob<T>(jobId, fallbackMsg, 1000, onWaiting);
 }
-
-// A lasso (embedding_polygon) drawn on a map that has since been re-fitted: the server refuses every
-// request that carries it (409, code map_refitted). FilterContext drops such lassos when it hears this.
-export const MAP_REFITTED_EVENT = 'fridge:map-refitted';
-export interface MapRefitted { datasetId: number; field: string; modelId: string | null }
 
 // Error that preserves the HTTP status so global 401 handling in providers.tsx
 // can distinguish expired sessions from other failures.
 export class ApiError extends Error {
     status: number;
     code?: string;
-    constructor(status: number, message: string, body?: { code?: unknown; dataset_id?: unknown; field?: unknown; model_id?: unknown }) {
+    constructor(status: number, message: string, body?: { code?: unknown }) {
         super(message);
         this.name = 'ApiError';
         this.status = status;
         if (typeof body?.code === 'string') this.code = body.code;
-        // Announced here, at the choke point every API error flows through, so a stale lasso is dropped
-        // whichever panel's request met it first (grid, scatter, sidebar, a saved view's first load).
-        if (status === 409 && body?.code === 'map_refitted' && typeof body.field === 'string'
-            && typeof body.dataset_id === 'number' && typeof window !== 'undefined') {
-            const detail: MapRefitted = {
-                datasetId: body.dataset_id,
-                field: body.field,
-                modelId: typeof body.model_id === 'string' ? body.model_id : null,
-            };
-            window.dispatchEvent(new CustomEvent<MapRefitted>(MAP_REFITTED_EVENT, { detail }));
-        }
         // A 401 from any API call means the session is gone. Announce it here — at
         // the single choke point every status-bearing API error flows through — so
         // the app logs out even when the caller swallows this error (e.g. a
@@ -797,6 +807,19 @@ export async function getView(slug: string): Promise<View> {
     return res.json();
 }
 
+// Replaces a saved view's filters with `content` (Update this view): its name, slug, sharing and default-view status
+// stay. Its owner or an admin may; a mirror's copy of the primary's view is refused (409 view_on_primary), and so is
+// a view whose filters changed since its `updatedAt` was read (409 view_changed).
+export async function updateView(datasetId: number, viewId: number, content: View['content'], updatedAt: string | null): Promise<View> {
+    const res = await fetch(`${API_BASE}/datasets/${datasetId}/views/${viewId}/content`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ content, updated_at: updatedAt }),
+    });
+    await ensureOk(res, 'Failed to update view');
+    return res.json();
+}
+
 export async function deleteView(id: number): Promise<void> {
     const res = await fetch(`${API_BASE}/views/${id}`, { method: 'DELETE' });
     await ensureOk(res, 'Failed to delete view');
@@ -875,6 +898,9 @@ export interface EmbeddingsResponse {
     rank_stale?: boolean;
     /** The map's current model when it has scheduled re-fits (Jobs → Schedules); null otherwise. */
     map_state?: { model_id: string; refitted_at: string } | null;
+    /** The map's current layout id; it changes each time the map is laid out again. Null: not laid out again since
+     *  the upgrade that added layout ids (the layout a lasso saved without one was drawn on). */
+    layout_id?: string | null;
 }
 
 // Parse the columnar binary scatter payload (see _embeddings_binary_response in the
@@ -897,6 +923,7 @@ function parseEmbeddingsBinary(buf: ArrayBuffer): EmbeddingsResponse {
         sampled: header.sampled,
         rank_stale: header.rank_stale === true,
         map_state: header.map_state ?? null,
+        layout_id: header.layout_id ?? null,
     };
 }
 
@@ -1090,6 +1117,46 @@ export async function getDatasetCoverage(datasetId: number): Promise<DatasetCove
     return res.json();
 }
 
+// Object samples with no image (backend/unlinked_objects.py), by kind. The finder links first those whose image is
+// there (for a user who may edit the dataset), so they are never counted here.
+export const UNLINKED_KINDS = ['image_gone', 'other_dataset', 'object', 'not_a_sample_id', 'no_parent_id'] as const;
+export type UnlinkedKind = typeof UNLINKED_KINDS[number];
+export const UNLINKED_KIND_LABELS: Record<UnlinkedKind, string> = {
+    image_gone: 'whose image is gone',
+    other_dataset: 'naming a sample of another dataset',
+    object: 'naming another object',
+    not_a_sample_id: 'with a parent_id that is not a sample id',
+    no_parent_id: 'with no parent_id',
+};
+export interface UnlinkedObjects {
+    total: number;
+    kinds: Record<UnlinkedKind, number>;
+    linkable: number;
+    linked: number;
+    mirror: boolean;
+    filter: ComplexFilter;
+}
+export async function findUnlinkedObjects(datasetId: number): Promise<UnlinkedObjects> {
+    const res = await fetch(`${API_BASE}/datasets/${datasetId}/objects/unlinked`, { method: 'POST', credentials: 'include' });
+    await ensureOk(res, 'Failed to find the objects with no image');
+    return res.json();
+}
+// Delete the objects with no image of these kinds, as a bulk delete job (admin). No job when there are none.
+export async function deleteUnlinkedObjects(
+    datasetId: number, kinds: UnlinkedKind[],
+): Promise<{ job_id?: string; expected: number; deleted_count?: number }> {
+    const res = await fetch(`${API_BASE}/datasets/${datasetId}/objects/unlinked/delete`, {
+        method: 'POST', credentials: 'include', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ kinds }),
+    });
+    await ensureOk(res, 'Could not delete the objects with no image');
+    return res.json();
+}
+// A view of the objects with no image: the stage the "N objects have no image" warning opens. Its operator has no
+// form in the builder or the query text, so the chip is read-only (filter-query.ts isReadOnlyStage).
+export function unlinkedObjectsStage(filter: ComplexFilter): ViewStage {
+    return { type: 'filter', description: 'Objects with no image', filter, metadata: { unlinked: true } };
+}
+
 // Filter names of the derived fields /coverage reports: embeddings and hashes are rows in their
 // own tables, not metadata keys, so they are `embeddings.<field>` / `hashes.<field>`; plus `location`.
 // They take exists / not_exists like any field.
@@ -1276,10 +1343,10 @@ async function sendFacetBatch(id: number, filters: ComplexFilter | undefined, wa
         let complete = false;
         await readLines(
             res,
-            (entry: SchemaField & { error?: string; done?: boolean; refusal?: { status: number; detail: string; code?: string; dataset_id?: number; field?: string; model_id?: string | null } }) => {
+            (entry: SchemaField & { error?: string; done?: boolean; refusal?: { status: number; detail: string; code?: string } }) => {
                 if (entry.done) complete = true;
-                // Refused after the stream began (a concept being rescored, a lasso on a re-fitted map): the
-                // same ApiError a 409 answer gives, so the query retries or the stale lasso is dropped.
+                // Refused after the stream began (a concept being rescored): the same ApiError a 409 answer gives,
+                // so the query retries.
                 else if (entry.refusal) {
                     const refusal = entry.refusal;
                     answer(entry.name, waiter => waiter.reject(new ApiError(refusal.status, refusal.detail, refusal)));
@@ -1368,12 +1435,14 @@ export async function saveOverlayConfig(
 }
 
 // The index builds in a server job; this resolves when it is ready (or rejects if it failed).
-export async function promoteField(datasetId: number, fieldName: string): Promise<void> {
+export async function promoteField(
+    datasetId: number, fieldName: string, onWaiting?: (waitingFor: string | null) => void,
+): Promise<void> {
     const res = await fetch(`${API_BASE}/datasets/${datasetId}/fields/${fieldName}/promote`, {
         method: 'POST',
         credentials: 'include',
     });
-    await jobResult<{ message: string }>(res, datasetId, 'Failed to promote field');
+    await jobResult<{ message: string }>(res, datasetId, 'Failed to promote field', onWaiting);
 }
 
 // `exhaustive: false` = the server's bounded value scan hit its time budget and `values` is

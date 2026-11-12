@@ -693,6 +693,23 @@ metadata = {
 }
 ```
 
+#### Dates and times
+
+A `datetime` or `date` can go straight into metadata, or be a filter value; the SDK sends it as ISO-8601 text:
+
+- A `datetime` with a time zone is sent as it is: `datetime(2026, 6, 1, 17, 5, tzinfo=timezone.utc)` is
+  `"2026-06-01T17:05:00+00:00"`.
+- A `datetime` without a time zone (such as `datetime.now()`) is the local time of the machine running the script,
+  so it is sent with that machine's offset: `datetime(2026, 6, 1, 17, 5)` on a machine in California (UTC-7 in June)
+  is `"2026-06-01T17:05:00-07:00"`. Text without an offset would be read as UTC, seven hours off.
+- A `date` is sent as `"2026-06-01"`.
+- Text is never changed: `"2026-06-01T17:05:00"` is stored as written.
+
+A filter value is sent the same way (`dataset.filter(captured_at__gte=datetime(2026, 6, 1))`, or a filter dict you
+build), so it matches the data the same machine wrote; so is a `datetime` anywhere else in a request, such as
+`lookup_samples` values. The server compares a datetime field's values as moments, whatever offset each was
+written with, and sorts the samples without one last ([Dataset management](DATASET_MANAGEMENT.md#dates-and-times)).
+
 #### Location
 
 Location is a GeoJSON Point or a `(longitude, latitude)` pair:
@@ -834,7 +851,10 @@ then refreshes field stats. `compute_uniqueness`, `compute_representativeness` a
 bounded memory, resumable, and they score ALL samples (no cap). The index build is
 a server job (Jobs panel: progress, cancel); `build_ann_index` waits for it
 (`timeout=3700`) and returns `{"field", "dim", "index", "built", "seconds"}`, or
-`{"built": False, "detail": "index already exists"}`; `wait=False` returns a `Job`. `find_unique` (farthest-point) stays client-side and is
+`{"built": False, "detail": "index already exists"}`; `wait=False` returns a `Job`. The server builds one index at
+a time (field and vector indexes alike), so a build can first wait for another, for hours if that one is a large
+vector index; `timeout` ends the SDK's wait, not the job, which still runs when its turn comes (a second call joins
+it). `find_unique` (farthest-point) stays client-side and is
 approximate-by-sample (`sample_size=`, default 200k; `-1` for all). `max_samples=`
 is accepted but ignored on the server-side methods.
 
@@ -1366,6 +1386,22 @@ ds.compute_metrics()   # brightness / blurriness / contrast / entropy / salt_and
                        # saturation / pct_underexposed / pct_overexposed
 ```
 
+### Lassos drawn on an earlier map layout
+
+A view or filter made in the app can hold a lasso: a polygon on one embeddings map (`embedding_polygon`), which
+records the layout of the map it was drawn on (`layout_id`). Once the map is laid out again (a re-fit, a reduce, an
+upload of coordinates that moves its points), the same polygon may select other samples. The SDK passes such filters
+through unchanged, and:
+
+- a query (`count()`, iterating a view, `query_samples`) and a bulk tag or metadata edit go ahead, and issue a
+  `fridge.StaleLassoWarning` naming the map, once per call (the server's answer carries `stale_lassos`);
+- a bulk delete of samples or of a field's vectors is refused: the server answers 409 (code `stale_lasso`) with a
+  message naming the map, raised as the usual `requests.HTTPError`. It is checked again as the job runs: if the map
+  is laid out again after the delete was submitted, the job fails (`JobFailed`) and deletes nothing more.
+
+Redraw the lasso in the app (and save the view again), or remove it. To make the warning an error:
+`warnings.simplefilter("error", fridge.StaleLassoWarning)`.
+
 ### Deleting a field's vectors
 
 `delete_embeddings(field, sample_ids, *, wait=True, timeout=1800)` removes one embedding field's
@@ -1418,7 +1454,8 @@ sample. A list of ids together with a filter is refused too.
 
 Deleting every vector of a field removes the vectors only, exactly like a partial
 delete: the dataset's map state, map point count, the field's model record (`embeddings/field-model`,
-shared by every dataset using the field name), any scheduled re-fit and the ANN index all stay. If the
+shared by every dataset using the field name), any scheduled re-fit and the ANN index all stay. The map gets a new
+layout id, so a lasso drawn on it before warns once it is filled again. If the
 field is refilled by a different model under the same name, re-fit the map or use a new field name.
 
 **Dimension.** A field's dimension is fixed per field name within a dataset, and the dataset's ANN index
@@ -1745,7 +1782,9 @@ does: one keeps what was added since (the button then reads **Restore sample dat
 other also restores the settings. For anyone but an admin the button is disabled and says why.
 
 `exact_membership=True` also restores deleted samples and removes later additions, samples
-and public saved views alike; it is an explicit destructive operation. It supports empty snapshots. Restores run
+and public saved views alike; it is an explicit destructive operation. An image added since the version goes with its
+object samples, which were added since too: the result's `samples_removed` counts them all. It supports empty
+snapshots. Restores run
 in a serializable transaction and return HTTP 409 on a concurrent-write or filepath
 conflict, with all changes rolled back. Retry a concurrency conflict after the other
 writer finishes. The returned `auto_snapshot_id` can be restored with
@@ -2097,7 +2136,7 @@ class Dataset:
     # Sample operations
     def add_samples(samples: list[Sample], on_duplicate="error") -> dict  # {"ids": [...]}
     def iter_samples(selected_fields=None, progress=False, batch_size=1000, filters=None) -> Iterator[Sample]
-    def delete_sample(sample_id: int) -> dict
+    def delete_sample(sample_id: int) -> dict     # an image's objects with it: {"objects_deleted": n, ...}
     def get_or_create(filepath: str, **kwargs) -> tuple[Sample, bool]
     def __getitem__(filepath: str) -> Sample            # dataset["/path/img.jpg"]
     # No __len__: use dataset.all().count()
@@ -2116,7 +2155,15 @@ class Dataset:
     def tag_samples(sample_ids: list[int], tags: list[str], *, wait=True, timeout=1800) -> dict | Job
     def untag_samples(sample_ids: list[int], tags: list[str], *, wait=True, timeout=1800) -> dict | Job
     def set_values(sample_ids: list[int], field: str, value: Any, *, wait=True, timeout=1800) -> int | Job
-    def delete_samples(sample_ids, *, wait=True, timeout=1800) -> dict | Job   # admin only
+    # admin only. Deleting an image deletes its object samples: the result's deleted_count counts the samples
+    # targeted, objects_deleted the objects that went with their images. A bulk delete deletes an image's objects
+    # even when its filter or excluded_ids left them out, and counts them in objects_deleted.
+    def delete_samples(sample_ids, *, wait=True, timeout=1800) -> dict | Job
+    # Objects with no image (docs/OBJECT_PATCH_VIEW.md): counts by kind, a view of them, and deleting the kinds named
+    # (admin; by default only those whose image is gone; refused on a mirror)
+    def unlinked_objects() -> dict      # {'total', 'kinds': {...}, 'linkable', 'linked', 'mirror', 'filter'}
+    def unlinked_objects_view(kinds: list[str] | None = None) -> DatasetView
+    def delete_unlinked_objects(kinds=('image_gone',), *, wait=True, timeout=1800) -> dict | Job
     # One embedding field's vectors only; see "Deleting a field's vectors". sample_ids: a list or a view
     def delete_embeddings(field, sample_ids, *, wait=True, timeout=1800) -> dict | Job   # admin only
     def delete_embedding_field(field, *, wait=True, timeout=1800) -> dict | Job   # every sample; admin only

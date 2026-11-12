@@ -283,15 +283,22 @@ async def ensure_array_columns(pool, dataset_id: int, names: list) -> None:
     for name in names:
         if name in existing:
             continue
-        if not datasets_router._SAFE_COLUMN_RE.match(name) or name in datasets_router._RESERVED_COLUMNS:
+        if not datasets_router._SAFE_COLUMN_RE.match(name):
             raise ValueError(f'The primary sent an array field this instance cannot hold: {name!r}')
+        # A name the samples table here has for a column of its own (parent_id since 2.11.0, say).
+        taken = ValueError(
+            f'The primary sent an array field this instance cannot hold: {name!r} is already a column of the samples '
+            f'here. Rename the field {name!r} on the primary (copy it to a field of another name there and delete it).',
+        )
+        if name in datasets_router._RESERVED_COLUMNS:
+            raise taken
         try:
             await datasets_router.add_array_column(pool, dataset_id, name)
         except HTTPException as error:
             if error.status_code == 409:
                 raise job_queue.QueueContended(error.detail) from None
             if error.status_code == 400:
-                raise ValueError(f'The primary sent an array field this instance cannot hold: {name!r}') from None
+                raise taken from None
             raise
 
 
@@ -311,21 +318,40 @@ def _record_type(arrays: list) -> str:
     return ', '.join(columns)
 
 
+async def detach_children(connection, dataset_id: int, doomed: list) -> None:
+    """Before the mirror deletes these samples: their objects that it keeps lose their image, so the key (0030) never
+    deletes a mirror's object with its image. A primary on 2.10.x or older keeps an image's objects when it deletes the
+    image, and a 2.11 one deletes them through their own blocks, or re-points them in the same batch. Their parent_id
+    becomes JSON null, what a copy writes for a parent that isn't here, so a re-read writes the same. They are selected
+    by the column, which is what the key deletes by; mirror_samples keeps their primary's parent, for a re-point if it
+    returns. Run in the transaction that then deletes."""
+    await connection.execute(
+        """UPDATE samples SET metadata = jsonb_set(metadata, '{parent_id}', 'null')
+           WHERE dataset_id = $1 AND parent_id = ANY($2::int[]) AND NOT (id = ANY($2::int[]))""",
+        dataset_id,
+        doomed,
+    )
+
+
 async def write_samples(connection, dataset_id: int, blocks: list, data: dict) -> list:
     """Make the mirror's samples in these blocks the primary's: delete what it no longer has, update what changed,
     insert what's new, and translate object samples' parent ids. Returns the origin ids present."""
     arrays = data['array_fields']
     samples = data['samples']
     present = [sample['id'] for sample in samples]
-    await connection.execute(
-        f"""DELETE FROM samples s USING mirror_samples m, unnest($2::bigint[]) b
-            WHERE m.dataset_id = $1 AND s.id = m.sample_id
-              AND m.origin_id >= b * {BLOCK} AND m.origin_id < (b + 1) * {BLOCK}
-              AND NOT (m.origin_id = ANY($3::int[]))""",
-        dataset_id,
-        blocks,
-        present,
-    )
+    doomed = [
+        row['sample_id']
+        for row in await connection.fetch(
+            f"""SELECT m.sample_id FROM mirror_samples m, unnest($2::bigint[]) b
+                WHERE m.dataset_id = $1 AND m.origin_id >= b * {BLOCK} AND m.origin_id < (b + 1) * {BLOCK}
+                  AND NOT (m.origin_id = ANY($3::int[]))""",
+            dataset_id,
+            blocks,
+            present,
+        )
+    ]
+    await detach_children(connection, dataset_id, doomed)
+    await connection.execute('DELETE FROM samples WHERE dataset_id = $1 AND id = ANY($2::int[])', dataset_id, doomed)
     if not samples:
         return present
     # A filepath the primary moved here from another sample (two samples swapping paths, or a version restore
@@ -549,23 +575,36 @@ async def supersede(connection, dataset_id: int, column: str, fields: list, what
     )
     if not arriving:
         return
+    replaced: set = set()  # the fields and maps this instance had of its own
     if 'embeddings' in what:
-        await connection.execute(
-            """DELETE FROM embeddings e USING mirror_samples m
-               WHERE m.dataset_id = $1 AND e.dataset_id = $1 AND e.sample_id = m.sample_id
-                 AND e.field_name = ANY($2::text[])""",
+        gone = await connection.fetch(
+            """WITH gone AS (
+                   DELETE FROM embeddings e USING mirror_samples m
+                   WHERE m.dataset_id = $1 AND e.dataset_id = $1 AND e.sample_id = m.sample_id
+                     AND e.field_name = ANY($2::text[])
+                   RETURNING e.field_name)
+               SELECT DISTINCT field_name FROM gone""",
             dataset_id,
             arriving,
         )
+        replaced.update(row['field_name'] for row in gone)
     if 'map_state_rows' in what:
         # A patch map is kept under its scale's name (clip_patch_4x4), not its tiles' (clip_patch_4x4_r0c0).
         maps = sorted({*arriving, *(PATCH_TILE.sub(r'\1', field) for field in arriving)})
-        for table in ('embedding_viz_rank', 'embedding_viz_meta', 'embedding_map_state'):
-            await connection.execute(
-                f'DELETE FROM {table} WHERE dataset_id = $1 AND field_name = ANY($2::text[])',
+        for table in ('embedding_viz_rank', 'embedding_viz_meta', 'embedding_map_state', 'embedding_layouts'):
+            verb = 'SELECT field_name FROM' if table == 'embedding_layouts' else 'DELETE FROM'
+            returning = '' if table == 'embedding_layouts' else 'RETURNING field_name'
+            gone = await connection.fetch(
+                f"""WITH gone AS ({verb} {table} WHERE dataset_id = $1 AND field_name = ANY($2::text[]) {returning})
+                    SELECT DISTINCT field_name FROM gone""",
                 dataset_id,
                 maps,
             )
+            replaced.update(row['field_name'] for row in gone)
+        # A map of this instance's own is another one now: a new layout id here, so a lasso drawn on it (with its id,
+        # or with none) warns. The primary's id replaces it once the primary has one (write_layouts).
+        for name in sorted({PATCH_TILE.sub(r'\1', field) for field in replaced}):
+            await connection.execute('SELECT bump_map_layout($1, $2)', dataset_id, name)
     if 'sample_hashes' in what:
         await connection.execute(
             """DELETE FROM sample_hashes h USING mirror_samples m
@@ -624,6 +663,52 @@ async def write_coordinates(connection, dataset_id: int, blocks: list, coordinat
         blocks,
     )
     await clear_placement(connection, dataset_id, [row['origin_id'] for row in origin_ids])
+
+
+async def write_layouts(connection, dataset_id: int, layouts: list) -> None:
+    """The layout ids of the primary's maps (embedding_layouts), each with the last transaction the primary's read of
+    it could see. The mirror takes one once its feed has passed that transaction (take_layouts), so its id never names
+    a layout whose coordinates haven't all arrived: a lasso drawn here meanwhile records the old id, and warns later,
+    which is true. A map the primary has no id for keeps the one it has here: none, as the primary's (a copy starts
+    with none, forget_primary_layouts), or the one a superseded map of this instance's got. The maps of this
+    instance's own vector fields keep their own ids."""
+    sent = [layout for layout in layouts if layout['field_name'] in await primary_maps(connection, dataset_id)]
+    await connection.execute(
+        """INSERT INTO embedding_layouts AS l (dataset_id, field_name, pending_layout_id, pending_txid)
+           SELECT $1, s.field_name, s.layout_id, s.txid
+           FROM jsonb_to_recordset($2::jsonb) AS s(field_name text, layout_id uuid, txid bigint)
+           ON CONFLICT (dataset_id, field_name) DO UPDATE
+           SET pending_layout_id = EXCLUDED.pending_layout_id, pending_txid = EXCLUDED.pending_txid
+           WHERE l.layout_id IS DISTINCT FROM EXCLUDED.pending_layout_id OR l.pending_layout_id IS NOT NULL""",
+        dataset_id,
+        sent,
+    )
+    await take_layouts(connection, dataset_id)
+
+
+async def primary_maps(connection, dataset_id: int) -> set:
+    """The maps of the primary's vector fields here: a whole-image field, or a patch scale (its tiles' fields)."""
+    fields = await connection.fetchval('SELECT vector_fields FROM mirrors WHERE dataset_id = $1', dataset_id)
+    return {*fields, *(PATCH_TILE.sub(r'\1', field) for field in fields)}
+
+
+async def forget_primary_layouts(connection, dataset_id: int) -> None:
+    """A copy that starts again (after a restore of the primary, or into a copy stopped before) takes the primary's
+    layout ids afresh, at its end: the ones held, and any waiting, are another database's."""
+    await connection.execute(
+        'DELETE FROM embedding_layouts WHERE dataset_id = $1 AND field_name = ANY($2::text[])',
+        dataset_id,
+        sorted(await primary_maps(connection, dataset_id)),
+    )
+
+
+async def take_layouts(connection, dataset_id: int) -> None:
+    """The primary's layout ids whose transaction the mirror's feed has passed (write_layouts)."""
+    await connection.execute(
+        """UPDATE embedding_layouts l SET layout_id = l.pending_layout_id, pending_layout_id = NULL, pending_txid = NULL
+           FROM mirrors m WHERE m.dataset_id = $1 AND l.dataset_id = $1 AND l.pending_txid <= m.feed_cursor""",
+        dataset_id,
+    )
 
 
 async def write_fields(connection, dataset_id: int, fields: list) -> None:
@@ -949,6 +1034,7 @@ async def held_step(pool, link, client, row: dict, checkpoint: dict) -> StepResu
         async def publish(connection):
             await begin_mirror_write(connection, dataset_id)
             if phase == 'unmatched':
+                await detach_children(connection, dataset_id, ids)  # so the count asked about stays exact
                 await connection.execute(
                     'DELETE FROM samples WHERE dataset_id = $1 AND id = ANY($2::int[])',
                     dataset_id,
@@ -1174,6 +1260,7 @@ async def resume_held(pool, link, client, row: dict, checkpoint: dict) -> StepRe
             entry['start_txid'] - 1,
             current,
         )
+        await forget_primary_layouts(connection, dataset_id)
         await connection.execute('DELETE FROM mirror_restores WHERE dataset_id = $1', dataset_id)
 
     checkpoint['mirror_turn'] = True
@@ -1325,6 +1412,7 @@ async def configure(pool, link, client, checkpoint: dict) -> StepResult:
                     entry['start_txid'] - 1,
                     current,
                 )
+                await forget_primary_layouts(connection, previous['dataset_id'])
                 resumed.append(previous['dataset_id'])
                 continue
             name = await local_name(connection, entry['name'], host_of(link), origin)
@@ -1402,6 +1490,8 @@ async def apply_state(pool, link, client, mirror, checkpoint: dict, *, views: bo
         if views:
             await write_views(connection, dataset_id, state['views'])
         await write_settings(connection, dataset_id, state['dataset'], host_of(link), origin)
+        if 'layouts' in state:  # a primary before 2.11 sends none: the mirror's ids stay as they are
+            await write_layouts(connection, dataset_id, state['layouts'])
         if after_write is not None:
             await after_write(connection)
 
@@ -1536,6 +1626,7 @@ async def advance_cursor(connection, dataset_id: int, cursor: int) -> None:
         dataset_id,
         cursor,
     )
+    await take_layouts(connection, dataset_id)
 
 
 async def feed_step(pool, link, client, mirror, checkpoint: dict) -> StepResult:

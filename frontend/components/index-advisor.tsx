@@ -281,7 +281,11 @@ function Table({ head, children }: { head: string[]; children: ReactNode }) {
     );
 }
 
-function Suggested({ items, buildSeconds }: { items: AdvisorSuggestion[]; buildSeconds: number | null | undefined }) {
+function Suggested({ items, buildSeconds, rebuilding }: {
+    items: AdvisorSuggestion[];
+    buildSeconds: number | null | undefined;
+    rebuilding: Set<string>;
+}) {
     return (
         <Section testId="index-advisor-suggested" title="Suggested indexes" count={items.length}>
             {items.length === 0 ? (
@@ -315,7 +319,11 @@ function Suggested({ items, buildSeconds }: { items: AdvisorSuggestion[]; buildS
                                     {item.excess_seconds > 0 ? seconds(item.excess_seconds) : '—'}
                                     {item.build_seconds != null && <div className="text-zinc-500">a build takes ~{seconds(item.build_seconds)}</div>}
                                 </td>
-                                <td className="px-2 py-1.5 text-right"><IndexField field={item.field} /></td>
+                                <td className="px-2 py-1.5 text-right">
+                                    {rebuilding.has(item.field)
+                                        ? <span data-testid="index-field-rebuilding" className="text-xs text-cyan-300">Being rebuilt</span>
+                                        : <IndexField field={item.field} />}
+                                </td>
                             </tr>
                         );
                     })}
@@ -529,6 +537,7 @@ export function IndexAdvisor({ datasetId }: { datasetId?: number }) {
     const { active_job: active, last_failure: failure, schedule } = advisor.data;
     const result = advisor.data.review;
     const removed = advisor.data.removed ?? [];
+    const rebuilding = advisor.data.rebuilding ?? [];
     return (
         <Scope.Provider value={{ datasetId, removed: new Map(removed.map(item => [item.index_name, item])), pending: new Set(advisor.data.pending_actions ?? []) }}>
         <section data-testid={`index-advisor-${scope}`} className="space-y-4 text-sm">
@@ -563,6 +572,12 @@ export function IndexAdvisor({ datasetId }: { datasetId?: number }) {
                     Weekly review: {schedule?.enabled ? `on, ${ruleText(schedule)}` : 'off'}. Change it in the dataset&apos;s Jobs → Schedules.
                 </p>
             )}
+            {rebuilding.length > 0 && (
+                <p className="text-cyan-300" data-testid="index-advisor-rebuilding">
+                    Being rebuilt in the background: <span className="font-mono">{rebuilding.join(', ')}</span>. Each is not indexed
+                    until its new index is built (Jobs shows the build); filters and sorts on it stay correct, only slower.
+                </p>
+            )}
             {result?.skipped && <p className="text-zinc-400">{result.skipped}</p>}
             {result && !result.skipped && (
                 <>
@@ -572,7 +587,9 @@ export function IndexAdvisor({ datasetId }: { datasetId?: number }) {
                             ? ` · this dataset's requests timed since ${day(result.telemetry_since)} (the last ${result.window_days} days are used)`
                             : ' · no requests to this dataset timed yet')}
                     </p>
-                    {result.scope === 'dataset' && <Suggested items={result.suggested ?? []} buildSeconds={result.build_seconds} />}
+                    {result.scope === 'dataset' && (
+                        <Suggested items={result.suggested ?? []} buildSeconds={result.build_seconds} rebuilding={new Set(rebuilding)} />
+                    )}
                     <Unused review={result} />
                     <Overlapping items={result.overlapping} />
                     {!!result.recreated?.length && (

@@ -376,6 +376,39 @@
       ]
     },
     {
+      "name": "lasso drawn on a layout of its map (2.11)",
+      "f": "1.RYxNCoMwGAWvUt46gfqTtmbfC3QrIjH5lEBqgokFEe9eUpCuBoY3b0dMaqII2e5IWyBIjNYlWsBgKOrFhmT9DInneyBj7DzFy4um7Ng5lTtGS85AgkrqtbMBDD7QopJfsj3bPni3Tb_2o9xKkG3LBeOiY23xZwbP6Bic2vyaepvf6_GuS_Ugfh0Kw2stBG9URbwYS1PpehDq1uA4uuML",
+      "stages": [
+        {
+          "type": "filter",
+          "description": "Embeddings Region",
+          "filter": {
+            "field": "e2e_clip",
+            "operator": "embedding_polygon",
+            "value": [
+              [
+                -5,
+                -5
+              ],
+              [
+                15,
+                -5
+              ],
+              [
+                15,
+                5
+              ],
+              [
+                -5,
+                5
+              ]
+            ],
+            "layout_id": "4f7c2a8e-0b1d-4c55-9a3e-1f2d3c4b5a69"
+          }
+        }
+      ]
+    },
+    {
       "name": "picked samples",
       "f": "1.LY1BCsMgEEWvEv6qBRem7uYCPUCXIQvRSRFsFJ0Ugnj3Yujmw4PPew1V7JsraGmQMzMIlSM7CWmHgufqSsgXEZ4l-Olmptf1YH-HwhaicAE1bIGjByF4KKTMxUoqg4foa-PBoGXW2qhZ63nMY-0KHxbrrdihcOnYBWQUajqK438Tva_9Bw",
       "stages": [
@@ -454,6 +487,31 @@
             "op": ">",
             "threshold": 0.62,
             "mode": "exclude"
+          }
+        }
+      ]
+    },
+    {
+      "name": "objects with no image (read-only chip)",
+      "f": "1.RY7bDcMgDEVXifydCViiA0QRcoOb0BKMwGlVRexek77-LN_jc71DEZypgBl2kGciMHDxQShDD47KlH0Sz1HXp_OVJindw8vSRe78qodKfXCz60TBKZkwUxTrnaacKKOw5rDF4OONnOXDpOEdw6aNAxwuO3NsQpaFsnUoWKhRPzyyWLQF1xTobY9s_2Vj7WElwXbZ3vn2gZG8Ua1jfQE",
+      "count": 0,
+      "stages": [
+        {
+          "type": "filter",
+          "description": "Objects with no image",
+          "filter": {
+            "field": "parent_id",
+            "operator": "unlinked_object",
+            "value": [
+              "image_gone",
+              "other_dataset",
+              "object",
+              "not_a_sample_id",
+              "no_parent_id"
+            ]
+          },
+          "metadata": {
+            "unlinked": true
           }
         }
       ]

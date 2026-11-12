@@ -257,7 +257,9 @@ def test_datetime_metadata_is_serialised_not_crashed():
     s, client = _saveable({})
     s.metadata["captured_at"] = datetime.datetime(2026, 1, 2, 3, 4, 5)
     s.save()
-    assert client.calls[-1]["metadata"]["captured_at"] == "2026-01-02T03:04:05"
+    # With the machine's offset: test_sdk_naive_datetimes.py checks it in a fixed time zone.
+    sent = client.calls[-1]["metadata"]["captured_at"]
+    assert sent == datetime.datetime(2026, 1, 2, 3, 4, 5).astimezone().isoformat()
 
 
 def test_assigning_a_whole_metadata_dict_is_a_MERGE_not_a_purge():

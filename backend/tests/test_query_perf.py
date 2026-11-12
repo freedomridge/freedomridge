@@ -12,16 +12,18 @@ from backend.routers import datasets
 
 # --- promoted numeric sort uses the float index --------------------------
 # A promoted numeric field's index is ((metadata->>'f')::float); the guarded CASE
-# expression doesn't match it, and DESC+NULLS LAST doesn't match the btree's null
-# order. So promoted sorts must emit the bare cast with index-friendly nulls
-# (ASC->NULLS LAST, DESC->NULLS FIRST) or every sorted page seq-scans + sorts 2M rows.
+# expression doesn't match it, so promoted sorts emit the bare cast. DESC NULLS LAST doesn't
+# match the btree's null order, so the pages are read in two parts (datasets._sorted_page_ids)
+# rather than every sorted page seq-scanning and sorting 2M rows.
 
 
-def test_promoted_numeric_sort_uses_bare_cast_and_index_friendly_nulls():
+def test_promoted_numeric_sort_uses_bare_cast_and_missing_values_last():
+    # Missing values last in both directions (the owner's rule); the pages still ride the index, in two parts
+    # (datasets._sorted_page_ids).
     asc = datasets._numeric_sort_order_by("year", True, "ASC")
     desc = datasets._numeric_sort_order_by("year", True, "DESC")
     assert asc == "ORDER BY (metadata->>'year')::float ASC NULLS LAST"
-    assert desc == "ORDER BY (metadata->>'year')::float DESC NULLS FIRST"
+    assert desc == "ORDER BY (metadata->>'year')::float DESC NULLS LAST"
     assert "CASE" not in asc and "CASE" not in desc  # bare cast matches the index
 
 

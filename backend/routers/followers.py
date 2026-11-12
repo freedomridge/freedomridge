@@ -824,11 +824,20 @@ async def follower_state(dataset_id: int, follower: dict = Depends(current_follo
         'SELECT field_name, rank_stale FROM embedding_viz_meta WHERE dataset_id = $1 ORDER BY field_name',
         dataset_id,
     )
+    # Each map's layout id, with the last transaction this read could see (its snapshot's xmax - 1, same statement):
+    # every write behind the id, in whatever order they committed, is at or below it. A mirror takes the id once its
+    # feed has passed it (follower_sync.write_layouts), so it never names a layout whose points haven't all arrived.
+    layouts = await db.fetch(
+        """SELECT field_name, layout_id::text AS layout_id, txid_snapshot_xmax(txid_current_snapshot()) - 1 AS txid
+           FROM embedding_layouts WHERE dataset_id = $1 AND layout_id IS NOT NULL ORDER BY field_name""",
+        dataset_id,
+    )
     return {
         'dataset': dict(dataset),
         'fields': [dict(row) for row in fields],
         'views': [dict(row) for row in views],
         'maps': [dict(row) for row in maps],
+        'layouts': [dict(row) for row in layouts],
     }
 
 

@@ -38,6 +38,7 @@ def test_binary_round_trip_values_and_alignment():
         "sampled": True,
         "rank_stale": False,
         "map_state": None,
+        "layout_id": None,
         "fields": ["sample_id", "x", "y"],
     }
     assert list(ids) == [0, 1, 2, 3, 4]

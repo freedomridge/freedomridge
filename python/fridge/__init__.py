@@ -1,4 +1,4 @@
-from .core.client import IncompatibleServerError, connect, get_client
+from .core.client import IncompatibleServerError, StaleLassoWarning, connect, get_client
 from .core.dataset import Dataset, compute_image_metrics
 from .core.geometry3d import Calibration
 from .core.job import Job, JobCancelled, JobError, JobFailed, JobTimeout
@@ -46,6 +46,7 @@ __all__ = [
     'connect',
     'get_client',
     'IncompatibleServerError',
+    'StaleLassoWarning',
     # Core classes
     'Dataset',
     'Sample',

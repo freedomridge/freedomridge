@@ -4,7 +4,13 @@ import json
 
 # Last occurrence wins within a retried batch; PostgreSQL upsert cannot touch
 # the same key twice. The joins preserve the existing cross-dataset/missing-key guard.
+# Answers whether this is a new layout of the map (bump_map_layout): it moved a point already on the map, or it added
+# points to a whole-image map whose point count (embedding_viz_meta, kept by the coordinate triggers) was 0, as after
+# every sample of it was deleted. One key lookup, made only when the upload added points and moved none; a map with
+# no count (a patch scale, a map never ranked) isn't asked. A whole-field delete gives the map a new id itself
+# (bulk_jobs). An unchanged point isn't written, and a row the upsert updated has xmax set, one it inserted has 0.
 SAVE_COORDINATES = """
+WITH written AS (
 INSERT INTO embedding_coordinates AS c (sample_id, field_name, x, y, dataset_id)
 SELECT e.sample_id, e.field_name, v.x, v.y, $4
 FROM (
@@ -16,6 +22,16 @@ JOIN samples s ON s.id = v.sample_id AND s.dataset_id = $4
 JOIN embeddings e ON e.dataset_id = $4 AND e.sample_id = v.sample_id AND e.field_name = $5
 ON CONFLICT (sample_id, field_name) DO UPDATE SET x = EXCLUDED.x, y = EXCLUDED.y
 WHERE (c.x, c.y) IS DISTINCT FROM (EXCLUDED.x, EXCLUDED.y)
+RETURNING c.xmax <> '0'::xid AS moved
+), summary AS (
+    SELECT COALESCE(bool_or(moved), FALSE) AS moved, COALESCE(bool_or(NOT moved), FALSE) AS added FROM written
+)
+-- The count as the statement found it: the insert above isn't visible here.
+SELECT moved OR (added AND COALESCE(
+    (SELECT total_points = 0 FROM embedding_viz_meta WHERE dataset_id = $4 AND field_name = $5),
+    FALSE
+))
+FROM summary
 """
 
 # Projection reads happen before model.transform. Hold a SHARE row lock while

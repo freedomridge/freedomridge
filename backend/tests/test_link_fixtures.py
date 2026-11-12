@@ -16,6 +16,8 @@ from backend.routers.datasets import parse_filter_node
 FIXTURES = json.loads((Path(__file__).resolve().parents[2] / 'frontend' / 'tests' / 'link-fixtures.json').read_text())
 LINKS = [(fixture['name'], [stage['filter'] for stage in fixture['stages']]) for fixture in FIXTURES['f']]
 LINKS += [(fixture['name'], fixture['filters']) for fixture in FIXTURES['q']]
+# The fixtures' declared datetime fields, so their filters compile as a dataset's would: by instant.
+DATETIMES = {name for name, kind in FIXTURES['fields'].items() if kind == 'datetime'}
 
 
 @pytest.mark.parametrize('fixture', FIXTURES['q'], ids=lambda fixture: fixture['name'])
@@ -39,10 +41,12 @@ def test_every_link_filter_still_compiles(name, filters):
             args,
             2,
             dataset_id=1,
-            array_columns=DatasetArrayColumns({'tags'}, label_fields=set()),
+            array_columns=DatasetArrayColumns({'tags'}, label_fields=set(), datetime_fields=DATETIMES),
         )
         # A filter the compiler reads as nothing (TRUE) or as matching nothing (FALSE) has lost its meaning.
         assert sql.strip() not in ('', 'TRUE', 'FALSE'), (name, node)
+        if any(field in json.dumps(node) for field in DATETIMES):
+            assert 'metadata_instant_v1' in sql and "metadata->>'sampled_at' >=" not in sql, (name, node)
 
 
 def test_the_fixtures_cover_every_operator_family_and_chip_kind():

@@ -5,13 +5,11 @@ import { AUTH_STATE, asLargeDataset, expandField, expectTotal } from './helpers'
 test.use({ storageState: AUTH_STATE, viewport: { width: 1600, height: 1100 } });
 
 // #138's refusals reaching the sidebar's streamed filtered values after the stream began: a concept
-// being rescored (the field waits and retries, as every view does) and a lasso drawn on a re-fitted map
-// (the UI drops the lasso). Each answer is the real stream with refusal lines put in place of the
-// fields, as the server writes them when the refusal comes mid-stream.
+// being rescored (the field waits and retries, as every view does). Each answer is the real stream with
+// refusal lines put in place of the fields, as the server writes them when the refusal comes mid-stream.
+// (A lasso drawn on a re-fitted map was refused too until 2.11; it now filters, and its chip warns.)
 const RESCORED = 'Concept "sky" is being rescored; use it again when its scoring job finishes';
 const FIELD = 'e2e_refusal_lasso';
-// Coordinates x = i % 10, y = floor(i / 10): this polygon holds x 0..4, y 0..5 = 30 of the 60 points.
-const POLYGON = [[-0.5, -0.5], [4.5, -0.5], [4.5, 5.5], [-0.5, 5.5]];
 let cookie = '';
 let dsId = 0;
 
@@ -104,19 +102,4 @@ test('fields refused at different moments retry together, in one request', async
     await expect(sidebar.getByTestId('facet-status-level')).toHaveText(/Filtered values/);
     await expect(sidebar.getByText('55 - 60', { exact: true })).toBeVisible();
     expect(requests.slice(recovering)).toEqual([['brightness', 'level']]);
-});
-
-test('a lasso refused mid-stream as drawn on a re-fitted map is dropped, and the view loads again', async ({ page }) => {
-    const refusal = {
-        status: 409, code: 'map_refitted', dataset_id: dsId, field: FIELD, model_id: '00000000-0000-0000-0000-000000000001',
-        detail: `The map of ${FIELD} was re-fitted on 2026-10-21 08:58 UTC after this lasso selection was drawn; draw the selection again on the current map`,
-    };
-    const refused = await refuseFacets(page, refusal, 1);
-    const lasso = { type: 'filter', description: 'Embeddings Region', filter: { field: FIELD, operator: 'embedding_polygon', value: POLYGON, model_id: null } };
-    await openWith(page, lasso, ['brightness', 'level']);
-    // The lasso (accepted up front: no re-fitted map on the server) selects 30 of 60, until the stream refuses it.
-    await expect.poll(() => refused(), { timeout: 20_000 }).toBe(1);
-    await expect(page.getByText(`The map of ${FIELD} was re-fitted`)).toBeVisible();
-    await expect(page.getByTestId('query-stage-chip')).toHaveCount(0);
-    await expectTotal(page, 60);
 });

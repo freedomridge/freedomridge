@@ -270,8 +270,7 @@ async def _restore_field_registry(conn, dataset_id: int, version):
                    CASE WHEN count(DISTINCT jsonb_typeof(value)) FILTER (WHERE value <> 'null'::jsonb) > 1
                             THEN 'string'
                         WHEN bool_and(jsonb_typeof(value) = 'string'
-                            AND value #>> '{}' ~ '^\\d{4}-\\d{2}-\\d{2}([T ]|$)'
-                            AND pg_input_is_valid(value #>> '{}', 'timestamp with time zone'))
+                            AND metadata_instant_v1(value #>> '{}') IS NOT NULL)
                             FILTER (WHERE value <> 'null'::jsonb) THEN 'datetime'
                         ELSE field_type_canonical(min(jsonb_typeof(value)) FILTER (WHERE value <> 'null'::jsonb)) END,
                    'metadata'
@@ -1022,7 +1021,8 @@ async def get_version_samples(
 
 
 # Samples-endpoint operators that read live tables (duplicates, concept scores, parent/object links) a
-# version does not snapshot. Refused rather than answered from today's data.
+# version does not snapshot. Refused rather than answered from today's data. unlinked_object asks whether an object
+# has an image now: against a version's rows it would ask something else.
 _LIVE_ONLY_FILTER_OPS = frozenset(
     {
         'collapse_duplicates',
@@ -1032,6 +1032,7 @@ _LIVE_ONLY_FILTER_OPS = frozenset(
         'cg_self',
         'parent_matches',
         'has_matching_object',
+        'unlinked_object',
     },
 )
 _VERSION_COLUMN_FIELDS = ('filepath', 'media_type', 'tags', 'created_at', 'last_modified_at')
@@ -1080,14 +1081,17 @@ async def _version_columns(id: int, version: dict) -> DatasetArrayColumns:
     (no ``field_registry_version``) kept no reliable field list and reads with the live one, as before.
     """
     live = await get_dataset_array_columns(id)
+    columns = copy.copy(live)
+    # A version's rows are read from a CTE, which no index serves: its datetimes take the unindexed form.
+    columns.promoted_datetime = set()
     snapshot = version.get('dataset_snapshot') or {}
     if snapshot.get('field_registry_version') != 1:
-        return live
+        return columns
     fields = snapshot.get('fields') or []
-    columns = copy.copy(live)
     columns.label_fields = set(LEGACY_LABEL_FIELDS)
     columns.registered = {field['field_name'] for field in fields}
     columns.list_fields = {field['field_name'] for field in fields if field.get('field_type') == 'list'}
+    columns.datetime_fields = {field['field_name'] for field in fields if field.get('field_type') == 'datetime'}
     return columns
 
 
@@ -1686,6 +1690,18 @@ async def _restore_version(
 
             removed = 0
             if exact_membership:
+                # The samples added since go, and an image's objects with it (0030): those are newer too, and counted.
+                # An object the version has whose image it doesn't (written before its image) stays: it loses that
+                # image first, as a mirror's object does, and the restore below writes its metadata back.
+                await conn.execute(
+                    """UPDATE samples c SET metadata = jsonb_set(c.metadata, '{parent_id}', 'null')
+                       WHERE c.dataset_id = $2 AND c.parent_id IS NOT NULL
+                         AND EXISTS (SELECT 1 FROM version_snapshots v WHERE v.version_id = $1 AND v.sample_id = c.id)
+                         AND NOT EXISTS (SELECT 1 FROM version_snapshots v
+                                         WHERE v.version_id = $1 AND v.sample_id = c.parent_id)""",
+                    version_id,
+                    id,
+                )
                 delete_status = await conn.execute(
                     """DELETE FROM samples s WHERE s.dataset_id = $2
                        AND NOT EXISTS (SELECT 1 FROM version_snapshots v
@@ -1800,6 +1816,10 @@ async def _restore_version(
                     timeout=600,
                 )
                 restored = int(insert_status.split()[-1]) if insert_status else 0
+                if restored:
+                    # The triggers link an object and its image written in either order; this relinks the whole
+                    # dataset as a safety net, for a restored row whose column is stale (0029).
+                    await conn.execute('SELECT link_object_parents($1)', id)
             definitions_query = (
                 'SELECT field_name, field_type, display_type, origin FROM dataset_fields WHERE dataset_id = $1'
             )

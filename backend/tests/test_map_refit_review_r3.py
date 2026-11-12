@@ -7,7 +7,6 @@ import os
 import uuid
 from pathlib import Path
 
-import asyncpg
 import pytest
 from fridge import map_fit
 from fridge.core import dataset as sdk_dataset
@@ -25,16 +24,16 @@ BACKEND = Path(__file__).resolve().parents[1]
 needs_postgres = pytest.mark.skipif(not os.getenv('FRIDGE_TEST_POSTGRES_DSN'), reason='Disposable PostgreSQL required')
 
 
-# --- every samples-path variant refuses a stale lasso with the 409, never a 500 -----------------
+# --- every samples-path variant filters by a lasso drawn before a re-fit, as by a current one -----
 
 
 @needs_postgres
-def test_page_only_keyset_and_slim_grid_queries_refuse_a_stale_lasso(registry_database, monkeypatch):
+def test_page_only_keyset_and_slim_grid_queries_filter_by_a_lasso_drawn_before_a_re_fit(registry_database, monkeypatch):
     async def scenario(database):
         monkeypatch.setattr(datasets, 'db', database)
         await seed(database, n=40)
         model = await managed_map(database)
-        current, stale = lasso(model), lasso(uuid.uuid4())
+        current, drawn_before = lasso(model), lasso(uuid.uuid4())
         variants: dict[str, dict] = {
             'page only': {'skip_count': True},
             'keyset page': {'skip_count': True, 'after_id': 0},
@@ -43,12 +42,14 @@ def test_page_only_keyset_and_slim_grid_queries_refuse_a_stale_lasso(registry_da
         }
         for name, options in variants.items():
             page = await datasets.list_samples_post(1, datasets.SamplesRequest(limit=5, filters=current, **options))
-            assert page['items'], name
-            with pytest.raises(asyncpg.ObjectNotInPrerequisiteStateError, match='re-fitted'):
-                await datasets.list_samples_post(1, datasets.SamplesRequest(limit=5, filters=stale, **options))
-        with pytest.raises(asyncpg.ObjectNotInPrerequisiteStateError, match='re-fitted'):
-            no_query = Request({'type': 'http', 'query_string': b'', 'headers': []})
-            await datasets.list_samples(1, no_query, limit=5, offset=0, filters=json.dumps(stale))
+            again = await datasets.list_samples_post(
+                1,
+                datasets.SamplesRequest(limit=5, filters=drawn_before, **options),
+            )
+            assert page['items'] and again['items'] == page['items'], name
+        no_query = Request({'type': 'http', 'query_string': b'', 'headers': []})
+        page = await datasets.list_samples(1, no_query, limit=5, offset=0, filters=json.dumps(drawn_before))
+        assert page['items']
 
     registry_database(scenario)
 
@@ -186,8 +187,8 @@ async def unscoped(f, args):
 
 
 def test_every_dataset_scoped_filter_compile_passes_its_dataset():
-    """Without a dataset the lasso's map check is correlated: one plpgsql call per matching sample and no
-    parallel plan (an 88% lasso over 1M samples went from 0.88 to 3.16 s)."""
+    """Cross-grain subqueries are scoped by the dataset (cg_self, parent_matches, has_matching_object): without one
+    they scan every dataset's partners. (Until 2.11 a lasso's map check also needed it, to be one InitPlan.)"""
     # _scatter_rejections (and its nested visit) compiles only tags / media_type leaves, never a lasso.
     exempt = {('routers/embeddings.py', '_scatter_rejections'), ('routers/embeddings.py', 'visit')}
     missing = set()
@@ -196,12 +197,3 @@ def test_every_dataset_scoped_filter_compile_passes_its_dataset():
             relative = str(path.relative_to(BACKEND))
             missing |= {hit for hit in dataset_less_compiles(path.read_text(), relative) if hit[:2] not in exempt}
     assert missing == set()
-
-
-# --- a malformed lasso field is the compiler's 400, not a 500 from the up-front check -----------
-
-
-def test_the_up_front_check_skips_a_malformed_lasso_field():
-    malformed = {'logic': 'AND', 'filters': [{'field': 5, 'operator': 'embedding_polygon', 'value': [[0, 0], [1, 1]]}]}
-    assert datasets._lasso_maps(malformed) == set()
-    asyncio.run(datasets.require_current_lassos(1, malformed))  # no query: the compiler answers 400 later

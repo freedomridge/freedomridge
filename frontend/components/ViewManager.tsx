@@ -1,10 +1,11 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { View, ViewStage, ComplexFilter, DatasetMirror, getDatasetViews, createView, deleteView, updateDataset } from '../lib/api';
+import { ApiError, View, ViewStage, ComplexFilter, DatasetMirror, getDatasetViews, getView, createView, deleteView, updateDataset, updateView } from '../lib/api';
 import { primaryHost } from './mirror-badge';
 import { useUser } from '@/contexts/UserContext';
 import { useToast } from '@/contexts/ToastContext';
 import { filterHasInSelection } from '@/lib/filter-query';
 import { copyLink, viewLink } from '@/lib/links';
+import { type SourceView, mayUpdateView, sameStages, stagesToSave } from '@/lib/source-view';
 import { ShareViewModal } from './ShareViewModal';
 import { Share1Icon, TrashIcon, EyeOpenIcon, LockClosedIcon, GlobeIcon, PersonIcon, StarIcon, StarFilledIcon, Link2Icon } from '@radix-ui/react-icons';
 
@@ -18,10 +19,15 @@ interface ViewManagerProps {
     onDefaultViewChanged?: () => void;
     // Set on a mirror of a dataset on a primary instance (docs/FOLLOWERS.md).
     mirror?: DatasetMirror | null;
+    // The saved view the applied filters came from (lib/source-view.ts): while they differ, its owner or an admin can
+    // update it with them ("Update this view"). onViewSaved gets a view saved or updated here: the filters' source now.
+    sourceView?: SourceView | null;
+    onViewSaved?: (view: View) => void;
 }
 
 export default function ViewManager({
     datasetId, currentFilters, currentViewStages, onLoadView, defaultViewId = null, onDefaultViewChanged, mirror = null,
+    sourceView = null, onViewSaved,
 }: ViewManagerProps) {
     const { user } = useUser();
     const { addToast } = useToast();
@@ -33,6 +39,9 @@ export default function ViewManager({
     const [sharingView, setSharingView] = useState<View | null>(null);
     const [filterType, setFilterType] = useState<'all' | 'mine' | 'shared' | 'public'>('all');
     const [defaultError, setDefaultError] = useState<string | null>(null);
+    // An update refused because the view's filters changed since it was opened (409 view_changed), for that opening.
+    const [changed, setChanged] = useState<{ id: number; updatedAt: string | null; message: string } | null>(null);
+    const nameInputRef = useRef<HTMLInputElement>(null);
 
     // Ref for detecting outside clicks
     const containerRef = useRef<HTMLDivElement>(null);
@@ -87,7 +96,7 @@ export default function ViewManager({
         if (!newViewName || !user || !canSave) return;
         setLoading(true);
         try {
-            await createView(datasetId, {
+            const view = await createView(datasetId, {
                 name: newViewName,
                 content: {
                     // The compiled filters are the AND of the stages (FilterContext.globalFilters);
@@ -97,6 +106,7 @@ export default function ViewManager({
                 }
             });
             setNewViewName('');
+            onViewSaved?.(view);
             await loadViews();
         } catch {
             alert('Failed to save view');
@@ -104,6 +114,47 @@ export default function ViewManager({
             setLoading(false);
         }
     }
+
+    // Changed since the view was opened, and whether this viewer may replace its filters with the applied ones.
+    const sourceDiffers = !!sourceView && !sameStages(sourceView.stages, stages);
+    const mayUpdate = mayUpdateView(sourceView, user);
+
+    async function handleUpdateView() {
+        if (!sourceView || !mayUpdate || !canSave) return;
+        if (!confirm(`Replace the filters of the view “${sourceView.name}” with the ones applied now? Its name, link and sharing stay.`)) return;
+        setLoading(true);
+        try {
+            // As Save View writes them, without a temporary selection.
+            const view = await updateView(datasetId, sourceView.id, {
+                filters: { logic: 'AND', filters: savedStages.map(s => s.filter) },
+                viewStages: stagesToSave(savedStages),
+            }, sourceView.updatedAt ?? null);
+            onViewSaved?.(view);
+            addToast(`Updated the view “${view.name}”`, 'success');
+            await loadViews();
+        } catch (e) {
+            // Someone changed its filters since it was opened: nothing is written over them.
+            if (e instanceof ApiError && e.code === 'view_changed') {
+                setChanged({ id: sourceView.id, updatedAt: sourceView.updatedAt ?? null, message: e.message });
+            } else {
+                alert(e instanceof Error ? e.message : 'Failed to update view');
+            }
+        } finally {
+            setLoading(false);
+        }
+    }
+
+    // The view as it is now, in place of the applied filters (which can first be saved as a new view instead).
+    async function handleReopenView() {
+        if (!sourceView) return;
+        try {
+            onLoadView(await getView(sourceView.slug));
+        } catch (e) {
+            alert(e instanceof Error ? e.message : 'Failed to open the view');
+        }
+    }
+    const changedSinceOpened = !!changed && !!sourceView && changed.id === sourceView.id
+        && changed.updatedAt === (sourceView.updatedAt ?? null);
 
     async function handleDeleteView(id: number) {
         if (!confirm('Are you sure?')) return;
@@ -172,11 +223,58 @@ export default function ViewManager({
                         </p>
                     )}
 
+                    {sourceView && sourceDiffers && (
+                        <div data-testid="view-source" className="p-3 bg-zinc-800/50 rounded border border-zinc-800 text-xs text-zinc-300">
+                            {changedSinceOpened ? (
+                                <div data-testid="view-update-conflict" role="alert" className="flex flex-col gap-2">
+                                    <p className="text-amber-300">“{sourceView.name}”: {changed.message}</p>
+                                    <div className="flex gap-2">
+                                        <button
+                                            data-testid="view-reopen"
+                                            onClick={handleReopenView}
+                                            className="px-3 py-1.5 bg-zinc-700 text-white rounded text-xs font-medium hover:bg-zinc-600 transition-colors"
+                                        >
+                                            Open it again
+                                        </button>
+                                        <button
+                                            data-testid="view-save-as-new"
+                                            onClick={() => nameInputRef.current?.focus()}
+                                            className="px-3 py-1.5 bg-zinc-700 text-white rounded text-xs font-medium hover:bg-zinc-600 transition-colors"
+                                        >
+                                            Save as a new view
+                                        </button>
+                                    </div>
+                                </div>
+                            ) : mayUpdate ? (
+                                <div className="flex items-center gap-2">
+                                    <p className="flex-1 min-w-0">
+                                        The filters differ from the view <span className="font-medium text-white">“{sourceView.name}”</span> they came from.
+                                    </p>
+                                    <button
+                                        data-testid="view-update"
+                                        onClick={handleUpdateView}
+                                        disabled={loading || !canSave}
+                                        className="px-3 py-2 bg-amber-600 text-white rounded text-sm font-medium disabled:opacity-50 hover:bg-amber-500 transition-colors whitespace-nowrap"
+                                    >
+                                        Update this view
+                                    </button>
+                                </div>
+                            ) : (
+                                <p data-testid="view-source-read-only">
+                                    The filters differ from the view “{sourceView.name}” they came from, which{' '}
+                                    {sourceView.fromPrimary && mirror ? `changes on ${primaryHost(mirror)}` : "isn't yours to change"}:
+                                    save them as a new view below.
+                                </p>
+                            )}
+                        </div>
+                    )}
+
                     {/* Save New View - Improved Layout */}
                     <div className="p-3 bg-zinc-800/50 rounded border border-zinc-800">
                         <h4 className="text-xs font-semibold uppercase text-zinc-500 mb-2">Save Current View</h4>
                         <div className="flex gap-2">
                             <input
+                                ref={nameInputRef}
                                 type="text"
                                 value={newViewName}
                                 onChange={e => setNewViewName(e.target.value)}

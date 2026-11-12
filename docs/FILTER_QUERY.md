@@ -36,7 +36,8 @@ A query is an AND of parts. In the SDK and the API, each top-level `AND` part be
 ## Fields
 
 - A field is named as the dataset names it: `split`, `score`, `detections.label`.
-- The fields every dataset has are `id`, `filepath`, `media_type`, `created_at` and `tags`.
+- The fields every dataset has are `id`, `filepath`, `media_type`, `created_at`, `last_modified_at` (when a sample
+  last changed) and `tags`.
 - On a mirror, its own fields are named `@local.<name>` and written as they are: `@local.weeds > 3`,
   `@local.tags in ("checked")` ([FOLLOWERS.md](FOLLOWERS.md#fields-of-its-own)).
 - A name that isn't a plain word, or that is one of the language's keywords, goes in backticks: `` `weather station` = "A" `` or `` `in` = 1 ``.
@@ -61,6 +62,15 @@ Logic: `AND`, `OR` and `NOT`, with brackets. Keywords aren't case sensitive.
 - **Text:** `"double"` or `'single'` quotes, with `\"`, `\\`, `\n` and `\t` escapes. A plain word needs no quotes: `split = train`. `and`, `or`, `not`, `in`, `contains`, `exists`, `is`, `null`, `between` and `like` always need quotes.
 - **Numbers:** `12`, `-1.5`, `1e3`.
 - **Dates:** ISO text, quoted or not: `created_at >= 2026-01-01T00:00:00Z`. Text that isn't an ISO date and time is an error.
+  On `created_at`, `last_modified_at` and any field declared `datetime`, dates compare as moments: `2026-01-01T10:00:00+02:00` is the same
+  moment as `2026-01-01T08:00:00Z`, and a date or time written without an offset is UTC. A value written to the day,
+  minute or second means that whole unit: `captured_at = 2026-01-01` is the whole UTC day, `captured_at <=
+  2026-01-01T10:00` ends where 10:01 UTC starts, and `captured_at > 2026-01-01` starts on 2 January UTC; `in` and
+  `not in` take each value's unit too, and a value written with a fraction of a second is that exact moment. One rule
+  for every datetime, `created_at` and `last_modified_at` included. A sample
+  whose value isn't a date and time never matches a range, and `!=` and `not in` include it. To filter by the
+  clock time where a picture was taken, store that time as its own field without an offset (see
+  [Dataset management](DATASET_MANAGEMENT.md#dates-and-times)).
 - **Booleans:** `true` and `false`.
 - **Lists:** brackets, `(...)` or `[...]`, with commas, spaces or newlines between values. A column of serial numbers pasted between `(` and `)` works as it is, and so does a JSON list.
 

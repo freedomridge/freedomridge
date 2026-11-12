@@ -81,7 +81,15 @@ def test_a_public_view_of_the_dataset_becomes_its_default_and_the_dataset_return
         assert (await _set_default(TRAINING, clean))['default_view_id'] == clean
         got = await datasets.get_dataset(TRAINING, REQUEST)
         assert got['default_view_id'] == clean
-        assert got['default_view'] == {'id': clean, 'name': 'clean', 'slug': 'slug-clean', 'content': CONTENT}
+        assert got['default_view'] == {
+            'id': clean,
+            'name': 'clean',
+            'slug': 'slug-clean',
+            'content': CONTENT,
+            'user_id': None,  # who may update it (with an admin): its owner
+            'updated_at': await database_.fetchval('SELECT updated_at FROM views WHERE id = $1', clean),
+            'from_primary': False,
+        }
         # Changing another setting keeps it; null removes it.
         renamed = await datasets.update_dataset(TRAINING, datasets.DatasetUpdate(description='x'), USER)
         assert renamed['default_view_id'] == clean

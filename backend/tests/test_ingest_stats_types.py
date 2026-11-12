@@ -33,7 +33,7 @@ def test_datetime_type_preserved_and_bounds_extended():
     batch = _batch({'2025-12-25T00:00:00', '2026-07-06T20:17:00'})
     field_type, _, _, uniques = _merge_batch_field_stats(batch, current)
     assert field_type == 'datetime'
-    assert uniques == ['2025-12-25T00:00:00', '2026-07-06T20:17:00']
+    assert uniques == ['2025-12-25T00:00:00.000000Z', '2026-07-06T20:17:00.000000Z']
 
 
 def test_datetime_bounds_stay_two_elements_on_large_batch():
@@ -43,7 +43,7 @@ def test_datetime_bounds_stay_two_elements_on_large_batch():
     batch = _batch({f'2026-03-01T00:00:{s:02d}.{ms:03d}' for s in range(60) for ms in range(3)})
     field_type, _, _, uniques = _merge_batch_field_stats(batch, current)
     assert field_type == 'datetime'
-    assert uniques == ['2026-01-01T00:00:00', '2026-03-01T00:00:59.002']
+    assert uniques == ['2026-01-01T00:00:00.000000Z', '2026-03-01T00:00:59.002000Z']
 
 
 def test_datetime_survives_previously_wiped_bounds():
@@ -53,7 +53,15 @@ def test_datetime_survives_previously_wiped_bounds():
     batch = _batch({'2026-05-01T00:00:00', '2026-05-02T00:00:00'})
     field_type, _, _, uniques = _merge_batch_field_stats(batch, current)
     assert field_type == 'datetime'
-    assert uniques == ['2026-05-01T00:00:00', '2026-05-02T00:00:00']
+    assert uniques == ['2026-05-01T00:00:00.000000Z', '2026-05-02T00:00:00.000000Z']
+
+
+def test_datetime_bounds_are_the_earliest_and_latest_instants():
+    # Text order isn't time order with offsets: 10:00+02:00 is 08:00 UTC, before 09:00Z. Junk has no say.
+    current = _row('datetime', unique_values=['2026-01-01T09:00:00Z', '2026-01-01T09:30:00Z'])
+    batch = _batch({'2026-01-01T10:00:00+02:00', 'unknown', '2026-02-30', '2026-01-01T05:00:00-05:00'})
+    _, _, _, uniques = _merge_batch_field_stats(batch, current)
+    assert uniques == ['2026-01-01T08:00:00.000000Z', '2026-01-01T10:00:00.000000Z']
 
 
 def test_enum_type_preserved_with_merged_values():
@@ -98,7 +106,7 @@ def test_new_field_all_iso_values_is_datetime_at_first_sight():
     batch['type'] = infer_fields({'field': value} for value in batch['unique_values'])['field']
     field_type, _, _, uniques = _merge_batch_field_stats(batch, None)
     assert field_type == 'datetime'
-    assert uniques == ['2025-01-01T00:00:00', '2026-07-09T08:00:00']
+    assert uniques == ['2025-01-01T00:00:00.000000Z', '2026-07-09T08:00:00.000000Z']
 
 
 def test_new_field_date_only_values_are_datetime():
@@ -124,7 +132,7 @@ def test_existing_string_row_is_not_promoted_by_ingest():
 def test_sdk_serializes_datetime_objects_to_iso():
     # Ergonomics: metadata={"captured_at": datetime.now()} must not crash
     # at request time — it serializes to ISO strings, which first-sight detection then
-    # types as 'datetime' on ingest.
+    # types as 'datetime' on ingest. A naive datetime gets the machine's offset.
     import json
     from datetime import date, datetime
 
@@ -135,6 +143,6 @@ def test_sdk_serializes_datetime_objects_to_iso():
         metadata={'captured_at': datetime(2026, 7, 9, 8, 0), 'day': date(2026, 7, 9), 'nested': [datetime(2026, 1, 1)]},
     )
     meta = json.loads(json.dumps(s.to_dict()))['metadata']
-    assert meta['captured_at'] == '2026-07-09T08:00:00'
+    assert meta['captured_at'] == datetime(2026, 7, 9, 8, 0).astimezone().isoformat()
     assert meta['day'] == '2026-07-09'
-    assert meta['nested'] == ['2026-01-01T00:00:00']
+    assert meta['nested'] == [datetime(2026, 1, 1).astimezone().isoformat()]

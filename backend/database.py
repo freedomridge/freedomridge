@@ -60,6 +60,10 @@ class Database:
             max_size=max_size,
             command_timeout=600,  # Timeout for queries (seconds)
             init=init_connection,  # Initialize JSONB codec on each connection
+            # No `reset=`: asyncpg's default reset (RequestConnection keeps get_reset_query) runs
+            # pg_advisory_unlock_all() when a connection goes back. Requests holding session advisory locks rely on
+            # it if they die before their own unlock: the index operations' (routers.datasets._field_index_operation)
+            # and add_array_column's claim lock for index builds, which would otherwise stop every build being claimed.
             connection_class=RequestConnection,
             server_settings={'application_name': application_name(), **PLANNING},
         )

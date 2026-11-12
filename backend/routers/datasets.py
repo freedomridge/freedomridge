@@ -22,6 +22,15 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field, TypeAdapter, ValidationError, field_validator
 
+from backend.datetimes import (
+    UTC_TEXT_SQL,
+    instant_expr,
+    instant_sql,
+    literal_window,
+    parse_instant,
+    utc_text,
+    window_sql,
+)
 from backend.field_registry import (
     LOCAL_PREFIX,
     REQUEST_FULL_REFRESH,
@@ -47,7 +56,17 @@ from backend.label_fields import (
 from backend.local_fields import LOCAL_TAGS, local_field
 from backend.sample_ingest import insert_samples
 
-from .. import class_rules, dataset_deletion, field_usage, job_queue, job_wait, local_writes, statistics
+from .. import (
+    class_rules,
+    dataset_deletion,
+    field_usage,
+    job_queue,
+    job_wait,
+    local_writes,
+    stale_lassos,
+    statistics,
+    unlinked_objects,
+)
 from ..access import check_dataset_access, filter_datasets_for_user, require_dataset_access
 from ..database import db
 from ..diskspace import INGEST_ROW_BYTES, require_free_space
@@ -55,7 +74,7 @@ from ..models import Dataset, Sample
 from ..request_limits import guest_heavy
 from ..security import private_guest, production
 from ..validation import clean_name, clean_tags
-from .auth import get_current_user, get_optional_user, require_role
+from .auth import get_allowed_roles, get_current_user, get_optional_user, require_role
 from .embeddings import _validate_field_name as is_embedding_field_name
 from .embeddings import validate_embedding_dims
 from .views import _decode_content as _decode_view_content
@@ -82,6 +101,8 @@ _RESERVED_COLUMNS = frozenset(
         # A mirror's own fields (0022): never an array field, so the sync never writes them.
         'local_metadata',
         'local_tags',
+        # An object's image (0029), derived from metadata.parent_id.
+        'parent_id',
     ],
 )
 _SAFE_COLUMN_RE = re.compile(r'^[a-z][a-z0-9_]{0,62}$')
@@ -344,7 +365,19 @@ async def get_dataset(id: int, request: Request):
         **_parse_dataset_row(row),
         'sidebar_expand_all': await _sidebar_expands_all(id),
         'default_view': await _default_view(row['default_view_id']),
+        'map_layouts': await _map_layouts(id),
     }
+
+
+async def _map_layouts(dataset_id: int) -> Dict[str, str]:
+    """Each embeddings map's current layout id (embedding_layouts), by map: a whole-image field, or a patch scale. A
+    map not listed has not been laid out again since the upgrade that added layout ids: its layout id is null, and a
+    lasso saved without one was drawn on that layout, so it is stale only once the map is listed here with an id."""
+    rows = await db.fetch(
+        'SELECT field_name, layout_id::text FROM embedding_layouts WHERE dataset_id = $1 AND layout_id IS NOT NULL',
+        dataset_id,
+    )
+    return {row['field_name']: row['layout_id'] for row in rows}
 
 
 async def _default_view(view_id: Optional[int]) -> Optional[Dict[str, Any]]:
@@ -352,7 +385,14 @@ async def _default_view(view_id: Optional[int]) -> Optional[Dict[str, Any]]:
     so everyone who can open the dataset may read it."""
     if view_id is None:
         return None
-    row = await db.fetchrow("SELECT id, name, slug, content FROM views WHERE id = $1", view_id)
+    # Its owner and whether it is a mirror's copy of the primary's: the app offers "Update this view" to who may. When
+    # it was last updated: the app takes its new filters (Clear All goes back to them).
+    row = await db.fetchrow(
+        """SELECT id, name, slug, content, user_id, updated_at,
+                  EXISTS (SELECT 1 FROM mirror_views m WHERE m.view_id = views.id) AS from_primary
+           FROM views WHERE id = $1""",
+        view_id,
+    )
     return None if row is None else {**dict(row), 'content': _decode_view_content(row['content'])}
 
 
@@ -726,7 +766,6 @@ async def _check_facet_request(id: int, filter_obj: Optional[Dict[str, Any]]) ->
         )
         # Before a stream starts, so the request can still answer 409 (as the impl checks for itself).
         await require_ready_concepts(filter_obj)
-        await require_current_lassos(id, filter_obj)
 
 
 async def _stream_field_facets(
@@ -1242,23 +1281,9 @@ def _facet_failure(error: BaseException, what: str) -> Dict[str, str]:
 
 
 def _refusal(error: asyncpg.ObjectNotInPrerequisiteStateError) -> Dict[str, Any]:
-    """The 409 body of a refusal (SQLSTATE 55000: a concept being rescored, a lasso drawn on a previous
-    map, a dataset being deleted), as the app's handler answers it and as a facet stream answers it for
-    the fields it had not answered yet. require_current_map names the stale lasso's field and the map's
-    current model, so the UI can drop that lasso."""
-    body: Dict[str, Any] = {'detail': str(error).splitlines()[0]}
-    try:
-        extra = json.loads(getattr(error, 'detail', None) or 'null')
-    except ValueError:
-        extra = None
-    if isinstance(extra, dict) and extra.get('code') == 'map_refitted':
-        body.update(
-            code='map_refitted',
-            dataset_id=extra.get('dataset_id'),
-            field=extra.get('field'),
-            model_id=extra.get('model_id'),
-        )
-    return body
+    """The 409 body of a refusal (SQLSTATE 55000: a concept being rescored, a dataset being deleted), as the app's
+    handler answers it and as a facet stream answers it for the fields it had not answered yet."""
+    return {'detail': str(error).splitlines()[0]}
 
 
 def _finite_bounds(entry: Dict[str, Any]) -> Dict[str, Any]:
@@ -1281,7 +1306,7 @@ async def _facet_query(coro, budget_s: Optional[float]) -> tuple[str, Any]:
     except asyncio.TimeoutError:
         return 'out_of_budget', None
     except asyncpg.ObjectNotInPrerequisiteStateError:
-        raise  # a refusal (a concept being rescored, a lasso on a re-fitted map): the request's 409
+        raise  # a refusal (a concept being rescored): the request's 409
     except asyncpg.PostgresError:
         return 'cached', None
 
@@ -1527,8 +1552,6 @@ async def _get_dataset_field_stats_impl(
     # Filtered sidebar values fall back to cached ones when a sub-query fails; a concept whose
     # scores are being rebuilt must refuse (409) instead of quietly showing unfiltered values.
     await require_ready_concepts(filter_obj)
-    if filter_obj:
-        await require_current_lassos(id, filter_obj)
 
     # Best-effort timeout per filter sub-query in lightning_mode; off in
     # non-lightning mode where the user has explicitly opted into waiting
@@ -1621,6 +1644,7 @@ async def _get_dataset_field_stats_impl(
         {"name": "id", "type": "number"},
         {"name": "filepath", "type": "filepath"},
         created_at_field,
+        await _last_modified_field(id, lightning_mode),
     ]
 
     # Helper to find stat in cached list
@@ -2107,6 +2131,11 @@ async def _get_dataset_field_stats_impl(
     dataset_media_fields = (
         set(dataset_row['media_fields']) if dataset_row and dataset_row['media_fields'] else {'filepath'}
     )
+    # Fields whose index is being rebuilt in the background (index_jobs.queue_rebuilds): not indexed until it is.
+    from ..index_jobs import rebuild_waiting, rebuilding_fields
+
+    rebuilding = set(await rebuilding_fields(db, id))
+    waiting = await rebuild_waiting(db, id, rebuilding) if rebuilding else {}
 
     # Prepare lists for parallel processing
     number_fields_to_filter: List[tuple[str, Any]] = []
@@ -2180,10 +2209,11 @@ async def _get_dataset_field_stats_impl(
     async def filter_datetime_field(field_name, stat):
         if not _queryable_field(field_name):
             return (field_name, 'datetime', 'cached', None, stat)
-        text = _field_text_sql(field_name)
+        # The earliest and latest instants (an indexed field's index answers), as the statistics write them.
+        instant = instant_expr(_field_text_sql(field_name), bool(stat.get('is_promoted')))
         args = [id]
         arg_idx = 2
-        conditions = ["dataset_id = $1", f"{text} IS NOT NULL"]
+        conditions = ["dataset_id = $1", f"{instant} IS NOT NULL"]
         if filter_obj:
             sql, arg_idx = parse_filter_node(
                 filter_obj,
@@ -2196,11 +2226,12 @@ async def _get_dataset_field_stats_impl(
             if sql and sql != "TRUE":
                 conditions.append(sql)
         where = " AND ".join(conditions)
+        earliest, latest = UTC_TEXT_SQL.format(f'MIN({instant})'), UTC_TEXT_SQL.format(f'MAX({instant})')
         with field_usage.measure(id, {'facet': [field_name]}):
             state, row = await _facet_query(
                 db.fetchrow(
                     f"""
-                SELECT MIN({text}) as min_val, MAX({text}) as max_val
+                SELECT {earliest} as min_val, {latest} as max_val
                 FROM samples WHERE {where}
             """,
                     *args,
@@ -2335,6 +2366,15 @@ async def _get_dataset_field_stats_impl(
 
         if not _queryable_field(stat['field_name']):
             field_schema['filterable'] = False  # no query can name it: never pending, never asked for
+        # parent_id names each object's image: in the schema (the stage editor, the query editor, the SDK), not in the
+        # sidebar, so nothing is computed for it there; a facet request that names it still gets it.
+        hidden = stat['field_name'] in SIDEBAR_HIDDEN_FIELDS and not facet_request
+        if hidden:
+            field_schema['sidebar'] = False
+        if stat['field_name'] in rebuilding:
+            field_schema['index_rebuilding'] = True
+            if stat['field_name'] in waiting:  # not started yet: say what for
+                field_schema['index_rebuild_waiting'] = waiting[stat['field_name']]
 
         # null_count: samples with no value for this field — drives the "(no value)"
         # filter option, shown only for PARTIAL fields (some present, some missing).
@@ -2354,11 +2394,14 @@ async def _get_dataset_field_stats_impl(
         )
         if kind in ('enum', 'datetime'):
             field_schema['type'] = kind
-        if kind is not None:
+        if kind is not None and hidden:
+            await fill_cached(field_schema, stat, kind)
+            field_schema['provenance'] = 'cached'
+        elif kind is not None:
             facet_entries.append((field_schema, promoted, 1 if kind == 'enum' else 0))
         if kind is not None and facet_request:
             facet_jobs.append((field_schema, partial(stat_facet_job, stat, field_schema, kind)))
-        elif kind is not None:
+        elif kind is not None and not hidden:
             # See _field_stats_filter_decision: MIN/MAX filters on a small set (any field) or an indexed
             # field (even broad); DISTINCT only on a small set (the broad fan-out is the freeze the cap
             # prevents). A lightning sidebar request computes neither: its fields are labelled below.
@@ -2608,10 +2651,15 @@ class CreateArrayFieldRequest(BaseModel):
     field_name: str
 
 
+_INDEX_BUILD_RUNNING = 'An index build is running; try again when it finishes (Background jobs shows it)'
+
+
 async def add_array_column(pool, dataset_id: int, name: str) -> None:
     """The physical TEXT[] column and GIN index of an array field, shared by every dataset (a follower's sync adds
     the primary's this way, from the job runner's pool). ``name`` must already be checked against _SAFE_COLUMN_RE
     and _RESERVED_COLUMNS."""
+    from ..index_jobs import INDEX_BUILD
+
     async with pool.acquire() as conn, _field_index_operation(conn, dataset_id, index_ddl=True):
         # Bounded: ACCESS EXCLUSIVE queued behind a long reader would stall every samples read and
         # write queued behind it (ingest included) until the request timed out. Busy: 409, retry.
@@ -2624,19 +2672,36 @@ async def add_array_column(pool, dataset_id: int, name: str) -> None:
         )
         if taken is not None and taken != 'text[]':
             raise HTTPException(status_code=400, detail=f"'{name}' is a reserved column name")
+        # Not during an index build (index_jobs.INDEX_BUILD): a GIN build waits for the snapshot of a concurrent
+        # build of an expression or partial index (a field's, a vector index), so this request would wait out an
+        # hours-long vector build. The queue's own claim lock for that resource, held until the GIN index is built,
+        # keeps a build from starting meanwhile (one queued waits for this, unstarted). Refused: 409 with Retry-After,
+        # which the SDK retries for a while, as for a busy table.
+        # A session lock on a pooled connection: released in the `finally` below, and, should this request die
+        # before that runs, by the pool's reset when the connection goes back (asyncpg's default reset runs
+        # pg_advisory_unlock_all(); see database.Database.connect). Without either, no index build would ever be
+        # claimed again.
+        claims = (job_queue.EXCLUSIVE_LOCK, INDEX_BUILD)
+        if not await conn.fetchval('SELECT pg_try_advisory_lock($1, hashtext($2))', *claims):
+            raise HTTPException(status_code=409, detail=_INDEX_BUILD_RUNNING, headers={'Retry-After': '30'})
         try:
-            async with conn.transaction():
-                await conn.execute("SET LOCAL lock_timeout = '2s'")
-                await conn.execute(f"ALTER TABLE samples ADD COLUMN IF NOT EXISTS {name} TEXT[] DEFAULT '{{}}'")
-        except asyncpg.LockNotAvailableError:
-            raise HTTPException(
-                status_code=409,
-                detail='The samples table is busy (a long read or an index build); retry shortly',
-                headers={'Retry-After': '5'},
-            ) from None
-        await conn.execute(
-            f"CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_samples_{name}_gin ON samples USING gin ({name})",
-        )
+            if await job_queue.exclusive_owned(conn, INDEX_BUILD):
+                raise HTTPException(status_code=409, detail=_INDEX_BUILD_RUNNING, headers={'Retry-After': '30'})
+            try:
+                async with conn.transaction():
+                    await conn.execute("SET LOCAL lock_timeout = '2s'")
+                    await conn.execute(f"ALTER TABLE samples ADD COLUMN IF NOT EXISTS {name} TEXT[] DEFAULT '{{}}'")
+            except asyncpg.LockNotAvailableError:
+                raise HTTPException(
+                    status_code=409,
+                    detail='The samples table is busy (a long read or an index build); retry shortly',
+                    headers={'Retry-After': '5'},
+                ) from None
+            await conn.execute(
+                f"CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_samples_{name}_gin ON samples USING gin ({name})",
+            )
+        finally:
+            await conn.execute('SELECT pg_advisory_unlock($1, hashtext($2))', *claims)
         await conn.execute(
             "INSERT INTO sample_array_columns (column_name) VALUES ($1) ON CONFLICT DO NOTHING",
             name,
@@ -2794,18 +2859,16 @@ async def promote_field(
     # desync the verify/drop lookups below); demote_field derives the same name.
     index_name = _promoted_index_name(id, field_name)
 
-    # Pick the index expression for the field type (field_name already validated).
-    if field_type in ('number', 'float', 'int', 'integer'):
-        index_expr = f"(( (metadata->>'{field_name}')::float ))"  # numeric: cast to float
-    elif field_type in ('string', 'enum', 'datetime'):
-        index_expr = f"(( metadata->>'{field_name}' ))"  # text: equality + ORDER BY
-    else:
+    # The index expression for the field type (field_name already validated): a number as a float, a datetime on
+    # its instant, a string as its text. The background rebuilds use the same one.
+    from ..index_jobs import field_index_expression, submit_field_index
+
+    index_expr = field_index_expression(field_type, field_name)
+    if index_expr is None:
         raise HTTPException(status_code=400, detail=f"Cannot promote field type: {field_type}")
 
     # The job builds CONCURRENTLY on its own connection under the index-operation guard (20261017),
     # removes invalid leftovers, and marks the field promoted only if its definition is unchanged.
-    from ..index_jobs import submit_field_index
-
     try:
         job = await submit_field_index(
             db.pool,
@@ -2999,7 +3062,6 @@ async def _autocomplete_impl(id: int, field_name: str, q: str, limit: int, filte
 
     # Apply global filters (excluding the field being searched)
     if filter_obj:
-        await require_current_lassos(id, filter_obj)
         try:
             # Remove filter for the field being autocompleted to avoid circular filtering
             cleaned = _remove_field_from_filter(filter_obj, field_name)
@@ -3054,8 +3116,10 @@ async def _autocomplete_impl(id: int, field_name: str, q: str, limit: int, filte
     # while Enter (an indexed `=` filter) found it instantly. `=` IS indexed: probe it first.
     exact_hit = None
     if q and scalar_meta:
+        # A datetime field's index is on its instant, not its text (backend/datetimes.py): no probe to ride.
         promoted = await db.fetchval(
-            "SELECT is_promoted FROM dataset_fields WHERE dataset_id = $1 AND field_name = $2",
+            "SELECT is_promoted AND field_type <> 'datetime' FROM dataset_fields "
+            "WHERE dataset_id = $1 AND field_name = $2",
             id,
             field_name,
         )
@@ -3155,7 +3219,6 @@ async def get_dataset_schema(id: int, filters: Optional[str] = None, lightning_m
             filter_obj = json.loads(filters)
         except (json.JSONDecodeError, TypeError) as e:
             raise HTTPException(status_code=400, detail=f"Invalid filter JSON: {e}")
-        await require_current_lassos(id, filter_obj)
 
     # 1. media_type (enum)
     if filter_obj and has_active_filters(filter_obj):
@@ -3259,6 +3322,7 @@ async def get_dataset_schema(id: int, filters: Optional[str] = None, lightning_m
                 "max": created_at_stats['max_val'].isoformat(),
             },
         )
+    schema.append(await _last_modified_field(id, lightning_mode))
 
     # 4. id (number) - keep global
     id_stats = await db.fetchrow(
@@ -3706,6 +3770,152 @@ def _iso_unit_window(val) -> Optional[tuple[str, str]]:
     return val, (start + datetime.timedelta(seconds=1)).strftime(f"%Y-%m-%d{sep}%H:%M:%S")
 
 
+def _datetime_window(value) -> Optional[tuple[datetime.datetime, datetime.datetime]]:
+    """A filter value's [start, end) on a datetime field: the UTC day, minute or second it was written to, or the one
+    microsecond it names (backend/datetimes.py literal_window). None for a value that isn't a datetime."""
+    window = literal_window(value)
+    if window is None:
+        return None
+    start, end = window
+    return start, end or start + datetime.timedelta(microseconds=1)
+
+
+def _datetime_leaf_sql(field, col, op, val, args, arg_idx, indexed) -> Optional[tuple[str, int]]:
+    """A comparison on a field declared datetime, by instant: `=` is the window the value was written to (a whole
+    UTC day for a date), `!=` its complement, `in` any of them, `not in` none, and a range starts or ends where the
+    value's unit does. Every predicate is TRUE or FALSE, never NULL, so a complement includes the samples without a
+    datetime, as `!=` always has. A promoted field is compared through its index. Returns None for comparisons the
+    field makes as any other does: equality with a value that isn't a datetime compares text (a stray "unknown"
+    can still be found), with a JSON number, numbers."""
+
+    next_idx = arg_idx
+
+    def param(value):
+        nonlocal next_idx
+        args.append(value)
+        next_idx += 1
+        return f"${next_idx - 1}"
+
+    def bound(instant):
+        return f"{param(instant)}::timestamptz", instant.date()
+
+    if op in ('>', '>=', '<', '<='):
+        if val is None or (isinstance(val, str) and val.strip() == ''):
+            return "TRUE", arg_idx  # an unfinished filter (a picker with no value yet) filters nothing
+        window = _datetime_window(val)
+        if window is None:
+            raise HTTPException(
+                status_code=400,
+                detail=f"{field} is a datetime field: compare it with a date and time, such as 2026-01-31T12:00:00Z",
+            )
+        start, end = window
+        lower, upper = {'>=': (start, None), '>': (end, None), '<': (None, start), '<=': (None, end)}[op]
+        sql = window_sql(
+            col,
+            indexed,
+            lower=bound(lower) if lower is not None else None,
+            upper=bound(upper) if upper is not None else None,
+        )
+        return sql, next_idx
+    if op in ('=', '!='):
+        window = _datetime_window(val)
+        if window is None:
+            return None
+        sql = window_sql(col, indexed, lower=bound(window[0]), upper=bound(window[1]))
+        return (sql if op == '=' else f"(NOT {sql})"), next_idx
+    if op in ('in', 'not in'):
+        values = val if isinstance(val, list) else [val]
+        windows = [window for window in map(_datetime_window, values) if window is not None]
+        if not windows:
+            return None
+        clauses = [window_sql(col, indexed, lower=bound(start), upper=bound(end)) for start, end in windows]
+        others = [_text_value(value) for value in values if _datetime_window(value) is None]
+        if others:
+            clauses.append(f"COALESCE({col} = ANY({param(others)}::text[]), FALSE)")
+        sql = f"({' OR '.join(clauses)})"
+        return (sql if op == 'in' else f"(NOT {sql})"), next_idx
+    return None
+
+
+def _native_timestamp_sql(field, col, op, val, args, arg_idx) -> Optional[tuple[str, int]]:
+    """A comparison on created_at or last_modified_at (timestamptz columns) by the rule every datetime follows
+    (backend/datetimes.py literal_window): a value means the UTC day, minute or second it was written to, whatever its
+    offset, and one written with a fraction of a second that exact microsecond. `=` is that window, `!=` its
+    complement, `in` any of them, `not in` none, and a range starts or ends where the unit does; a sample without the
+    timestamp is in every complement. Plain comparisons of the column, so (dataset_id, created_at)'s index serves
+    them. None for the other operators (presence)."""
+    values = val if isinstance(val, list) and op in ('in', 'not in') else [val]
+    if op not in ('=', '!=', 'in', 'not in', '>', '>=', '<', '<=') or any(value is None for value in values):
+        return None  # presence, or `= null`, compile as before
+    windows = []
+    for value in values:
+        window = _datetime_window(value)
+        if window is None:
+            raise HTTPException(status_code=400, detail=f"Invalid {field} value: {value!r}")
+        windows.append(window)
+    next_idx = arg_idx
+
+    def param(instant):
+        nonlocal next_idx
+        args.append(instant)
+        next_idx += 1
+        return f"${next_idx - 1}"
+
+    if op in ('>', '>=', '<', '<='):
+        start, end = windows[0]
+        sign, instant = {'>=': ('>=', start), '>': ('>=', end), '<': ('<', start), '<=': ('<', end)}[op]
+        return f"{col} {sign} {param(instant)}", next_idx
+    clauses = [f"({col} >= {param(start)} AND {col} < {param(end)})" for start, end in windows]
+    within = clauses[0] if len(clauses) == 1 else f"({' OR '.join(clauses) or 'FALSE'})"  # FALSE: `in` []
+    return (within if op in ('=', 'in') else f"({col} IS NULL OR NOT {within})"), next_idx
+
+
+def _merge_datetime_ranges(filters, args, arg_idx, field_mapping, array_columns) -> tuple[list, list, int]:
+    """Two or more range comparisons on one datetime field, ANDed (a slider's two handles, a histogram bar, `a >= x
+    AND a < y`), become one window, so the instant is computed once per row and only for rows near either bound.
+    Returns the filters left to compile, the merged windows' SQL and the next parameter index."""
+    datetimes = getattr(array_columns, 'datetime_fields', ())
+    ranges: dict[str, list] = {}
+    for node in filters:
+        if not isinstance(node, dict):
+            continue  # the compiler refuses it (400)
+        field, op = node.get('field'), str(node.get('operator', '=')).lower()
+        window = _datetime_window(node.get('value'))
+        if (
+            isinstance(field, str)
+            and field in datetimes
+            and op in ('>', '>=', '<', '<=')
+            and not (field_mapping and field in field_mapping)
+            and window is not None
+        ):
+            ranges.setdefault(field, []).append((node, op, window))
+    merged = {field: nodes for field, nodes in ranges.items() if len(nodes) > 1}
+    if not merged:
+        return filters, [], arg_idx
+    sqls = []
+    for field, nodes in merged.items():
+        lower = upper = None
+        for _node, op, (start, end) in nodes:
+            low, high = {'>=': (start, None), '>': (end, None), '<': (None, start), '<=': (None, end)}[op]
+            lower = low if lower is None or (low is not None and low > lower) else lower
+            upper = high if upper is None or (high is not None and high < upper) else upper
+        if lower is not None and upper is not None and lower >= upper:
+            sqls.append("FALSE")
+            continue
+        bounds: list[Optional[tuple[str, datetime.date]]] = []
+        for instant in (lower, upper):
+            if instant is None:
+                bounds.append(None)
+                continue
+            args.append(instant)
+            bounds.append((f"${arg_idx}::timestamptz", instant.date()))
+            arg_idx += 1
+        indexed = field in getattr(array_columns, 'promoted_datetime', ())
+        sqls.append(window_sql(_field_text_sql(field), indexed, lower=bounds[0], upper=bounds[1]))
+    used = {id(node) for nodes in merged.values() for node, _op, _window in nodes}
+    return [node for node in filters if id(node) not in used], sqls, arg_idx
+
+
 def _utc_datetime(text: str) -> datetime.datetime:
     """Parse an ISO datetime for a created_at (timestamptz) comparison; zone-less means UTC.
 
@@ -3717,19 +3927,45 @@ def _utc_datetime(text: str) -> datetime.datetime:
     return dt if dt.tzinfo is not None else dt.replace(tzinfo=datetime.timezone.utc)
 
 
-def _utc_label(epoch: float) -> Optional[str]:
-    """A histogram bin edge (epoch seconds) as a zone-less ISO string in UTC.
+async def _instant_histogram(field, data_cte, args, minmax, total_rows, bin_count, degenerate) -> dict:
+    """A date and time field's histogram, on whole microseconds (`val` in `data_cte`: microseconds since 1970).
 
-    It was `datetime.fromtimestamp(epoch)` — the backend host's LOCAL time — so on a host west of
-    UTC every label was hours early and clicking a bar staged a filter for the wrong window (often
-    0 rows). UTC matches the stored strings, which the metadata
-    filters compare as text, and _utc_datetime() reads it back as UTC for created_at. No zone
-    suffix: '…T00:00:00Z' would sort AFTER a stored '…T00:00:00+00:00' and drop it.
-    """
-    try:
-        return datetime.datetime.fromtimestamp(epoch, tz=datetime.timezone.utc).replace(tzinfo=None).isoformat()
-    except (OverflowError, OSError, ValueError):
-        return None
+    Each bar covers whole microseconds, and its labels are its first and last one, zone-less UTC text with six
+    fraction digits: the filter a bar stages (`>= min_label AND <= max_label`, frontend/lib/filter-utils.ts) then
+    matches exactly that bar's samples. Float edges drifted a microsecond either way of the bar they labelled."""
+    lowest, highest = int(minmax['min']), int(minmax['max'])
+    total = int(minmax['total'] or 0)
+    wanted = 1 if degenerate else (bin_count or max(8, min(30, int(math.sqrt(total)) or 8)))
+    width = -(-(highest - lowest + 1) // wanted)  # whole microseconds, at least one
+    bin_count = -(-(highest - lowest + 1) // width)  # no bar past the latest value
+    rows = await db.fetch(
+        f"{data_cte} SELECT (val - {lowest}) / {width} + 1 AS bucket, COUNT(*) AS count FROM data "
+        "WHERE val IS NOT NULL GROUP BY 1 ORDER BY 1",
+        *args,
+    )
+    counts = {row['bucket']: row['count'] for row in rows}
+    buckets = []
+    for key in range(1, bin_count + 1):
+        first = lowest + (key - 1) * width
+        last = min(first + width, highest + 1) - 1
+        min_label, max_label = _utc_micros_label(first), _utc_micros_label(last)
+        buckets.append(
+            {
+                "key": key,
+                "count": counts.get(key, 0),
+                "label": f"{min_label} - {max_label}",
+                "range": {"min": first / 1e6, "max": last / 1e6, "min_label": min_label, "max_label": max_label},
+            },
+        )
+    missing = max(total_rows - total, 0)
+    return {"field": field, "total": total_rows, "missing": missing, "buckets": buckets, "bins": bin_count}
+
+
+def _utc_micros_label(micros: int) -> str:
+    """Microseconds since 1970 as zone-less UTC text with six fraction digits, which filters read as that exact UTC
+    microsecond (backend/datetimes.py; created_at as _utc_datetime does)."""
+    instant = datetime.datetime(1970, 1, 1) + datetime.timedelta(microseconds=micros)
+    return f'{instant.year:04d}-{instant:%m-%dT%H:%M:%S}.{instant.microsecond:06d}'
 
 
 def _escape_like(val) -> str:
@@ -3739,26 +3975,39 @@ def _escape_like(val) -> str:
 
 
 def _numeric_sort_order_by(field: str, promoted: bool, direction: str, source: str = 'metadata') -> str:
-    """ORDER BY clause for sorting the grid by a numeric metadata field.
+    """ORDER BY clause for sorting the grid by a numeric metadata field: samples without a value last, in both
+    directions.
 
-    A promoted numeric field uses the bare `(metadata->>'f')::float` cast (matching
-    the promote_field index) with INDEX-FRIENDLY null ordering — ASC->NULLS LAST,
-    DESC->NULLS FIRST — so the query rides the btree instead of a full seq-scan + sort
-    of every row per page (which is what `_numeric_metadata_sql(...) DESC NULLS LAST`
-    forced: the CASE expression doesn't match the index, and DESC+NULLS LAST doesn't
-    match the btree's null order even with the bare cast). The cast is safe because
-    promotion only builds the index when every value is numeric. Missing-value rows
-    therefore sort last on ASC / first on DESC. Unpromoted fields keep the guarded CASE
-    (cast-safe on mixed data), NULLS LAST, and pay the sort — there's no index to ride.
-    `field` must already be validated.
+    A promoted numeric field uses the bare `(metadata->>'f')::float` cast (matching the promote_field index; safe
+    because promotion only builds the index when every value is numeric). Its pages ride the index all the same:
+    _sorted_page_ids reads the samples with a value in index order, then those without (one ORDER BY can't: the
+    btree holds missing values last ascending, so first descending). Unpromoted fields keep the guarded CASE
+    (cast-safe on mixed data) and pay the sort: there's no index to ride. `field` must already be validated.
     """
     if promoted:
-        nulls = "NULLS LAST" if direction == "ASC" else "NULLS FIRST"
-        return f"ORDER BY ({source}->>'{field}')::float {direction} {nulls}"
+        return f"ORDER BY ({source}->>'{field}')::float {direction} NULLS LAST"
     return f"ORDER BY {_numeric_metadata_sql(field, source)} {direction} NULLS LAST"
 
 
 _NATIVE_SORT_COLUMNS = ('id', 'created_at', 'last_modified_at', 'filepath')
+# The samples' own timestamps (timestamptz columns, not metadata keys): filters compare them as instants.
+_NATIVE_TIMESTAMPS = ('created_at', 'last_modified_at')
+
+
+async def _last_modified_field(dataset_id: int, lightning_mode: bool) -> Dict[str, Any]:
+    """The samples' last_modified_at, a datetime filters compare like created_at. No index covers it (one would make
+    every edit's UPDATE non-HOT), so its bounds are a scan of the dataset's rows: read only outside lightning mode, a
+    dataset small enough to compute every field. Without them the sidebar shows no slider; the filter card, the query
+    language and the histogram still filter by it. Its bounds are the dataset's, whatever the filter (`cached`)."""
+    field: Dict[str, Any] = {"name": "last_modified_at", "type": "datetime", "provenance": "cached"}
+    if not lightning_mode:
+        bounds = await db.fetchrow(
+            "SELECT MIN(last_modified_at) AS mn, MAX(last_modified_at) AS mx FROM samples WHERE dataset_id = $1",
+            dataset_id,
+        )
+        if bounds and bounds['mn'] is not None:
+            field['min'], field['max'] = bounds['mn'].isoformat(), bounds['mx'].isoformat()
+    return field
 
 
 def _grid_order_by(sort_by: str, direction: str, field_type_row) -> str:
@@ -3790,9 +4039,121 @@ def _grid_order_by(sort_by: str, direction: str, field_type_row) -> str:
     if field_type in ('number', 'float', 'int', 'integer'):
         # Cast to float for numeric sorting; promoted fields ride their index.
         return _numeric_sort_order_by(key, bool(field_type_row['is_promoted']), direction, source) + ", id"
-    if field_type in ('string', 'enum', 'datetime'):
+    if field_type == 'datetime':
+        # By instant (backend/datetimes.py); samples without a datetime last. Pages: _sorted_page_ids.
+        instant = instant_expr(f"{source}->>'{key}'", bool(field_type_row['is_promoted']))
+        return f"ORDER BY {instant} {direction} NULLS LAST, id"
+    if field_type in ('string', 'enum'):
         return f"ORDER BY {source}->>'{key}' {direction} NULLS LAST, id"
     return "ORDER BY id"  # unsupported type (array, object, ...): fall back to the default order
+
+
+async def _sorted_page_ids(sort_by, direction, field_type_row, where_clause, args, limit, offset):
+    """The ids of one page of a sort that one ORDER BY can't answer fast, in order; None for every other sort
+    (_grid_order_by's ORDER BY answers those). Samples without a value come last in both directions, as
+    _grid_order_by orders them:
+
+    - an indexed (promoted) datetime or number field: the samples with a value in index order, then the rest by
+      id (_two_part_page_ids);
+    - a datetime field without an index: two cheap passes over the written dates (_datetime_page_ids).
+
+    `where_clause` (" WHERE ...") uses `args` as $1..$len(args). OFFSET paging keeps its meaning."""
+    if sort_by in _NATIVE_SORT_COLUMNS or not field_type_row:
+        return None
+    local = local_field(sort_by)
+    if local is not None and local.array:
+        return None
+    text = _field_text_sql(sort_by)
+    promoted = bool(field_type_row['is_promoted'])
+    if field_type_row['field_type'] == 'datetime':
+        if not promoted:
+            return await _datetime_page_ids(text, direction, where_clause, args, limit, offset)
+        key = instant_expr(text, True)
+    elif field_type_row['field_type'] in ('number', 'float', 'int', 'integer') and promoted:
+        key = f"({text})::float"
+    else:
+        return None
+    return await _two_part_page_ids(key, direction, where_clause, args, limit, offset)
+
+
+async def _two_part_page_ids(key, direction, where_clause, args, limit, offset) -> list:
+    """A page sorted by an indexed `key`, samples without a value last, still an index scan with no sort of
+    the dataset: the samples with a value in the index's own order (its missing values are last ascending and
+    first descending, and there are none here), then, once those run out, the samples without one by id."""
+    n = len(args)
+    nulls = 'NULLS LAST' if direction == 'ASC' else 'NULLS FIRST'
+    rows = await db.fetch(
+        f"SELECT id FROM samples {where_clause} AND {key} IS NOT NULL "
+        f"ORDER BY {key} {direction} {nulls}, id LIMIT ${n + 1} OFFSET ${n + 2}",
+        *args,
+        limit,
+        offset,
+    )
+    ids = [row['id'] for row in rows]
+    if len(ids) == limit:
+        return ids
+    skip = 0  # the page holds the last samples with a value: those without one start right after them
+    if not ids:  # the page is past them all: how many there are decides where it starts
+        with_value = await db.fetchval(f"SELECT count(*) FROM samples {where_clause} AND {key} IS NOT NULL", *args)
+        skip = max(offset - with_value, 0)
+    rows = await db.fetch(
+        f"SELECT id FROM samples {where_clause} AND {key} IS NULL ORDER BY id LIMIT ${n + 1} OFFSET ${n + 2}",
+        *args,
+        limit - len(ids),
+        skip,
+    )
+    return ids + [row['id'] for row in rows]
+
+
+async def _datetime_page_ids(text, direction, where_clause, args, limit, offset) -> list:
+    """A page sorted by a datetime field without an index, samples without a datetime last, without computing
+    every sample's instant. A value written on date W names an instant within 15:59 of that day, so:
+
+    1. find the date D of the page's last sample by the written date alone (newest first: the offset+limit-th
+       latest date among values that start like a date);
+    2. compute instants only for samples written within three days of D on the near side, and order those.
+
+    When at least offset+limit of them are datetimes written within a day of D or beyond, every sample further
+    away is later in the order than all of those (newest first: it names an instant before D - 3 + 15:59, they
+    after D - 1 - 15:59), so the page is exact. Otherwise (values that look like dates but aren't, or fewer
+    datetimes than the page needs) it falls back to the full sort."""
+    n = len(args)
+    date = f'pg_catalog.left({text}, 10) COLLATE "C"'
+    instant = instant_sql(text)
+    newest = direction == 'DESC'
+    cutoff = await db.fetchval(
+        f"SELECT {date} FROM samples {where_clause} AND {date} BETWEEN '0001-01-01' AND '9999-12-31' "
+        f"ORDER BY 1 {direction} LIMIT 1 OFFSET ${n + 1}",
+        *args,
+        offset + limit - 1,
+    )
+    try:
+        day = datetime.date.fromisoformat(cutoff) if cutoff else None
+        step = datetime.timedelta(days=-1 if newest else 1)
+        far, near = (day + 3 * step, day + step) if day else (None, None)
+    except (ValueError, OverflowError):
+        far = near = None
+    if far is not None:
+        side = '>=' if newest else '<='
+        rows = await db.fetch(
+            f"SELECT id, count(*) FILTER (WHERE near) OVER () AS near_count FROM ("
+            f"SELECT id, {instant} AS instant, {date} {side} '{near}' AS near FROM samples {where_clause} "
+            f"AND {date} {side} '{far}') candidates WHERE instant IS NOT NULL "
+            f"ORDER BY instant {direction}, id LIMIT ${n + 1} OFFSET ${n + 2}",
+            *args,
+            limit,
+            offset,
+        )
+        if rows and rows[0]['near_count'] >= offset + limit:
+            return [row['id'] for row in rows]
+    rows = await db.fetch(
+        f"SELECT id FROM samples {where_clause} ORDER BY {instant} {direction} NULLS LAST, id "
+        f"LIMIT ${n + 1} OFFSET ${n + 2}",
+        *args,
+        limit,
+        offset,
+    )
+    return [row['id'] for row in rows]
 
 
 async def get_promoted_numeric_fields(dataset_id: int, source=None) -> set:
@@ -3827,6 +4188,7 @@ _CROSSGRAIN_SKIP_OPS = {
     'cg_self',
     'parent_matches',
     'has_matching_object',
+    unlinked_objects.OPERATOR,
     'is_null',
     'exists',
     'not_exists',
@@ -3992,6 +4354,9 @@ async def require_ready_concepts(filter_obj: Any) -> None:
 # dataset while the identical filter worked in search and embeddings. Import this instead of
 # writing the dict inline. EXTEND IT if a new query joins a table that shares another native
 # samples column (`media_type`, `filepath`, `tags`, ...); nothing else joins one today.
+# Fields the sidebar doesn't list (field-stats marks them `sidebar: false` and computes nothing for them there).
+SIDEBAR_HIDDEN_FIELDS = frozenset({'parent_id'})
+
 SAMPLES_JOIN_FIELD_MAPPING: Dict[str, str] = {
     'id': 's.id',
     'created_at': 's.created_at',
@@ -4002,34 +4367,6 @@ def _realiased(field_mapping: Optional[Dict[str, str]], alias: str) -> Dict[str,
     """`field_mapping` for a subquery over samples aliased `alias`: every mapped column on the inner alias. A
     cross-grain subquery that kept the outer `s.created_at` compared the outer row's date on every partner."""
     return {key: f"{alias}.{column.rsplit('.', 1)[-1]}" for key, column in (field_mapping or {}).items()}
-
-
-def _lasso_maps(node: Any) -> set:
-    """(field, model_id) of every whole-image lasso polygon in a filter tree, nested ones included."""
-    found: set = set()
-    if isinstance(node, dict):
-        for child in node.get('filters') or []:
-            found |= _lasso_maps(child)
-        operator = str(node.get('operator', '')).lower()
-        if operator in ('cg_self', 'parent_matches', 'has_matching_object'):
-            found |= _lasso_maps(node.get('value'))
-        elif (
-            operator in ('embedding_polygon', 'embedding_polygon_exclude')
-            and isinstance(node.get('field'), str)  # a malformed field is the compiler's 400 to give
-            and node['field']
-            and not re.search(r'_patch_\d+x\d+$', node['field'])
-        ):
-            model = node.get('model_id')
-            found.add((node['field'], None if model is None else str(model)))
-    return found
-
-
-async def require_current_lassos(dataset_id: int, filter_obj: Any) -> None:
-    """Refuse (409, code map_refitted) a request whose filters hold a lasso drawn on a previous map, up
-    front: the sidebar's best-effort sub-queries would otherwise swallow the refusal and show unfiltered
-    values next to a grid that refuses the same filters."""
-    for field, model in sorted(_lasso_maps(filter_obj), key=str):
-        await db.fetchval('SELECT require_current_map($1, $2, $3::text)', dataset_id, field, model)
 
 
 def parse_filter_node(
@@ -4120,6 +4457,14 @@ def _compile_filter_node(
                 return "TRUE", arg_idx
 
             child_sqls = []
+            if logic == 'AND':
+                sub_filters, child_sqls, arg_idx = _merge_datetime_ranges(
+                    sub_filters,
+                    args,
+                    arg_idx,
+                    field_mapping,
+                    array_columns,
+                )
             for f in sub_filters:
                 sql, arg_idx = _compile_filter_node(
                     f,
@@ -4158,6 +4503,23 @@ def _compile_filter_node(
                 f"WHERE _dup.sample_id = {id_col} AND _dup.hash_config = ${arg_idx})",
                 arg_idx + 1,
             )
+
+        # Objects with no image, of some kinds (unlinked_objects.py): the finder's filter, and the bulk delete's.
+        # `field` is a sentinel. The row's dataset is a constant, as the cross-grain operators below take it.
+        if op == unlinked_objects.OPERATOR:
+            ds = dataset_id if dataset_id is not None else (args[0] if args and isinstance(args[0], int) else None)
+            id_col = (field_mapping or {}).get('id', 'samples.id')
+            table = id_col.rsplit('.', 1)[0] if '.' in id_col else 'samples'
+            try:
+                return unlinked_objects.compile_leaf(
+                    val,
+                    table,
+                    str(int(ds)) if ds is not None else f'{table}.dataset_id',
+                    arg_idx,
+                    args,
+                )
+            except ValueError as error:
+                raise HTTPException(status_code=400, detail=str(error)) from None
 
         # Embedding "concept" select/exclude: keep / hide samples whose
         # materialized concept score passes a threshold. `value` = {concept_id, op, threshold};
@@ -4204,7 +4566,7 @@ def _compile_filter_node(
             ), arg_idx + 1
 
         # Cross-grain link operators (objects are media_type='object' rows whose
-        # metadata.parent_id points at their source image, in the SAME dataset). withGrain
+        # samples.parent_id is their source image, in the SAME dataset). withGrain
         # wraps a panel's base filter so the two grains stay coupled: an OBJECT grid shows the
         # objects of whatever images match, and an IMAGE grid shows the parent images of
         # whatever objects match — for ANY filter/selection, not just the embeddings lasso.
@@ -4213,13 +4575,12 @@ def _compile_filter_node(
         # concept/id leaves correlate to it; bare metadata/native columns bind to it naturally).
         # Dispatched before field validation, like concept_select.
         #
-        # The sub-query is scoped to this dataset as a CONSTANT (an int we control, never
-        # `= {outer}.dataset_id` — a correlation would re-run it per outer row, an O(rows) blowup
-        # that hung the object grid). parent_id is globally unique so the scope isn't needed for
-        # correctness; it's purely so a metadata @>/scan hits only this dataset's rows, not the
-        # whole (multi-million-row) table. The dataset id comes from the explicit param OR, for
-        # callers that don't thread it (field-stats, map, selection_token), args[0] — every
-        # dataset-scoped query seeds args with [dataset_id], so args[0] is reliably it.
+        # The sub-query is scoped to this dataset as a CONSTANT (an int we control), so a hashed
+        # partner set is built from this dataset's rows only, not the whole (multi-million-row)
+        # table. The dataset id comes from the explicit param OR, for callers that don't thread
+        # it (field-stats, map, selection_token), args[0] — every dataset-scoped query seeds args
+        # with [dataset_id], so args[0] is reliably it. Without either, an image's objects are
+        # found by its own dataset_id, still one probe of (dataset_id, parent_id).
         # cg_self: the cross-grain link's SAME-grain branch — render the sub-filter (with each
         # negation strictified PER-LEAF so an exclusion on a metadata field this grain LACKS can't
         # vacuously match every row, the whole-grain leak) against the current row. Positive
@@ -4255,13 +4616,14 @@ def _compile_filter_node(
             ds = dataset_id if dataset_id is not None else (args[0] if args and isinstance(args[0], int) else None)
             id_col = (field_mapping or {}).get('id', 'samples.id')
             outer_tbl = id_col.rsplit('.', 1)[0] if '.' in id_col else 'samples'
-            ds_scope = f"s2.dataset_id = {int(ds)} AND " if ds is not None else ""
-            ds_scope_o = f"o.dataset_id = {int(ds)} AND " if ds is not None else ""
-            # Both branches build the partner-id set ONCE via `= ANY(ARRAY(subquery))` rather than
-            # `IN (subquery)` / a correlated EXISTS: the planner has no stats on the JSONB
-            # parent_id::int expression and mis-estimates it as 1 row, which intermittently flips
-            # `IN`/EXISTS to a per-row Nested Loop that re-scans the table (30-55s hang). ARRAY()
-            # forces a single materialization, so the join can't degenerate (measured: 35s -> ~25ms).
+            # The link is samples.parent_id (0029): an object's image, NULL unless its metadata.parent_id names a
+            # non-object of its dataset. Each operator is one EXISTS keyed on it, which the planner runs either
+            # as a hashed set built once (when it expects few partners) or as one index probe per row:
+            # (dataset_id, parent_id) from an image, the (dataset_id, id) key from an object. Neither re-scans
+            # the table per row, as `IN (subquery)` / EXISTS on the JSON expression they read until 0029 did
+            # (30-55 s), nor searches a whole array per row, as `= ANY(ARRAY(subquery))` did for every row a
+            # count visits. Every unlinked row is FALSE, where the JSON read gave FALSE or NULL: the same rows,
+            # since a NOT here coalesces its child to FALSE.
             if op == 'has_matching_object':
                 # IMAGE row matches if its id is the parent of an object satisfying the sub-filter.
                 sub_map = {**_realiased(field_mapping, 'o'), 'id': 'o.id'}
@@ -4275,12 +4637,13 @@ def _compile_filter_node(
                     array_columns=array_columns,
                     concepts=concepts,
                 )
+                scope = int(ds) if ds is not None else f"{outer_tbl}.dataset_id"
                 return (
-                    f"{id_col} = ANY(ARRAY(SELECT (o.metadata->>'parent_id')::int FROM samples o "
-                    f"WHERE {ds_scope_o}o.media_type = 'object' "
-                    f"AND o.metadata->>'parent_id' ~ '^-?[0-9]+$' AND ({sub_sql})))"
+                    f"EXISTS (SELECT 1 FROM samples o WHERE o.dataset_id = {scope} AND o.parent_id = {id_col} "
+                    f"AND o.media_type = 'object' AND ({sub_sql}))"
                 ), arg_idx
             # parent_matches: OBJECT row matches if its parent image satisfies the sub-filter.
+            ds_scope = f"s2.dataset_id = {int(ds)} AND " if ds is not None else ""
             sub_map = {**_realiased(field_mapping, 's2'), 'id': 's2.id'}
             sub_sql, arg_idx = _compile_filter_node(
                 strict,
@@ -4293,9 +4656,8 @@ def _compile_filter_node(
                 concepts=concepts,
             )
             return (
-                f"({outer_tbl}.metadata->>'parent_id' ~ '^-?[0-9]+$' "
-                f"AND ({outer_tbl}.metadata->>'parent_id')::int = ANY(ARRAY"
-                f"(SELECT s2.id FROM samples s2 WHERE {ds_scope}s2.media_type != 'object' AND ({sub_sql}))))"
+                f"EXISTS (SELECT 1 FROM samples s2 WHERE {ds_scope}s2.id = {outer_tbl}.parent_id "
+                f"AND s2.media_type != 'object' AND ({sub_sql}))"
             ), arg_idx
 
         # `field` is the only user-controlled token interpolated into SQL below
@@ -4374,8 +4736,8 @@ def _compile_filter_node(
             col = "filepath"
         elif field == 'id':
             col = "id"
-        elif field == 'created_at':
-            col = "created_at"
+        elif field in _NATIVE_TIMESTAMPS:
+            col = field
         elif (
             label_path(field, array_columns)
             and field.endswith('.label')
@@ -4462,6 +4824,19 @@ def _compile_filter_node(
         # the argument only picks the index-matching cast.
         numeric_strings = promoted_numeric or field in getattr(array_cols, 'promoted_numeric', ())
 
+        # A field declared datetime compares instants, through its index when it is promoted.
+        if not is_array and field not in ('id', *_NATIVE_TIMESTAMPS, 'media_type', 'filepath'):
+            if field in getattr(array_cols, 'datetime_fields', ()):
+                indexed = field in getattr(array_cols, 'promoted_datetime', ())
+                compiled = _datetime_leaf_sql(field, col, op, val, args, arg_idx, indexed)
+                if compiled is not None:
+                    return compiled
+        # The samples' own timestamps, by the same rule.
+        if not is_array and field in _NATIVE_TIMESTAMPS:
+            compiled = _native_timestamp_sql(field, col, op, val, args, arg_idx)
+            if compiled is not None:
+                return compiled
+
         # A date / datetime given to day, minute or second precision means that whole unit
         #: `=` is the unit, `!=` its complement, `<=` ends where the next unit
         # starts and `>` starts there. (`>=` and `<` are already right at the unit's start.)
@@ -4470,7 +4845,7 @@ def _compile_filter_node(
             if window is not None:
                 lo, hi = window
                 bounds: list[Any] = [lo, hi]
-                if field == 'created_at':
+                if field in _NATIVE_TIMESTAMPS:
                     bounds = [_utc_datetime(b) for b in bounds]
                 if op == '<=':
                     args.append(bounds[1])
@@ -4485,7 +4860,7 @@ def _compile_filter_node(
         # created_at is timestamptz; coerce string values to datetime so asyncpg binds
         # them as timestamps (a raw string param errors: `timestamp = text`). Applies to
         # =, !=, range, in, not in below — all of which then bind the value natively.
-        if field == 'created_at' and val is not None:
+        if field in _NATIVE_TIMESTAMPS and val is not None:
 
             def _to_ts(v):
                 if isinstance(v, str):
@@ -4494,7 +4869,7 @@ def _compile_filter_node(
                     except ValueError:
                         # A malformed date bound as text errors at the DB (`timestamp =
                         # text`) → opaque 500. Reject it up front as a clean 400.
-                        raise HTTPException(status_code=400, detail=f"Invalid created_at value: {v!r}")
+                        raise HTTPException(status_code=400, detail=f"Invalid {field} value: {v!r}")
                 return v
 
             val = [_to_ts(v) for v in val] if isinstance(val, list) else _to_ts(val)
@@ -4503,12 +4878,12 @@ def _compile_filter_node(
             if is_array:
                 args.append(val)
                 return f"${arg_idx} = ANY({arr})", arg_idx + 1
-            elif field in ['media_type', 'filepath', 'id', 'created_at']:
+            elif field in ['media_type', 'filepath', 'id', *_NATIVE_TIMESTAMPS]:
                 # id (int) and created_at (datetime, coerced above) bind natively; only
                 # the text columns are stringified. Use the RESOLVED col (e.g. s.id) — a bare
                 # `id`/`created_at` is ambiguous in the embeddings/search JOIN (both tables have
                 # them) and 500s; every sibling op already uses {col}, only `=` regressed.
-                args.append(val if field in ['id', 'created_at'] else str(val))
+                args.append(val if field in ['id', *_NATIVE_TIMESTAMPS] else str(val))
                 return f"{col} = ${arg_idx}", arg_idx + 1
             else:
                 num = _equality_number(val, numeric_strings)
@@ -4527,7 +4902,7 @@ def _compile_filter_node(
                 args.append(val)
                 # Include rows with no/empty array value in the complement.
                 return f"(NOT (${arg_idx} = ANY({arr})) OR {arr} IS NULL)", arg_idx + 1
-            elif field in ['id', 'created_at']:
+            elif field in ['id', *_NATIVE_TIMESTAMPS]:
                 # Native typed columns — bind as-is (int / coerced datetime). _text_value
                 # would stringify and break `integer/timestamp IS DISTINCT FROM text`.
                 args.append(val)
@@ -4552,7 +4927,7 @@ def _compile_filter_node(
             # unfinished filter never 500s the whole query.
             if val is None or (isinstance(val, str) and val.strip() == ''):
                 return "TRUE", arg_idx
-            if field not in ['id', 'created_at', 'media_type', 'filepath'] and not is_array:
+            if field not in ['id', *_NATIVE_TIMESTAMPS, 'media_type', 'filepath'] and not is_array:
                 # Use the NUMERIC (::float) path only when the value is actually a number.
                 # Anything else — an ISO date ('2025-01-01') or datetime ('2025-01-01T00:00'),
                 # or arbitrary text — compares as TEXT: correct for datetime (ISO-8601 sorts
@@ -4605,7 +4980,7 @@ def _compile_filter_node(
             if is_array:
                 args.append(val)
                 return f"{arr} && ${arg_idx}::text[]", arg_idx + 1
-            elif field in ['media_type', 'filepath', 'id', 'created_at']:
+            elif field in ['media_type', 'filepath', 'id', *_NATIVE_TIMESTAMPS]:
                 args.append(val)
                 return f"{col} = ANY(${arg_idx})", arg_idx + 1
             else:
@@ -4628,7 +5003,7 @@ def _compile_filter_node(
                 args.append(val)
                 # Include rows with no/empty array value in the complement.
                 return f"(NOT ({arr} && ${arg_idx}::text[]) OR {arr} IS NULL)", arg_idx + 1
-            elif field in ['media_type', 'filepath', 'id', 'created_at']:
+            elif field in ['media_type', 'filepath', 'id', *_NATIVE_TIMESTAMPS]:
                 # Native columns — compare WITHOUT the ::text[] cast, mirroring `in`
                 # above. id is integer / created_at is timestamp; a text[] cast here
                 # produced `integer = text` and broke every `id not in [...]` (e.g.
@@ -4666,7 +5041,8 @@ def _compile_filter_node(
                 # tags=[] has the column but no tags; NULL/empty -> not exists. (metadata ? field
                 # was wrong here — tags isn't a metadata key, so `exists` matched zero rows.)
                 return f"({arr} IS NOT NULL AND array_length({arr}, 1) > 0)", arg_idx
-            if (field_mapping and field in field_mapping) or field in ('media_type', 'filepath', 'id', 'created_at'):
+            native = ('media_type', 'filepath', 'id', *_NATIVE_TIMESTAMPS)
+            if (field_mapping and field in field_mapping) or field in native:
                 # Native scalar column: existence = the column is set.
                 return f"{col} IS NOT NULL", arg_idx
             # Metadata field: JSONB key-existence — matches when `field` is a top-level key
@@ -4680,7 +5056,8 @@ def _compile_filter_node(
             if is_array:
                 # Inverse of exists: no elements (NULL column or empty array).
                 return f"array_length({arr}, 1) IS NULL", arg_idx
-            if (field_mapping and field in field_mapping) or field in ('media_type', 'filepath', 'id', 'created_at'):
+            native = ('media_type', 'filepath', 'id', *_NATIVE_TIMESTAMPS)
+            if (field_mapping and field in field_mapping) or field in native:
                 return f"{col} IS NULL", arg_idx
             args.append(json_key)
             return f"NOT ({json_source} ? ${arg_idx})", arg_idx + 1
@@ -4765,28 +5142,18 @@ def _compile_filter_node(
             # so match by prefix; whole-image fields match exactly.
             # Alias `ep` (not `e`) to avoid colliding with the embeddings endpoints'
             # own `e` alias when this filter is applied to their queries too.
-            current_map = ''
+            # The layout the lasso was drawn on (`layout_id`, from the scatter; `model_id` before 2.11) is the app's
+            # to compare with the map's current one, to warn when the map was laid out again since: it never
+            # changes what the polygon selects, which is always the map's current points.
+            layout = node.get('layout_id')
+            if layout is not None and (not isinstance(layout, str) or len(layout) > 64):
+                raise HTTPException(status_code=400, detail="embedding_polygon layout_id must be a string or null")
             if re.search(r'_patch_\d+x\d+$', field):
                 args.append(field + '_%')
                 field_match = f"ep.field_name LIKE ${arg_idx}"
             else:
                 args.append(field)
                 field_match = f"ep.field_name = ${arg_idx}"
-                # A polygon belongs to the map it was drawn on (`model_id`, from the scatter's map_state).
-                # After a re-fit it would silently select other samples: refuse it with a 409 instead
-                # (require_current_map). With the dataset as a parameter the check is an
-                # InitPlan evaluated once per query, and the function is PARALLEL SAFE, so the query keeps
-                # its parallel plan. Every dataset-scoped caller passes dataset_id (a test enforces it);
-                # without one, each matching row's own dataset is checked, which is correct but slow.
-                model = node.get('model_id')
-                args.append(None if model is None else str(model))
-                if dataset_id is not None:
-                    args.append(int(dataset_id))
-                    owner = f"${arg_idx + 2}::int"
-                else:
-                    owner = f"(SELECT _ms.dataset_id FROM samples _ms WHERE _ms.id = {outer_id})"
-                current_map = f"(SELECT require_current_map({owner}, ${arg_idx}, ${arg_idx + 1}::text)) AND "
-                arg_idx += 2 if dataset_id is not None else 1  # the model (and dataset) after the field
             arg_idx += 1
             bbox = (
                 f"AND ep.x BETWEEN {min(xs)} AND {max(xs)} AND ep.y BETWEEN {min(ys)} AND {max(ys)} "  # bbox pre-filter (index)  # noqa: E501
@@ -4804,9 +5171,9 @@ def _compile_filter_node(
             if op == 'embedding_polygon_exclude':
                 # Exclude removes what is inside the polygon and keeps everything else, samples with no point on
                 # this map included (as geo_polygon_exclude keeps samples with no location). The inside test keeps
-                # its bbox index, and a lasso on a re-fitted map is still refused.
-                return f"({current_map}NOT {inside})", arg_idx
-            return f"{current_map}{inside}", arg_idx
+                # its bbox index.
+                return f"(NOT {inside})", arg_idx
+            return inside, arg_idx
 
         else:
             # A field leaf with an unrecognized operator must not silently match
@@ -5366,11 +5733,17 @@ def _plan_indexes_samples(plan: Dict[str, Any]) -> bool:
 @guest_heavy
 async def list_samples_post(id: int, request: SamplesRequest):
     """
-    POST version of list_samples to handle large filter payloads.
+    POST version of list_samples to handle large filter payloads. When the filters hold a lasso drawn on an earlier
+    layout of its map, the answer names those maps (`stale_lassos`): it may select different samples now. The SDK
+    warns; the app's chip already does.
     """
     # Index advisor telemetry (backend/field_usage.py): an in-memory count, never a failure or a wait.
     with field_usage.measure(id, _grid_usage(request.filters, request.sort_by)):
-        return await _list_samples_post(id, request)
+        answer = await _list_samples_post(id, request)
+    stale = await stale_lassos.stale_maps(db, id, request.filters)
+    if stale and isinstance(answer, dict):
+        answer['stale_lassos'] = stale
+    return answer
 
 
 def _slim_metadata_select(keys_param: int, source: str = 'metadata') -> str:
@@ -5410,6 +5783,7 @@ async def _list_samples_post(id: int, request: SamplesRequest):
 
     # Build ORDER BY clause
     order_by = "ORDER BY id"  # Default sort
+    direction, field_type_row = 'ASC', None
     if request.sort_by:
         # Sanitize field name (a mirror's own `@local.` field is checked by local_field)
         if not (_queryable_field(request.sort_by) or request.sort_by.replace("_", "").replace("-", "").isalnum()):
@@ -5496,6 +5870,25 @@ async def _list_samples_post(id: int, request: SamplesRequest):
                 order_by = "ORDER BY id + 0"
                 where_clause = indexed_where_clause
 
+    # A sort one ORDER BY can't answer fast (_sorted_page_ids) picks its page's ids first; the page's rows then
+    # come back in that order. After the count, which doesn't take the ids.
+    if request.sort_by and request.after_id is None and not request.order_by_ids:
+        page_ids = await _sorted_page_ids(
+            request.sort_by,
+            direction,
+            field_type_row,
+            where_clause,
+            args,
+            request.limit,
+            request.offset,
+        )
+        if page_ids is not None:
+            args.append(page_ids)
+            where_clause += f" AND id = ANY(${arg_idx}::int[])"
+            order_by = f"ORDER BY array_position(${arg_idx}::int[], id)"
+            arg_idx += 1
+            request = request.model_copy(update={'offset': 0})
+
     # Ranked ordering (similarity / patch search): order rows by their position in the
     # provided id list. Appended AFTER the count query so the count arg list excludes it.
     if request.order_by_ids:
@@ -5504,14 +5897,8 @@ async def _list_samples_post(id: int, request: SamplesRequest):
             # Object rows ranked by their parent image's position in the (image) rank list, so an
             # image/patch search orders the cross-grain object grid too. Objects of the same image
             # share a rank (tie) -> a secondary `id` makes the order TOTAL so offset paging can't
-            # duplicate/skip a tied row. Non-integer/absent parent_id -> NULL (CASE guard, no 500),
-            # which sorts last.
-            order_by = (
-                f"ORDER BY array_position("
-                f"${arg_idx}::bigint[], "
-                f"CASE WHEN metadata->>'parent_id' ~ '^-?[0-9]+$' THEN (metadata->>'parent_id')::bigint END"
-                f"), id"
-            )
+            # duplicate/skip a tied row. An object with no image (parent_id NULL, 0029) sorts last.
+            order_by = f"ORDER BY array_position(${arg_idx}::bigint[], parent_id::bigint), id"
         else:
             order_by = f"ORDER BY array_position(${arg_idx}::bigint[], id)"
         arg_idx += 1
@@ -5727,6 +6114,7 @@ async def _list_samples(
 
     # Build ORDER BY clause
     order_by = "ORDER BY id"  # Default sort
+    direction, field_type_row = 'ASC', None
     if sort_by:
         print(f"DEBUG: sort_by={sort_by}, sort_order={sort_order}")
         # Sanitize field name (a mirror's own `@local.` field is checked by local_field)
@@ -5754,6 +6142,16 @@ async def _list_samples(
     # Count query
     count_query = f"SELECT count(*) FROM samples {where_clause}"
     total = await db.fetchval(count_query, *args)
+
+    # A sort one ORDER BY can't answer fast picks its page's ids first (_sorted_page_ids).
+    if sort_by:
+        page_ids = await _sorted_page_ids(sort_by, direction, field_type_row, where_clause, args, limit, offset)
+        if page_ids is not None:
+            args.append(page_ids)
+            where_clause += f" AND id = ANY(${arg_idx}::int[])"
+            order_by = f"ORDER BY array_position(${arg_idx}::int[], id)"
+            arg_idx += 1
+            offset = 0
 
     # Parse requested fields if provided
     selected_fields = None
@@ -5950,7 +6348,7 @@ async def _histogram(
     numbers_only = stats_type == 'number'
     # Declared text is categorical unless the caller asks for numbers.
     declared_text = stats_type == 'string' and not as_number and not bins
-    if declared_text and field != 'created_at' and (field.endswith('_at') or field.endswith('_date')):
+    if declared_text and field not in _NATIVE_TIMESTAMPS and (field.endswith('_at') or field.endswith('_date')):
         # A time-named field typed text (e.g. its first write mixed ISO times with '') keeps main's
         # time bins when its values are mostly ISO dates; non-date text stays categorical. A bounded
         # sample through the metadata index decides, not a scan of the field.
@@ -5997,11 +6395,11 @@ async def _histogram(
     elif field == 'id':
         value_expr = "id"
         field_kind = "numeric"
-    elif declared_text and field != 'created_at':
+    elif declared_text and field not in _NATIVE_TIMESTAMPS:
         value_expr = meta_text
         field_kind = "categorical"
-    elif field == 'created_at' or field.endswith('_at') or field.endswith('_date') or field_is_datetime:
-        value_expr = "created_at" if field == 'created_at' else meta_text
+    elif field in _NATIVE_TIMESTAMPS or field.endswith('_at') or field.endswith('_date') or field_is_datetime:
+        value_expr = field if field in _NATIVE_TIMESTAMPS else meta_text
         field_kind = "timestamp"
     else:
         # Default to metadata field (string)
@@ -6016,7 +6414,7 @@ async def _histogram(
         # Extract a metadata value (one de-TOAST of `metadata`) once per row in each pass. A
         # function scan keeps the planner from copying the extraction into every reference below
         # (as an inlined expression would) while staying parallel safe (unlike an OFFSET 0
-        # subquery). `_value` cannot collide with a samples column. Both passes stream, so no
+        # subquery). `_value` and `_micros` cannot collide with a samples column. Both passes stream, so no
         # extracted value is spooled to memory or temp files.
         source = f"samples {where_clause}"
         text_expr, json_expr = value_expr, meta_json
@@ -6025,19 +6423,19 @@ async def _histogram(
             if numbers_only and field_kind == "numeric_or_categorical":
                 # Keep the JSON value for the number-type guard.
                 extract, text_expr, json_expr = json_expr, "(_value #>> '{}')", "_value"
-            source = f"samples CROSS JOIN LATERAL unnest(ARRAY[{extract}]) AS _extracted(_value) {where_clause}"
+            lateral = f"CROSS JOIN LATERAL unnest(ARRAY[{extract}]) AS _extracted(_value)"
+            if is_timestamp:
+                # A datetime's instant, by the rule in backend/datetimes.py: text that isn't a datetime counts as
+                # missing, and no offset is UTC whatever the session's time zone. It costs a parse, and the passes
+                # below read it two or three times, so it is computed once per row the same way.
+                micros = f"(EXTRACT(EPOCH FROM {instant_sql(text_expr)}) * 1000000)::int8"
+                lateral += f" CROSS JOIN LATERAL unnest(ARRAY[{micros}]) AS _instant(_micros)"
+            source = f"samples {lateral} {where_clause}"
         # Build a safe numeric expression; any non-numeric values become NULL
         if is_timestamp:
-            if field == 'created_at':
-                numeric_expr = "EXTRACT(EPOCH FROM created_at)"
-            else:
-                numeric_expr = f"""
-                    CASE
-                        WHEN ({text_expr}) ~ '^[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}'
-                            THEN EXTRACT(EPOCH FROM ({text_expr})::timestamptz)
-                        ELSE NULL
-                    END
-                """
+            # Whole microseconds since 1970, so a bar's edges are exact instants; `infinity` counts as missing.
+            column = f"CASE WHEN isfinite({field}) THEN (EXTRACT(EPOCH FROM {field}) * 1000000)::int8 END"
+            numeric_expr = column if field in _NATIVE_TIMESTAMPS else "_micros"
         elif field_kind == "numeric":
             numeric_expr = "id::float" if field == 'id' else f"({value_expr})::float"
         elif numbers_only:
@@ -6096,6 +6494,8 @@ async def _histogram(
             if field_kind in ("numeric", "timestamp"):
                 return {"field": field, "total": total_rows, "missing": total_rows, "buckets": []}
             # Categorical fallback handled later
+        elif is_timestamp:
+            return await _instant_histogram(field, data_cte, args, minmax, total_rows, bin_count, degenerate)
         else:
             min_val = float(minmax['min'])
             max_val = float(minmax['max'])
@@ -6142,27 +6542,14 @@ async def _histogram(
                 # Use the true max for the upper label to avoid showing the epsilon bump
                 if is_last:
                     end = max_val
-                if is_timestamp:
-                    start_label = _utc_label(start)
-                    end_label = _utc_label(max_val if is_last else end)
-                    label_text = f"{start_label or start} - {end_label or end}"
-                    buckets.append(
-                        {
-                            "key": i,
-                            "count": count,
-                            "label": label_text,
-                            "range": {"min": start, "max": end, "min_label": start_label, "max_label": end_label},
-                        },
-                    )
-                else:
-                    buckets.append(
-                        {
-                            "key": i,
-                            "count": count,
-                            "label": f"{start:.2f} - {end:.2f}",
-                            "range": {"min": start, "max": end},
-                        },
-                    )
+                buckets.append(
+                    {
+                        "key": i,
+                        "count": count,
+                        "label": f"{start:.2f} - {end:.2f}",
+                        "range": {"min": start, "max": end},
+                    },
+                )
 
             return {"field": field, "total": total_rows, "missing": missing, "buckets": buckets, "bins": bin_count}
 
@@ -6385,8 +6772,11 @@ async def get_sample_stats(id: int, sample_ids: Optional[str] = None):
                 value = f"jsonb_array_elements_text(metadata->{field_param})"
                 condition = f"jsonb_typeof(metadata->{field_param}) = 'array'"
             if field_type == 'datetime':
+                # The earliest and latest instants, written as the statistics write them.
+                instant = instant_sql(value)
                 row = await db.fetchrow(
-                    f"SELECT MIN({value}) AS min_val, MAX({value}) AS max_val "
+                    f"SELECT {UTC_TEXT_SQL.format(f'MIN({instant})')} AS min_val, "
+                    f"{UTC_TEXT_SQL.format(f'MAX({instant})')} AS max_val "
                     f"FROM samples WHERE dataset_id = $1 {id_condition} AND {condition}",
                     *args,
                     field,
@@ -6538,10 +6928,11 @@ def _merge_batch_field_stats(stats: Dict[str, Any], current: Optional[Any]) -> t
 
     new_uniques: Optional[list]
     if field_type == 'datetime':
+        # The earliest and latest instants (backend/datetimes.py), written as the statistics write them: text order
+        # isn't time order once values carry offsets. A value that isn't a datetime has no instant and no say.
         prev_bounds = (current['unique_values'] if current else None) or ()
-        bounds = [v for v in prev_bounds if v is not None]
-        bounds.extend(stats['unique_values'])
-        new_uniques = [min(bounds), max(bounds)] if bounds else None
+        instants = sorted(filter(None, map(parse_instant, [*prev_bounds, *stats['unique_values']])))
+        new_uniques = [utc_text(instants[0]), utc_text(instants[-1])] if instants else None
     else:
         # Calculate new unique values (limit to 100 to prevent bloat)
         uniques_list = list(stats['unique_values'])
@@ -6777,6 +7168,13 @@ async def delete_sample(id: int, sample_id: int, user: dict = Depends(require_ro
     async with db.pool.acquire() as conn:
         async with conn.transaction():
             await lock_field_lifecycle(conn, id, exclusive=True, wait=False)
+            # Deleting an image deletes its objects (0030). They go first, here, so they are counted and their fields
+            # reach the caches; the key would delete them with the image anyway.
+            objects = await conn.fetch(
+                'DELETE FROM samples WHERE dataset_id = $2 AND parent_id = $1 RETURNING metadata',
+                sample_id,
+                id,
+            )
             removed = await conn.fetchrow(
                 'DELETE FROM samples WHERE id = $1 AND dataset_id = $2 RETURNING metadata',
                 sample_id,
@@ -6784,9 +7182,15 @@ async def delete_sample(id: int, sample_id: int, user: dict = Depends(require_ro
             )
             if removed is None:
                 raise HTTPException(status_code=404, detail="Sample not found")
-            await invalidate_values(conn, id, set(removed['metadata']) | {'tags'})
-            await prune_fields(conn, id, removed['metadata'])
-    return {"message": "Sample deleted"}
+            keys = {key for row in [removed, *objects] for key in row['metadata'] or {}}
+            await invalidate_values(conn, id, keys | {'tags'})
+            await prune_fields(conn, id, keys)
+    if not objects:
+        return {"message": "Sample deleted", "objects_deleted": 0}
+    return {
+        "message": f"Sample and its {len(objects)} object{'s' if len(objects) != 1 else ''} deleted",
+        "objects_deleted": len(objects),
+    }
 
 
 class SampleUpdate(BaseModel):
@@ -6865,9 +7269,10 @@ async def update_sample(
                 exclusive=bool(request.remove_metadata_keys),
                 wait=not request.remove_metadata_keys,
             )
-            # Check sample exists and belongs to dataset
+            # Check sample exists and belongs to dataset. NO KEY: the edit never writes id or dataset_id, so an object
+            # written meanwhile can still check its image (the parent key's FOR KEY SHARE); edits still serialize.
             existing = await conn.fetchrow(
-                "SELECT id, tags, metadata FROM samples WHERE id = $1 AND dataset_id = $2 FOR UPDATE",
+                "SELECT id, tags, metadata FROM samples WHERE id = $1 AND dataset_id = $2 FOR NO KEY UPDATE",
                 sample_id,
                 id,
             )
@@ -7071,6 +7476,80 @@ async def bulk_delete_samples(id: int, request: BulkTargetRequest, user: dict = 
     return await _bulk_response(id, user, 'delete', request.model_dump())
 
 
+class UnlinkedObjectsDelete(BaseModel):
+    # Only these kinds (unlinked_objects.KINDS); by default the objects whose image is gone.
+    kinds: List[str] = list(unlinked_objects.DEFAULT_DELETE)
+
+
+async def _link_unlinked_objects(id: int) -> int:
+    """The finder's first step: link the objects whose image is there but not linked yet, so they're never counted or
+    deleted as having none. Not on a mirror (its sync keeps it) or a dataset being deleted."""
+    async with db.pool.acquire() as conn, conn.transaction():
+        await lock_field_lifecycle(conn, id)
+        return await unlinked_objects.link(conn, id)
+
+
+async def _mirror_or_deleting(id: int) -> tuple[bool, bool]:
+    row = await db.fetchrow(
+        'SELECT EXISTS (SELECT 1 FROM mirrors WHERE dataset_id = $1) AS mirror, deleting FROM datasets WHERE id = $1',
+        id,
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail='Dataset not found')
+    return row['mirror'], row['deleting']
+
+
+@router.post('/datasets/{id}/objects/unlinked', dependencies=[Depends(require_dataset_access)])
+async def find_unlinked_objects(id: int, user: dict = Depends(get_current_user)):
+    """The object samples of this dataset with no image, by kind (unlinked_objects.py), with the filter that shows
+    them. For a user who may edit the dataset, the objects whose image is there but not linked yet are linked first
+    (`linked`); anyone else sees them as `linkable`. Cheap: idx_samples_unlinked_objects holds only those objects."""
+    mirror, deleting = await _mirror_or_deleting(id)
+    linked = 0
+    if not mirror and not deleting and user['role'] in get_allowed_roles('power_user'):
+        linked = await _link_unlinked_objects(id)
+    found = await unlinked_objects.counts(db, id)
+    return {**found, 'linked': linked, 'mirror': mirror, 'filter': unlinked_objects.filter_leaf()}
+
+
+@router.post('/datasets/{id}/objects/unlinked/delete', dependencies=[Depends(require_dataset_access)])
+async def delete_unlinked_objects(
+    id: int,
+    request: UnlinkedObjectsDelete,
+    user: dict = Depends(require_role('admin')),
+):
+    """Delete the object samples with no image of the kinds named (by default only those whose image is gone), as a
+    bulk delete of their filter: resumable units, logged for followers and statistics like any delete, each unit
+    deleting only what still matches. Never automatic. The objects are linked first, so one whose image is there is
+    never deleted. Refused on a mirror: its objects change only through its sync."""
+    if not request.kinds:
+        raise HTTPException(status_code=400, detail=f'Name the kinds to delete: {", ".join(unlinked_objects.KINDS)}')
+    try:
+        kinds = unlinked_objects.kinds_of(request.kinds)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from None
+    mirror, deleting = await _mirror_or_deleting(id)
+    if mirror:
+        raise HTTPException(
+            status_code=409,
+            detail='This dataset is a read-only mirror of a dataset on another Freedom Ridge instance: its objects '
+            'change only through its sync, so delete them on the primary',
+        )
+    if deleting:
+        raise HTTPException(status_code=409, detail='This dataset is being deleted')
+    linked = await _link_unlinked_objects(id)
+    found = await unlinked_objects.counts(db, id)
+    expected = sum(found['kinds'][kind] for kind in kinds)
+    answer = {'kinds': kinds, 'linked': linked, 'expected': expected}
+    if not expected:
+        return {**answer, 'deleted_count': 0, 'objects_deleted': 0}
+    from .. import bulk_jobs
+
+    target = BulkTargetRequest(filters={'logic': 'AND', 'filters': [unlinked_objects.filter_leaf(kinds)]})
+    result = await bulk_jobs.submit(db.pool, id, user['id'], 'delete', target.model_dump())
+    return JSONResponse(status_code=202, content={**result, **answer})
+
+
 @router.post('/datasets/{id}/embeddings/{field_name}/delete', dependencies=[Depends(require_dataset_access)])
 async def bulk_delete_embeddings(
     id: int,
@@ -7223,7 +7702,7 @@ async def tag_samples(id: int, request: BulkTagRequest, user: dict, made_by: str
             if request.add_tags or request.remove_tags:
                 result = await conn.fetchrow(
                     f"""WITH targets AS MATERIALIZED (
-                        SELECT id FROM samples WHERE {where_sql} ORDER BY id FOR UPDATE
+                        SELECT id FROM samples WHERE {where_sql} ORDER BY id FOR NO KEY UPDATE
                     ), changed AS (
                         UPDATE samples
                         SET {col} = array(SELECT DISTINCT unnest(samples.{col} || {add_arg})
@@ -7397,9 +7876,10 @@ async def bulk_set_metadata(id: int, request: BulkSetRequest, user: dict = Depen
     async with db.pool.acquire() as conn:
         async with conn.transaction():
             await lock_field_lifecycle(conn, id, exclusive=bool(remove_keys), wait=not remove_keys)
+            # NO KEY, as update_sample: only metadata is written.
             await conn.fetchval(
                 'SELECT count(*) FROM (SELECT id FROM samples WHERE dataset_id = $1 '
-                'AND id = ANY($2::int[]) ORDER BY id FOR UPDATE) locked_samples',
+                'AND id = ANY($2::int[]) ORDER BY id FOR NO KEY UPDATE) locked_samples',
                 id,
                 sample_ids,
             )
@@ -7694,6 +8174,21 @@ async def _drop_promoted_index(connection, dataset_id: int, field_name: str) -> 
     await connection.execute(f'DROP INDEX CONCURRENTLY IF EXISTS "{_promoted_index_name(dataset_id, field_name)}"')
 
 
+async def _refuse_parent_field_change(id: int, *names: str) -> None:
+    """parent_id names each object sample's image (0029). On a dataset with object samples, renaming or clearing the
+    field, or copying another over it, would unlink every object at once, so it is refused. Writing one sample's
+    parent_id (PATCH, a bulk set) re-points that object and stays allowed."""
+    if 'parent_id' in names and await db.fetchval(
+        "SELECT EXISTS (SELECT 1 FROM samples WHERE dataset_id = $1 AND media_type = 'object')",
+        id,
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="parent_id names each object sample's image, and this dataset has object samples, so the field "
+            "can't be renamed, cleared or overwritten. Re-point an object by writing its own parent_id",
+        )
+
+
 @router.post("/datasets/{id}/fields/{field_name}/rename", dependencies=[Depends(require_dataset_access)])
 async def rename_field(
     id: int,
@@ -7710,12 +8205,16 @@ async def rename_field(
     """
     # Reject invalid requests before choosing sync/job execution; revalidate under
     # the definition guard below (or at job submission) to cover concurrent writes.
+    await _refuse_parent_field_change(id, field_name, request.new_name)
     await _check_field_target(id, field_name, request.new_name, request.overwrite)
     if request.background or await _large_bulk_target(id):
         return await _bulk_response(id, user, 'rename', {**request.model_dump(), 'field_name': field_name})
     assert db.pool is not None
     promoted = await _is_promoted(id, field_name)
-    async with db.pool.acquire() as conn, _field_index_operation(conn, id, index_ddl=promoted):
+    from .. import index_jobs
+
+    rebuilding = await index_jobs.is_rebuilding(db, id, field_name)  # its old index is still there (0024)
+    async with db.pool.acquire() as conn, _field_index_operation(conn, id, index_ddl=promoted or rebuilding):
         async with conn.transaction():
             await lock_field_lifecycle(conn, id, exclusive=True)
             target_had_values = await _check_field_target(id, field_name, request.new_name, request.overwrite, conn)
@@ -7773,11 +8272,13 @@ async def rename_field(
             await copy_discovery(conn, id, field_name, request.new_name)
             await _carry_segmentation_entries(conn, id, field_name, request.new_name, keep_source=False)
             await _invalidate_field_derivations(conn, id, [field_name, request.new_name])
+            # Being rebuilt: the new name is rebuilt instead, and the old name's index goes below.
+            moved = rebuilding and await index_jobs.move_field_rebuild(conn, id, field_name, request.new_name)
             await conn.execute(
                 REQUEST_FULL_REFRESH,
                 id,
             )
-        if was_promoted:
+        if was_promoted or moved:
             await _drop_promoted_index(conn, id, field_name)
     if was_promoted:
         await promote_field(id, request.new_name, user)
@@ -7796,6 +8297,7 @@ async def clone_field(
     The copy is registered with the source's type and display type (not promoted — indexing is a
     choice per field) and, when the new key was empty, starts with the source's exact stats.
     """
+    await _refuse_parent_field_change(id, request.new_name)
     await _check_field_target(id, field_name, request.new_name, request.overwrite)
     if request.background or await _large_bulk_target(id):
         return await _bulk_response(id, user, 'clone', {**request.model_dump(), 'field_name': field_name})
@@ -7868,12 +8370,16 @@ async def clear_field(
 ):
     """Remove a metadata key from every sample in the dataset — and its registration, cached stats
     and promoted index, which used to linger as an empty schema/export column."""
+    await _refuse_parent_field_change(id, field_name)
     if background or await _large_bulk_target(id):
         return await _bulk_response(id, user, 'clear', {'field_name': field_name})
     _refuse_local_field_operation(field_name)
     _validate_field_name(field_name)
     promoted = await _is_promoted(id, field_name)
-    async with db.pool.acquire() as conn, _field_index_operation(conn, id, index_ddl=promoted):
+    from .. import index_jobs
+
+    rebuilding = await index_jobs.is_rebuilding(db, id, field_name)  # its old index is still there (0024)
+    async with db.pool.acquire() as conn, _field_index_operation(conn, id, index_ddl=promoted or rebuilding):
         async with conn.transaction():
             await lock_field_lifecycle(conn, id, exclusive=True)
             registration = await conn.fetchrow(
@@ -7900,7 +8406,8 @@ async def clear_field(
                 field_name,
             )
             await _invalidate_field_derivations(conn, id, [field_name])
-        if was_promoted:
+            moved = rebuilding and await index_jobs.move_field_rebuild(conn, id, field_name, None)
+        if was_promoted or moved:
             await _drop_promoted_index(conn, id, field_name)
     return {"updated_count": _parse_update_status(status, 0)}
 
@@ -8039,6 +8546,12 @@ async def run_aggregations(
         elif op in ("count_values", "distinct", "values"):
             columns = array_columns if array_columns is not None else await get_dataset_array_columns(id)
             value_expr = _agg_value_expr(field, array_columns=columns)
+            # A datetime field's values in instant order (backend/datetimes.py), those without one last, then by text.
+            datetime_field = field in getattr(columns, 'datetime_fields', ())
+
+            def order(column):
+                return f"{instant_sql(column)} NULLS LAST, {column}" if datetime_field else column
+
             args = list(base_args)
             limit_sql = ""
             if spec.limit is not None:
@@ -8056,9 +8569,9 @@ async def run_aggregations(
                 )
             elif op == "distinct":
                 rows = await db.fetch(
-                    f"{with_clause}SELECT DISTINCT v AS value FROM "
+                    f"{with_clause}SELECT value FROM (SELECT DISTINCT v AS value FROM "
                     f"(SELECT {value_expr} AS v FROM samples {where_clause}) sub "
-                    f"WHERE v IS NOT NULL ORDER BY value{limit_sql}",
+                    f"WHERE v IS NOT NULL) found ORDER BY {order('value')}{limit_sql}",
                     *args,
                 )
                 results.append({"op": op, "field": field, "value": [r['value'] for r in rows]})
@@ -8066,7 +8579,7 @@ async def run_aggregations(
                 rows = await db.fetch(
                     f"{with_clause}SELECT v AS value FROM "
                     f"(SELECT {value_expr} AS v FROM samples {where_clause}) sub "
-                    f"WHERE v IS NOT NULL ORDER BY value{limit_sql}",
+                    f"WHERE v IS NOT NULL ORDER BY {order('v')}{limit_sql}",
                     *args,
                 )
                 results.append({"op": op, "field": field, "value": [r['value'] for r in rows]})

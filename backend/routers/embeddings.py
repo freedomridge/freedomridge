@@ -685,6 +685,9 @@ async def reduce_embeddings(id: int, req: ReduceRequest, user: dict = Depends(re
                 id,
                 req.field_name,
             )
+        # A new layout of the map (a patch scale's: all its tiles), whatever it moved. Last, so its row is the last
+        # lock this takes, as in an upload.
+        await conn.execute('SELECT bump_map_layout($1, $2)', id, req.field_name)
 
     # The coordinate triggers hold the rank fence shared. Commit before taking it exclusive,
     # otherwise concurrent reductions can deadlock while both upgrade that fence. A failed rank
@@ -1150,7 +1153,13 @@ async def _query_embeddings_with_filter(
             )
 
 
-def _embeddings_binary_response(rows, total: int, rank_stale: bool = False, map_state=None) -> Response:
+def _embeddings_binary_response(
+    rows,
+    total: int,
+    rank_stale: bool = False,
+    map_state=None,
+    layout_id=None,
+) -> Response:
     """Pack base scatter coords as a columnar binary payload (Part 2): a 4-byte LE
     header length, a JSON header (space-padded to a 4-byte boundary), then
     int32[count] sample_id, float32[count] x, float32[count] y. ~½ the bytes of JSON
@@ -1168,6 +1177,7 @@ def _embeddings_binary_response(rows, total: int, rank_stale: bool = False, map_
             "sampled": n < total,
             "rank_stale": rank_stale,
             "map_state": map_state,
+            "layout_id": layout_id,
             "fields": ["sample_id", "x", "y"],
         },
     ).encode("utf-8")
@@ -1177,9 +1187,13 @@ def _embeddings_binary_response(rows, total: int, rank_stale: bool = False, map_
 
 
 async def _map_status(dataset_id: int, field: str):
+    # layout_id: the map's current layout (embedding_layouts). Null, with no row, until the map is first laid out
+    # again after the upgrade that added it: a lasso saved without a layout id was drawn on that layout, so it is
+    # stale only once this is set or changes.
     return await db.fetchrow(
         """SELECT (SELECT rank_stale FROM embedding_viz_meta WHERE dataset_id = $1 AND field_name = $2) AS rank_stale,
-                  m.model_id, m.refitted_at
+                  m.model_id, m.refitted_at,
+                  (SELECT layout_id::text FROM embedding_layouts WHERE dataset_id = $1 AND field_name = $2) AS layout_id
            FROM (SELECT 1) one LEFT JOIN embedding_map_state m ON m.dataset_id = $1 AND m.field_name = $2""",
         dataset_id,
         field,
@@ -1239,8 +1253,8 @@ async def get_embeddings_post(id: int, request: EmbeddingsRequest, format: str =
             use_temp = False
 
     # A map re-fit publishes all of a map's points in one transaction, and each query below reads one
-    # snapshot. Reading the map's identity before and after makes the points and the map_state they are
-    # reported with agree: if a re-fit was published in between, read the points again.
+    # snapshot. Reading the map's identity before and after makes the points and the map_state (and
+    # layout_id) they are reported with agree: if a new layout was written in between, read the points again.
     before = await _map_status(id, request.field)
     for _ in range(2):
         if not use_temp:
@@ -1265,7 +1279,7 @@ async def get_embeddings_post(id: int, request: EmbeddingsRequest, format: str =
                 filter_args,
             )
         status = await _map_status(id, request.field)
-        if status['model_id'] == before['model_id']:
+        if (status['model_id'], status['layout_id']) == (before['model_id'], before['layout_id']):
             break
         before = status
 
@@ -1280,7 +1294,7 @@ async def get_embeddings_post(id: int, request: EmbeddingsRequest, format: str =
 
     # Binary fast path: base coords only (no include_fields, no patch metadata).
     if format == "bin" and not request.include_fields and not is_patch:
-        return _embeddings_binary_response(rows, total, rank_stale, map_state)
+        return _embeddings_binary_response(rows, total, rank_stale, map_state, status['layout_id'])
 
     results = []
     for row in rows:
@@ -1307,6 +1321,7 @@ async def get_embeddings_post(id: int, request: EmbeddingsRequest, format: str =
         "sampled": len(results) < total,
         "rank_stale": rank_stale,
         "map_state": map_state,
+        "layout_id": status['layout_id'],
     }
 
 
@@ -1849,16 +1864,13 @@ async def upload_coordinates(
             len(coordinates) * COORDINATE_ROW_BYTES,
             f"updating {len(coordinates)} coordinates",
         )
-        await conn.execute(
-            SAVE_PROJECTED_COORDINATES if any(versions) else SAVE_COORDINATES,
-            sample_ids,
-            xs,
-            ys,
-            id,
-            field_name,
-            *([versions] if any(versions) else []),
-            timeout=120.0,
-        )
+        if any(versions):
+            await conn.execute(SAVE_PROJECTED_COORDINATES, sample_ids, xs, ys, id, field_name, versions, timeout=120.0)
+        # A point already on the map moved, or points were added to a whole-image map with none: a new layout
+        # (bump_map_layout). New points on a map that has some are not one. A layout uploaded in several requests may
+        # count several times.
+        elif await conn.fetchval(SAVE_COORDINATES, sample_ids, xs, ys, id, field_name, timeout=120.0):
+            await conn.execute('SELECT bump_map_layout($1, $2)', id, field_name)
 
     return {"message": f"Updated {len(coordinates)} coordinates"}
 

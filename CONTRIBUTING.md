@@ -229,10 +229,12 @@ To change the schema:
    and its release's upgrade notes say to stop the app.
 4. Think about followers ([docs/FOLLOWERS.md](docs/FOLLOWERS.md)) when a migration changes rows, not only the
    schema. Statements on the tables followers read (`samples`, `embeddings`, `sample_hashes`,
-   `embedding_coordinates`, `dataset_fields`, `views`, `embedding_viz_meta` and `datasets`: the ones with the
-   `follower_truncate_guard` trigger) run those tables' triggers like any other write. On a primary, each changed row of a followed dataset
+   `embedding_coordinates`, `dataset_fields`, `views`, `embedding_viz_meta`, `embedding_layouts` and `datasets`: the
+   ones with the `follower_truncate_guard` trigger) run those tables' triggers like any other write. On a primary, each changed row of a followed dataset
    is logged, and every follower fetches it again. On a follower, a mirror's read-only guard refuses the
-   statement and the migration fails. When the rows mean the same afterwards (a column filled in, a table
+   statement and the migration fails. `embedding_layouts` has neither trigger: a migration that changes its rows logs
+   a `'maps'` dataset change for each followed dataset it touches, as `bump_map_layout` does, so followers read the
+   ids again. When the rows mean the same afterwards (a column filled in, a table
    rebuilt), keep the triggers from firing, for example with `ALTER TABLE ... DISABLE TRIGGER USER` around the
    statement or by creating the triggers after the rows are copied, and say in the file that it is on purpose.
 5. Run sections 4 and 5.

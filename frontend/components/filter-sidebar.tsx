@@ -4,7 +4,8 @@ import { isOverlayActive, isDerivedLabelField } from '@/lib/labels';
 
 import { type SchemaField, type Filters, type ComplexFilter, getFieldFacet, isRescoringRefusal, promoteField, rescoringRetryTurn } from '@/lib/api';
 import { SearchableSelect } from './searchable-select';
-import { convertSimpleFiltersToComplex, describeFilter, excludeKeyFor, isTextFilter, type TextFilter } from '@/lib/filter-utils';
+import { convertSimpleFiltersToComplex, describeFilter, excludeKeyFor, isTextFilter, type RangeFilter, type TextFilter } from '@/lib/filter-utils';
+import { datetimeMs } from '@/lib/datetimes';
 import { filteredFieldNames, readCollapsedFields, readExpandedFields, storeFieldExpanded } from '@/lib/sidebar-sections';
 import { EyeOpenIcon, EyeNoneIcon, MixerHorizontalIcon } from '@radix-ui/react-icons';
 import { Rocket } from 'lucide-react';
@@ -45,6 +46,7 @@ function RangeSlider({ min, max, fieldMin, fieldMax, step, variant, formatLabel,
             ) : (
                 <div className="flex justify-between text-xs text-zinc-300 mb-1">
                     <span>{formatLabel(val[0])}</span>
+                    <span className="text-zinc-500" title="Dates are in UTC">UTC</span>
                     <span>{formatLabel(val[1])}</span>
                 </div>
             )}
@@ -163,7 +165,7 @@ function SidebarValuePicker({ datasetId, field, filters, globalFilters, onChange
 
 export function FilterSidebar({
     datasetId,
-    schema,
+    schema: fullSchema,
     isLoading,
     filters,
     globalFilters,
@@ -177,6 +179,8 @@ export function FilterSidebar({
     valuesUpdating = false,
     expandAll: expandAllOnOpen = false,
 }: Props) {
+    // The fields the sidebar lists: parent_id isn't one (`sidebar: false`); nothing here asks for it.
+    const schema = useMemo(() => fullSchema.filter(field => field.sidebar !== false), [fullSchema]);
     const hasActiveFilters = Object.keys(filters).length > 0;
     const [promotingField, setPromotingField] = useState<string | null>(null);
     const { addToast } = useToast();
@@ -424,10 +428,9 @@ export function FilterSidebar({
         // Annotation label fields cannot be indexed (nested in JSONB arrays)
         if (isDerivedLabelField(field.name, schema)) return null;
 
-        // Native columns (id, created_at, filepath) are already indexed and live
-        // outside `metadata` — promoting them would build a useless
-        // metadata->>'created_at' index over NULLs. Never offer it.
-        const nativeColumns = ['id', 'created_at', 'filepath'];
+        // Native columns (id, created_at, last_modified_at, filepath) live outside `metadata` —
+        // promoting them would build a useless metadata->>'created_at' index over NULLs. Never offer it.
+        const nativeColumns = ['id', 'created_at', 'last_modified_at', 'filepath'];
         if (nativeColumns.includes(field.name)) return null;
 
         // Allow promoting number, string, enum, and datetime fields
@@ -900,17 +903,23 @@ export function FilterSidebar({
 
                             // Datetime (Date Range)
                             if (field.type === 'datetime' && field.min && field.max) {
-                                const fieldMin = new Date(field.min as string).getTime();
-                                const fieldMax = new Date(field.max as string).getTime();
+                                // Read as the server reads them: text with no offset is UTC.
+                                const fieldMin = datetimeMs(String(field.min));
+                                const fieldMax = datetimeMs(String(field.max));
                                 const currentVal = filters[field.name] || { min: field.min, max: field.max };
                                 const curMin = typeof currentVal === 'object' && 'min' in currentVal
-                                    ? new Date(currentVal.min).getTime() : fieldMin;
+                                    ? datetimeMs(String(currentVal.min)) : fieldMin;
                                 const curMax = typeof currentVal === 'object' && 'max' in currentVal
-                                    ? new Date(currentVal.max).getTime() : fieldMax;
+                                    ? datetimeMs(String(currentVal.max)) : fieldMax;
+                                // Steps of at most a day that divide the range evenly, so a handle dragged back to
+                                // its end reaches it: whole days from the earliest value could stop up to half a day
+                                // short of the latest, which then sent a bound that cut the newest samples off.
+                                const span = fieldMax - fieldMin;
+                                const step = Math.max(1, Math.ceil(span / Math.max(1, Math.ceil(span / 86400000))));
 
                                 const formatDate = (ts: number) => {
                                     const d = new Date(ts);
-                                    return d.toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' });
+                                    return d.toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric', timeZone: 'UTC' });
                                 };
 
                                 return renderSection(schemaField, index, {
@@ -940,17 +949,20 @@ export function FilterSidebar({
                                                 max={curMax}
                                                 fieldMin={fieldMin}
                                                 fieldMax={fieldMax}
-                                                step={86400000}
+                                                step={step}
                                                 formatLabel={formatDate}
                                                 onCommit={(lo, hi) => {
+                                                    // Only a handle off its end is a bound. An end at its limit is
+                                                    // no bound, so a newer (or older) sample, or one past the
+                                                    // limit's millisecond, isn't cut off.
+                                                    const range: RangeFilter = {};
+                                                    if (lo !== fieldMin) range.min = new Date(lo).toISOString();
+                                                    if (hi !== fieldMax) range.max = new Date(hi).toISOString();
                                                     const newFilters = { ...filters };
-                                                    if (lo === fieldMin && hi === fieldMax) {
+                                                    if (range.min === undefined && range.max === undefined) {
                                                         delete newFilters[field.name];
                                                     } else {
-                                                        newFilters[field.name] = {
-                                                            min: new Date(lo).toISOString(),
-                                                            max: new Date(hi).toISOString()
-                                                        };
+                                                        newFilters[field.name] = range;
                                                     }
                                                     onChange(newFilters);
                                                 }}

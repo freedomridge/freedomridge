@@ -14,7 +14,7 @@ services:
   # PostgreSQL Database with PostGIS and pgvector
   db:
     logging: *default-logging
-    image: ghcr.io/freedomridge/db:2.10.0
+    image: ghcr.io/freedomridge/db:2.11.0
     build:
       context: .
       dockerfile: Dockerfile.db
@@ -52,7 +52,7 @@ services:
   # Backend API (FastAPI)
   backend:
     logging: *default-logging
-    image: ghcr.io/freedomridge/backend:2.10.0
+    image: ghcr.io/freedomridge/backend:2.11.0
     build:
       context: .
       dockerfile: Dockerfile.backend
@@ -126,7 +126,7 @@ services:
   # Database upkeep runs in job-runner. Shares the cache volume with the backend.
   worker:
     logging: *default-logging
-    image: ghcr.io/freedomridge/worker:2.10.0
+    image: ghcr.io/freedomridge/worker:2.11.0
     build:
       context: .
       dockerfile: Dockerfile.worker
@@ -147,7 +147,7 @@ services:
 
   job-runner:
     logging: *default-logging
-    image: ghcr.io/freedomridge/worker:2.10.0
+    image: ghcr.io/freedomridge/worker:2.11.0
     build:
       context: .
       dockerfile: Dockerfile.worker
@@ -187,7 +187,7 @@ services:
   # instance role for off-box copies. The application Backups card is separate.
   backup:
     logging: *default-logging
-    image: ghcr.io/freedomridge/backup:2.10.0
+    image: ghcr.io/freedomridge/backup:2.11.0
     build:
       context: .
       dockerfile: Dockerfile.backup
@@ -211,7 +211,7 @@ services:
     # Frontend (Next.js)
   frontend:
     logging: *default-logging
-    image: ghcr.io/freedomridge/frontend:2.10.0
+    image: ghcr.io/freedomridge/frontend:2.11.0
     build:
       context: .
       dockerfile: Dockerfile.frontend

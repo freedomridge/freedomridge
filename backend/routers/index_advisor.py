@@ -15,7 +15,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field, StrictBool, StrictInt, model_validator
 
-from .. import dataset_schedules, index_actions, index_advisor, job_wait
+from .. import dataset_schedules, index_actions, index_advisor, index_jobs, job_wait
 from ..access import check_dataset_access
 from ..database import db
 from ..job_queue import QueueBusy
@@ -68,6 +68,7 @@ async def dataset_index_advisor(id: int, user: dict = Depends(require_role('admi
         )
         removed = await index_actions.removals(connection, id)
         pending = await index_actions.pending(connection, id)
+        rebuilding = await index_jobs.rebuilding_fields(connection, id)
     rule = _rule(schedule)
     if rule is not None:
         rule['id'] = schedule['id']
@@ -77,6 +78,8 @@ async def dataset_index_advisor(id: int, user: dict = Depends(require_role('admi
         'schedule': rule,
         'removed': removed,
         'pending_actions': pending,
+        # Fields whose index is being rebuilt in the background: not indexed until it is, and not to be suggested.
+        'rebuilding': rebuilding,
         'window_days': index_advisor.WINDOW.days,
     }
 

@@ -3,12 +3,13 @@
 import React, { createContext, useContext, useState, useCallback, useMemo, useEffect, useRef } from 'react';
 import { useSearchParams } from 'next/navigation';
 import type { Feature, Polygon } from 'geojson';
-import { ComplexFilter, MAP_REFITTED_EVENT, type MapRefitted, ViewStage } from '@/lib/api';
-import { useToast } from '@/contexts/ToastContext';
+import { ComplexFilter, ViewStage } from '@/lib/api';
 import { convertSimpleFiltersToComplex, describeFilter, upgradeDraftKeys } from '@/lib/filter-utils';
 import { type DefaultView, defaultViewStages, isDefaultViewStage, opensOnDefaultView } from '@/lib/default-view';
 import { type DatasetLink, linkSetsFilters, readLink, withoutLinkParameters } from '@/lib/links';
 import { type ExpiredSelection, expiredSelection, filterHasInSelection } from '@/lib/filter-query';
+import { lassoFilter } from '@/lib/stale-lasso';
+import { type SourceView, sourceOf } from '@/lib/source-view';
 
 // The map lasso selection — a GeoJSON polygon feature (or none).
 type MapPolygon = Feature<Polygon> | null;
@@ -23,7 +24,9 @@ type SimpleFilters = Record<string, any>;
 const STORAGE_PREFIX = 'fridge-filters-';
 
 // A lasso on a sampled scatter: the polygon is the selection, and brushedIds holds only its visible points.
-type EmbeddingRegion = { field: string; polygon: number[][]; token: string; total: number; modelId?: string | null };
+// layoutId: the layout of the map the lasso was drawn on (the scatter's layout_id), recorded on the filter it makes, with
+// modelId until 2.12 (lib/stale-lasso.ts lassoFilter).
+type EmbeddingRegion = { field: string; polygon: number[][]; token: string; total: number; layoutId?: string | null; modelId?: string | null };
 
 // The spelling of simpleFilters' keys a saved state uses: 2 marks exclusions and bounds with ':' (filter-utils); a
 // state saved without it used `exclude_` and `_min` / `_max`, and is read through upgradeDraftKeys.
@@ -46,6 +49,9 @@ interface PersistedFilterState {
     // The default view this browser's viewer chose to see past (Show all images, or removing its filters):
     // the dataset doesn't open on it again until they clear the filters.
     dismissedDefaultViewId?: number | null;
+    // The saved view the filters came from (lib/source-view.ts): kept with them, so after a reload they can still
+    // update it.
+    sourceView?: SourceView | null;
     // The chips of applied selections that couldn't be saved (isEphemeralSelectionStage), shown expired.
     expiredSelections?: ExpiredSelection[];
 }
@@ -136,7 +142,14 @@ interface FilterContextType {
 
     // View Stages
     viewStages: ViewStage[];
+    // Stages put in place of all the applied ones (not an update of them) aren't a saved view's: the source view is
+    // cleared. openView applies a saved view's stages and makes it the source.
     setViewStages: React.Dispatch<React.SetStateAction<ViewStage[]>>;
+    // The saved view the applied filters came from (Saved Views, the default view, a ?view= link), or null:
+    // lib/source-view.ts. Its owner or an admin can update it with the applied filters while they differ.
+    sourceView: SourceView | null;
+    setSourceView: (source: SourceView | null) => void;
+    openView: (view: Parameters<typeof sourceOf>[0], stages: ViewStage[]) => void;
     // Chips of applied selections that couldn't be kept across a reload or Back: shown expired, applying nothing.
     // Kept apart from viewStages, so nothing that reads the stages (the queries, saved views, links) sees them.
     expiredSelections: ExpiredSelection[];
@@ -174,8 +187,9 @@ interface FilterContextType {
     // The link the page was opened with (lib/links.ts), read once as it opened; null without one. The page opens
     // it and hands its filter stages to settleLink (null when the link sets none or can't be opened), which puts
     // them in place of the restored filters and removes the link from the address.
+    // A `?view=` link's stages come with their view, which becomes the source view.
     link: DatasetLink | null;
-    settleLink: (stages: ViewStage[] | null) => void;
+    settleLink: (stages: ViewStage[] | null, source?: SourceView | null) => void;
     // A link that sets the filters is still being opened: the page holds its panels back, so the restored filters
     // aren't queried (and shown) only to be replaced.
     linkPending: boolean;
@@ -321,17 +335,6 @@ export function withGrain(
     return { logic: 'AND', filters: parts };
 }
 
-// Does this filter tree hold a lasso of `field` drawn on another map than `modelId` (the field's current
-// one)? Such a polygon would select other samples now; the server refuses it (409 map_refitted).
-function holdsStaleLasso(node: ComplexFilter | undefined, field: string, modelId: string | null): boolean {
-    if (!node) return false;
-    if ((node.operator === 'embedding_polygon' || node.operator === 'embedding_polygon_exclude') && node.field === field && (node.model_id ?? null) !== modelId) return true;
-    if ((node.filters ?? []).some((child) => holdsStaleLasso(child, field, modelId))) return true;
-    const value = node.value as unknown;
-    return typeof value === 'object' && value !== null && !Array.isArray(value)
-        && holdsStaleLasso(value as ComplexFilter, field, modelId);
-}
-
 export function FilterProvider({ children, datasetId }: { children: React.ReactNode; datasetId?: number }): React.ReactNode {
     // Load persisted state (runs once per datasetId)
     const savedState = useMemo(() => loadFilterState(datasetId), [datasetId]);
@@ -348,6 +351,15 @@ export function FilterProvider({ children, datasetId }: { children: React.ReactN
 
     // View Stages - The source of truth for global filters
     const [viewStages, setViewStages] = useState<ViewStage[]>(savedState?.viewStages ?? []);
+    const [sourceView, setSourceView] = useState<SourceView | null>(savedState?.sourceView ?? null);
+    const replaceViewStages = useCallback((next: React.SetStateAction<ViewStage[]>) => {
+        if (typeof next !== 'function') setSourceView(null);
+        setViewStages(next);
+    }, []);
+    const openView = useCallback((view: Parameters<typeof sourceOf>[0], stages: ViewStage[]) => {
+        setViewStages(stages);
+        setSourceView(sourceOf(view, stages));
+    }, []);
     const [expiredSelections, setExpiredSelections] = useState<ExpiredSelection[]>(savedState?.expiredSelections ?? []);
 
     // Grain-less view-stage filters. The grain predicate (image vs object) is applied
@@ -365,11 +377,14 @@ export function FilterProvider({ children, datasetId }: { children: React.ReactN
         setViewStages(prev => [...prev, stage]);
     }, []);
 
-    // The dataset's default view, from the page's dataset answer. Its id only changes when an administrator
-    // picks another view, and a saved view's content never changes, so the id says whether it is new.
+    // The dataset's default view, from the page's dataset answer. Its id changes when an administrator picks another
+    // view, and its updated_at when its filters are replaced (Update this view): together they say whether it is new.
     const [defaultView, setDefaultViewState] = useState<DefaultView | null | undefined>(undefined);
     const setDefaultView = useCallback((view: DefaultView | null) => {
-        setDefaultViewState(prev => (prev !== undefined && (prev?.id ?? null) === (view?.id ?? null) ? prev : view));
+        setDefaultViewState(prev => (
+            prev !== undefined && (prev?.id ?? null) === (view?.id ?? null) && (prev?.updated_at ?? null) === (view?.updated_at ?? null)
+                ? prev : view
+        ));
     }, []);
     const [dismissedDefaultViewId, setDismissedDefaultViewId] = useState<number | null>(savedState?.dismissedDefaultViewId ?? null);
 
@@ -430,11 +445,11 @@ export function FilterProvider({ children, datasetId }: { children: React.ReactN
             saveFilterState(datasetId, {
                 viewStages, filterMode, simpleFilters, advancedFilters,
                 brushedIds, currentEmbeddingRegion, selectedIds, selectionGrain, currentPolygon, selectionSource, dismissedDefaultViewId,
-                expiredSelections,
+                expiredSelections, sourceView,
             });
         }, 300);
         return () => { if (saveTimerRef.current) clearTimeout(saveTimerRef.current); };
-    }, [datasetId, viewStages, filterMode, simpleFilters, advancedFilters, brushedIds, currentEmbeddingRegion, selectedIds, selectionGrain, currentPolygon, selectionSource, dismissedDefaultViewId, expiredSelections]);
+    }, [datasetId, viewStages, filterMode, simpleFilters, advancedFilters, brushedIds, currentEmbeddingRegion, selectedIds, selectionGrain, currentPolygon, selectionSource, dismissedDefaultViewId, expiredSelections, sourceView]);
 
     // --- Browser history (back/forward) for filter state ---
     // Each settled filter change pushes a history entry; Back/Forward restores that
@@ -462,7 +477,9 @@ export function FilterProvider({ children, datasetId }: { children: React.ReactN
         selectionGrain,
         currentPolygon,
         selectionSource,
-    }), [viewStages, expiredSelections, brushedIds, currentEmbeddingRegion, selectedIds, selectionGrain, currentPolygon, selectionSource]);
+        // Each entry keeps the view its filters came from: Back to them can update it again, Back past it can't.
+        sourceView,
+    }), [viewStages, expiredSelections, brushedIds, currentEmbeddingRegion, selectedIds, selectionGrain, currentPolygon, selectionSource, sourceView]);
 
     // Every entry we write KEEPS the app router's own keys (__NA + its tree). Next reloads the page
     // on Back/Forward to an entry without them, and ours never had them: the router stamps the entry
@@ -496,8 +513,12 @@ export function FilterProvider({ children, datasetId }: { children: React.ReactN
                 return;
             }
             const cur = window.history.state;
-            // Don't push a duplicate of the current entry (mount echo / no-op churn).
-            if (cur && cur._fridge && historyStateSig(cur) === historyStateSig(snap)) return;
+            // Don't push a duplicate of the current entry (mount echo / no-op churn). The same filters from another
+            // source view (just saved as one, say) replace it: Back goes to other filters, not to the same ones.
+            if (cur && cur._fridge && historyStateSig(cur) === historyStateSig(snap)) {
+                if ((cur.sourceView?.id ?? null) !== (snap.sourceView?.id ?? null)) window.history.replaceState(withRouterState(snap), '');
+                return;
+            }
             // pushState can still throw if the snapshot is unexpectedly large (browser
             // history.state cap) — never let a history push crash the app.
             try {
@@ -507,7 +528,7 @@ export function FilterProvider({ children, datasetId }: { children: React.ReactN
             }
         }, 400);
         return () => { if (historyTimerRef.current) clearTimeout(historyTimerRef.current); };
-    }, [viewStages, expiredSelections, brushedIds, currentEmbeddingRegion, selectedIds, currentPolygon, selectionSource, buildHistorySnapshot]);
+    }, [viewStages, expiredSelections, brushedIds, currentEmbeddingRegion, selectedIds, currentPolygon, selectionSource, sourceView, buildHistorySnapshot]);
 
     // Listen for popstate (back/forward)
     useEffect(() => {
@@ -526,6 +547,7 @@ export function FilterProvider({ children, datasetId }: { children: React.ReactN
             setSelectionGrain(state.selectionGrain ?? null);
             setCurrentPolygon(state.currentPolygon ?? null);
             setSelectionSource(state.selectionSource ?? 'Manual');
+            setSourceView(state.sourceView ?? null);
         };
         window.addEventListener('popstate', handler);
         return () => window.removeEventListener('popstate', handler);
@@ -593,12 +615,7 @@ export function FilterProvider({ children, datasetId }: { children: React.ReactN
         // stage, so draft and applied behave identically. The (field_name, x, y) btree
         // serves the bbox; a GiST point index measured ~3x SLOWER, so we don't add one.
         if (currentEmbeddingRegion) {
-            base.filters?.push({
-                field: currentEmbeddingRegion.field,
-                operator: 'embedding_polygon',
-                value: currentEmbeddingRegion.polygon,
-                model_id: currentEmbeddingRegion.modelId ?? null,
-            });
+            base.filters?.push(lassoFilter(currentEmbeddingRegion));
         }
 
         return base;
@@ -683,12 +700,7 @@ export function FilterProvider({ children, datasetId }: { children: React.ReactN
             addStage({
                 type: 'filter',
                 description: 'Embeddings Region',
-                filter: {
-                    field: currentEmbeddingRegion.field,
-                    operator: 'embedding_polygon',
-                    value: currentEmbeddingRegion.polygon,
-                    model_id: currentEmbeddingRegion.modelId ?? null,
-                }
+                filter: lassoFilter(currentEmbeddingRegion),
             });
         }
 
@@ -732,13 +744,16 @@ export function FilterProvider({ children, datasetId }: { children: React.ReactN
     const resetFilters = useCallback(() => {
         // Clear only global filters (view stages), back to the dataset's default view.
         // Preserve draft sidebar filters and selections
-        setViewStages(defaultViewStages(defaultView));
+        const stages = defaultViewStages(defaultView);
+        setViewStages(stages);
+        setSourceView(defaultView && stages.length ? sourceOf(defaultView, stages) : null);
         setExpiredSelections([]);
         setDismissedDefaultViewId(null);
     }, [defaultView]);
 
     const showAllImages = useCallback(() => {
         setViewStages([]);
+        setSourceView(null);
         setExpiredSelections([]);
         if (defaultView) setDismissedDefaultViewId(defaultView.id);
     }, [defaultView]);
@@ -751,10 +766,10 @@ export function FilterProvider({ children, datasetId }: { children: React.ReactN
         if (defaultView === undefined || openedRef.current || linkPending) return;
         openedRef.current = true;
         if (linkAppliedRef.current) return;
-        if (opensOnDefaultView(viewStages, dismissedDefaultViewId, defaultView, expiredSelections)) {
+        if (defaultView && opensOnDefaultView(viewStages, dismissedDefaultViewId, defaultView, expiredSelections)) {
             replaceHistoryRef.current = true;
             // eslint-disable-next-line react-hooks/set-state-in-effect -- once per visit, when the dataset's answer arrives
-            setViewStages(defaultViewStages(defaultView));
+            openView(defaultView, defaultViewStages(defaultView));
         }
     }, [defaultView, linkPending]); // eslint-disable-line react-hooks/exhaustive-deps -- once, with the filters this visit opened with
 
@@ -764,10 +779,11 @@ export function FilterProvider({ children, datasetId }: { children: React.ReactN
     // open the link again. The state goes in without the router's own mark (__NA): Next's replaceState then takes
     // the new address as its own and copies its keys back beside our snapshot. With the mark it would pass the call
     // through unseen, keep the address with the link, and write that back at its next state change.
-    const settleLink = useCallback((stages: ViewStage[] | null) => {
+    const settleLink = useCallback((stages: ViewStage[] | null, source: SourceView | null = null) => {
         if (stages) {
             linkAppliedRef.current = true;
             setViewStages(stages);
+            setSourceView(source);
             setExpiredSelections([]);
         }
         const state = { ...window.history.state };
@@ -783,6 +799,7 @@ export function FilterProvider({ children, datasetId }: { children: React.ReactN
     // images while the chip still said the search had succeeded.
     const showResultsAsView = useCallback((stage: ViewStage) => {
         setViewStages([stage]);
+        setSourceView(null);
         setExpiredSelections([]);
         setSimpleFilters({});
         setAdvancedFilters({ logic: 'AND', filters: [] });
@@ -803,41 +820,14 @@ export function FilterProvider({ children, datasetId }: { children: React.ReactN
         // Do not reset source here as it might be used for re-selection
     }, []);
 
-    // A re-fit moved every point of a map: a lasso drawn on the old map (an applied "Embeddings Region"
-    // stage, one inside a saved view, or the draft) is refused by every request that carries it. Drop it,
-    // so the grid, the sidebar and the scatter load again and the selection can be drawn on the new map.
-    const { addToast } = useToast();
-    const regionRef = useRef(currentEmbeddingRegion);
-    useEffect(() => { regionRef.current = currentEmbeddingRegion; }, [currentEmbeddingRegion]);
-    const announced = useRef<string | null>(null);
-    useEffect(() => {
-        const onRefitted = (event: Event) => {
-            const { datasetId: refitted, field, modelId } = (event as CustomEvent<MapRefitted>).detail;
-            if (refitted !== datasetId) return;
-            setViewStages((prev) => {
-                const kept = prev.filter((stage) => !holdsStaleLasso(stage.filter, field, modelId));
-                return kept.length === prev.length ? prev : kept;
-            });
-            const region = regionRef.current;
-            if (region && region.field === field && (region.modelId ?? null) !== modelId) {
-                setCurrentEmbeddingRegion(null);
-                setBrushedIds([]);
-            }
-            const key = `${field}:${modelId}`;
-            if (announced.current !== key) {  // every request carrying the lasso answers alike: say it once
-                announced.current = key;
-                addToast(`The map of ${field} was re-fitted, so the lasso selection drawn on the old map was removed. Draw it again on the new map.`, 'warning', 10000);
-            }
-        };
-        window.addEventListener(MAP_REFITTED_EVENT, onRefitted);
-        return () => window.removeEventListener(MAP_REFITTED_EVENT, onRefitted);
-    }, [datasetId, addToast]);
-
     const value = {
         globalFilters,
         userFilters,
         viewStages,
-        setViewStages,
+        setViewStages: replaceViewStages,
+        sourceView,
+        setSourceView,
+        openView,
         expiredSelections,
         setExpiredSelections,
         addStage,

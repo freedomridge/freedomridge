@@ -596,6 +596,7 @@ interface Props {
 }
 
 const DECLARED_TYPES: DeclaredFieldType[] = ['unknown', 'boolean', 'number', 'string', 'datetime', 'list', 'object'];
+const REBUILDING_NOTE = 'Its index is being rebuilt in the background (Jobs shows its progress). Until then it filters and sorts correctly, only slower.';
 
 function FieldTypeRow({ datasetId, field, readOnly, onSaved }: {
     datasetId: number; field: SchemaField; readOnly: boolean; onSaved: () => Promise<void>;
@@ -676,14 +677,14 @@ export function DatasetSettingsModal({ dataset, onClose, readOnly = false, onVie
     const [togglingField, setTogglingField] = useState<string | null>(null);
     const [indexStatus, setIndexStatus] = useState<string | null>(null);
 
-    // Indexable fields: number and enum types (not arrays, objects, filepath)
+    // Indexable fields: number, string, enum and datetime types (not arrays, objects, filepath)
     const indexableFields = useMemo(() => {
         if (!schema) return [];
         const mediaFieldSet = new Set(dataset.media_fields || ['filepath']);
         return schema.filter(f => {
             const origType = (f as SchemaField & { original_type?: string }).original_type || f.type;
-            return (origType === 'number' || origType === 'enum' || origType === 'string' || f.type === 'number' || f.type === 'enum') &&
-                !['id', 'created_at', 'media_type'].includes(f.name) &&
+            return (origType === 'number' || origType === 'enum' || origType === 'string' || origType === 'datetime' || f.type === 'number' || f.type === 'enum') &&
+                !['id', 'created_at', 'last_modified_at', 'media_type'].includes(f.name) &&
                 !mediaFieldSet.has(f.name) &&
                 !f.name.includes('.');
         });
@@ -697,7 +698,9 @@ export function DatasetSettingsModal({ dataset, onClose, readOnly = false, onVie
             if (currentlyPromoted) {
                 await demoteField(dataset.id, fieldName);
             } else {
-                await promoteField(dataset.id, fieldName);
+                await promoteField(dataset.id, fieldName, waitingFor => setIndexStatus(waitingFor
+                    ? `The index for "${fieldName}" is waiting ${waitingFor}`
+                    : `${action} index for "${fieldName}"...`));
             }
             setIndexStatus(`Done — "${fieldName}" ${currentlyPromoted ? 'demoted' : 'promoted'}`);
             queryClient.invalidateQueries({ queryKey: ['dataset-schema', dataset.id] });
@@ -934,6 +937,13 @@ export function DatasetSettingsModal({ dataset, onClose, readOnly = false, onVie
                                         <tbody>
                                             {indexableFields.map(field => {
                                                 const isPromoted = field.is_promoted || false;
+                                                // Not indexed until its index is rebuilt in the background (after an upgrade).
+                                                const isRebuilding = !isPromoted && !!field.index_rebuilding;
+                                                // Not started while a bulk job keeps the dataset's fields (a stopped one too): say which.
+                                                const rebuildNote = field.index_rebuild_waiting
+                                                    ? `Its index rebuild is waiting: ${field.index_rebuild_waiting}`
+                                                    : REBUILDING_NOTE;
+                                                const rebuildLabel = field.index_rebuild_waiting ? 'Waiting' : 'Rebuilding';
                                                 const isToggling = togglingField === field.name;
                                                 return (
                                                     <tr key={field.name} className="border-t border-zinc-800 hover:bg-zinc-800/30">
@@ -965,9 +975,9 @@ export function DatasetSettingsModal({ dataset, onClose, readOnly = false, onVie
                                                                 <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs font-medium ${
                                                                     isPromoted
                                                                         ? 'bg-yellow-400/15 text-yellow-400 border border-yellow-400/30'
-                                                                        : 'text-zinc-600'
-                                                                }`}>
-                                                                    {isPromoted ? <><Rocket className="w-3 h-3" /> Yes</> : 'No'}
+                                                                        : isRebuilding ? 'text-cyan-400' : 'text-zinc-600'
+                                                                }`} title={isRebuilding ? rebuildNote : undefined}>
+                                                                    {isPromoted ? <><Rocket className="w-3 h-3" /> Yes</> : isRebuilding ? rebuildLabel : 'No'}
                                                                 </span>
                                                             ) : (
                                                                 <button
@@ -977,12 +987,15 @@ export function DatasetSettingsModal({ dataset, onClose, readOnly = false, onVie
                                                                         isToggling ? 'opacity-50 cursor-wait' :
                                                                         isPromoted
                                                                             ? 'bg-yellow-400/15 text-yellow-400 border border-yellow-400/30 hover:bg-yellow-400/25'
-                                                                            : 'bg-zinc-800 text-zinc-500 border border-zinc-700 hover:text-yellow-400 hover:border-yellow-400/30'
+                                                                            : isRebuilding
+                                                                                ? 'bg-cyan-900/20 text-cyan-400 border border-cyan-800 hover:text-yellow-400 hover:border-yellow-400/30'
+                                                                                : 'bg-zinc-800 text-zinc-500 border border-zinc-700 hover:text-yellow-400 hover:border-yellow-400/30'
                                                                     }`}
-                                                                    title={isPromoted ? 'Click to remove index' : 'Click to add index'}
+                                                                    title={isPromoted ? 'Click to remove index' : isRebuilding ? `${rebuildNote} Click to build it now.` : 'Click to add index'}
+                                                                    data-testid={isRebuilding ? 'index-rebuilding' : undefined}
                                                                 >
                                                                     <Rocket className="w-3 h-3" />
-                                                                    {isToggling ? '...' : isPromoted ? 'Yes' : 'No'}
+                                                                    {isToggling ? '...' : isPromoted ? 'Yes' : isRebuilding ? rebuildLabel : 'No'}
                                                                 </button>
                                                             )}
                                                         </td>

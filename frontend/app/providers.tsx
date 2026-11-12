@@ -58,8 +58,6 @@ function QueryErrorToaster() {
             const err = event.query.state.error;
             if (is401(err)) return;
             if (event.query.meta?.errorHandledLocally === true) return;
-            // A lasso drawn on a re-fitted map: FilterContext removes it and says so (no error toast).
-            if ((err as { code?: string } | null)?.code === 'map_refitted') return;
             const at = event.query.state.errorUpdatedAt;
             if (seen.get(event.query.queryHash) === at) return; // already toasted this occurrence
             seen.set(event.query.queryHash, at);

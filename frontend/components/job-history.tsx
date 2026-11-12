@@ -6,7 +6,7 @@ import { Cross2Icon } from '@radix-ui/react-icons';
 import { keepPreviousData, useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { buildAnnIndex, discardBulkJob, getDatasetJobHistory, getGlobalJobs, resumeBulkJob, type JobRecord, type JobRecordPage } from '@/lib/api';
 import { useUser } from '@/contexts/UserContext';
-import { canRetryIndexBuild, waitingNote } from '@/lib/job-status';
+import { canRetryIndexBuild, notRebuilt, waitingNote } from '@/lib/job-status';
 import { jobName } from '@/components/dataset-jobs';
 import { DatasetSchedules } from '@/components/dataset-schedules';
 
@@ -42,11 +42,14 @@ export function BulkJobOutcome({ job, canResume, resume, discard, pending }: {
     if (job.kind !== 'bulk_mutation') return null;
     const stopped = job.state === 'cancelled' || job.state === 'failed';
     const result = job.result as {
-        updated_count?: number; deleted_count?: number; discarded?: { by?: string | null };
+        updated_count?: number; deleted_count?: number; objects_deleted?: number; discarded?: { by?: string | null };
     } | null | undefined;
     const count = result?.deleted_count ?? result?.updated_count;
+    // Deleting an image deletes its objects: those the job didn't select itself are counted apart.
+    const objects = result?.objects_deleted ?? 0;
     return <p className="mt-1 text-xs text-zinc-400" role="status">
-        {count != null && <span>{count.toLocaleString()} samples {result?.deleted_count != null ? 'deleted' : 'updated'}. </span>}
+        {count != null && <span>{count.toLocaleString()} samples {result?.deleted_count != null ? 'deleted' : 'updated'}{objects > 0
+            ? `, and ${objects.toLocaleString()} object${objects === 1 ? '' : 's'} with their images` : ''}. </span>}
         {stopped && (result?.discarded
             ? <>Discarded{result.discarded.by ? ` by ${result.discarded.by}` : ''}: completed chunks have been kept and the rest will not run.</>
             : <>Completed chunks have been kept. {canResume && <>
@@ -82,9 +85,10 @@ function JobHistoryItem({ job, listed }: { job: JobRecord; listed: JobRecord[] }
         },
     });
     const canRetry = canRetryIndexBuild(job, listed, user?.role);
+    const unbuilt = notRebuilt(job);
     const state = job.state === 'running' && job.cancel_requested
         ? { label: 'Cancelling', tone: STATE.cancelled.tone }
-        : STATE[job.state];
+        : unbuilt ? { label: 'Not rebuilt yet', tone: STATE.queued.tone } : STATE[job.state];
     const waiting = waitingNote(job);
     const error = waiting ? null : errorText(job.error);
     return (
@@ -108,6 +112,9 @@ function JobHistoryItem({ job, listed }: { job: JobRecord; listed: JobRecord[] }
                 discard={() => discard.mutate()}
                 pending={resume.isPending || discard.isPending}
             />
+            {unbuilt && job.progress.message && (
+                <p className="mt-1 text-xs text-zinc-400" data-testid="index-not-rebuilt">{job.progress.message}</p>
+            )}
             {job.kind === 'map_refit' && job.progress.message && job.state !== 'running' && (
                 <p className="mt-1 text-xs text-zinc-400" data-testid="map-refit-outcome">{job.progress.message}</p>
             )}

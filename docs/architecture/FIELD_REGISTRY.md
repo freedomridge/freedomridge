@@ -37,8 +37,9 @@ single set-based registration orders new/unknown definitions by name; already-de
 fields are read without updating or locking their registry rows.
 
 First-write inference considers every non-null value in the request, not just its first
-row or first 500-row chunk. Extended ISO dates/timestamps infer `datetime`; heterogeneous
-values infer `string`. Later batches cannot downgrade a concrete declaration. The only
+row or first 500-row chunk. Values all written in the one datetime grammar the database reads
+(`backend/datetimes.py`, [Dataset management](../DATASET_MANAGEMENT.md#dates-and-times)) infer `datetime`;
+heterogeneous values infer `string`. Later batches cannot downgrade a concrete declaration. The only
 automatic widening is `unknown` to a concrete type when a null-only field gains values.
 Invalid non-finite or out-of-float8-range numeric JSON values are rejected before encoding.
 

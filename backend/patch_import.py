@@ -293,7 +293,7 @@ def handler(pool):
                 for field in fields:
                     existing = await index_jobs._unfinished(connection, index_jobs.ANN_KIND, dataset_id, 'field', field)
                     if existing is None:
-                        existing = await job_queue.enqueue_job(
+                        existing = await index_jobs.enqueue_build(
                             connection,
                             index_jobs.ANN_KIND,
                             dataset_id=dataset_id,

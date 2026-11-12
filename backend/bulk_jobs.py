@@ -6,7 +6,8 @@ from datetime import datetime
 
 from fastapi import HTTPException
 
-from . import job_queue, local_writes
+from . import job_queue, local_writes, stale_lassos
+from .api_errors import CodedHTTPException
 from .diskspace import INGEST_ROW_BYTES, require_free_space
 from .field_registry import (
     LOCAL_PREFIX,
@@ -163,6 +164,11 @@ async def submit(pool, dataset_id, user_id, operation, payload):
             # Poll briefly for in-flight ingest without queueing behind it.
             await lock_field_lifecycle(connection, dataset_id, exclusive=True, wait=False)
             await connection.execute('SELECT require_writable_dataset($1)', dataset_id)
+            # A lasso drawn on an earlier layout of its map may select other samples now: a delete is refused (and
+            # checked again in every unit), another edit goes ahead and says so.
+            stale = await stale_lassos.stale_maps(connection, dataset_id, payload.get('filters'))
+            if stale and operation in stale_lassos.DESTRUCTIVE:
+                raise CodedHTTPException(409, stale_lassos.refusal(stale), 'stale_lasso')
             # Cleanup and pin admission serialize; no unbounded token copy is needed.
             if tokens:
                 await connection.execute('LOCK TABLE bulk_selection_pins IN SHARE ROW EXCLUSIVE MODE')
@@ -182,6 +188,15 @@ async def submit(pool, dataset_id, user_id, operation, payload):
                     raise HTTPException(400, 'Field operations require a metadata field')
                 if source is not None and source['is_promoted']:
                     raise HTTPException(409, 'Demote the field before a bulk field operation')
+                from .index_jobs import is_rebuilding
+
+                if operation != 'clone' and await is_rebuilding(connection, dataset_id, field):
+                    # Its old index, named for this name, would stay behind (the rename and clear endpoints drop it,
+                    # but that can't happen in this transaction).
+                    raise HTTPException(
+                        409,
+                        'The field\'s index is being rebuilt (Dataset Settings > Indexes); try again when that is done',
+                    )
                 if operation != 'clear':
                     if source is None:
                         raise HTTPException(404, f"Field '{field}' is not registered")
@@ -236,6 +251,14 @@ async def submit(pool, dataset_id, user_id, operation, payload):
                     ),
                     'predicate': predicate,
                     'typed_predicate_args': _freeze_value(args),
+                    # Every vector of the field (Dataset.delete_embedding_field): each unit gives its map a new
+                    # layout id with the delete, so a lasso drawn on it warns, whatever lays it out again after.
+                    'stale_lassos': stale,
+                    'whole_field': operation == 'delete_embeddings'
+                    and payload.get('filters') == {}
+                    and not ids
+                    and not payload.get('selection_token')
+                    and not payload.get('excluded_ids'),
                 },
                 barrier={'max_id': cutoff},
             )
@@ -253,7 +276,7 @@ async def submit(pool, dataset_id, user_id, operation, payload):
         raise HTTPException(409, 'Dataset has an active operation; retry', headers={'Retry-After': '1'}) from error
     if ids:
         await _stage_targets(pool, dataset_id, job['id'], ids, patches)
-    return {'job_id': str(job['id']), 'state': job['state']}
+    return {'job_id': str(job['id']), 'state': job['state'], **({'stale_lassos': stale} if stale else {})}
 
 
 async def _stage_targets(pool, dataset_id, job_id, ids, patches):
@@ -389,7 +412,35 @@ async def _mutate_local(connection, job, ids):
     return count
 
 
-async def _mutate(connection, job, ids, removed_fields):
+async def _delete(connection, job, ids, removed_fields, targeted):
+    """Delete these samples and the objects of the images among them (0030), whose key would delete them with their
+    images anyway: here they are counted, and their fields reach the caches. An object the job deletes itself, in this
+    unit or a later one, counts as a deleted sample, one it doesn't as an object deleted with its image: each row once.
+    Returns (deleted samples, objects deleted with their images)."""
+    dataset_id = job['dataset_id']
+    children = [
+        row['id']
+        for row in await connection.fetch(
+            'SELECT id FROM samples WHERE dataset_id=$1 AND parent_id=ANY($2::int[]) AND NOT id=ANY($2::int[]) '
+            'ORDER BY id FOR UPDATE',
+            dataset_id,
+            ids,
+        )
+    ]
+    own = await targeted(children) if children else set()
+    removed = await connection.fetch(
+        'DELETE FROM samples WHERE dataset_id=$1 AND id=ANY($2::int[]) RETURNING id, metadata',
+        dataset_id,
+        ids + children,
+    )
+    keys = {key for row in removed for key in row['metadata'] or {}}
+    removed_fields.update(keys)
+    await invalidate_values(connection, dataset_id, {'tags'} | keys)
+    objects = len({row['id'] for row in removed} & (set(children) - own))
+    return len(removed) - objects, objects
+
+
+async def _mutate(connection, job, ids, removed_fields, targeted=None):
     from .routers import datasets
 
     request = job['args']
@@ -398,15 +449,7 @@ async def _mutate(connection, job, ids, removed_fields):
     if request.get('local'):
         return await _mutate_local(connection, job, ids)
     if operation == 'delete':
-        removed = await connection.fetch(
-            'DELETE FROM samples WHERE dataset_id=$1 AND id=ANY($2::int[]) RETURNING metadata',
-            dataset_id,
-            ids,
-        )
-        names = {'tags'} | {key for row in removed for key in row['metadata']}
-        removed_fields.update(key for row in removed for key in row['metadata'])
-        await invalidate_values(connection, dataset_id, names)
-        return len(removed)
+        return await _delete(connection, job, ids, removed_fields, targeted)  # (samples, objects with their images)
     if operation == 'delete_embeddings':
         # Cascades remove the vectors' coordinates and queued projections; triggers keep map rank rows and counts.
         status = await connection.execute(
@@ -415,7 +458,10 @@ async def _mutate(connection, job, ids, removed_fields):
             ids,
             dataset_id,
         )
-        return int(status.split()[-1])
+        deleted = int(status.split()[-1])
+        if deleted and request.get('whole_field'):
+            await connection.execute('SELECT bump_map_layout($1, $2)', dataset_id, request['field_name'])
+        return deleted
     if operation == 'tag':
         col = request['field_name'].replace('"', '""')
         status = await connection.execute(
@@ -634,10 +680,14 @@ def handler(pool):
             count = checkpoint.get('affected', 0)
             operation = request['operation']
             result = {_count_key(operation): count}
+            if operation == 'delete':
+                result['objects_deleted'] = checkpoint.get('objects', 0)
             if operation in ('set', 'tag'):
                 result['message'] = f"Updated {request.get('field_name', 'metadata')} for {count} samples"
             if operation == 'rename':
                 result['promoted'] = False
+            if request.get('stale_lassos'):
+                result['stale_lassos'] = request['stale_lassos']
             return StepResult(
                 checkpoint=checkpoint,
                 finished=not targets,
@@ -693,13 +743,39 @@ def handler(pool):
             args[n - 2] = [row['id'] for row in selected]
             selected = await connection.fetch(f'SELECT id FROM samples WHERE {where}', *args) if selected else []
             removed_fields = set(checkpoint.get('removed_fields', []))
-            affected = (
-                await _mutate(connection, job, [row['id'] for row in selected], removed_fields) if selected else 0
-            )
+
+            async def targeted(candidates):
+                """Those of these samples the job deletes itself, in this unit or a later one."""
+                test = list(args)
+                test[n - 2] = candidates
+                extra = f" AND id <= {int(job['barrier']['max_id'])}"
+                if request['explicit']:
+                    test.append(job['id'])
+                    extra += f' AND id IN (SELECT sample_id FROM bulk_job_targets WHERE job_id=${len(test)})'
+                rows = await connection.fetch(f'SELECT id FROM samples WHERE {where}{extra}', *test)
+                return {row['id'] for row in rows}
+
+            affected = 0
+            if selected:
+                outcome = await _mutate(connection, job, [row['id'] for row in selected], removed_fields, targeted)
+                if request['operation'] == 'delete':
+                    affected, objects = outcome
+                    checkpoint['objects'] = checkpoint.get('objects', 0) + objects
+                else:
+                    affected = outcome
+            if request['operation'] in stale_lassos.DESTRUCTIVE:
+                # After the delete, in its transaction: a new layout committed before this read is seen, and the unit
+                # rolls back; one committed after it came after the delete's own reads. Jobs submitted before 2.11
+                # are checked too: their lassos carry no id, so they stop once their map is laid out again.
+                stale = await stale_lassos.stale_maps(connection, job['dataset_id'], request.get('filters'))
+                if stale:
+                    raise stale_lassos.StaleLassoRefused(stale_lassos.stopped(stale))
             if removed_fields:
                 checkpoint['removed_fields'] = sorted(removed_fields)
             checkpoint['affected'] = checkpoint.get('affected', 0) + affected
             progress[_count_key(request['operation'])] = checkpoint['affected']
+            if request['operation'] == 'delete':
+                progress['objects_deleted'] = checkpoint.get('objects', 0)
 
         return StepResult(
             checkpoint=checkpoint,

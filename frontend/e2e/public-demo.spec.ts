@@ -52,10 +52,16 @@ test('guest at 100k can browse and save a view without calling selection_token',
         await expect(page.getByRole('button', { name: 'Upload…' })).toBeVisible();
         await expect(page.getByTestId('image-search-url')).toHaveCount(0);
         await page.keyboard.press('Escape');
+        // The search popover must be gone before the hover: closing, it still takes the pointer, and a hover that
+        // lands meanwhile opens no tooltip. The hover is repeated from elsewhere until the tooltip shows.
+        await expect(page.getByRole('button', { name: 'Upload…' })).toHaveCount(0);
         const select = page.getByTestId('grid-select-all');
         await expect(select).toBeDisabled();
-        await select.locator('..').hover();
-        await expect(page.getByRole('tooltip')).toContainText('Browse, filter, export or save this view');
+        await expect(async () => {
+            await page.mouse.move(0, 0);
+            await select.locator('..').hover();
+            await expect(page.getByRole('tooltip')).toContainText('Browse, filter, export or save this view', { timeout: 2000 });
+        }).toPass({ timeout: 15_000 });
         await expectTotal(page, 100_000);
         await expect(page.getByRole('button', { name: 'Tag', exact: true })).toHaveCount(0);
         const { datasetId } = readState();

@@ -1,9 +1,7 @@
 """Authoritative field definitions; statistics are optional, derived measurements."""
 
 import asyncio
-import datetime
 import math
-import re
 import time
 from collections.abc import Iterable, Mapping
 from typing import Any
@@ -11,6 +9,7 @@ from typing import Any
 import asyncpg
 from fastapi import HTTPException
 
+from .datetimes import parse_instant
 from .label_fields import LABEL_CACHES, LEGACY_GEOMETRY_FIELDS, LEGACY_LABEL_FIELDS, label_context, overlay_type
 
 FIELD_TYPES = frozenset({'unknown', 'boolean', 'number', 'string', 'datetime', 'list', 'object'})
@@ -36,7 +35,6 @@ SYSTEM_FIELDS = frozenset(
 # A mirror's own fields (docs/FOLLOWERS.md), stored in samples.local_metadata and local_tags, never in metadata: a
 # metadata key with this prefix is refused, and the registry's `@local.` names are origin 'local' only.
 LOCAL_PREFIX = '@local.'
-_ISO_DATE = re.compile(r'^\d{4}-\d{2}-\d{2}(?:$|[T ])')
 
 
 def canonical_type(field_type: str) -> str:
@@ -89,12 +87,9 @@ def value_type(value: Any) -> str:
         return 'list'
     if isinstance(value, dict):
         return 'object'
-    if isinstance(value, str) and _ISO_DATE.match(value):
-        try:
-            datetime.datetime.fromisoformat(value.replace('Z', '+00:00'))
-            return 'datetime'
-        except ValueError:
-            pass
+    # The datetime rule (backend/datetimes.py), the one the database reads datetimes with.
+    if parse_instant(value) is not None:
+        return 'datetime'
     return 'string'
 
 
