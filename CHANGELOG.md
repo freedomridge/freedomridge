@@ -4,6 +4,20 @@ Freedom Ridge has one version for the server, the web app and the Python SDK (th
 file), following [Semantic Versioning](https://semver.org). A release lists **upgrade notes** when
 it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
 
+## Unreleased
+
+### Fixed
+
+- **The object grid shows a selection or a search's results quickly again.** Since 2.11.0, when the object grid
+  showed the results of Find Similar, or any other list of samples, its count and its page read every object of the
+  dataset, and PostgreSQL first compiled each of them to machine code (JIT) because it overestimated their cost. Both
+  now find the listed objects and the objects of the listed images directly. Measured on copies, the database
+  answers each of them in:
+  - COCO (37,000 objects): 0.1 to 0.2 ms instead of 0.2 to 0.3 s;
+  - Open Images (304,000 objects): 8 to 15 ms instead of 0.3 to 0.4 s.
+
+  The rows are the same.
+
 ## 2.11.0 (2026-11-11)
 
 2.11.0 gives each object sample its image in a column of its own, `samples.parent_id`, so deleting an image
