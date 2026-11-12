@@ -19,7 +19,8 @@
 #                    skipping itself. The token goes only into this run's frontend build. Its URL
 #                    restrictions must allow localhost; an e2e run checks a map tile first.
 #   BACKEND_TESTS    pytest arguments to run instead of the whole backend suite (skips the SDK suites).
-#   E2E_SPECS        Playwright spec files to run instead of the whole e2e suite.
+#   E2E_SPECS        Playwright spec files (a :line is fine) to run instead of the whole e2e suite: the ordinary ones
+#                    named, then the *.fits.spec.ts ones named (playwright.config.ts), without the rest of the suite.
 #
 # Differences from GitHub Actions:
 # - Every database is a new container on a loopback port, kept in memory. DATABASE_URL, FRIDGE_DATA_ROOT
@@ -322,14 +323,38 @@ if want e2e; then
   timeout 60 bash -c "until curl -sf -o /dev/null http://localhost:$FEPORT/login; do sleep 1; done"
   result "e2e frontend start" $?
   # Playwright finds the server on E2E_BASE_URL and reuses it instead of starting `next dev`.
-  # shellcheck disable=SC2086 # E2E_SPECS holds several arguments
-  E2E_BASE_URL=http://localhost:$FEPORT E2E_API_URL=http://localhost:$APIPORT/api \
-    npx playwright test ${E2E_SPECS:-} > "$L/e2e.log" 2>&1
-  status=$?
+  export E2E_BASE_URL=http://localhost:$FEPORT E2E_API_URL=http://localhost:$APIPORT/api
+  # Two commands, the ordinary specs then the fits (playwright.config.ts), so the fits run even when an ordinary spec
+  # failed: in one command Playwright skips a project whose dependency failed. With E2E_SPECS, only the specs named
+  # (a fits spec named as a plain file would first run the whole default project, its dependency).
+  ordinary=""
+  fits=""
+  run_ordinary=1
+  run_fits=1
+  if [ -n "${E2E_SPECS:-}" ]; then
+    for spec in $E2E_SPECS; do
+      case "$spec" in
+        *.fits.spec.ts | *.fits.spec.ts:*) fits="$fits $spec" ;;
+        *) ordinary="$ordinary $spec" ;;
+      esac
+    done
+    [ -n "$ordinary" ] || run_ordinary=
+    [ -n "$fits" ] || run_fits=
+  fi
+  status=0
+  : > "$L/e2e.log"
+  # shellcheck disable=SC2086 # several arguments each
+  if [ -n "$run_ordinary" ]; then npx playwright test --project=default $ordinary >> "$L/e2e.log" 2>&1 || status=1; fi
+  # Its own output folder: a run clears its projects' folder when it starts, which would delete the first run's traces.
+  # shellcheck disable=SC2086
+  if [ -n "$run_fits" ]; then
+    npx playwright test --project=fits --no-deps --output=test-results/fits $fits >> "$L/e2e.log" 2>&1 || status=1
+  fi
+  unset E2E_BASE_URL E2E_API_URL
   # A failed test's trace (its network requests too) and page snapshot, kept with the logs, so they outlive
   # the clone; ci.yml uploads the same folder.
   if [ "$status" != 0 ] && [ -d test-results ]; then cp -r test-results "$L/e2e-test-results"; fi
-  counts=$(grep -E '^ *[0-9]+ (passed|failed|skipped|flaky)' "$L/e2e.log" | tr -s ' \n' ' ')
+  counts=$(grep -E '^ *[0-9]+ (passed|failed|skipped|flaky|did not run)' "$L/e2e.log" | tr -s ' \n' ' ')
   result "e2e (next start)" $status "${counts:-$(tail -1 "$L/e2e.log")}"
   cd "$W" || exit 1
 fi
