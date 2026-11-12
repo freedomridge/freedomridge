@@ -126,9 +126,11 @@ def test_a_field_build_during_a_restore_defers_instead_of_deadlocking_it(registr
             restoring = asyncio.create_task(restore(claimed))
             await asyncio.sleep(1)
             await datasets.promote_field(1, 'score', ADMIN, wait=False)  # "Index this field" during the restore
-            building = asyncio.create_task(
-                index_jobs.field_handler(database.pool)(await _claim(database, index_jobs.FIELD_KIND)),
-            )
+            # Not started during the restore (one index build at a time, index_jobs.enqueue_build). Run anyway, as a
+            # build queued before that rule would be, it defers on the table lock.
+            assert await _claim(database, index_jobs.FIELD_KIND) is None
+            queued = dict(await database.fetchrow('SELECT * FROM jobs WHERE kind = $1', index_jobs.FIELD_KIND))
+            building = asyncio.create_task(index_jobs.field_handler(database.pool)(queued))
             await asyncio.sleep(1)
         outcomes = await asyncio.gather(_finish(restoring), _finish(building), return_exceptions=True)
         unit = outcomes[0]
@@ -595,7 +597,10 @@ def test_an_ann_build_during_another_embeddings_build_defers_instead_of_deadlock
         await index_jobs.submit_ann_index(database.pool, 1, ADMIN['id'], 'clip')
         first = await _claim(database, index_jobs.ANN_KIND)
         await index_jobs.submit_ann_index(database.pool, 2, ADMIN['id'], 'dino')
-        second = await _claim(database, index_jobs.ANN_KIND)
+        # Not started beside the first (one index build at a time, index_jobs.enqueue_build). Run anyway, as a build
+        # queued before that rule would be, it defers on embeddings' table lock.
+        assert await _claim(database, index_jobs.ANN_KIND) is None
+        second = dict(await database.fetchrow("SELECT * FROM jobs WHERE args->>'field' = 'dino'"))
         assert (first['args']['field'], second['args']['field']) == ('clip', 'dino')
         async with _holding(database, 'LOCK TABLE embeddings IN ROW EXCLUSIVE MODE'):  # ingest: holds the first build
             building = asyncio.create_task(build(first))

@@ -104,6 +104,9 @@ test('a big Select All chip stays expired after Back', async ({ page }) => {
     await expect(chips(page)).toHaveCount(2);
     await historyHolds(page, 1, 1);
 
+    // The state before Back holds the live token, and the sidebar may still owe a request for it: let those leave
+    // before recording, and don't count one that carries this state's idx stage.
+    await page.waitForLoadState('networkidle');
     const sent = recordRequests(page);
     await page.evaluate(() => { (window as unknown as { __noReload: number }).__noReload = 1; });
     await page.goBack();
@@ -113,7 +116,10 @@ test('a big Select All chip stays expired after Back', async ({ page }) => {
 
     await removeExpired(page);
     await expectTotal(page, TOTAL);
-    expect(carrying(sent, 'e2e-expired-token', 'in_selection', '"expired"', description)).toEqual([]);
+    const decoded = (line: string) => { try { return decodeURIComponent(line); } catch { return line; } };  // a body, or a query string
+    const forStateBeforeBack = (line: string) => ['"field":"idx"', '"operator":">="'].every((part) => decoded(line).includes(part));
+    const afterBack = sent.filter((line) => !forStateBeforeBack(line));
+    expect(carrying(afterBack, 'e2e-expired-token', 'in_selection', '"expired"', description)).toEqual([]);
 });
 
 test.describe('an applied id list over 50,000', () => {

@@ -172,7 +172,7 @@ def test_cleanup_during_a_sample_lock_wait_cannot_shrink_bulk_targets(registry_d
                 async def waiting():
                     return await database.fetchval(
                         """SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=current_database()
-                           AND wait_event_type='Lock' AND query LIKE '%ORDER BY id FOR UPDATE%')""",
+                           AND wait_event_type='Lock' AND query LIKE '%ORDER BY id FOR NO KEY UPDATE%')""",
                     )
 
                 await wait_until(waiting, timeout=2)

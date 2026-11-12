@@ -3,6 +3,7 @@
 import base64
 import binascii
 import json
+import re
 from datetime import datetime, timezone
 from typing import Any, Literal
 from uuid import UUID
@@ -20,6 +21,17 @@ from ..security import private_guest
 from .auth import get_current_user
 
 router = APIRouter(tags=['jobs'])
+# A queued job that hasn't started while another owns its exclusive resource (job_queue): waiting for that one.
+_EXCLUSIVE_WAITING = (
+    "(jobs.state = 'queued' AND jobs.started_at IS NULL AND jobs.resources ? 'exclusive' AND EXISTS ("
+    "SELECT 1 FROM jobs owner WHERE owner.resources->>'exclusive' = jobs.resources->>'exclusive' "
+    "AND owner.id <> jobs.id "
+    "AND (owner.state = 'running' OR (owner.state = 'queued' AND owner.started_at IS NOT NULL))))"
+)
+_WAITING_FOR = {
+    'index_build': 'for another index build to finish (one index build at a time)',
+    'map_fit': 'for another map re-fit to finish (one at a time)',
+}
 _PUBLIC_COLUMNS = (
     'id, kind, dataset_id, placement, lane, resources, state, progress_done, progress_total, message, '
     'result, error, created_by, created_at, updated_at, started_at, finished_at, '
@@ -28,7 +40,8 @@ _PUBLIC_COLUMNS = (
     "CASE WHEN kind IN ('ann_index_build', 'field_index_build') "
     "THEN COALESCE(args->>'field', args->>'field_name') END AS field, "
     "COALESCE((SELECT username FROM users WHERE users.id = jobs.created_by), "
-    "CASE WHEN jobs.dedupe_owner = 'system' THEN 'System' ELSE 'Deleted user' END) AS started_by"
+    "CASE WHEN jobs.dedupe_owner = 'system' THEN 'System' ELSE 'Deleted user' END) AS started_by, "
+    f'{_EXCLUSIVE_WAITING} AS exclusive_waiting'
 )
 _ACTIVE_COLUMNS = (
     'id, kind, placement, lane, state, progress_done, progress_total, message, available_at, created_at, '
@@ -66,6 +79,8 @@ class JobStatus(BaseModel):
     available_at: datetime
     cancel_requested: bool
     started_by: str
+    # What a queued job that hasn't started waits for, when it isn't its turn yet: "for ..." (waiting_for).
+    waiting_for: str | None = None
 
 
 class JobPage(BaseModel):
@@ -88,6 +103,7 @@ class ActiveJobStatus(BaseModel):
     # False for a job about this dataset that owns no dataset lane (an index review): it neither waits
     # behind the lane's owner nor holds up the lane's other jobs.
     dataset_lane: bool = True
+    waiting_for: str | None = None  # as JobStatus.waiting_for
 
 
 # Read-only jobs about one dataset that belong to no dataset lane, so they never wait behind a long
@@ -111,6 +127,23 @@ def _can_cancel(job, user: dict) -> bool:
     # Map re-fits are system jobs from a dataset's schedules, which its power users manage (the caller
     # has already checked dataset access); they can stop tonight's fit like they can Run now.
     return user['role'] == 'power_user' and (job['created_by'] == user['id'] or job['kind'] == 'map_refit')
+
+
+def waiting_for(job, user: dict) -> str | None:
+    """What a queued job that hasn't started waits for: another job owning its exclusive resource (one index build,
+    one map re-fit at a time), or what put it aside (a field rebuild parked while a bulk job holds its dataset; the
+    job it names is left out for a private guest, who sees no job's error)."""
+    if job['state'] != 'queued' or job['started_at'] is not None:
+        return None
+    if job.get('exclusive_waiting'):
+        resource = job['resources'].get('exclusive')
+        return _WAITING_FOR.get(resource, f'for another job using {resource} to finish')
+    error = job.get('error')
+    if isinstance(error, dict) and error.get('code') == 'fields_held':
+        if private_guest(user):
+            return 'for an unfinished bulk job on this dataset'
+        return re.sub(r'^waiting\s+', '', str(error.get('message') or ''), flags=re.IGNORECASE) or None
+    return None
 
 
 def _message(job, user: dict) -> str | None:
@@ -146,6 +179,7 @@ def job_status(job, user: dict) -> JobStatus:
         available_at=job['available_at'],
         cancel_requested=job['cancel_requested'],
         started_by='' if private_guest(user) else job['started_by'],
+        waiting_for=waiting_for(job, user),
         **outcome,
     )
 
@@ -303,6 +337,7 @@ async def list_active_dataset_jobs(
                 (jobs.state = 'running' AND jobs.checkpoint ? 'uncancellable') AS uncancellable,
                 (jobs.state='running' AND jobs.lease_expires_at<=clock_timestamp()) AS stalled,
                 (jobs.state='queued' AND jobs.available_at>clock_timestamp()) AS retry_delayed,
+                jobs.resources, jobs.error, {_EXCLUSIVE_WAITING} AS exclusive_waiting,
                 COALESCE(submitter.username,
                     CASE WHEN jobs.dedupe_owner='system' THEN 'System' ELSE 'Deleted user' END) AS started_by
             FROM active jobs JOIN job_controls controls ON controls.job_id=jobs.id
@@ -332,6 +367,7 @@ async def list_active_dataset_jobs(
             stalled=row['stalled'],
             retry_delayed=row['retry_delayed'],
             dataset_lane=row['dataset_lane'],
+            waiting_for=waiting_for(row, user),
         )
 
     return ActiveJobPage(

@@ -445,6 +445,7 @@ def test_subset_statistics_use_declared_types(registry_database):
         assert stats['score'] == {'type': 'number', 'min': 1.0, 'max': 1.0}
         assert stats['labels']['type'] == 'list' and stats['labels']['values'] == ['car']
         assert stats['kind']['type'] == 'string' and stats['kind']['values'] == ['a']
-        assert stats['day']['type'] == 'datetime' and stats['day']['min'] == '2026-01-01'
+        # The earliest instant, written as the statistics write datetime bounds.
+        assert stats['day']['type'] == 'datetime' and stats['day']['min'] == '2026-01-01T00:00:00.000000Z'
 
     registry_database(scenario)

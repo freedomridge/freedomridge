@@ -4,6 +4,234 @@ Freedom Ridge has one version for the server, the web app and the Python SDK (th
 file), following [Semantic Versioning](https://semver.org). A release lists **upgrade notes** when
 it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
 
+## 2.11.0 (2026-11-11)
+
+2.11.0 gives each object sample its image in a column of its own, `samples.parent_id`, so deleting an image
+deletes its objects, the image and object grids link through it, and objects whose image is gone can be found and
+deleted. Dates and times in metadata compare as the moments they name, however they are written, and indexed datetime
+fields are rebuilt on the moment. A lasso drawn before its map was laid out again keeps filtering and warns instead of
+being dropped, a bulk delete refuses it, and a saved view can be updated with the current filters. Index builds run one
+at a time on the server. It also fixes the Edit User dialog dropping a typed password, and histogram, sort and SDK
+datetime bugs. Six migrations; two of them need the app stopped (about a minute for a few hundred thousand objects).
+
+### Upgrade notes
+
+- **Stop the app before the migrations.** Six database migrations, applied with `scripts/apply_migrations.sh` (step 4
+  of [Upgrading](docs/UPGRADING.md); see [Upgrading to 2.11.0](docs/UPGRADING.md#upgrading-to-2110)). `0029` and
+  `0030` refuse to run while anything else is connected to the database, as `0021` did; the other four take a moment.
+  - `0027_map_layouts.sql` adds a small table for each embeddings map's layout id, and `0028_view_updated_at.sql` a
+    column saying when a saved view's filters last changed, with the trigger that stamps it; neither changes a row.
+    Every map keeps the layout it has: a lasso saved before the upgrade counts as drawn on it.
+  - `0029_object_parent_column.sql` gives every object sample its image in a new column. It checks the free disk first
+    and prints its progress. It links about 13,000 objects a second on a large table (3.2 million in 4 minutes,
+    measured) and indexes them again (7 s for 3.2 million); other samples cost only the new indexes, about 0.6 s a
+    million. If it fails or is interrupted, nothing has changed and it can run again.
+  - **`0029` deletes the object samples whose image no longer exists**: those whose `metadata.parent_id` is an id no
+    sample has any more, in any dataset. Their vectors go with them, and followers delete them too. It prints, per
+    dataset, how many it deleted, and how many objects it kept with no image because they name another object or a
+    sample of another dataset, have a `parent_id` that isn't a sample id, or have none. On a follower, a mirror's
+    objects aren't deleted: they go when the primary deletes them.
+  - `0029` stops, naming it, if an array field is already called `parent_id`: copy that field to another name and
+    delete it, then upgrade. A follower of a primary on 2.10.x or older that has an array field named `parent_id`
+    refuses that dataset and says to rename the field on the primary.
+  - **`0030_object_parent_key.sql` adds the key that deletes an image's objects with it**. It checks every object's
+    image in one pass: 2.3 s for 3.2 million objects among 4 million samples, measured. An object whose image was
+    deleted after `0029` linked it (a database that ran `0029` and then deleted images before `0030`) is deleted, and
+    counted, as `0029` deletes its orphans; on a mirror, or in a dataset being deleted, it is kept with no image.
+  - `0031_metadata_instant.sql` adds one function, `metadata_instant_v1`, the rule that reads a datetime field's text
+    as an instant, and changes no rows. `0032_datetime_index_rebuilds.sql` builds and drops no index: it marks each
+    indexed datetime field not indexed and queues its rebuild, so it takes seconds.
+- **Once the app is up again, run `VACUUM (ANALYZE) samples;` in psql once**: every object `0029` linked leaves an old
+  row version behind until then.
+- **Indexed datetime fields are rebuilt in the background.** They now compare as moments, so their indexes, built on
+  the stored text, are rebuilt on the moment. Until its new index is built, a field shows
+  **Rebuilding** in Dataset Settings → Indexes, and filters, sorts and bounds on it give correct results without the
+  index (slower on a large dataset). The rebuilds run smallest dataset first, and Background jobs shows each as a
+  field index build ([Upgrading](docs/UPGRADING.md#upgrading-to-2110)).
+- **One index build at a time on the server, field indexes before vector indexes.** A `CREATE INDEX CONCURRENTLY`
+  waits for every other one's snapshot, even on another table, so a field index built during an hours-long vector
+  index build waited it out and could fail on its one-hour budget. Now every index build (promote, the index advisor's
+  Index, `build_ann_index`, the rebuilds, a restore of a removed index) is started only when no other one runs: one
+  queued meanwhile waits unstarted, holding nothing, so its dataset's other jobs run, and Background jobs and the
+  Indexes tab say what it waits for. The rebuilds go field indexes first (minutes) and vector indexes after (hours). A
+  field rebuild on a dataset with an unfinished rename, clone or clear (a stopped one too) waits for it, shown as
+  waiting with the job named, instead of failing every day. Creating an array field (and a follower adding its
+  primary's) is refused with 409 and `Retry-After` while an index build runs, instead of waiting it out: the SDK
+  retries it for up to two minutes, and a follower's sync waits and tries again.
+- The API no longer answers 409 `map_refitted` to a filter holding a lasso drawn before its map was re-fitted: it
+  filters by it. An SDK script that relied on that refusal gets the samples the polygon selects on the current map.
+- **Followers:**
+  - **Upgrade followers soon after their primary.** A shared view, and a relayed patch search, is evaluated by the
+    server that runs it. Until a primary and its followers all run this release, the same filter on a datetime field
+    whose values carry offsets or mixed spellings (`T` or a space, `Z` or `+00:00`) can count differently on each
+    side, and one on `last_modified_at` matches nothing on a server still on 2.10.x. Nothing breaks and no protocol
+    changes; the answers agree once both are upgraded. A follower rebuilds its own datetime indexes after its upgrade,
+    as a primary does.
+  - A new lasso still records the map's model (`model_id`) beside its layout, in 2.11 only, so followers on 2.10 or
+    earlier keep answering relayed searches that hold one (they refuse a lasso without it on a re-fitted map). 2.12
+    stops writing it: upgrade followers to 2.11 or later before their primary takes 2.12.
+
+### Added
+
+- **A lasso warns when its map was laid out again after it was drawn.** A lasso now records the layout of the map it
+  was drawn on. When the map is laid out again, by a re-fit, Run UMAP reduction, or an upload of coordinates that
+  moves its points, the lasso's chip turns amber ("This map was laid out again after this selection was drawn. It may
+  select different samples now. Redraw it or remove it.") and a toast says so once. That covers applied chips, the
+  draft, saved views, the default view and links. Lassos saved before this release warn once their map is first laid
+  out again.
+- **Update this view.** When the filters you opened from a saved view (in Saved Views, as the dataset's default view,
+  or from its link) differ from it, its owner or an admin can replace the view's filters with them: Saved Views offers
+  "Update this view", after a confirm naming the view. Its name, link and sharing stay, and a default view stays the
+  default. A stale lasso's chip says so ("…then use Update this view to save it.") when you may. Anyone else, and a
+  mirror's copy of a view on its primary, is offered only saving the filters as a new view. If someone changed the
+  view's filters after you opened it, the update is refused ("This view changed since you opened it") rather than
+  written over theirs, and Saved Views offers to open it again or save yours as a new view. The API is
+  `PATCH /api/datasets/{id}/views/{view_id}/content` with the new `content` and the `updated_at` you read (409
+  `view_changed` when it moved; without it the last writer wins). Views now return `updated_at`, which the database
+  sets whenever a view's filters change, whoever changes them: an update, a version restore, a mirror's sync.
+- **Finding and deleting object samples with no image.** An object whose `parent_id` names no image of its dataset
+  is still accepted (its image may come in a later request, and links it then); what stays unlinked can now be seen
+  and removed. `POST /api/datasets/{id}/objects/unlinked` counts them by kind (its image is gone, it names a sample
+  of another dataset, it names another object, its `parent_id` isn't a sample id, it has none) and returns the
+  filter that shows them; for someone who may edit the dataset it first links the objects whose image is there.
+  `POST /api/datasets/{id}/objects/unlinked/delete` (admin) deletes the kinds named, by default only the objects whose
+  image is gone, as a bulk delete job whose result counts them; never on its own, and refused on a mirror. The SDK
+  has `dataset.unlinked_objects()`, `dataset.unlinked_objects_view(kinds)` and
+  `dataset.delete_unlinked_objects(kinds)`. In the app, the Objects grid says "⚠ N objects have no image" when there
+  are any; clicking it shows them, and an admin can delete those whose image is gone from there.
+- **`last_modified_at` can be filtered**, like `created_at`: in the filter card, the query language, links and
+  views, and by its histogram's bars. It was read as a metadata key, so a filter on it matched nothing. The sidebar
+  shows its date slider on a dataset small enough to compute every field; on a larger one its bounds would mean
+  reading every sample on each visit (no index covers it, and one would slow every edit).
+
+### Changed
+
+- **A bulk delete by a filter holding a lasso drawn on an earlier layout of its map is refused.** Deleting samples,
+  or a field's vectors, by such a filter (the API, or the SDK's `delete_samples` and `delete_embeddings` on a view)
+  answers 409 (code `stale_lasso`) naming the map, and is checked again as the job runs: if the map is laid out again
+  after the delete was submitted, the job fails and deletes nothing more. Redraw the lasso, or remove it. Tagging and
+  metadata edits by such a filter go ahead and name the maps in their answer (`stale_lassos`); the SDK warns
+  (`fridge.StaleLassoWarning`), as it does when a query's filter holds one, and the app's tag dialog says so, with
+  the count, before applying.
+- **A re-fitted map no longer removes a lasso drawn on it before.** The lasso was refused and dropped, from the bar,
+  from a saved view as it opened, and from the scatter's draft. It now stays and keeps filtering, on the new map, with
+  the warning above, until you redraw or remove it.
+- **The `parent_id` field can't be renamed or cleared, and no field can be renamed or copied over it, on a dataset
+  with object samples** (409, saying why): every object would lose its image at once. Writing one sample's
+  `parent_id` (a PATCH, a bulk set) re-points that object and stays allowed. A dataset without objects is unaffected.
+- **The filter sidebar no longer lists `parent_id`** and computes nothing for it, on either grain. It is still a
+  field: the query text, the stage editor's field search, links and the SDK filter on it, and the sample modal shows
+  it with the other metadata.
+- **An object sample's image is kept in a column of its own, `samples.parent_id`.** Triggers fill it from
+  `metadata.parent_id` on every write when that names an image of the same dataset, whichever of the object and its
+  image is written first, and leave it empty otherwise. `metadata.parent_id` is still what clients write and read.
+  `parent_id` can't be the name of an array field any more.
+- **The image and object grids are linked through that column.** When a filter, a selection or a lasso on one grain
+  carries over to the other (the object grid showing the objects of the matching images, the image grid the images
+  of the matching objects), and when the object grid is ranked by an image search, an object's image is read from
+  `samples.parent_id`. The rows are the same; a count visits each row once instead of searching every partner for it:
+  on 3.2 million objects, counts that ran past a minute take 1 to 2 s, and the grids' pages are as fast or faster. A
+  filter for images with a matching object, sent without a grain, no longer returns an object that another object
+  names as its parent: it isn't an image. A filter on the field `parent_id` still reads `metadata.parent_id`.
+- The index advisor lists `idx_samples_parent_id` as needed, and never offers to remove it: the trigger that links
+  objects to an image when it arrives reads it.
+- **Deleting an image deletes its object samples**, whatever deletes it: one sample's delete, a bulk delete, a
+  version restore that removes the samples added since, a dataset's deletion, and a delete in psql (a database key
+  on `samples.parent_id`). Their vectors, map points and hashes go with them, and followers and statistics are told
+  as for any delete. The counts name them: the single delete answers `objects_deleted`; a bulk delete's result has
+  `objects_deleted` beside `deleted_count` (the samples it targeted), and job history says "1,200 samples deleted,
+  and 9,840 objects with their images."; a restore's `samples_removed` includes them, and so does the count the
+  app's revert asks with. A bulk delete deletes an image's objects even when its filter or `excluded_ids` left them
+  out, and counts them in `objects_deleted`. Objects that name no image (a junk `parent_id`, an image of another
+  dataset) are never deleted this way. An image with objects can't be moved to another dataset. An object written
+  while its image is being deleted is refused with a 409 that the SDK retries; written again, it has no image. The
+  key makes adding objects slower: through `add_samples`, 11% for 3,000 objects and 16% for 50,000 (measured on a
+  small table); in plain SQL on 4 million samples, about 5,400 a second instead of 7,000. Deletes take about 13%
+  longer. Adding images costs nothing more.
+- A follower's mirror keeps the objects its primary keeps when the primary deletes their image (a primary on 2.10.x
+  or older keeps them; a 2.11 one deletes them, or re-points them): its sync clears their `metadata.parent_id` before
+  it deletes the image, so they keep their sample ids and `@local.` fields.
+- **Find unlabeled regions** (object grain) reads the objects of the images it finds from `samples.parent_id`, through
+  its index, to leave out the regions already labeled.
+- **Dates and times in metadata compare as moments.** On a field declared `datetime` (and a mirror's own
+  `@local.` datetime fields), filters, sorts, the histogram, the sidebar's bounds, `/stats`, the SDK and the query
+  language compare the moment a value names, not its text: `2026-01-01T10:00:00+02:00` is the same moment as
+  `2026-01-01T08:00:00Z`. A value written without an offset is UTC, and a date alone is midnight UTC. What you
+  stored is shown as you stored it. Before and after, on the KITTI importer's Berlin-time values
+  (`2011-09-26T13:02:45.123456+02:00`), `captured_at >= 2011-09-26T12:00:00Z` matched that sample (the text
+  `13:02` sorts after `12:00`) and now doesn't (it is 11:02:45 UTC). Data written in UTC, or without offsets,
+  gives the same answers as before, except:
+  - **A date means a whole UTC day**, for `=`, `!=`, `<=`, `>` and now `in` too: `in (2026-01-01)` matched only
+    the text `2026-01-01` and now matches that whole day. A value with an offset belongs to its UTC day:
+    `2026-01-01T23:30:00-05:00` is in `= 2026-01-02`. To filter by local days, store local time as its own
+    field ([Dataset management](docs/DATASET_MANAGEMENT.md#dates-and-times)).
+  - **A range on a datetime field needs a date and time:** `captured_at > soon` is refused (400) instead of
+    comparing text. Equality with text that isn't a date still compares text, so `captured_at = unknown` finds
+    a stray `unknown`.
+  - **Samples whose value isn't a date and time** (`2026-02-30`, `n/a`, a number) never match a range, sort
+    after every datetime with the samples that have none, and count as missing in the histogram.
+- **An indexed datetime field is indexed on the moment it names**, not its text, so range filters, sorts and
+  bounds on it use the index. Dataset Settings → Indexes now lists datetime fields too.
+- **Sorting by a datetime field puts the samples without one last, oldest or newest first.** An indexed field's
+  pages still come from its index; an unindexed field's newest-first page reads the written dates first and
+  computes moments only for the samples near the page.
+- **The sidebar's date slider sends only the end you moved.** An end left at its limit adds no bound, so newer
+  samples, or ones within a fraction of a millisecond of the limit, are no longer cut off, and a handle dragged
+  back to its end reaches it. Its dates are UTC and say so. The filter card's date picker is labelled UTC (a
+  value without an offset is UTC) and shows a value written with an offset as its UTC time. The histogram says
+  "UTC" with a datetime bar's range, and its axis shows dates instead of epoch seconds.
+- **The SDK sends a `datetime` without a time zone with the machine's offset.** In metadata and in filter values, a
+  Python `datetime` with no time zone now goes with the offset of the machine running the script, so it names the
+  instant the script meant (a date and time written without an offset means UTC). This changes what a script
+  writes. On a machine in Chicago in January, `metadata={"captured_at": datetime(2026, 1, 15, 10, 30)}` was stored
+  as `"2026-01-15T10:30:00"` and is now stored as `"2026-01-15T10:30:00-06:00"`. A `datetime` with a time zone, a
+  `date` and text are sent as before, and values already stored don't change. To store clock time without an
+  offset, pass it as text.
+- **`created_at` and `last_modified_at` follow the rule every datetime follows.** A value means the UTC day, minute
+  or second it was written to, whatever its offset, for `=`, `!=`, `in` and `not in` too:
+  `created_at = 2026-01-01T10:00+02:00` and `last_modified_at in (2026-01-01)` matched nothing, as the stored moments
+  carry fractions of a second. A value written with a fraction is still that exact moment.
+- **A datetime filter's chip shows its time.** A bound with a time of day is shown in UTC, to the precision it
+  was written (`captured_at ≥ 2026-01-01 08:00 UTC`); it showed the date alone, so `08:00` and `20:00` read the
+  same. A bound written with an offset is shown at its UTC time.
+- **A new metadata field is a datetime only when its values are written the one way the database reads them**
+  (`YYYY-MM-DD`, then optionally `T` or a space, `hh:mm`, `:ss`, a fraction and `Z`, `±hh`, `±hhmm` or `±hh:mm`).
+  For example, a new field whose values are written `2026-01-01T10` (an hour without minutes) was typed
+  `datetime` and is now `string`; so are `2026-01-01T1000`, `2026-01-01T24:00:00` and a comma fraction, which
+  Python's parser read but the database can't. Fields already registered keep their type.
+
+### Fixed
+
+- **An object whose `metadata.parent_id` is a number beyond 2,147,483,647 no longer makes the image or object grid
+  fail** while a filter links the two grains.
+- **A histogram bar of a time-named field typed text no longer stages a filter that can't match it.** Such a field
+  (`seen_at` whose first value was `unknown`) keeps time bars, but its filters compare text, so a click staged the
+  bar's edges as numbers. Its bars now say to declare the field a datetime (Dataset Settings) to filter by them.
+- **Renaming or clearing a field whose index is being rebuilt removes its old index.** The index on its text,
+  named for the old field, stayed behind; a renamed field is now rebuilt under its new name. The background
+  (bulk) rename and clear refuse such a field until its rebuild is done.
+- **Sorting by an indexed number field puts the samples without a value last from largest first too.** They
+  came first, because the index holds them there. The page is still read from the index, in two parts: the
+  samples with a value, then the rest by id.
+- **A histogram bar's filter returns exactly that bar.** A datetime field's bars cover whole microseconds and
+  are labelled with their first and last one, so the `>=` and `<=` a click stages match the bar's samples; float
+  edges drifted a microsecond. `created_at = infinity` counts as missing instead of failing the histogram.
+- **Datetime bounds are the earliest and latest moments**: the sidebar's (filtered or not), `/stats` and the
+  bounds kept at ingest compared text, so a value with an offset could be the wrong end.
+- **The histogram of a datetime field no longer fails on a value that isn't a date and time.** A field typed
+  datetime holding `2026-02-30` or `2026-01-01 n/a` made its histogram fail with an error 500; such values now
+  count as missing. `24:00` and a leap second (`:60`) are no longer binned as the next day or minute but count as
+  missing too, and a value without an offset is binned as UTC whatever the database's time zone setting.
+- **A `datetime` or `date` anywhere in an SDK request no longer fails with "Object of type datetime is not JSON
+  serializable"**: a filter value (`dataset.filter(captured_at__gte=date(2026, 1, 1))`, a filter dict a script
+  builds), values for `set_values`, `set_values_per_sample`, `lookup_samples`, `client.update_sample`,
+  `client.bulk_set_metadata` or `client.add_samples`. It is sent as metadata is.
+- **An admin's password reset in the Edit User dialog can no longer be lost.** The new password had its own Reset
+  button, and **Save Changes** (or Enter in the field) closed the dialog without it, so the user kept their old
+  password and nothing said so. The dialog now has one button, named for what it does: **Save Changes**, **Reset
+  Password** when only a new password is typed, or **Save and Reset Password**. A typed password is reset first; if
+  the server refuses it, nothing else is saved and the dialog says why.
+
 ## 2.10.0 (2026-11-11)
 
 2.10.0 makes versions keep more of what a dataset was: who made each one, its public saved views and the view it

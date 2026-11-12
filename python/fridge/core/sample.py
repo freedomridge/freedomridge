@@ -6,15 +6,32 @@ if TYPE_CHECKING:
     from .dataset import Dataset  # noqa: F401 — quoted forward refs only
 
 
+def _json_value(value):
+    """A datetime or date as ISO-8601 text (which ingest then types as 'datetime' at first sight):
+    the default hook of every JSON body the SDK sends (client._Session). A datetime with no time
+    zone is the machine's local time, so it is sent with the local offset (the instant the script
+    meant: a date and time without an offset means UTC); one with a time zone is sent as it is,
+    and a date as YYYY-MM-DD. Anything else JSON can't hold still raises TypeError."""
+    import datetime as _dt
+
+    if isinstance(value, _dt.datetime) and value.utcoffset() is None:
+        # As a plain datetime: a subclass's astimezone can refuse a naive value (pandas' Timestamp does).
+        plain = _dt.datetime(*value.timetuple()[:6], value.microsecond, fold=value.fold)
+        return plain.astimezone().isoformat()
+    if isinstance(value, (_dt.datetime, _dt.date)):
+        return value.isoformat()
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
+
+
 def _jsonable(value):
-    """Make metadata JSON-serializable: datetime/date objects become ISO-8601 strings
-    (which ingest then types as 'datetime' at first sight), recursing into dicts/lists.
-    Without this, the natural ``metadata={"captured_at": datetime.now()}`` crashed at
-    request time with an opaque "Object of type datetime is not JSON serializable"."""
+    """Metadata or a filter value with its datetimes and dates written as :func:`_json_value`
+    writes them, recursing into dicts/lists: for the dicts a Sample or a filter condition hands
+    out. Without it, the natural ``metadata={"captured_at": datetime.now()}`` crashed at request
+    time with an opaque "Object of type datetime is not JSON serializable"."""
     import datetime as _dt
 
     if isinstance(value, (_dt.datetime, _dt.date)):
-        return value.isoformat()
+        return _json_value(value)
     if isinstance(value, dict):
         return {k: _jsonable(v) for k, v in value.items()}
     if isinstance(value, (list, tuple)):

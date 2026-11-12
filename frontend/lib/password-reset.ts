@@ -47,6 +47,15 @@ export function passwordResetMessage(revoked: RevokedTokens | undefined, revokeT
     return revokedMessage('Password reset. They are signed out', '; they had no API tokens.', revoked);
 }
 
+/**
+ * The Edit User dialog's one button, named for what it will do: a typed new password is reset by it, never dropped
+ * (a separate Reset next to the field used to be the only way, and Save Changes closed the dialog without it).
+ */
+export function editUserSaveLabel(passwordTyped: boolean, otherChanges: boolean): string {
+    if (!passwordTyped) return 'Save Changes';
+    return otherChanges ? 'Save and Reset Password' : 'Reset Password';
+}
+
 /** The message shown after a user changed their own password and asked for their API tokens to be revoked. */
 export function passwordChangeMessage(revoked: RevokedTokens | undefined): string {
     return revokedMessage('Password changed', '. You had no API tokens.', revoked);

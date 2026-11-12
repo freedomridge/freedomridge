@@ -41,7 +41,7 @@ class WriteConn:
             return None
         raise Reached('execute')
 
-    async def fetchval(self, query, *args):
+    async def fetchval(self, query, *args, **kwargs):
         if 'pg_try_advisory_xact_lock_shared' in query:
             return True
         if "kind='map_refit'" in query:

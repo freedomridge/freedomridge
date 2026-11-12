@@ -80,7 +80,7 @@ def test_add_tags_stamps_the_rows_and_registers_the_tags(monkeypatch):
     out = asyncio.run(datasets.bulk_tag_samples(7, req, user=USER))
     assert out["updated_count"] == 3
     (upd,) = [call for call in db.calls if call[0] == 'fetchrow' and 'UPDATE samples' in call[1]]
-    assert 'ORDER BY id FOR UPDATE' in upd[1]
+    assert 'ORDER BY id FOR NO KEY UPDATE' in upd[1]  # an object can still check its image
     assert "last_modified_at = NOW(), modified_by_user_id = $5" in upd[1]
     assert upd[2] == ([1, 2, 3], 7, ["dated", "other"], [], 42)
     (reg,) = _executes(db, "INSERT INTO dataset_tags")

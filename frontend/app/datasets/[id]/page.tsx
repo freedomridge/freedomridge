@@ -9,6 +9,9 @@ import { ApiError, isRescoringRefusal, getSamples, getDatasetSchema, getDataset,
 import { describeFilter, convertSimpleFiltersToComplex } from '@/lib/filter-utils';
 import { copyLink, datasetLink, decodeStages, joinQueryParts, LinkError, mayBeText, type DatasetLink } from '@/lib/links';
 import { useToast } from '@/contexts/ToastContext';
+import { STALE_LASSO_WARNING, lassoFilter, lassoKey, staleLasso } from '@/lib/stale-lasso';
+import { type SourceView, mayUpdateView, sameStages, sourceOf } from '@/lib/source-view';
+import { defaultViewStages } from '@/lib/default-view';
 import { usePatchState } from '@/hooks/usePatchState';
 import { useSampleCount } from '@/hooks/useSampleCount';
 import Link from 'next/link';
@@ -69,8 +72,9 @@ async function retryDropped<T>(request: () => Promise<T>): Promise<T> {
 }
 
 // The stages a link's filter opens on (its view, else its encoded stages, else its query: lib/links.ts), or null
-// when it sets no filter. A link that can't be opened here throws a LinkError saying why.
-async function linkStages(datasetId: number, link: DatasetLink): Promise<ViewStage[] | null> {
+// when it sets no filter, with the view they came from (lib/source-view.ts). A link that can't be opened here throws
+// a LinkError saying why.
+async function linkStages(datasetId: number, link: DatasetLink): Promise<{ stages: ViewStage[] | null; source: SourceView | null }> {
     if (link.view !== undefined) {
         const view = await getView(link.view).catch((error: unknown) => {
             if (error instanceof ApiError && error.status === 404) return null;  // also a view the reader can't open
@@ -79,10 +83,16 @@ async function linkStages(datasetId: number, link: DatasetLink): Promise<ViewSta
         if (!view || view.dataset_id !== datasetId) throw new LinkError("This view no longer exists or isn't shared with you.");
         // Its stages, as choosing it in Saved Views applies them. A view saved before views kept their stages holds
         // only its compiled filter: one stage named after the view, as the default view does.
-        if (view.content.viewStages) return view.content.viewStages;
         const filter = view.content.filters;
-        return filter?.filters?.length || filter?.field ? [{ type: 'filter', description: view.name, filter }] : [];
+        const stages: ViewStage[] = view.content.viewStages
+            ?? (filter?.filters?.length || filter?.field ? [{ type: 'filter', description: view.name, filter }] : []);
+        return { stages, source: sourceOf(view, stages) };
     }
+    return { stages: await encodedStages(datasetId, link), source: null };
+}
+
+// The stages of a link that holds its filter (`f=` encoded, or `q=` text), or null when it holds none.
+async function encodedStages(datasetId: number, link: DatasetLink): Promise<ViewStage[] | null> {
     if (link.f !== undefined) return decodeStages(link.f);
     if (link.q !== undefined) {
         if (!link.q.trim()) return [];  // "no filters", as Copy link writes it for a dataset with none applied
@@ -121,20 +131,27 @@ const NO_IDS: number[] = [];
 
 // A draft-filter chip with its own clear (✕) button, so each transient selection /
 // filter group in the draft bar can be cleared independently (not just "Clear Draft").
-function DraftChip({ label, tone, onClear }: {
+function DraftChip({ label, tone, onClear, warning }: {
     label: string;
-    tone: 'cyan' | 'indigo' | 'purple' | 'zinc';
+    tone: 'cyan' | 'indigo' | 'purple' | 'zinc' | 'amber';
     onClear: () => void;
+    warning?: string;  // shown on hover, with a ⚠ before the label
 }) {
     const tones = {
         cyan: 'bg-cyan-900/40 text-cyan-300 border-cyan-700/50',
         indigo: 'bg-indigo-900/40 text-indigo-300 border-indigo-700/50',
         purple: 'bg-purple-900/40 text-purple-300 border-purple-700/50',
         zinc: 'bg-zinc-800/60 text-zinc-400 border-zinc-700/50',
+        amber: 'bg-amber-900/40 text-amber-200 border-amber-600/60',
     } as const;
     return (
-        <span className={`px-2 py-1 rounded border flex items-center gap-1.5 ${tones[tone]}`}>
-            <span>{label}</span>
+        <span
+            data-testid="draft-chip"
+            data-stale-lasso={warning ? 'true' : undefined}
+            title={warning}
+            className={`px-2 py-1 rounded border flex items-center gap-1.5 ${tones[tone]}`}
+        >
+            <span>{warning && <span className="mr-1">⚠</span>}{label}</span>
             <button onClick={onClear} title="Clear this" className="opacity-70 hover:opacity-100 transition-opacity">
                 <Cross2Icon className="w-3 h-3" />
             </button>
@@ -237,6 +254,9 @@ function DatasetPageContent() {
         userFilters,
         viewStages,
         setViewStages,
+        sourceView,
+        setSourceView,
+        openView,
         expiredSelections,
         setExpiredSelections,
         addStage,
@@ -291,6 +311,30 @@ function DatasetPageContent() {
         staleTime: 0,
         refetchOnWindowFocus: false,
     });
+
+    // A lasso drawn on an earlier layout of its map (the dataset's map_layouts): its chip, applied or draft, warns, and
+    // a toast says so once per lasso while the page is open. The lasso keeps filtering (lib/stale-lasso.ts).
+    const mapLayouts = dataset?.map_layouts;
+    const staleDraftLasso = useMemo(
+        () => currentEmbeddingRegion ? staleLasso(lassoFilter(currentEmbeddingRegion), mapLayouts) : null,
+        [currentEmbeddingRegion, mapLayouts],
+    );
+    // The grid's selection is picked from the filters as they are (Select All, or a page of them): with a stale lasso
+    // among them, the tag dialog says it may hold other samples than the lasso was drawn around.
+    const staleSelectionLasso = useMemo(
+        () => viewStages.map((stage) => staleLasso(stage.filter, mapLayouts)).find(Boolean) ?? staleDraftLasso,
+        [viewStages, mapLayouts, staleDraftLasso],
+    );
+    const announcedLassos = useRef(new Set<string>());
+    useEffect(() => {
+        for (const lasso of [...viewStages.map((stage) => staleLasso(stage.filter, mapLayouts)), staleDraftLasso]) {
+            if (!lasso) continue;
+            const key = lassoKey(datasetId, lasso);
+            if (announcedLassos.current.has(key)) continue;
+            announcedLassos.current.add(key);
+            addToast(`A lasso on the ${lasso.field} map: ${STALE_LASSO_WARNING}`, 'warning', 10000);
+        }
+    }, [viewStages, staleDraftLasso, mapLayouts, datasetId, addToast]);
 
     const [modalMediaField, setModalMediaFieldLocal] = useState<string>('filepath');
     const [activeOverlayFields, setActiveOverlayFields] = useState<string[]>([]);
@@ -411,12 +455,7 @@ function DatasetPageContent() {
         // so it composes with the other filters and stays consistent with the applied
         // stage. (See FilterContext for why this isn't the frozen in_selection token.)
         if (currentEmbeddingRegion) {
-            transientFilters.push({
-                field: currentEmbeddingRegion.field,
-                operator: 'embedding_polygon',
-                value: currentEmbeddingRegion.polygon,
-                model_id: currentEmbeddingRegion.modelId ?? null,
-            });
+            transientFilters.push(lassoFilter(currentEmbeddingRegion));
         }
 
         // If no transient selections, just use the image-grain filters
@@ -609,13 +648,13 @@ function DatasetPageContent() {
         linkOpenedRef.current = true;
         const notice = (message: string) => addToast(message, 'warning', 10000);
         void (async () => {
-            let stages: ViewStage[] | null = null;
+            let opened: Awaited<ReturnType<typeof linkStages>> = { stages: null, source: null };
             try {
-                stages = await linkStages(datasetId, link);
+                opened = await linkStages(datasetId, link);
             } catch (error) {
                 notice(error instanceof LinkError ? error.message : `Couldn't open the link: ${(error as Error).message}`);
             }
-            settleLink(stages);
+            settleLink(opened.stages, opened.source);
             if (link.sample === undefined) return;
             const id = Number(link.sample);
             let sample: Sample | undefined;
@@ -1168,6 +1207,7 @@ function DatasetPageContent() {
                         // tags (`@local.tags`) are its own while it follows: the tag dialog offers whichever it may edit.
                         canTag={(user?.role === 'admin' || user?.role === 'power_user')
                             && (!dataset?.mirror || dataset.mirror.state !== 'stopped')}
+                        canDeleteObjects={user?.role === 'admin' && !dataset?.mirror}
                         gridSamplesRef={getGridSamplesRef(panelId)}
                         gridMoreRef={getGridMoreRef(panelId)}
                         // Patches are a sub-grid of IMAGES only. An object-grain grid never shows
@@ -1462,8 +1502,9 @@ function DatasetPageContent() {
                                 has resolved yet. */}
                             {(currentEmbeddingRegion || (selectionSource === 'Embeddings' && brushedIds.length > 0)) && (
                                 <DraftChip
-                                    tone="indigo"
+                                    tone={staleDraftLasso ? 'amber' : 'indigo'}
                                     label="Embeddings region"
+                                    warning={staleDraftLasso ? STALE_LASSO_WARNING : undefined}
                                     onClear={() => { setCurrentEmbeddingRegion(null); setBrushedIds([]); }}
                                 />
                             )}
@@ -1550,9 +1591,20 @@ function DatasetPageContent() {
                                 onDefaultViewChanged={() => queryClient.invalidateQueries({ queryKey: ['dataset', datasetId] })}
                                 onLoadView={(view) => {
                                     if (view.content.viewStages) {
-                                        setViewStages(view.content.viewStages);
+                                        openView(view, view.content.viewStages);
                                         setExpiredSelections([]);
                                     }
+                                }}
+                                sourceView={sourceView}
+                                onViewSaved={(view) => {
+                                    // The applied filters are the view's now (a temporary selection aside, which it
+                                    // can't hold). The default view's get its mark again, and the dataset its filters.
+                                    const saved = view.content.viewStages ?? [];
+                                    if (view.id === defaultView?.id) {
+                                        if (sameStages(saved, viewStages)) setViewStages(defaultViewStages({ ...defaultView, content: view.content }));
+                                        queryClient.invalidateQueries({ queryKey: ['dataset', datasetId] });
+                                    }
+                                    setSourceView(sourceOf(view, saved));
                                 }}
                             />
                         )}
@@ -1597,6 +1649,8 @@ function DatasetPageContent() {
                 <div className="px-6 pb-3 pt-0">
                     <QueryBuilderBar
                         stages={viewStages}
+                        mapLayouts={dataset?.map_layouts}
+                        canUpdateView={mayUpdateView(sourceView, user)}
                         expiredSelections={expiredSelections}
                         onRemoveExpired={(index) => setExpiredSelections(prev => prev.filter((_, i) => i !== index))}
                         onRemoveStage={removeStage}
@@ -1809,6 +1863,7 @@ function DatasetPageContent() {
                 showTagModal && datasetId && (
                     <TagManagementModal
                         mirror={dataset?.mirror ?? null}
+                        staleLassoMap={staleSelectionLasso?.field ?? null}
                         selectedSampleIds={selectedIds}
                         selectionToken={selectAll?.token ?? null}
                         excludedIds={deselectedIds}

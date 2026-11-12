@@ -1026,6 +1026,8 @@ async def _publish(pool, job, store):
                     field,
                     timeout=budget,
                 )
+                # One new layout of the map, with the coordinates.
+                await connection.execute('SELECT bump_map_layout($1, $2)', dataset_id, field)
                 timings['coordinates'] = time.monotonic() - gated
                 # Until the rank step has re-ranked the new map, readers draw it from its coordinates
                 # (occupied_cells = 0 turns off the rank fast path everywhere). The rank rows are gone, but

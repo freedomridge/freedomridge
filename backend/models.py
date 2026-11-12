@@ -44,6 +44,9 @@ class Dataset(BaseModel):
     default_view_id: Optional[int] = None
     # GET /datasets/{id} only: that view's id, name and content, so the app can apply it without another request.
     default_view: Optional[Dict[str, Any]] = None
+    # GET /datasets/{id} only: each embeddings map's current layout id, by map (a whole-image field or a patch
+    # scale). A map not listed has layout id null: not laid out again since the upgrade that added them.
+    map_layouts: Optional[Dict[str, str]] = None
     # Set when this dataset is a read-only mirror of one on a primary (docs/FOLLOWERS.md): its state
     # (copying, following or stopped), the primary's URL, the dataset there, and the tags and views options.
     mirror: Optional[Dict[str, Any]] = None
@@ -160,6 +163,15 @@ class View(BaseModel):
     created_at: datetime
     # The dataset is a mirror and this view is its copy of one on the primary (docs/FOLLOWERS.md).
     from_primary: bool = False
+    # When its filters were last replaced (PATCH /datasets/{id}/views/{view_id}/content); None: never.
+    updated_at: Optional[datetime] = None
+
+
+class ViewContentUpdate(BaseModel):
+    content: Dict[str, Any]
+    # The view's updated_at as the client read it (null: never changed). Given, the update is refused (409
+    # view_changed) when the view's filters changed since; left out, the last writer wins.
+    updated_at: Optional[datetime] = None
 
 
 class ViewCreate(BaseModel):

@@ -120,10 +120,10 @@ async def test_histogram_timestamp(monkeypatch):
     # Simulate timestamp data that converts to epoch
     fake_db = FakeDB(
         fetchrow_map={
-            "MIN(val)": {"min": 1_700_000_000, "max": 1_700_010_000, "total": 4, "total_rows": 4},
+            "MIN(val)": {"min": 1_700_000_000_000_000, "max": 1_700_010_000_000_000, "total": 4, "total_rows": 4},
         },
         fetch_map={
-            "width_bucket": [
+            "AS bucket": [
                 {"bucket": 1, "count": 1},
                 {"bucket": 2, "count": 3},
             ],
@@ -177,10 +177,10 @@ async def test_histogram_datetime_metadata_field(monkeypatch):
     # categorical path and renders ~one bucket per distinct timestamp (the bug).
     fake_db = FakeDB(
         fetchrow_map={
-            "MIN(val)": {"min": 1_700_000_000, "max": 1_700_010_000, "total": 4, "total_rows": 4},
+            "MIN(val)": {"min": 1_700_000_000_000_000, "max": 1_700_010_000_000_000, "total": 4, "total_rows": 4},
         },
         fetch_map={
-            "width_bucket": [
+            "AS bucket": [
                 {"bucket": 1, "count": 1},
                 {"bucket": 2, "count": 3},
             ],
@@ -205,15 +205,17 @@ async def test_single_value_timestamp_field_is_one_bucket_not_no_data(monkeypatc
     # Regression: every sample shares one created_at (one ingest batch) -> the panel said "No data for
     # this field" and reported missing = total. It is one bucket holding every sample.
     fake_db = FakeDB(
-        fetchrow_map={"MIN(val)": {"min": 1_700_000_000, "max": 1_700_000_000, "total": 24, "total_rows": 24}},
-        fetch_map={"width_bucket": [{"bucket": 1, "count": 24}]},
+        fetchrow_map={
+            "MIN(val)": {"min": 1_700_000_000_000_000, "max": 1_700_000_000_000_000, "total": 24, "total_rows": 24},
+        },
+        fetch_map={"AS bucket": [{"bucket": 1, "count": 24}]},
         fetchval_map={"FROM dataset_fields": None},
     )
     monkeypatch.setattr(datasets, "db", fake_db)
     resp = await datasets.get_histogram(id=1, field="created_at", bins=None, filters=None)
     assert resp["missing"] == 0
     assert [b["count"] for b in resp["buckets"]] == [24]
-    assert resp["buckets"][0]["range"]["min_label"] == "2023-11-14T22:13:20"
+    assert resp["buckets"][0]["range"]["min_label"] == "2023-11-14T22:13:20.000000"
 
 
 @pytest.mark.parametrize('declared,as_number', [(None, False), ('string', True)])

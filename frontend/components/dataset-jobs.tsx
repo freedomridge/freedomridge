@@ -46,6 +46,7 @@ function stateLabel(job: ActiveDatasetJob, owners: ActiveDatasetJob[]) {
     if (job.stalled) return job.cancel_requested ? 'Stalled — cancellation pending' : 'Stalled — waiting for a worker';
     if (job.cancel_requested) return 'Cancellation requested';
     if (job.state === 'running') return 'Running';
+    if (job.waiting_for) return `Waiting ${job.waiting_for}`;
     if (job.retry_delayed) return 'Waiting to retry';
     if (owners.some(owner => owner.id === job.id)) {
         return job.placement === 'compute' ? 'Waiting to resume on compute' : 'Waiting to resume';
@@ -181,6 +182,8 @@ export function DatasetJobs({ datasetId, onShowHistory }: { datasetId: number; o
             queryClient.invalidateQueries({ predicate: query => query.queryKey[1] === datasetId && query.queryKey[0] !== SAMPLE_COUNT_KEY && !String(query.queryKey[0]).includes('job') });
         } else if (mapChanged) {
             queryClient.invalidateQueries({ queryKey: ['embeddings', datasetId] });
+            // Its maps' layout ids (map_layouts): a lasso chip drawn on the previous map warns.
+            queryClient.invalidateQueries({ queryKey: ['dataset', datasetId] });
         }
     }, [recent.data, datasetId, queryClient]);
     if (cursor && jobs.isSuccess && !jobs.isPlaceholderData && jobs.data.waiting.length === 0) {

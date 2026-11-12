@@ -25,7 +25,14 @@ from .datasets import get_dataset_array_columns
 router = APIRouter()
 
 # Fields every dataset has, and the samples columns behind them.
-_SYSTEM_FIELDS = {'id': NUMBER, 'filepath': TEXT, 'media_type': TEXT, 'created_at': DATETIME, 'tags': LIST}
+_SYSTEM_FIELDS = {
+    'id': NUMBER,
+    'filepath': TEXT,
+    'media_type': TEXT,
+    'created_at': DATETIME,
+    'last_modified_at': DATETIME,
+    'tags': LIST,
+}
 _KINDS = {'number': NUMBER, 'datetime': DATETIME, 'boolean': BOOLEAN, 'list': LIST, 'object': OBJECT}
 
 

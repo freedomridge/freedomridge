@@ -38,6 +38,7 @@ DATASET_TABLES = (
     ('dataset_fields', ('dataset_id', 'field_name')),
     ('dataset_tags', ('dataset_id', 'field_name', 'tag')),
     ('embedding_viz_meta', ('dataset_id', 'field_name')),
+    ('embedding_layouts', ('dataset_id', 'field_name')),
     ('views', ('id',)),
     ('dataset_access', ('dataset_id', 'user_id')),
     ('dataset_stats_state', ('dataset_id',)),
@@ -348,17 +349,33 @@ def handler(pool):
             return StepResult(checkpoint={**checkpoint, 'table': index + 1})
 
         if phase == 'samples':
+            # Objects linked to an image go in a pass of their own first: the key would delete an image's objects, and
+            # their vectors, with it (0030), past this unit's budgets. Each pass keeps its own cursors.
+            objects_first = not checkpoint.get('children_done')
+            scope: str | None = 'children' if objects_first else None
             sample_ids = checkpoint.get('sample_ids')
             if not sample_ids:
                 rows, _ = await _batch(
                     pool,
                     'samples',
                     ('id',),
-                    't.dataset_id=$1',
+                    't.dataset_id=$1 AND t.parent_id IS NOT NULL' if objects_first else 't.dataset_id=$1',
                     [dataset_id],
                     batch_size,
                     checkpoint,
+                    scope,
                 )
+                if not rows and objects_first:  # none left: the rest, in this unit
+                    scope, checkpoint = None, {**checkpoint, 'children_done': True}
+                    rows, _ = await _batch(
+                        pool,
+                        'samples',
+                        ('id',),
+                        't.dataset_id=$1',
+                        [dataset_id],
+                        batch_size,
+                        checkpoint,
+                    )
                 if not rows:
                     return StepResult(checkpoint={**checkpoint, 'phase': 'indexes'})
                 sample_ids = [row['id'] for row in rows]
@@ -367,9 +384,9 @@ def handler(pool):
                 where, args = 't.sample_id=ANY($1::int[])', [sample_ids]
                 if 'dataset_id' in keys:
                     where, args = f'{where} AND t.dataset_id=$2', [sample_ids, dataset_id]
-                rows, size = await _batch(pool, table, keys, where, args, batch_size, checkpoint)
+                rows, size = await _batch(pool, table, keys, where, args, batch_size, checkpoint, scope)
                 if rows:
-                    return _delete_step(job, checkpoint, table, keys, rows, size)
+                    return _delete_step(job, checkpoint, table, keys, rows, size, scope)
             rows, size = await _batch(
                 pool,
                 'samples',
@@ -378,10 +395,11 @@ def handler(pool):
                 [sample_ids],
                 batch_size,
                 checkpoint,
+                scope,
             )
             # A retry can shrink the sample batch; retain its remaining IDs until all are removed.
             if rows:
-                return _delete_step(job, checkpoint, 'samples', ('id',), rows, size)
+                return _delete_step(job, checkpoint, 'samples', ('id',), rows, size, scope)
             checkpoint.pop('sample_ids')
             return StepResult(checkpoint=checkpoint)
 

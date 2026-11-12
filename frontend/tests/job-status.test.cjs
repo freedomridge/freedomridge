@@ -43,6 +43,27 @@ test('a failure, a finished job and a job with no error are not waiting', () => 
     assert.equal(waitingNote({ state: 'queued', created_at }), null);
 });
 
+test('a queued job that has not started says what it waits for, from when it was queued', () => {
+    const waiting_for = 'for another index build to finish (one index build at a time)';
+    assert.equal(waitingNote({ state: 'queued', created_at, waiting_for }, at(42)), `Waiting 42 min: ${waiting_for}`);
+    // What put it back says more once it has started; a finished job waits for nothing.
+    assert.equal(waitingNote({ state: 'queued', error: contended, created_at, waiting_for }, at(1)), `Waiting 1 min: ${contended.message}`);
+    assert.equal(waitingNote({ state: 'succeeded', created_at, waiting_for }), null);
+    assert.equal(waitingNote({ state: 'queued', created_at, waiting_for: null }), null);
+});
+
+const { notRebuilt } = require('../lib/job-status.ts');
+
+test('a rebuild that ended without building is not shown as a finished build', () => {
+    const ended = { kind: 'field_index_build', state: 'succeeded', progress: { message: 'Not rebuilt yet: Unfinished bulk jobs block this operation: rename job 7' } };
+    assert.equal(notRebuilt(ended), true);
+    // From the result alone (an admin sees it), or the message alone (anyone with access does).
+    assert.equal(notRebuilt({ ...ended, progress: { message: null }, result: { rebuilt: false, message: 'Not rebuilt yet: …' } }), true);
+    assert.equal(notRebuilt({ ...ended, progress: { message: 'Field index built' }, result: { message: 'Field captured promoted successfully' } }), false);
+    assert.equal(notRebuilt({ ...ended, state: 'failed' }), false);
+    assert.equal(notRebuilt({ ...ended, kind: 'ann_index_build' }), false);
+});
+
 const { canRetryIndexBuild } = require('../lib/job-status.ts');
 
 test('a failed or cancelled vector index build offers a retry to a power user or admin, until a later build', () => {

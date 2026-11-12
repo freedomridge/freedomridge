@@ -12,7 +12,8 @@ import time
 
 import pytest
 
-from backend.routers.datasets import _utc_datetime, _utc_label, parse_filter_node
+from backend.datetimes import literal_window
+from backend.routers.datasets import _utc_datetime, _utc_micros_label, parse_filter_node
 
 
 @pytest.fixture
@@ -29,21 +30,21 @@ def non_utc_host():
 
 
 def test_bin_labels_are_utc_on_a_non_utc_host(non_utc_host):
-    epoch = datetime.datetime(2024, 2, 1, tzinfo=datetime.timezone.utc).timestamp()
-    assert datetime.datetime.fromtimestamp(epoch).hour == 19  # the old label: Jan 31, 19:00 local
-    assert _utc_label(epoch) == "2024-02-01T00:00:00"
-    assert _utc_label(epoch + 0.5) == "2024-02-01T00:00:00.500000"
+    micros = int(datetime.datetime(2024, 2, 1, tzinfo=datetime.timezone.utc).timestamp()) * 1_000_000
+    assert datetime.datetime.fromtimestamp(micros / 1e6).hour == 19  # the old label: Jan 31, 19:00 local
+    assert _utc_micros_label(micros) == "2024-02-01T00:00:00.000000"
+    assert _utc_micros_label(micros + 500_001) == "2024-02-01T00:00:00.500001"
 
 
-def test_label_is_zone_less_so_it_sorts_before_stored_offsets():
-    # A stored '…T00:00:00+00:00' must satisfy `>= label`; a 'Z' or '+00:00' suffix would not.
-    label = _utc_label(0.0)
-    assert label == "1970-01-01T00:00:00"
-    assert "1970-01-01T00:00:00+00:00" >= label
-
-
-def test_unrepresentable_epoch_gives_no_label():
-    assert _utc_label(1e20) is None
+def test_a_label_names_its_own_microsecond():
+    # Six fraction digits: a filter reads the label as that exact microsecond, in UTC (no offset), so a bar's
+    # `>= min_label AND <= max_label` covers its microseconds and no others.
+    label = _utc_micros_label(-1)
+    assert label == "1969-12-31T23:59:59.999999"
+    window = literal_window(label)
+    assert window is not None
+    start, end = window
+    assert end is None and start == datetime.datetime(1969, 12, 31, 23, 59, 59, 999999, tzinfo=datetime.timezone.utc)
 
 
 @pytest.mark.parametrize(

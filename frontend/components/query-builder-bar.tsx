@@ -5,6 +5,7 @@ import { FilterStageEditor, FilterModeSwitch } from './filter-stage-editor';
 import { describeFilter, isAutoFilterLabel } from '@/lib/filter-utils';
 import { type DefaultView, defaultViewStages, isDefaultViewStage } from '@/lib/default-view';
 import { EXPIRED_SELECTION_TITLE, type ExpiredSelection, isLassoStage, isReadOnlyStage } from '@/lib/filter-query';
+import { STALE_LASSO_WARNING, STALE_LASSO_WARNING_IN_VIEW, staleLasso } from '@/lib/stale-lasso';
 import { SEARCH_LIMIT_CHOICES, SEARCH_LIMIT_TITLE } from './find-similar';
 import * as Popover from '@radix-ui/react-popover';
 
@@ -30,6 +31,10 @@ interface QueryBuilderBarProps {
     // The page's latest search: its chip offers "top N", and changing it runs the search again.
     activeSearchId?: string | null;
     onSearchLimit?: (limit: number) => void;
+    // The dataset's map_layouts: a lasso chip drawn on an earlier layout of its map warns (lib/stale-lasso.ts).
+    mapLayouts?: Record<string, string> | null;
+    // The filters came from a saved view the viewer may update: a stale lasso's chip says to, once redrawn.
+    canUpdateView?: boolean;
 }
 
 // A selection or search chip includes or excludes its ids. A search keeps them in the one rule of an AND group (the
@@ -67,6 +72,8 @@ export function QueryBuilderBar({
     trailing,
     activeSearchId,
     onSearchLimit,
+    mapLayouts,
+    canUpdateView = false,
 }: QueryBuilderBarProps) {
     const [editingIndex, setEditingIndex] = useState<number | null>(null);
     const [isAdding, setIsAdding] = useState(false);
@@ -254,23 +261,29 @@ export function QueryBuilderBar({
                 )}
                 {stages.map((stage, index) => {
                     const isReadOnly = isReadOnlyStage(stage);
+                    // A lasso drawn on an earlier layout of its map: it keeps filtering, and says so.
+                    const stale = isLassoStage(stage) && staleLasso(stage.filter, mapLayouts) !== null;
 
                     const ChipContent = (
                         <div
                             data-testid="query-stage-chip"
+                            data-stale-lasso={stale ? 'true' : undefined}
                             className={`
                                 flex items-center gap-2 px-3 py-2 text-xs font-medium transition-all border-r border-zinc-900 min-w-fit group
                                 ${index === 0 ? 'rounded-l-md' : ''}
                                 ${index === stages.length - 1 ? 'rounded-r-md' : ''}
                                 ${editingIndex === index
                                     ? 'bg-zinc-800 text-white shadow-inner ring-1 ring-inset ring-zinc-700'
-                                    : 'bg-zinc-900 text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200'
+                                    : stale
+                                        ? 'bg-amber-950/60 text-amber-200 ring-1 ring-inset ring-amber-600/60 hover:bg-amber-900/60'
+                                        : 'bg-zinc-900 text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200'
                                 }
                                 ${!isReadOnly ? 'cursor-pointer' : 'cursor-default opacity-90'}
                             `}
                         >
-                            <span className={`whitespace-nowrap truncate ${stage.metadata?.search || isLassoStage(stage) ? 'max-w-[360px]' : 'max-w-[200px]'}`} title={stage.description}>
+                            <span className={`whitespace-nowrap truncate ${stage.metadata?.search || isLassoStage(stage) ? 'max-w-[360px]' : 'max-w-[200px]'}`} title={stale ? (canUpdateView ? STALE_LASSO_WARNING_IN_VIEW : STALE_LASSO_WARNING) : stage.description}>
                                 {stage.type === 'map_region' && <span className="mr-1">🌍</span>}
+                                {stale && <span className="mr-1">⚠</span>}
                                 {isLassoStage(stage) && <span className="mr-1">⬡</span>}
                                 {stage.type === 'similarity' && <span className="mr-1">🔍</span>}
                                 {(stage.metadata?.collapse || stage.metadata?.dupGroupCollapse) && <span className="mr-1">⧉</span>}

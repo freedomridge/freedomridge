@@ -417,7 +417,7 @@ loads. Use one of the two options above.
 | Datasets (name, settings, media fields) | `datasets` table | Yes |
 | Samples (filepath, metadata, location, heading) | `samples` table | Yes |
 | Embedding vectors (CLIP, DINOv2) | `embeddings` table | Yes |
-| Map coordinates and scatter ranking | `embedding_coordinates`, `embedding_viz_rank`, `embedding_viz_meta` tables | Yes |
+| Map coordinates and scatter ranking | `embedding_coordinates`, `embedding_viz_rank`, `embedding_viz_meta`, `embedding_layouts` tables | Yes |
 | Image hashes (dhash, phash) | `sample_hashes` table | Yes |
 | Field indexes and display settings | `dataset_fields` table | Yes |
 | Field statistics cache | `dataset_field_stats` table | Yes |

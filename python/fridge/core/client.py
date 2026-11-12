@@ -15,6 +15,7 @@ import requests
 from urllib3.util import Timeout
 
 from .job import Job
+from .sample import _json_value
 
 # Default (connect, read) timeout in seconds applied to every request.
 # Generous read timeout because some endpoints (large queries, histograms)
@@ -54,6 +55,26 @@ def _decode_vectors_binary(buf: bytes) -> Dict[str, Any]:
         "items": items,
         "total": header.get("total"),
     }
+
+
+class StaleLassoWarning(UserWarning):
+    """A filter holds a lasso drawn on an earlier layout of its map: it may select different samples now. Redraw it in
+    the app, or remove it. A bulk delete by such a filter is refused instead (an ``HTTPError``)."""
+
+
+def _warn_stale_lassos(answer, stacklevel=3):
+    """The server names the maps of the request's filter that were laid out again after its lasso was drawn
+    (``stale_lassos``): say so, once per call."""
+    maps = answer.get("stale_lassos") if isinstance(answer, dict) else None
+    if isinstance(maps, list) and maps:
+        names = " and ".join(str(name) for name in maps)
+        warnings.warn(
+            f"The filter holds a lasso drawn on an earlier layout of the {names} map"
+            f"{'s' if len(maps) > 1 else ''}: it may select different samples now. Redraw it in the app, or remove "
+            "it from the view.",
+            StaleLassoWarning,
+            stacklevel=stacklevel,
+        )
 
 
 def _raise_for_status(resp):
@@ -100,6 +121,15 @@ class _Session(requests.Session):
         if _SDK_VERSION:
             # The server refuses an SDK of another major version from this (backend/main.py).
             self.headers["X-Fridge-SDK-Version"] = _SDK_VERSION
+
+    def prepare_request(self, request):
+        if request.json is not None:
+            # Every JSON body is written here, so a date or time anywhere in one (metadata, a filter value, a
+            # lookup) is sent the one way the SDK writes them (_json_value); otherwise as requests writes json=.
+            request.data = json.dumps(request.json, default=_json_value, allow_nan=False).encode()
+            request.json = None
+            request.headers = {"Content-Type": "application/json", **(request.headers or {})}
+        return super().prepare_request(request)
 
     def rebuild_auth(self, prepared_request, response):
         super().rebuild_auth(prepared_request, response)
@@ -602,7 +632,9 @@ class Client:
             json=payload,
         )
         _raise_for_status(resp)
-        return resp.json()
+        answer = resp.json()
+        _warn_stale_lassos(answer)
+        return answer
 
     def add_samples(self, dataset_id, samples, on_duplicate='error'):
         """Add samples to a dataset.
@@ -1195,6 +1227,7 @@ class Client:
     def _bulk_result(self, response, *, wait=True, timeout=1800):
         _raise_for_status(response)
         result = response.json()
+        _warn_stale_lassos(result, stacklevel=4)
         if 'job_id' not in result:
             return result
         job = Job(self, result['job_id'])
@@ -1211,7 +1244,8 @@ class Client:
         wait=True,
         timeout=1800,
     ):
-        """Delete a captured target; cancellation retains already deleted chunks (admin only)."""
+        """Delete a captured target; cancellation retains already deleted chunks (admin only). Deleting an image
+        deletes its object samples (``objects_deleted`` in the result, apart from ``deleted_count``)."""
         payload = {
             'sample_ids': list(sample_ids or []),
             'filters': filters,
@@ -1221,6 +1255,24 @@ class Client:
         response = self.session.post(
             f'{self.base_url}/datasets/{dataset_id}/samples/bulk-delete',
             json=payload,
+            timeout=(10, 30),
+        )
+        return self._bulk_result(response, wait=wait, timeout=timeout)
+
+    def find_unlinked_objects(self, dataset_id) -> dict:
+        """The object samples with no image, by kind: ``{'total', 'kinds': {...}, 'linkable', 'linked', 'mirror',
+        'filter'}``. For a user who may edit the dataset, objects whose image is there but not linked yet are linked
+        first."""
+        resp = self.session.post(f'{self.base_url}/datasets/{dataset_id}/objects/unlinked')
+        _raise_for_status(resp)
+        return resp.json()
+
+    def delete_unlinked_objects(self, dataset_id, kinds=('image_gone',), *, wait=True, timeout=1800):
+        """Delete the object samples with no image of these kinds (admin only; refused on a mirror), as a bulk
+        delete job. By default only those whose image is gone. With none to delete there is no job."""
+        response = self.session.post(
+            f'{self.base_url}/datasets/{dataset_id}/objects/unlinked/delete',
+            json={'kinds': list(kinds)},
             timeout=(10, 30),
         )
         return self._bulk_result(response, wait=wait, timeout=timeout)
@@ -1644,7 +1696,8 @@ class Client:
     # --- Sample deletion ---
 
     def delete_sample(self, dataset_id, sample_id) -> dict:
-        """Delete a single sample from a dataset."""
+        """Delete a single sample from a dataset. Deleting an image deletes its object samples: ``objects_deleted``
+        in the answer says how many."""
         resp = self.session.delete(f"{self.base_url}/datasets/{dataset_id}/samples/{sample_id}")
         _raise_for_status(resp)
         return resp.json()
@@ -1657,7 +1710,7 @@ class Client:
         if filters:
             import json
 
-            params["filters"] = json.dumps(filters)
+            params["filters"] = json.dumps(filters, default=_json_value)
         resp = self.session.get(f"{self.base_url}/datasets/{dataset_id}/schema", params=params)
         _raise_for_status(resp)
         return resp.json()
@@ -1893,6 +1946,8 @@ class Client:
         restore_deleted=True also re-creates samples deleted since the version
         (from snapshot; embeddings/hashes must be backfilled — see get_missing).
         restore_settings=True also puts the dataset's settings back as the version recorded them.
+        exact_membership=True also removes samples added since; an image added since goes with its object samples,
+        and ``samples_removed`` counts them all.
         """
         resp = self.session.post(
             f"{self.base_url}/datasets/{dataset_id}/versions/{version_id}/revert",
@@ -2058,6 +2113,12 @@ class Client:
         take minutes on millions of vectors: the build is a server job (progress
         and cancel in the dataset's Jobs), and this waits for it — ``timeout``
         covers the server's 3600 s build cap. ``wait=False`` returns the Job.
+
+        The server builds one index at a time: a build that starts while another
+        runs (a field index, another vector index) waits for it before it starts,
+        which can take hours. ``timeout`` ends this wait, not the job: on
+        ``JobTimeout`` the build still runs when its turn comes (follow it with
+        ``client.get_job``, or call again later to join it).
         """
         resp = self.session.post(
             f"{self.base_url}/datasets/{dataset_id}/quality/ann-index",

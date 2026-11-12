@@ -262,7 +262,8 @@ async def submit_restore(pool, name: str, user: Dict[str, Any]) -> Dict[str, Any
             restore_bytes(removal['size_bytes'], removal['definition']),
             f'restoring index {name}',
         )
-        job = await job_queue.enqueue_job(
+        # A CREATE INDEX CONCURRENTLY: one index build at a time (index_jobs.enqueue_build).
+        job = await index_jobs.enqueue_build(
             connection,
             RESTORE_KIND,
             lane='user',
@@ -441,6 +442,8 @@ def drop_handler(pool):
                     dataset_id,
                     field,
                 )
+                # Removed on purpose: a rebuild queued for it (index_jobs.queue_rebuilds) would bring it back.
+                await index_jobs.field_rebuilt(connection, dataset_id, field)
             if args['record'] and index is not None:
                 # A removal still open for this name (stopped before its drop, or its index re-created since)
                 # is replaced by this one.

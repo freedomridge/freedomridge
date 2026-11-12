@@ -19,7 +19,8 @@ from __future__ import annotations
 import json
 from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional, cast
 
-from .client import _raise_for_status
+from .client import _raise_for_status, _warn_stale_lassos
+from .sample import _jsonable
 
 if TYPE_CHECKING:
     from .dataset import Dataset  # noqa: F401 — quoted forward refs only
@@ -57,8 +58,8 @@ class Condition:
             # Compound condition (AND/OR/NOT)
             return {"logic": self._logic, "filters": [c.to_dict() for c in self._conditions]}
         else:
-            # Simple condition
-            return {"field": self.field, "operator": self.operator, "value": self.value}
+            # Simple condition. A datetime value is sent as the data is (_jsonable), so the two agree.
+            return {"field": self.field, "operator": self.operator, "value": _jsonable(self.value)}
 
     def __and__(self, other: Condition) -> Condition:
         """Combine with AND: (a > 5) & (b < 10)"""
@@ -448,6 +449,7 @@ class DatasetView:
         response = client.session.post(f"{client.base_url}/datasets/{self._dataset._id}/samples/query", json=params)
         _raise_for_status(response)
         data = response.json()
+        _warn_stale_lassos(data, stacklevel=4)
 
         items = data.get("items", [])
         total = data.get("total", 0)
@@ -595,7 +597,9 @@ class DatasetView:
             json=payload,
         )
         _raise_for_status(response)
-        total = max(response.json().get("total", 0) - (self._offset_val or 0), 0)
+        answer = response.json()
+        _warn_stale_lassos(answer, stacklevel=5)
+        total = max(answer.get("total", 0) - (self._offset_val or 0), 0)
         return min(total, self._limit_val) if self._limit_val else total
 
     def __len__(self) -> int:
@@ -686,6 +690,8 @@ class DatasetView:
         return result['updated_count'] if wait else result
 
     def delete_samples(self, *, wait=True, timeout=1800):
+        """Delete this view's samples (admin only). Deleting an image deletes its object samples: the result's
+        ``objects_deleted`` counts those the view didn't include."""
         return self._dataset.client.bulk_delete_samples(
             self._dataset.id,
             wait=wait,

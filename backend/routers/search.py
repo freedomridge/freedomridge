@@ -729,18 +729,17 @@ async def object_to_patch_search(req: ObjectToPatchSearchRequest, request: Reque
     parent_ids = list({r['sample_id'] for r in rows})
     covered: dict[int, list[list[float]]] = {}
     if parent_ids:
-        # Match on the TEXT expression so idx_samples_parent_id (a text-expression index) serves
-        # the lookup — a `(metadata->>'parent_id')::int = ANY(int[])` predicate cannot use it and
-        # would full-scan every object row (~16M at Open Images scale) for a ~240-id candidate set.
+        # An image's objects by samples.parent_id (0029), through the (dataset_id, parent_id) index: one probe per
+        # candidate image (~240), never a scan of every object row (~16M at Open Images scale).
         box_rows = await db.fetch(
             """
-            SELECT (metadata ->> 'parent_id')::int AS pid, metadata -> 'crop_bbox' AS bbox
+            SELECT parent_id AS pid, metadata -> 'crop_bbox' AS bbox
             FROM samples
             WHERE dataset_id = $1 AND media_type = 'object'
-              AND metadata ->> 'parent_id' = ANY($2)
+              AND parent_id = ANY($2::int[])
             """,
             req.dataset_id,
-            [str(p) for p in parent_ids],
+            parent_ids,
         )
         for br in box_rows:
             bbox = br['bbox']

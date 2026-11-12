@@ -212,7 +212,7 @@ def test_eq_on_created_at_uses_mapped_column_in_joined_query():
         1,
         field_mapping={"id": "s.id", "created_at": "s.created_at"},
     )
-    assert sql == "s.created_at = $1", sql
+    assert sql == "(s.created_at >= $1 AND s.created_at < $2)", sql  # the second it names, on the mapped column
 
 
 def test_eq_on_id_grid_path_stays_bare():
@@ -319,11 +319,11 @@ def test_malformed_created_at_400():
 
 def test_valid_created_at_ok():
     sql, args = _sql("created_at", "=", "2026-06-08T00:00:00Z")
-    assert "created_at = " in sql
-    # coerced to a datetime, not left as a string
+    assert sql == "(created_at >= $1 AND created_at < $2)"  # the second it names
+    # coerced to datetimes, not left as strings
     import datetime
 
-    assert isinstance(args[0], datetime.datetime)
+    assert all(isinstance(arg, datetime.datetime) for arg in args)
 
 
 # ---- datetime metadata range ops compare as ISO text so they use the promoted index ----

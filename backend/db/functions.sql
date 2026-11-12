@@ -85,6 +85,63 @@ LANGUAGE SQL IMMUTABLE PARALLEL SAFE AS $$
     END FROM normalized
 $$;
 
+CREATE OR REPLACE FUNCTION samples_set_parent() RETURNS trigger AS $$
+BEGIN
+    NEW.parent_id := NULL;
+    IF NEW.media_type = 'object' AND NEW.metadata->>'parent_id' ~ '^[0-9]{1,10}$' THEN
+        SELECT p.id INTO NEW.parent_id FROM samples p
+         WHERE p.dataset_id = NEW.dataset_id AND p.id = (NEW.metadata->>'parent_id')::bigint
+           AND p.media_type <> 'object';
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION samples_link_new_children() RETURNS trigger AS $$
+BEGIN
+    UPDATE samples SET parent_id = (metadata->>'parent_id')::integer
+     WHERE ltrim(metadata->>'parent_id', '0')
+           = ANY (ARRAY(SELECT id::text FROM parent_new_rows WHERE media_type <> 'object'))
+       AND media_type = 'object' AND parent_id IS NULL
+       AND dataset_id IN (SELECT dataset_id FROM parent_new_rows WHERE media_type <> 'object');
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION samples_relink_children() RETURNS trigger AS $$
+BEGIN
+    UPDATE samples SET parent_id = NULL WHERE dataset_id = OLD.dataset_id AND parent_id = OLD.id;
+    IF NEW.media_type <> 'object' THEN
+        UPDATE samples SET parent_id = NEW.id
+         WHERE ltrim(metadata->>'parent_id', '0') = NEW.id::text AND media_type = 'object'
+           AND dataset_id = NEW.dataset_id AND parent_id IS DISTINCT FROM NEW.id;
+    END IF;
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION link_objects(target_dataset INTEGER, only_unlinked BOOLEAN) RETURNS BIGINT
+SET plan_cache_mode = force_custom_plan AS $$
+DECLARE
+    linked BIGINT;
+BEGIN
+    UPDATE samples o SET parent_id = p.id
+      FROM samples p
+     WHERE o.dataset_id = target_dataset AND o.media_type = 'object' AND p.dataset_id = target_dataset
+       AND (NOT only_unlinked OR o.parent_id IS NULL)
+       AND p.id = CASE WHEN o.metadata->>'parent_id' ~ '^[0-9]{1,10}$' THEN (o.metadata->>'parent_id')::bigint END
+       AND p.media_type <> 'object' AND o.parent_id IS DISTINCT FROM p.id;
+    GET DIAGNOSTICS linked = ROW_COUNT;
+    RETURN linked;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION link_object_parents(target_dataset INTEGER) RETURNS BIGINT AS $$
+BEGIN
+    RETURN link_objects(target_dataset, FALSE);
+END;
+$$ LANGUAGE plpgsql;
+
 CREATE OR REPLACE FUNCTION create_embeddings_partition(p_schema TEXT, p_dataset_id INTEGER) RETURNS void
 SET lock_timeout = '500ms' AS $$
 DECLARE
@@ -386,6 +443,17 @@ BEGIN
           FROM (SELECT dataset_id, field_name, COUNT(*) AS n FROM rank_old GROUP BY 1, 2) c
          WHERE m.dataset_id = c.dataset_id AND m.field_name = c.field_name$q$;
     RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION stamp_view_updated_at() RETURNS trigger AS $$
+BEGIN
+    IF TG_OP = 'INSERT' OR NEW.content IS DISTINCT FROM OLD.content THEN
+        NEW.updated_at := clock_timestamp();
+    ELSE
+        NEW.updated_at := OLD.updated_at;
+    END IF;
+    RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
 
@@ -902,14 +970,76 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+CREATE OR REPLACE FUNCTION metadata_instant_v1(value TEXT) RETURNS TIMESTAMPTZ
+LANGUAGE plpgsql IMMUTABLE STRICT PARALLEL SAFE AS $$
+DECLARE
+    zone_at INT;                    -- the offset's sign, counted from the 17th character, or 0
+    clock pg_catalog.text;          -- hh:mm[:ss[.fraction]], or '' for a date alone
+    zone pg_catalog.text := '';     -- the offset without its colon (+hh or +hhmm, or -), or ''
+    y INT;
+    mo INT;
+    d INT;
+    last_day INT;
+    oh INT;
+    om INT;
+BEGIN
+    -- YYYY-MM-DD, then optionally T or a space, hh:mm, :ss, .fraction, and Z, +hh, +hhmm or +hh:mm (or -), with
+    -- month 01-12, day 01-31, hour 00-23, minute and second 00-59 and an offset up to 15:59.
+    IF value OPERATOR(pg_catalog.!~) '^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])([T ]([01][0-9]|2[0-3]):[0-5][0-9](:[0-5][0-9](\.[0-9]+)?)?(Z|[+-](0[0-9]|1[0-5])(:?[0-5][0-9])?)?)?$' THEN
+        RETURN NULL;
+    END IF;
+    y := pg_catalog.substr(value, 1, 4)::INT;
+    mo := pg_catalog.substr(value, 6, 2)::INT;
+    d := pg_catalog.substr(value, 9, 2)::INT;
+    -- No year 0000, and no day past the end of its month (Gregorian leap years).
+    last_day := CASE
+        WHEN mo OPERATOR(pg_catalog.=) 2 THEN
+            CASE WHEN (y OPERATOR(pg_catalog.%) 4) OPERATOR(pg_catalog.=) 0
+                      AND ((y OPERATOR(pg_catalog.%) 100) OPERATOR(pg_catalog.<>) 0
+                           OR (y OPERATOR(pg_catalog.%) 400) OPERATOR(pg_catalog.=) 0)
+                 THEN 29 ELSE 28 END
+        WHEN mo OPERATOR(pg_catalog.=) ANY (ARRAY[4, 6, 9, 11]) THEN 30
+        ELSE 31
+    END;
+    IF y OPERATOR(pg_catalog.=) 0 OR d OPERATOR(pg_catalog.>) last_day THEN
+        RETURN NULL;
+    END IF;
+    -- The grammar allows one sign after the minutes: the offset's.
+    zone_at := pg_catalog.strpos(pg_catalog.translate(pg_catalog.substr(value, 17), '-', '+'), '+');
+    IF zone_at OPERATOR(pg_catalog.>) 0 THEN
+        clock := pg_catalog.substr(value, 12, zone_at OPERATOR(pg_catalog.+) 4);
+        zone := pg_catalog.translate(pg_catalog.substr(value, zone_at OPERATOR(pg_catalog.+) 16), ':', '');
+    ELSE
+        clock := pg_catalog.substr(pg_catalog.rtrim(value, 'Z'), 12);
+    END IF;
+    -- A part that isn't written is zero.
+    oh := pg_catalog.rpad(pg_catalog.substr(zone, 2, 2), 2, '0')::INT;
+    om := pg_catalog.rpad(pg_catalog.substr(zone, 4, 2), 2, '0')::INT;
+    IF pg_catalog.substr(zone, 1, 1) OPERATOR(pg_catalog.=) '-' THEN
+        oh := OPERATOR(pg_catalog.-) oh;
+        om := OPERATOR(pg_catalog.-) om;
+    END IF;
+    -- The wall-clock time, plus the fraction as whole microseconds, read at the offset (ISO sign: +02:00 is east).
+    RETURN pg_catalog.timezone(
+        pg_catalog.make_interval(hours => oh, mins => om),
+        pg_catalog.make_timestamp(
+            y,
+            mo,
+            d,
+            pg_catalog.rpad(pg_catalog.substr(clock, 1, 2), 2, '0')::INT,
+            pg_catalog.rpad(pg_catalog.substr(clock, 4, 2), 2, '0')::INT,
+            pg_catalog.rpad(pg_catalog.substr(clock, 7, 2), 2, '0')::INT
+        ) OPERATOR(pg_catalog.+) (
+            pg_catalog.rpad(pg_catalog.substr(clock, 10, 6), 6, '0')::INT OPERATOR(pg_catalog.*) INTERVAL '1 microsecond'
+        )
+    );
+END;
+$$;
+
 CREATE OR REPLACE FUNCTION stats_datetime(value TEXT)
 RETURNS TIMESTAMPTZ AS $$
-    SELECT CASE
-        WHEN value ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}([T ][0-9:.+-]+Z?)?$'
-             AND pg_input_is_valid(value, 'timestamp with time zone')
-        THEN value::timestamptz
-    END;
-$$ LANGUAGE sql IMMUTABLE STRICT SET timezone = 'UTC';
+    SELECT metadata_instant_v1(value);
+$$ LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE;
 
 CREATE OR REPLACE FUNCTION record_duplicate_hash_work()
 RETURNS TRIGGER AS $$
@@ -1264,6 +1394,20 @@ BEGIN
                                          'model_id', current_model)::text;
 END;
 $$ LANGUAGE plpgsql STABLE PARALLEL SAFE;
+
+CREATE OR REPLACE FUNCTION bump_map_layout(p_dataset_id INTEGER, p_field TEXT) RETURNS UUID AS $$
+DECLARE
+    made UUID := gen_random_uuid();
+BEGIN
+    INSERT INTO embedding_layouts (dataset_id, field_name, layout_id)
+    VALUES (p_dataset_id, regexp_replace(p_field, '(_patch_\d+x\d+)_r\d+c\d+$', '\1'), made)
+    ON CONFLICT (dataset_id, field_name) DO UPDATE SET layout_id = EXCLUDED.layout_id;
+    IF EXISTS (SELECT 1 FROM datasets WHERE id = p_dataset_id AND followed) THEN
+        INSERT INTO dataset_changes (dataset_id, kind) VALUES (p_dataset_id, 'maps');
+    END IF;
+    RETURN made;
+END;
+$$ LANGUAGE plpgsql;
 
 CREATE OR REPLACE FUNCTION sample_block_changed(target_dataset INTEGER, target_block BIGINT) RETURNS VOID AS $$
 BEGIN

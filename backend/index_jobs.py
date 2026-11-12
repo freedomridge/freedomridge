@@ -12,6 +12,8 @@ Every CREATE or DROP INDEX CONCURRENTLY the application runs on a table also hol
 would wait for the table's SHARE UPDATE EXCLUSIVE lock while holding a snapshot, and the first one's
 last phase, which waits for older snapshots, would then be killed as a deadlock. A busy table defers
 the job (no failure counted) or answers 409.
+
+One index build at a time, on the whole database (INDEX_BUILD): see enqueue_build.
 """
 
 import asyncio
@@ -25,6 +27,7 @@ import asyncpg
 from fastapi import HTTPException
 
 from . import job_queue
+from .datetimes import indexed_instant_sql
 from .job_runner import StepResult
 from .job_wait import JobConflict, JobInputError, JobNotFound, JobUnprocessable
 
@@ -33,6 +36,13 @@ ANN_KIND = 'ann_index_build'
 INDEX_LOCK = 20261017
 ANN_LOCK = 20261066
 TABLE_LOCK = 20261067
+# One index build at a time (enqueue_build). Outside it: the GIN index of a new array field, built in its request
+# (datasets.add_array_column refuses while a build owns this, and holds builds off while it builds), and migrations
+# (run with the app stopped).
+INDEX_BUILD = 'index_build'
+# A rebuild that ended without building (a bulk job held its dataset): its job message starts so, and the jobs
+# list shows it as not rebuilt rather than as a finished build (frontend/lib/job-status.ts, notRebuilt).
+NOT_REBUILT = 'Not rebuilt yet'
 # The API's former caps: promote ran under the 600 s command timeout, the ANN build had 3600 s.
 FIELD_BUILD_SECONDS = 3600
 ANN_BUILD_SECONDS = 3600
@@ -60,6 +70,43 @@ _VALIDITY = (
     'SELECT i.indisvalid FROM pg_class c JOIN pg_index i ON i.indexrelid = c.oid '
     'WHERE c.relname = $1 AND c.relnamespace = current_schema()::regnamespace'
 )
+# An index's key expression and predicate, as PostgreSQL prints them (field_index_printed).
+_DEFINITION = (
+    'SELECT pg_get_expr(i.indexprs, i.indrelid) AS expression, pg_get_expr(i.indpred, i.indrelid) AS predicate '
+    'FROM pg_class c JOIN pg_index i ON i.indexrelid = c.oid '
+    'WHERE c.relname = $1 AND c.relnamespace = current_schema()::regnamespace'
+)
+# The field types promote indexes, and how: a number as a float, a datetime on its instant, the rest as its text.
+_NUMBER_TYPES = ('number', 'float', 'int', 'integer')
+_TEXT_TYPES = ('string', 'enum')
+FIELD_INDEX_TYPES = (*_NUMBER_TYPES, *_TEXT_TYPES, 'datetime')
+
+
+def field_index_expression(field_type: str, field_name: str) -> Optional[str]:
+    """The expression a metadata field of this type is indexed on (promote and the rebuilds), or None for a type
+    that isn't indexed. A datetime is indexed on its instant, exactly as its queries compute it. `field_name` must
+    already be checked (promote's name rule)."""
+    text = f"metadata->>'{field_name}'"
+    if field_type in _NUMBER_TYPES:
+        return f"(( ({text})::float ))"
+    if field_type in _TEXT_TYPES:
+        return f"(( {text} ))"
+    if field_type == 'datetime':
+        return f"(( {indexed_instant_sql(text)} ))"
+    return None
+
+
+def field_index_printed(field_type: str, field_name: str) -> Optional[str]:
+    """field_index_expression as PostgreSQL prints the index's key (pg_get_expr of pg_index.indexprs): how the build
+    tells an index of the field's name built on another expression."""
+    text = f"(metadata ->> '{field_name}'::text)"
+    if field_type in _NUMBER_TYPES:
+        return f"({text})::double precision"
+    if field_type in _TEXT_TYPES:
+        return text
+    if field_type == 'datetime':
+        return indexed_instant_sql(text)
+    return None
 
 
 async def _unfinished(connection, kind, dataset_id, key, value):
@@ -72,6 +119,16 @@ async def _unfinished(connection, kind, dataset_id, key, value):
         dataset_id,
         value,
     )
+
+
+async def enqueue_build(connection, kind: str, **queued):
+    """Queue a job that runs CREATE INDEX CONCURRENTLY (calls _build): every such job is queued here, holding the
+    INDEX_BUILD resource, so one index build runs at a time on the whole database. A build of an expression or
+    partial index waits for every other such build's snapshot, even on another table: a second build at once would
+    only wait out the first (a field build an hours-long vector build) and could run past its budget. The queue
+    doesn't start a build while another one owns the resource (job_queue.claim_job): it waits unstarted, holding no
+    dataset lane, so its dataset's other jobs run meanwhile, and the jobs list says what it waits for."""
+    return await job_queue.enqueue_job(connection, kind, resources={'exclusive': INDEX_BUILD}, **queued)
 
 
 async def submit_field_index(pool, dataset_id, user_id, args):
@@ -87,7 +144,7 @@ async def submit_field_index(pool, dataset_id, user_id, args):
         if not await connection.fetchval('SELECT pg_try_advisory_xact_lock($1,$2)', INDEX_LOCK, dataset_id):
             raise HTTPException(status_code=409, detail='Another index operation is running for this dataset; retry')
         await require_no_pending_bulk(connection, dataset_id, fields_only=True)
-        return await job_queue.enqueue_job(connection, FIELD_KIND, dataset_id=dataset_id, created_by=user_id, args=args)
+        return await enqueue_build(connection, FIELD_KIND, dataset_id=dataset_id, created_by=user_id, args=args)
 
 
 async def submit_ann_index(pool, dataset_id, user_id, field):
@@ -95,7 +152,7 @@ async def submit_ann_index(pool, dataset_id, user_id, field):
         existing = await _unfinished(connection, ANN_KIND, dataset_id, 'field', field)
         if existing is not None:
             return dict(existing)
-        return await job_queue.enqueue_job(
+        return await enqueue_build(
             connection,
             ANN_KIND,
             dataset_id=dataset_id,
@@ -292,10 +349,15 @@ def field_handler(pool):
         name, field_name = args['index_name'], args['field_name']
         if not _SAFE_FIELD.match(field_name.replace('-', '_')):
             raise JobUnprocessable('Invalid field name')
+        # From the field's type, not args['expression']: a build queued before an upgrade gets today's expression.
+        expression = field_index_expression(args['field_type'], field_name)
+        if expression is None:
+            raise JobUnprocessable(f"A {args['field_type']} field can't be indexed")
         statement = (
             f'CREATE INDEX CONCURRENTLY IF NOT EXISTS "{name}" '
-            f'ON samples {args["expression"]} WHERE dataset_id = {int(dataset_id)}'
+            f'ON samples {expression} WHERE dataset_id = {int(dataset_id)}'
         )
+        wanted = (field_index_printed(args['field_type'], field_name), f'(dataset_id = {int(dataset_id)})')
 
         def unchanged(current):
             return (
@@ -309,6 +371,14 @@ def field_handler(pool):
             try:
                 await require_no_pending_bulk(connection, dataset_id, fields_only=True)
             except HTTPException as error:
+                if args.get('rebuild'):
+                    # Claimed before the queue parked it (_park_held_rebuilds): not a failure, the field's rebuild
+                    # row stays, and the queue queues it again, parked until the bulk job is done.
+                    return StepResult(
+                        finished=True,
+                        result={'message': f'{NOT_REBUILT}: {error.detail}', 'rebuilt': False},
+                        message=f'{NOT_REBUILT}: {error.detail}',  # the jobs list's, for those who can't see results
+                    )
                 raise JobConflict(error.detail) from None
             current = await _definition(connection, dataset_id, field_name)
             if unchanged(current) and current['is_promoted']:
@@ -319,6 +389,11 @@ def field_handler(pool):
                 )
             measured = None
             if unchanged(current):
+                found = await connection.fetchrow(_DEFINITION, name, timeout=5)
+                if found is not None and (found['expression'], found['predicate']) != wanted:
+                    # An index of this name on another expression (a datetime field's on its text, 0032; one left
+                    # from before a type change) goes first: IF NOT EXISTS would keep it and call the field indexed.
+                    await _drop_carcass(connection, name, valid_too=True)
                 built_before = await connection.fetchval(_VALIDITY, name, timeout=5)
                 if not built_before:
                     await _drop_carcass(connection, name)  # an INVALID leftover: not part of the measured build
@@ -351,6 +426,7 @@ def field_handler(pool):
             if not unchanged(current) or not await connection.fetchval(_VALIDITY, name):
                 raise job_queue.QueueContended('Field or index changed after the build')
             await connection.execute('UPDATE dataset_fields SET is_promoted = TRUE WHERE id = $1', current['id'])
+            await field_rebuilt(connection, dataset_id, field_name)  # a rebuild queued for it is done, by this build
             # An index advisor removal of this index is restored by the build.
             await connection.execute(
                 """UPDATE removed_indexes SET restored_at = clock_timestamp(), restored_by = $2,
@@ -437,10 +513,87 @@ _LANE_OWNED = """EXISTS (SELECT 1 FROM jobs owner WHERE owner.dataset_id = {data
     AND (owner.state = 'running' OR (owner.state = 'queued' AND owner.started_at IS NOT NULL)))"""
 
 
+# The rebuild queue's kinds (ann_index_rebuilds.kind, 0032): each one's build job and the argument naming its field.
+_REBUILDS = {'vector': (ANN_KIND, 'field'), 'field': (FIELD_KIND, 'field_name')}
+# A bulk job that keeps its dataset's fields while unfinished, a stopped one too (bulk_jobs.require_no_pending_bulk,
+# fields_only): a field build of that dataset would be refused, so its rebuilds wait, parked (_park_held_rebuilds).
+_HELD_BY = """bulk.dataset_id = {dataset} AND bulk.kind = 'bulk_mutation' AND bulk.state <> 'succeeded'
+    AND NOT COALESCE(bulk.result, '{{}}'::jsonb) ? 'discarded'
+    AND bulk.args->>'operation' IN ('rename', 'clone', 'clear')"""
+_FIELDS_HELD = f'EXISTS (SELECT 1 FROM jobs bulk WHERE {_HELD_BY})'
+
+
 async def queue_rebuilds(pool):
+    """Queue the next build the rebuild queue (ann_index_rebuilds) holds: a field index 0032 found on a datetime
+    field's text (field_index_expression builds it on the field's instant), or a vector index 0021 dropped with the
+    old embeddings table. This decides what is queued: one build of each kind at a time, field builds first (they
+    take minutes, vector builds hours), so no vector build is queued while a field build is queued or running. Which
+    queued build starts is the queue's: one index build at a time on the whole database (enqueue_build), so a field
+    build queued while a vector build runs waits for it, unstarted and holding no lane, as does a build someone
+    starts by hand. A build that can't start (another job holds its dataset's lane, or a bulk job its fields) holds
+    nothing up. An empty queue costs one indexed EXISTS per kind. Returns how many it queued: 0 or 1."""
+    return await _queue_field_rebuild(pool) or await _queue_vector_rebuild(pool)
+
+
+async def _queued(pool, kind) -> bool:
+    """Whether the queue holds rows of `kind`, read from its primary key: all a scheduling tick costs once empty."""
+    async with pool.acquire(timeout=1) as connection:
+        return bool(await connection.fetchval('SELECT EXISTS(SELECT 1 FROM ann_index_rebuilds WHERE kind = $1)', kind))
+
+
+async def _rebuild_turn(connection, kind) -> bool:
+    """Whether the queue's next build of `kind` may be queued now, in the caller's transaction (queue_rebuilds):
+    no build of that kind is running or waiting to start and, for a vector build, no field build either (they go
+    first). A build that hasn't started and can't (another job holds its dataset's lane, a map re-fit or a bulk
+    edit; a bulk job holds a field build's dataset) holds nothing up. Removes first the rows whose build this queue
+    started and someone cancelled: whoever cancelled it didn't want it, and building it again is theirs to do. (A
+    field build isn't held back by a vector build: queued meanwhile, it waits for it unstarted, enqueue_build.)"""
+    job_kind, key = _REBUILDS[kind]
+    # One lock for both kinds: the vector turn reads the field builds.
+    await connection.execute('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', 'ann_index_rebuilds')
+    lane_owned = _LANE_OWNED.format(dataset='build.dataset_id', lane="'user'", job='build.id')
+    for blocking in [job_kind] if kind == 'field' else [job_kind, FIELD_KIND]:
+        can_start = f'NOT {lane_owned}'
+        if blocking == FIELD_KIND:
+            can_start += f" AND NOT {_FIELDS_HELD.format(dataset='build.dataset_id')}"
+        if await connection.fetchval(
+            f"""SELECT EXISTS(SELECT 1 FROM jobs build WHERE build.kind = $1 AND (build.state = 'running'
+                OR (build.state = 'queued' AND (build.started_at IS NOT NULL OR ({can_start})))))""",
+            blocking,
+        ):
+            return False
+    await connection.execute(
+        f"""DELETE FROM ann_index_rebuilds r USING jobs cancelled WHERE r.kind = $2 AND cancelled.kind = $1
+               AND cancelled.state = 'cancelled' AND cancelled.args->>'rebuild' = 'true'
+               AND cancelled.dataset_id = r.dataset_id AND cancelled.args->>'{key}' = r.field_name
+               AND NOT EXISTS (SELECT 1 FROM jobs later WHERE later.kind = $1 AND later.dataset_id = r.dataset_id
+                   AND later.args->>'{key}' = r.field_name AND later.created_at > cancelled.created_at)""",
+        job_kind,
+        kind,
+    )
+    return True
+
+
+def _next_rebuild(kind) -> str:
+    """The WHERE clause of a row of `kind` whose build can start: its dataset isn't being deleted, its dataset's lane
+    is free, and its last build didn't fail within a day ($1 is the build job's kind). A field row also has no
+    build queued already (one parked for a bulk job doesn't count as waiting in _rebuild_turn)."""
+    key = _REBUILDS[kind][1]
+    lane_owned = _LANE_OWNED.format(dataset='r.dataset_id', lane="'user'", job='NULL')
+    queued = f"""AND NOT EXISTS (SELECT 1 FROM jobs queued WHERE queued.kind = $1 AND queued.dataset_id = r.dataset_id
+            AND queued.args->>'{key}' = r.field_name AND queued.state IN ('queued', 'running'))"""
+    return f"""r.kind = '{kind}' AND NOT d.deleting AND NOT {lane_owned}
+        AND NOT EXISTS (SELECT 1 FROM jobs ended WHERE ended.kind = $1 AND ended.dataset_id = r.dataset_id
+            AND ended.args->>'{key}' = r.field_name AND ended.state = 'failed'
+            AND ended.finished_at > clock_timestamp() - interval '1 day')
+        {queued if kind == 'field' else ''}"""
+
+
+async def _queue_vector_rebuild(pool):
     """Queue the next of the vector index builds 0021 recorded (the indexes it dropped with the old embeddings
-    table, one per dataset and field now), once no vector index build is running or waiting to start: the field
-    with the fewest vectors first, so most datasets search with an index soon. Builds run one at a time anyway.
+    table, one per dataset and field now), once no vector index build is running or waiting to start and no field
+    index build is queued or running (queue_rebuilds): the field with the fewest vectors first, so most datasets
+    search with an index soon. Builds run one at a time anyway.
     Queued all at once, every waiting build was claimed, refused the build lock and put back again and again
     (dozens of waiting jobs with their attempts counting up), and whichever was claimed first after a build went
     next, a large dataset's before small ones.
@@ -453,24 +606,11 @@ async def queue_rebuilds(pool):
     queued (args rebuild: true) is cancelled, its row goes: whoever cancelled it didn't want it, and Retry in the
     jobs list builds it again. A cancelled build of a user's own (Retry, the endpoint, the SDK) leaves a rebuild row
     alone. Returns how many it queued: 0 or 1."""
-    lane_owned = _LANE_OWNED.format(dataset='{dataset}', lane="'user'", job='{job}')
+    if not await _queued(pool, 'vector'):
+        return 0
     async with job_queue._transaction(pool) as connection:
-        await connection.execute('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', 'ann_index_rebuilds')
-        if await connection.fetchval(
-            f"""SELECT EXISTS(SELECT 1 FROM jobs build WHERE build.kind = $1 AND (build.state = 'running'
-                    OR (build.state = 'queued' AND (build.started_at IS NOT NULL
-                        OR NOT {lane_owned.format(dataset='build.dataset_id', job='build.id')}))))""",
-            ANN_KIND,
-        ):
+        if not await _rebuild_turn(connection, 'vector'):
             return 0
-        await connection.execute(
-            """DELETE FROM ann_index_rebuilds r USING jobs cancelled WHERE cancelled.kind = $1
-                   AND cancelled.state = 'cancelled' AND cancelled.args->>'rebuild' = 'true'
-                   AND cancelled.dataset_id = r.dataset_id AND cancelled.args->>'field' = r.field_name
-                   AND NOT EXISTS (SELECT 1 FROM jobs later WHERE later.kind = $1 AND later.dataset_id = r.dataset_id
-                       AND later.args->>'field' = r.field_name AND later.created_at > cancelled.created_at)""",
-            ANN_KIND,
-        )
         # Each field's own vectors, estimated: the partition's rows times the field's share in its statistics (the
         # vectors themselves are in TOAST, so the partition's size counts every field's rows alike). A field the
         # statistics don't list counts as the whole partition.
@@ -479,10 +619,7 @@ async def queue_rebuilds(pool):
                LEFT JOIN pg_class c ON c.oid = to_regclass('embeddings_d' || r.dataset_id)
                LEFT JOIN pg_stats s ON s.schemaname = c.relnamespace::regnamespace::text AND s.tablename = c.relname
                     AND s.attname = 'field_name' AND NOT s.inherited
-               WHERE NOT d.deleting AND NOT {lane_owned.format(dataset='r.dataset_id', job='NULL')}
-                 AND NOT EXISTS (SELECT 1 FROM jobs ended WHERE ended.kind = $1 AND ended.dataset_id = r.dataset_id
-                     AND ended.args->>'field' = r.field_name AND ended.state = 'failed'
-                     AND ended.finished_at > clock_timestamp() - interval '1 day')
+               WHERE {_next_rebuild('vector')}
                ORDER BY coalesce(
                     greatest(c.reltuples, 0) * (SELECT share.fraction FROM unnest(s.most_common_vals::text::text[],
                         s.most_common_freqs) AS share(field_name, fraction) WHERE share.field_name = r.field_name),
@@ -492,7 +629,7 @@ async def queue_rebuilds(pool):
         )
         if row is None:
             return 0
-        await job_queue.enqueue_job(
+        await enqueue_build(
             connection,
             ANN_KIND,
             dataset_id=row['dataset_id'],
@@ -501,10 +638,173 @@ async def queue_rebuilds(pool):
         return 1
 
 
+async def _queue_field_rebuild(pool):
+    """Queue the next field index build the queue holds (0032: a datetime field whose index was on its text), as
+    the field index build promote queues, once no field index build is running or waiting to start: the smallest
+    dataset first, by the sample count its statistics keep (the largest field's; a dataset without statistics
+    last), never by counting. Each build reads the whole samples table anyway, but sorts and computes only its
+    dataset's rows. As for vector rebuilds, a row stays until a build of its field publishes it indexed (whoever
+    queued that build), so a failed build is tried again at most once a day, and a cancelled one this queued
+    is not. A row whose field is gone, already indexed or of a type no index is built for has nothing left to
+    do and goes. A rebuild of a dataset whose fields a bulk job holds (_FIELDS_HELD) is queued parked, and doesn't
+    hold up the others (_park_held_rebuilds). Returns how many it queued: 0 or 1."""
+    from .routers.datasets import _promoted_index_name
+
+    if not await _queued(pool, 'field'):
+        return 0
+    async with job_queue._transaction(pool) as connection:
+        await _park_held_rebuilds(connection)
+        if not await _rebuild_turn(connection, 'field'):
+            return 0
+        await connection.execute(
+            """DELETE FROM ann_index_rebuilds r WHERE r.kind = 'field' AND NOT EXISTS (SELECT 1 FROM dataset_fields f
+                   WHERE f.dataset_id = r.dataset_id AND f.field_name = r.field_name AND NOT f.is_promoted
+                     AND f.field_type = ANY($1::text[]))""",
+            list(FIELD_INDEX_TYPES),
+        )
+        row = await connection.fetchrow(
+            f"""SELECT f.id, f.dataset_id, f.field_name, f.field_type FROM ann_index_rebuilds r
+               JOIN datasets d ON d.id = r.dataset_id
+               JOIN dataset_fields f ON f.dataset_id = r.dataset_id AND f.field_name = r.field_name
+               WHERE {_next_rebuild('field')}
+               ORDER BY (SELECT max(s.sample_count) FROM dataset_field_stats s WHERE s.dataset_id = r.dataset_id),
+                    r.dataset_id, r.field_name
+               LIMIT 1""",
+            FIELD_KIND,
+        )
+        if row is None:
+            return 0
+        field_name = row['field_name']
+        await enqueue_build(
+            connection,
+            FIELD_KIND,
+            dataset_id=row['dataset_id'],
+            args={
+                'field_name': field_name,
+                'index_name': _promoted_index_name(row['dataset_id'], field_name),
+                'expression': field_index_expression(row['field_type'], field_name),
+                'definition_id': row['id'],
+                'field_type': row['field_type'],
+                'rebuild': True,
+            },
+        )
+        await _park_held_rebuilds(connection)  # parked at once if a bulk job holds its dataset
+        return 1
+
+
+async def _park_held_rebuilds(connection) -> None:
+    """Park the field rebuilds of datasets whose fields a bulk job holds (_FIELDS_HELD), unstarted: not claimable
+    for a day and parked again while the hold lasts, so they wait holding nothing (no lane, no INDEX_BUILD) instead
+    of failing every day, with the reason in their error, which the jobs list shows as waiting. Woken when the hold
+    ends. One claimed between two ticks finds the bulk job, ends without building (field_handler), and is queued
+    again."""
+    held = _FIELDS_HELD.format(dataset='build.dataset_id')
+    await connection.execute(
+        f"""UPDATE jobs build SET available_at = clock_timestamp() + interval '1 day', updated_at = clock_timestamp(),
+               error = jsonb_build_object('type', 'QueueContended', 'code', 'fields_held', 'message',
+                   (SELECT 'Waiting for the unfinished bulk ' || string_agg(bulk.args->>'operation' || ' job '
+                        || bulk.id, ', ' ORDER BY bulk.created_at) || ' on this dataset to finish or be discarded'
+                    FROM jobs bulk WHERE {_HELD_BY.format(dataset='build.dataset_id')}))
+           WHERE build.kind = $1 AND build.state = 'queued' AND build.started_at IS NULL
+             AND build.args->>'rebuild' = 'true' AND build.available_at < clock_timestamp() + interval '12 hours'
+             AND {held}""",
+        FIELD_KIND,
+    )
+    await connection.execute(
+        f"""UPDATE jobs build SET available_at = clock_timestamp(), updated_at = clock_timestamp(), error = NULL
+           WHERE build.kind = $1 AND build.state = 'queued' AND build.started_at IS NULL
+             AND build.error->>'code' = 'fields_held' AND NOT {held}""",
+        FIELD_KIND,
+    )
+
+
+async def rebuilding_fields(connection, dataset_id: int) -> list[str]:
+    """The dataset's fields queued for an index rebuild: not indexed until it is built, and shown as rebuilding."""
+    rows = await connection.fetch(
+        "SELECT field_name FROM ann_index_rebuilds WHERE kind = 'field' AND dataset_id = $1 ORDER BY field_name",
+        dataset_id,
+    )
+    return [row['field_name'] for row in rows]
+
+
+async def rebuild_waiting(connection, dataset_id: int, fields) -> dict[str, str]:
+    """What each of these rebuilding fields waits for, if anything: an unfinished bulk job that keeps the dataset's
+    fields (a stopped rename, clone or clear too), whose end the queue waits for (_park_held_rebuilds), or another
+    index build, when its build is queued and another owns INDEX_BUILD (enqueue_build)."""
+    from .bulk_jobs import require_no_pending_bulk
+
+    try:
+        await require_no_pending_bulk(connection, dataset_id, fields_only=True)
+    except HTTPException as error:
+        return {field: str(error.detail) for field in fields}
+    waiting = await connection.fetch(  # its owner as the queue counts one (job_queue.exclusive_owned)
+        """SELECT build.args->>'field_name' AS field_name FROM jobs build
+           WHERE build.kind = $1 AND build.dataset_id = $2 AND build.args->>'field_name' = ANY($3::text[])
+             AND build.state = 'queued' AND build.started_at IS NULL
+             AND EXISTS (SELECT 1 FROM jobs owner WHERE owner.resources->>'exclusive' = $4 AND owner.id <> build.id
+                 AND (owner.state = 'running' OR (owner.state = 'queued' AND owner.started_at IS NOT NULL)))""",
+        FIELD_KIND,
+        dataset_id,
+        list(fields),
+        INDEX_BUILD,
+    )
+    note = 'Another index build is running; this one starts when it ends (one index build at a time).'
+    return {row['field_name']: note for row in waiting}
+
+
+async def is_rebuilding(connection, dataset_id: int, field_name: str) -> bool:
+    """Whether the field's index is queued for a rebuild: until it is built, the field's old index (named for it, on
+    its text) is still there, though the field isn't indexed."""
+    return bool(
+        await connection.fetchval(
+            "SELECT EXISTS(SELECT 1 FROM ann_index_rebuilds WHERE kind = 'field' AND dataset_id = $1 "
+            "AND field_name = $2)",
+            dataset_id,
+            field_name,
+        ),
+    )
+
+
+async def move_field_rebuild(connection, dataset_id: int, field_name: str, new_name: Optional[str]) -> bool:
+    """A field renamed (to new_name) or cleared (None), in the caller's transaction: its queued rebuild follows the
+    rename or goes, and a build of the old name not started yet is cancelled. Returns whether it was being rebuilt:
+    its old index, named for the old name, is then the caller's to drop once the transaction is done."""
+    if not await connection.fetchval(
+        "DELETE FROM ann_index_rebuilds WHERE kind = 'field' AND dataset_id = $1 AND field_name = $2 RETURNING TRUE",
+        dataset_id,
+        field_name,
+    ):
+        return False
+    if new_name is not None:
+        await connection.execute(
+            "INSERT INTO ann_index_rebuilds (kind, dataset_id, field_name) VALUES ('field', $1, $2) "
+            "ON CONFLICT DO NOTHING",
+            dataset_id,
+            new_name,
+        )
+    await connection.execute(
+        """UPDATE job_controls SET cancel_requested = TRUE WHERE job_id IN (SELECT id FROM jobs WHERE kind = $3
+               AND dataset_id = $1 AND args->>'field_name' = $2 AND state = 'queued' AND started_at IS NULL)""",
+        dataset_id,
+        field_name,
+        FIELD_KIND,
+    )
+    return True
+
+
+async def field_rebuilt(connection, dataset_id, field_name):
+    """A field's rebuild is done: a build of its field published it indexed, or its index was removed on purpose."""
+    await connection.execute(
+        "DELETE FROM ann_index_rebuilds WHERE kind = 'field' AND dataset_id = $1 AND field_name = $2",
+        dataset_id,
+        field_name,
+    )
+
+
 async def _rebuilt(connection, dataset_id, field):
     """The field's rebuild is done: its index exists, or it has nothing to index."""
     await connection.execute(
-        'DELETE FROM ann_index_rebuilds WHERE dataset_id = $1 AND field_name = $2',
+        "DELETE FROM ann_index_rebuilds WHERE kind = 'vector' AND dataset_id = $1 AND field_name = $2",
         dataset_id,
         field,
         timeout=5,

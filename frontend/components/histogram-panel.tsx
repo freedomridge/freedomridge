@@ -22,6 +22,7 @@ interface Props {
 const baseFields: SchemaField[] = [
     { name: 'id', type: 'number' },
     { name: 'created_at', type: 'datetime' },
+    { name: 'last_modified_at', type: 'datetime' },
 ];
 
 function formatNumber(value: number | string | null | undefined) {
@@ -155,7 +156,9 @@ export function HistogramPanel({
         enabled: !!datasetId && !!field && data === undefined && !error,
         retry: false,
     });
-    const binned = shouldBin || (asNumber && data?.bins !== undefined);
+    // Time bars (labelled with UTC instants) are drawn as such even for a time-named field typed text, whose bars
+    // the server bins by time too.
+    const binned = shouldBin || (asNumber && data?.bins !== undefined) || data?.buckets?.[0]?.range?.min_label != null;
 
     const renderOverlayToggle = (fieldName: string) => {
         if (!onToggleOverlay) return null;
@@ -190,7 +193,12 @@ export function HistogramPanel({
     // field's include and exclude value lists; a number range is stored as { min, max } under the field
     // or its exclude key; a datetime range has no exclude form, so a second click clears it.
 
+    // A time-named field that isn't declared a datetime (its text keeps time bars) compares its text, so a filter
+    // can't select a bar's instants: its bars aren't offered as filters (declaring it a datetime makes them so).
+    const timeBarsOnText = (bucket: HistogramBucket) => bucket.range?.min_label != null && fieldMeta?.type !== 'datetime';
+
     const applyBucket = (bucket: HistogramBucket) => {
+        if (timeBarsOnText(bucket)) return;
         setFilterMode('simple');
         setSimpleFilters((prev: Record<string, unknown>) => {
             const next = { ...prev };
@@ -357,7 +365,7 @@ export function HistogramPanel({
         if (fieldMeta?.type === 'datetime') {
             const min = simpleFilters[boundKeyFor(field, 'min')];
             const max = simpleFilters[boundKeyFor(field, 'max')];
-            if (min || max) parts.push(`${min || '...'} - ${max || '...'}`);
+            if (min || max) parts.push(`${min || '...'} - ${max || '...'} UTC`);
             // No explicit datetime range exclusion in context yet.
         } else {
             const sel = simpleFilters[field];
@@ -382,8 +390,10 @@ export function HistogramPanel({
         const count = buckets.length;
         const firstRange = buckets[0]?.range;
         const lastRange = buckets[count - 1]?.range;
-        const minLabel = firstRange ? formatNumber(firstRange.min) : 'min';
-        const maxLabel = lastRange ? formatNumber(lastRange.max) : 'max';
+        // Datetime bars are labelled with UTC text (their range in seconds would read as a number).
+        const utc = firstRange?.min_label != null;
+        const minLabel = firstRange ? formatNumber(firstRange.min_label ?? firstRange.min) : 'min';
+        const maxLabel = lastRange ? formatNumber(lastRange.max_label ?? lastRange.max) : 'max';
         const chartHeight = 180;
         const missingCount = data?.missing ?? 0;
 
@@ -403,13 +413,17 @@ export function HistogramPanel({
                                 if (state === 'included') bgClass = 'bg-cyan-500 hover:bg-cyan-400';
                                 if (state === 'excluded') bgClass = 'bg-red-500 hover:bg-red-400';
 
+                                const action = timeBarsOnText(bucket)
+                                    ? `Declare ${field} a datetime (Dataset Settings) to filter by these times`
+                                    : state === 'none' ? 'Click to Filter' : state === 'included' ? 'Click to Exclude' : 'Click to Reset';
                                 return (
                                     <div key={idx} className="flex flex-col items-center" style={{ minWidth: 20 }}>
                                         <button
                                             onClick={() => applyBucket(bucket)}
-                                            className={`w-full rounded-[2px] transition-colors ${bgClass}`}
+                                            disabled={timeBarsOnText(bucket)}
+                                            className={`w-full rounded-[2px] transition-colors ${bgClass} disabled:cursor-default`}
                                             style={{ height }}
-                                            title={`${bucket.count} samples • ${startLabel} – ${endLabel} • ${state === 'none' ? 'Click to Filter' : state === 'included' ? 'Click to Exclude' : 'Click to Reset'}`}
+                                            title={`${bucket.count} samples • ${startLabel} – ${endLabel}${utc ? ' UTC' : ''} • ${action}`}
                                         />
                                         <div className="text-[10px] leading-tight text-zinc-300 text-center px-1 pt-1 whitespace-nowrap">
                                             {startLabel}
@@ -428,6 +442,7 @@ export function HistogramPanel({
                 </div>
                 <div className="mt-2 text-xs text-zinc-400 flex justify-between">
                     <span>Bins: {count}</span>
+                    {utc && <span data-testid="histogram-utc">Times in UTC</span>}
                     <span>Total: {data?.total ?? 0}</span>
                     {missingCount > 0 && <span>Missing: {missingCount}</span>}
                 </div>

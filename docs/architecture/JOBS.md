@@ -945,20 +945,55 @@ each scatter query is one snapshot, and the response's `map_state` (`{model_id, 
 and binary header) is read before and after the points, which are read again if a swap landed between.
 The map panel shows "Map re-fitted on <date>".
 
-**Lasso selections** (`embedding_polygon`) are coordinates on one map. The panel sends the map's
-`model_id` with the polygon; on a field that has been re-fitted, a polygon drawn on another map (or
-sent without a model id) is refused with 409 (`require_current_map`, SQLSTATE 55000) instead of
-silently selecting other samples. The check is one InitPlan per query: every dataset-scoped caller of
-`parse_filter_node` passes `dataset_id` (a test walks the call sites), and the function is
-`PARALLEL SAFE`, so lasso queries keep their parallel plans (a lasso over 88% of 1M samples: 0.88 s, unchanged by the check). The
-sidebar's best-effort endpoints (field-stats, schema, autocomplete) check the request's lassos up front
-(`require_current_lassos`), so they refuse too rather than fall back to unfiltered values, and the
-samples paths (page-only, keyset, slim, GET) let the refusal through their generic 500 handlers. The 409
-carries `code: map_refitted` with the dataset, field and current model; the UI drops every stale lasso
-of that field (an applied "Embeddings Region" stage, one restored from a saved view or history, the
-draft), says so once, and the grid, sidebar and scatter load the new map, where the selection is drawn
-again. The panel also clears its own draft lasso when the map changes under it. Fields never re-fitted
-accept polygons as before.
+**Lasso selections** (`embedding_polygon`) are coordinates on one map, and record the layout of the map they were
+drawn on (`layout_id`, from the scatter; see Layout ids below). When the map is laid out again (a re-fit, a reduce,
+an upload that moved its points), the same polygon may select other samples. The lasso keeps filtering, on the
+map's current points, and is never refused or removed: its chip in the bar (applied, from a saved view, the default
+view or a link) and the draft "Embeddings region" chip turn amber, with "This map was laid out again after this
+selection was drawn. It may select different samples now. Redraw it or remove it.", and a toast says so once per
+lasso while the page is open (`frontend/lib/stale-lasso.ts`). When the filters came from a saved view the viewer may
+update (its owner, or an admin), the chip adds "…then use Update this view to save it.": Saved Views replaces the
+view's filters with the applied ones, the redrawn lasso and its new id included (`PATCH /datasets/{id}/views/{view_id}/content`,
+[Updating a saved view](../DATASET_MANAGEMENT.md#updating-a-saved-view)). The app compares the lasso's id with the map's
+current one in `GET /datasets/{id}` (`map_layouts`), which it asks again when the scatter reports another layout
+and when a re-fit job ends. A lasso without an id (saved before 2.11, or drawn on a map not laid out since) warns
+once its map has an id; one with an id on a map without one (a mirror that hasn't taken its primary's id yet)
+doesn't. That leaves a window on a mirror: a shared view's lasso drawn on the primary's new layout is evaluated on
+the mirror's older coordinates until the mirror takes that layout's id (its feed has passed the primary's read of
+it), without a warning when the mirror's map has no id yet, and with one when it has an older id (the map there is
+older than the lasso, not newer). Bulk jobs follow the same rule on the server (`backend/stale_lassos.py`, one
+implementation, with the app's cases as tests): a delete of samples or of a field's vectors by a filter holding a
+stale lasso is refused (409 `stale_lasso`) when submitted, and each of its units checks again after its delete, in
+its transaction, so a new layout committed before that check rolls the unit back and fails the job, and one committed
+after it came after the delete's reads. Jobs submitted before 2.11 are checked the same way. A tag or a metadata
+edit goes ahead and names the maps (`stale_lassos`) in its 202 answer and its result, and so does a samples query
+(`POST /samples/query`), for the SDK's `StaleLassoWarning`. On a mirror the mirror's own ids decide. The server accepts the id (a string of up to 64 characters, or null; anything else is a
+400), keeps it wherever a filter is stored, and never filters by it. A new lasso also records the re-fitted map's
+`model_id` beside it, in 2.11 only (2.12 stops writing it): a follower on 2.10 or earlier refuses a relayed search
+whose whole-image lasso has none, on a map its primary re-fitted. Until 2.11 a polygon drawn before a re-fit was
+refused with
+409 `map_refitted` (`require_current_map`) and the app removed it; the function stays only for bulk jobs submitted
+before the upgrade, whose stored SQL calls it.
+
+**Layout ids** (`embedding_layouts`, migration 0027) name each full layout of a map, re-fitted or not: a
+whole-image field, or a patch scale with all its tiles. `bump_map_layout` gives the map a new id in the
+writer's own transaction. Its writers call it: `POST /embeddings/reduce` (once per run), a re-fit's publish
+(once), and `POST /embeddings/coordinates` without vector versions when its upsert moved a point already on the
+map, or added points to a whole-image map whose point count (`embedding_viz_meta.total_points`) was 0, one key
+lookup made only when nothing moved (`SAVE_COORDINATES` reports both). The SDK's `compute_visualization`, which
+uploads in batches, may count once per batch. So do the deletes that make the map another one: each unit of a
+delete of every vector of the field (`Dataset.delete_embedding_field`), and a mirror's sync replacing a map of
+its own with the primary's (the primary's id follows once it has one). Placing new samples, versioned
+(projected) uploads, other deletes and a mirror's copy never do. Known gap: a map emptied by deleting every
+sample (not the field) and then laid out again by uploads of new points alone gets no new id when it has no point
+count, that is a patch scale, or a map never ranked. A map with no row has id null: the layout it had at the
+upgrade, which a lasso saved without an id was drawn on. The scatter answers the id (`layout_id`, JSON and
+binary header, read again with the points like `map_state`) and `GET /datasets/{id}` every map's
+(`map_layouts`). A mirror takes its primary's id for the primary's maps from `/follower/datasets/{id}/state`
+(`layouts`, each with the last transaction the read could see: its snapshot's xmax - 1) once its feed has passed
+that transaction. Every write behind the id is at or below it, whatever order they committed in, so the mirror
+never names a layout whose points haven't all arrived. A copy that starts again (after a primary restore, or into
+a stopped copy) forgets the primary's ids and takes them afresh. Its own maps count locally.
 
 **Placing new samples** on a map (`backend/map_placement.py`, kind `map_place`): every whole-image map, re-fitted
 or made by the SDK (`compute_visualization`), meaning every `embedding_viz_meta` row with points. Patch maps

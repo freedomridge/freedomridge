@@ -82,6 +82,11 @@ CREATE TABLE IF NOT EXISTS samples (
     -- local_tags. The sync never writes them; samples_mirror_local_guard holds a local write to them.
     local_metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
     local_tags TEXT[] DEFAULT '{}',
+    -- An object's image (0029): the sample its metadata.parent_id names, when that is a non-object sample of the
+    -- same dataset; NULL otherwise, and on every non-object. Derived by the triggers below (samples_set_parent and
+    -- samples_link_new_children / samples_relink_children), never written by the app. metadata.parent_id stays
+    -- what clients write and read.
+    parent_id INTEGER,
     -- Named explicitly so add_samples' duplicate handler
     -- — which checks for 'samples_dataset_filepath_unique' in the violation text —
     -- works on a fresh schema.sql-initialised prod DB too. With the auto-generated
@@ -246,8 +251,124 @@ CREATE INDEX IF NOT EXISTS idx_samples_dataset_created_at ON samples(dataset_id,
 -- index the grain filter (grid/scatter "object view") and the image->objects pivot
 -- (filter object rows by parent_id).
 CREATE INDEX IF NOT EXISTS idx_samples_dataset_media_type ON samples(dataset_id, media_type);
-CREATE INDEX IF NOT EXISTS idx_samples_parent_id ON samples ((metadata ->> 'parent_id'))
+-- The objects that name an id, by its digits with leading zeros trimmed: how the parent_id triggers find the objects
+-- waiting for an image (0029). An id is never 0, so a value of zeros only trims to '' and matches nothing.
+CREATE INDEX IF NOT EXISTS idx_samples_parent_id ON samples ((ltrim(metadata ->> 'parent_id', '0')))
     WHERE media_type = 'object';
+-- An image's objects, by the parent_id column (0029).
+CREATE INDEX IF NOT EXISTS idx_samples_dataset_parent ON samples (dataset_id, parent_id);
+-- The objects with no image, by dataset (0029): nearly empty, so counting and listing them costs nothing.
+CREATE INDEX IF NOT EXISTS idx_samples_unlinked_objects ON samples (dataset_id)
+    WHERE media_type = 'object' AND parent_id IS NULL;
+-- Deleting an image deletes its objects (0030), whatever deletes it: the app's own paths delete them first, to count
+-- them and keep the field caches right. The key names the image's dataset too, through the unique (dataset_id, id),
+-- and the cascade finds the objects by idx_samples_dataset_parent. A NULL parent_id is never checked.
+ALTER TABLE samples DROP CONSTRAINT IF EXISTS samples_parent_fkey;
+ALTER TABLE samples ADD CONSTRAINT samples_parent_fkey
+    FOREIGN KEY (dataset_id, parent_id) REFERENCES samples (dataset_id, id) ON DELETE CASCADE;
+
+-- samples.parent_id is kept to one rule, like lon/lat to location (0029): an object's column holds the id its
+-- metadata.parent_id names when that sample is a non-object of the same dataset, and is NULL otherwise; every
+-- non-object's is NULL. A value that names nothing usable gives NULL and never fails the write: a revert, a mirror's
+-- sync and scripts write such ids. Two sides keep it: the object's own writes (samples_set_parent), and its image's
+-- arrival or change (samples_link_new_children, samples_relink_children), so a parent written after its child links
+-- it too. link_object_parents links a dataset's objects in one statement, after rows are restored in any order.
+CREATE OR REPLACE FUNCTION samples_set_parent() RETURNS trigger AS $$
+BEGIN
+    NEW.parent_id := NULL;
+    IF NEW.media_type = 'object' AND NEW.metadata->>'parent_id' ~ '^[0-9]{1,10}$' THEN
+        SELECT p.id INTO NEW.parent_id FROM samples p
+         WHERE p.dataset_id = NEW.dataset_id AND p.id = (NEW.metadata->>'parent_id')::bigint
+           AND p.media_type <> 'object';
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+-- The objects of its datasets waiting for an image this statement inserted: one statement, which probes
+-- idx_samples_parent_id once per inserted image (by the id's digits, leading zeros trimmed, as the object's own trigger
+-- reads them), so an insert with none waiting writes nothing. An object of another dataset that names the new
+-- id is never written: that write would pass its dataset's guards, and a dataset being deleted would refuse this
+-- insert. The ids go in as one array, so the plan doesn't depend on the insert's size: the planner has no statistics
+-- on the JSON expression (it doesn't use a partial index's), and a join planned on that guess sorted every object for
+-- a 500-image insert. With the array it probes the index for 1, 500 and 50,000 rows, with images or objects the most
+-- of the table, planned generic or custom. Each object's own trigger (samples_set_parent) then checks its image's
+-- dataset and kind.
+CREATE OR REPLACE FUNCTION samples_link_new_children() RETURNS trigger AS $$
+BEGIN
+    UPDATE samples SET parent_id = (metadata->>'parent_id')::integer
+     WHERE ltrim(metadata->>'parent_id', '0')
+           = ANY (ARRAY(SELECT id::text FROM parent_new_rows WHERE media_type <> 'object'))
+       AND media_type = 'object' AND parent_id IS NULL
+       AND dataset_id IN (SELECT dataset_id FROM parent_new_rows WHERE media_type <> 'object');
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+-- A sample that became or stopped being an object, or moved to another dataset: its old children lose it, and the
+-- objects that name it in its dataset gain it if it is an image now. Each child's own trigger re-derives the value.
+CREATE OR REPLACE FUNCTION samples_relink_children() RETURNS trigger AS $$
+BEGIN
+    UPDATE samples SET parent_id = NULL WHERE dataset_id = OLD.dataset_id AND parent_id = OLD.id;
+    IF NEW.media_type <> 'object' THEN
+        UPDATE samples SET parent_id = NEW.id
+         WHERE ltrim(metadata->>'parent_id', '0') = NEW.id::text AND media_type = 'object'
+           AND dataset_id = NEW.dataset_id AND parent_id IS DISTINCT FROM NEW.id;
+    END IF;
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Links the objects of one dataset whose image is there and whose column doesn't name it yet; returns how many. The
+-- CASE keeps the cast from ever seeing a value that isn't a number. only_unlinked: just the objects with no image (by
+-- idx_samples_unlinked_objects), as the orphan finder links them before it counts or deletes any; a linked object
+-- needs no re-check there, as the parent key (0030) keeps its image and the triggers re-derive the column on every
+-- change of the object or its image. It sets plan_cache_mode = force_custom_plan for its own statement: only under a
+-- custom plan does `NOT only_unlinked OR o.parent_id IS NULL` fold to idx_samples_unlinked_objects' predicate (a
+-- generic plan, which a function's cached statement may switch to, keeps the OR and visits every object of the
+-- dataset). The setting chooses which cached plan runs, never a plan's shape, and costs one setting save per call,
+-- which is one per dataset.
+CREATE OR REPLACE FUNCTION link_objects(target_dataset INTEGER, only_unlinked BOOLEAN) RETURNS BIGINT
+SET plan_cache_mode = force_custom_plan AS $$
+DECLARE
+    linked BIGINT;
+BEGIN
+    UPDATE samples o SET parent_id = p.id
+      FROM samples p
+     WHERE o.dataset_id = target_dataset AND o.media_type = 'object' AND p.dataset_id = target_dataset
+       AND (NOT only_unlinked OR o.parent_id IS NULL)
+       AND p.id = CASE WHEN o.metadata->>'parent_id' ~ '^[0-9]{1,10}$' THEN (o.metadata->>'parent_id')::bigint END
+       AND p.media_type <> 'object' AND o.parent_id IS DISTINCT FROM p.id;
+    GET DIAGNOSTICS linked = ROW_COUNT;
+    RETURN linked;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Every object of one dataset, as this migration links them and a revert relinks them (rows it restores can carry a
+-- stale column).
+CREATE OR REPLACE FUNCTION link_object_parents(target_dataset INTEGER) RETURNS BIGINT AS $$
+BEGIN
+    RETURN link_objects(target_dataset, FALSE);
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_samples_parent_insert
+    BEFORE INSERT ON samples FOR EACH ROW WHEN (NEW.media_type = 'object' OR NEW.parent_id IS NOT NULL)
+    EXECUTE FUNCTION samples_set_parent();
+CREATE TRIGGER trg_samples_parent_update
+    BEFORE UPDATE OF metadata, media_type, dataset_id, parent_id ON samples FOR EACH ROW
+    WHEN (OLD.metadata->'parent_id' IS DISTINCT FROM NEW.metadata->'parent_id'
+          OR OLD.media_type IS DISTINCT FROM NEW.media_type OR OLD.dataset_id IS DISTINCT FROM NEW.dataset_id
+          OR OLD.parent_id IS DISTINCT FROM NEW.parent_id)
+    EXECUTE FUNCTION samples_set_parent();
+CREATE TRIGGER trg_samples_children_insert
+    AFTER INSERT ON samples REFERENCING NEW TABLE AS parent_new_rows
+    FOR EACH STATEMENT EXECUTE FUNCTION samples_link_new_children();
+CREATE TRIGGER trg_samples_children_update
+    AFTER UPDATE OF media_type, dataset_id ON samples FOR EACH ROW
+    WHEN ((OLD.media_type = 'object') IS DISTINCT FROM (NEW.media_type = 'object')
+          OR OLD.dataset_id IS DISTINCT FROM NEW.dataset_id)
+    EXECUTE FUNCTION samples_relink_children();
 
 -- Embedding indexes
 -- Note: HNSW index requires fixed-dimension vector column. With variable dimensions
@@ -333,12 +454,14 @@ EXCEPTION WHEN insufficient_privilege THEN
     RAISE NOTICE 'plan_cache_mode not set on the database (%); the app sets it on its own connections', SQLERRM;
 END $$;
 
--- The vector indexes 0021 dropped with the old embeddings table, by dataset and field: the app builds each again on
--- the dataset's partition (index_jobs). Empty on a fresh install.
+-- Indexes the app builds again in the background (index_jobs.queue_rebuilds), by kind, dataset and field: the vector
+-- indexes 0021 dropped with the old embeddings table, each on its dataset's partition ('vector'), and the datetime
+-- fields' indexes 0032 found on their text, each on the field's instant ('field'). Empty on a fresh install.
 CREATE TABLE IF NOT EXISTS ann_index_rebuilds (
     dataset_id INTEGER NOT NULL REFERENCES datasets(id) ON DELETE CASCADE,
     field_name TEXT NOT NULL,
-    PRIMARY KEY (dataset_id, field_name)
+    kind TEXT NOT NULL DEFAULT 'vector' CONSTRAINT ann_index_rebuilds_kind_check CHECK (kind IN ('vector', 'field')),
+    CONSTRAINT ann_index_rebuilds_pkey PRIMARY KEY (kind, dataset_id, field_name)
 );
 
 -- embedding_coordinates.dataset_id is there for the FK into the dataset's partition: filled from the sample, so its
@@ -719,12 +842,31 @@ CREATE TABLE IF NOT EXISTS views (
     shared_with_user_ids INTEGER[] DEFAULT '{}',
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     name_scope INTEGER NOT NULL DEFAULT 0,
+    updated_at TIMESTAMP WITH TIME ZONE,  -- (0028) when its filters last changed: stamp_view_updated_at
     UNIQUE(dataset_id, name_scope, name)
 );
 CREATE INDEX IF NOT EXISTS idx_views_dataset_id ON views(dataset_id);
 CREATE INDEX IF NOT EXISTS idx_views_user_id ON views(user_id);
 CREATE INDEX IF NOT EXISTS idx_views_slug ON views(slug);
 CREATE INDEX IF NOT EXISTS idx_views_public ON views(is_public) WHERE is_public = true;
+
+-- When a view's filters last changed (0028), stamped for every writer: Update this view, a version restore, a
+-- mirror's sync, and a new view. Its name, description and sharing don't count, and no writer sets it: the app
+-- takes a default view's new filters by it, and an update names the value it started from (409 when it moved).
+CREATE OR REPLACE FUNCTION stamp_view_updated_at() RETURNS trigger AS $$
+BEGIN
+    IF TG_OP = 'INSERT' OR NEW.content IS DISTINCT FROM OLD.content THEN
+        NEW.updated_at := clock_timestamp();
+    ELSE
+        NEW.updated_at := OLD.updated_at;
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS views_updated_at ON views;
+CREATE TRIGGER views_updated_at BEFORE INSERT OR UPDATE ON views
+    FOR EACH ROW EXECUTE FUNCTION stamp_view_updated_at();
 
 -- A dataset's default view (migration 0002): the saved view the app opens the dataset on, and goes back to
 -- when the filters are cleared. Only the app uses it. Deleting the view leaves the dataset without one.
@@ -1831,14 +1973,86 @@ DROP TRIGGER IF EXISTS trigger_full_stats_request ON datasets;
 CREATE TRIGGER trigger_full_stats_request AFTER UPDATE OF stats_full_requests ON datasets
     FOR EACH ROW EXECUTE FUNCTION mark_full_stats_request();
 
+-- The instant a metadata datetime's text names, or NULL when the text isn't one: the rule in backend/datetimes.py,
+-- whose parse_instant is its Python twin. Indexes on datetime fields are built on this function and store its
+-- answers, so it must NEVER change in place: a new rule is a new function (metadata_instant_v2) and every index on
+-- this one rebuilt. backend/tests/test_datetime_instants.py pins it. IMMUTABLE honestly: it reads no setting
+-- (TimeZone, DateStyle, timezone_abbreviations) and no time zone database, it calls only IMMUTABLE built-ins, each
+-- named with its schema so that no search_path changes what it calls, and it never raises: every number is checked
+-- before make_timestamp sees it. No offset is UTC, a date alone is midnight UTC, and the first six fraction digits
+-- count, added as whole microseconds.
+CREATE OR REPLACE FUNCTION metadata_instant_v1(value TEXT) RETURNS TIMESTAMPTZ
+LANGUAGE plpgsql IMMUTABLE STRICT PARALLEL SAFE AS $$
+DECLARE
+    zone_at INT;                    -- the offset's sign, counted from the 17th character, or 0
+    clock pg_catalog.text;          -- hh:mm[:ss[.fraction]], or '' for a date alone
+    zone pg_catalog.text := '';     -- the offset without its colon (+hh or +hhmm, or -), or ''
+    y INT;
+    mo INT;
+    d INT;
+    last_day INT;
+    oh INT;
+    om INT;
+BEGIN
+    -- YYYY-MM-DD, then optionally T or a space, hh:mm, :ss, .fraction, and Z, +hh, +hhmm or +hh:mm (or -), with
+    -- month 01-12, day 01-31, hour 00-23, minute and second 00-59 and an offset up to 15:59.
+    IF value OPERATOR(pg_catalog.!~) '^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])([T ]([01][0-9]|2[0-3]):[0-5][0-9](:[0-5][0-9](\.[0-9]+)?)?(Z|[+-](0[0-9]|1[0-5])(:?[0-5][0-9])?)?)?$' THEN
+        RETURN NULL;
+    END IF;
+    y := pg_catalog.substr(value, 1, 4)::INT;
+    mo := pg_catalog.substr(value, 6, 2)::INT;
+    d := pg_catalog.substr(value, 9, 2)::INT;
+    -- No year 0000, and no day past the end of its month (Gregorian leap years).
+    last_day := CASE
+        WHEN mo OPERATOR(pg_catalog.=) 2 THEN
+            CASE WHEN (y OPERATOR(pg_catalog.%) 4) OPERATOR(pg_catalog.=) 0
+                      AND ((y OPERATOR(pg_catalog.%) 100) OPERATOR(pg_catalog.<>) 0
+                           OR (y OPERATOR(pg_catalog.%) 400) OPERATOR(pg_catalog.=) 0)
+                 THEN 29 ELSE 28 END
+        WHEN mo OPERATOR(pg_catalog.=) ANY (ARRAY[4, 6, 9, 11]) THEN 30
+        ELSE 31
+    END;
+    IF y OPERATOR(pg_catalog.=) 0 OR d OPERATOR(pg_catalog.>) last_day THEN
+        RETURN NULL;
+    END IF;
+    -- The grammar allows one sign after the minutes: the offset's.
+    zone_at := pg_catalog.strpos(pg_catalog.translate(pg_catalog.substr(value, 17), '-', '+'), '+');
+    IF zone_at OPERATOR(pg_catalog.>) 0 THEN
+        clock := pg_catalog.substr(value, 12, zone_at OPERATOR(pg_catalog.+) 4);
+        zone := pg_catalog.translate(pg_catalog.substr(value, zone_at OPERATOR(pg_catalog.+) 16), ':', '');
+    ELSE
+        clock := pg_catalog.substr(pg_catalog.rtrim(value, 'Z'), 12);
+    END IF;
+    -- A part that isn't written is zero.
+    oh := pg_catalog.rpad(pg_catalog.substr(zone, 2, 2), 2, '0')::INT;
+    om := pg_catalog.rpad(pg_catalog.substr(zone, 4, 2), 2, '0')::INT;
+    IF pg_catalog.substr(zone, 1, 1) OPERATOR(pg_catalog.=) '-' THEN
+        oh := OPERATOR(pg_catalog.-) oh;
+        om := OPERATOR(pg_catalog.-) om;
+    END IF;
+    -- The wall-clock time, plus the fraction as whole microseconds, read at the offset (ISO sign: +02:00 is east).
+    RETURN pg_catalog.timezone(
+        pg_catalog.make_interval(hours => oh, mins => om),
+        pg_catalog.make_timestamp(
+            y,
+            mo,
+            d,
+            pg_catalog.rpad(pg_catalog.substr(clock, 1, 2), 2, '0')::INT,
+            pg_catalog.rpad(pg_catalog.substr(clock, 4, 2), 2, '0')::INT,
+            pg_catalog.rpad(pg_catalog.substr(clock, 7, 2), 2, '0')::INT
+        ) OPERATOR(pg_catalog.+) (
+            pg_catalog.rpad(pg_catalog.substr(clock, 10, 6), 6, '0')::INT OPERATOR(pg_catalog.*) INTERVAL '1 microsecond'
+        )
+    );
+END;
+$$;
+
+-- A datetime field's earliest and latest values in its statistics (statistics_measure.sql): the instants
+-- metadata_instant_v1 reads, so the sidebar's bounds agree with filters and the histogram.
 CREATE OR REPLACE FUNCTION stats_datetime(value TEXT)
 RETURNS TIMESTAMPTZ AS $$
-    SELECT CASE
-        WHEN value ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}([T ][0-9:.+-]+Z?)?$'
-             AND pg_input_is_valid(value, 'timestamp with time zone')
-        THEN value::timestamptz
-    END;
-$$ LANGUAGE sql IMMUTABLE STRICT SET timezone = 'UTC';
+    SELECT metadata_instant_v1(value);
+$$ LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE;
 
 -- Settings → System status → Backups: how often the job runner backs up the whole database
 -- (scripts/backup_local.py into FRIDGE_BACKUP_DIR). One row. interval_hours NULL means no scheduled
@@ -2424,9 +2638,10 @@ CREATE TABLE IF NOT EXISTS embedding_map_state (
     CONSTRAINT embedding_map_state_artifact_needs_model CHECK (artifact_location IS NULL OR model_id IS NOT NULL)
 );
 
--- A lasso selection is a polygon in one map's coordinates (`embedding_polygon` filters). Once a field's
--- map is re-fitted, the same polygon would silently select different samples: refuse it (409) unless it
--- was drawn on the field's current map. Fields without a re-fitted map keep accepting any polygon.
+-- Until 2.11 every lasso filter (`embedding_polygon`) called this, refusing (409) a polygon drawn before the field's
+-- map was re-fitted. No filter calls it now: a lasso keeps filtering on the current map, and the app warns when the
+-- map was laid out again since it was drawn (embedding_layouts). It stays for the bulk jobs submitted before the
+-- upgrade, whose stored SQL calls it.
 CREATE OR REPLACE FUNCTION require_current_map(p_dataset_id INTEGER, p_field TEXT, p_model_id TEXT)
 RETURNS BOOLEAN AS $$
 DECLARE
@@ -2446,6 +2661,44 @@ BEGIN
                                          'model_id', current_model)::text;
 END;
 $$ LANGUAGE plpgsql STABLE PARALLEL SAFE;
+
+-- (0027) A map's layout id: it changes each time the map is laid out again, so a lasso can tell that it was drawn on
+-- an earlier layout. One row per map that has been laid out since 0027: a whole-image vector field, or a patch scale
+-- (clip_patch_4x4) for all its tiles. bump_map_layout gives it a new id. A mirror's copy of a primary map takes the
+-- primary's id once its feed has passed every transaction the primary's read of it could see (pending_*,
+-- follower_sync.write_layouts).
+CREATE TABLE IF NOT EXISTS embedding_layouts (
+    dataset_id INTEGER NOT NULL REFERENCES datasets(id) ON DELETE CASCADE,
+    field_name TEXT NOT NULL,
+    layout_id UUID,  -- NULL, as no row: the layout the map had at the upgrade
+    -- A mirror only: the primary's newer id, taken once the feed has passed pending_txid, the last transaction the
+    -- primary's read of it could see.
+    pending_layout_id UUID,
+    pending_txid BIGINT,
+    PRIMARY KEY (dataset_id, field_name),
+    CHECK ((pending_layout_id IS NULL) = (pending_txid IS NULL))
+);
+
+-- A new layout of a map, in the transaction that writes it. Its writers call it: POST /embeddings/reduce, a map
+-- re-fit's publish, and a coordinates upload without vector versions that moved a point already on the map or added
+-- points to a whole-image map whose point count was 0. So do the deletes that make the map another one: a delete of
+-- every vector of its field (Dataset.delete_embedding_field), and a mirror's sync replacing a map of its own with the
+-- primary's. Placing new samples, a mirror's copy and other deletes never do. p_field is the map, or one of a patch
+-- scale's tiles (clip_patch_4x4_r0c0), whose scale is the map. A followed dataset logs a 'maps' change, so its
+-- followers read the new id with the map's state.
+CREATE OR REPLACE FUNCTION bump_map_layout(p_dataset_id INTEGER, p_field TEXT) RETURNS UUID AS $$
+DECLARE
+    made UUID := gen_random_uuid();
+BEGIN
+    INSERT INTO embedding_layouts (dataset_id, field_name, layout_id)
+    VALUES (p_dataset_id, regexp_replace(p_field, '(_patch_\d+x\d+)_r\d+c\d+$', '\1'), made)
+    ON CONFLICT (dataset_id, field_name) DO UPDATE SET layout_id = EXCLUDED.layout_id;
+    IF EXISTS (SELECT 1 FROM datasets WHERE id = p_dataset_id AND followed) THEN
+        INSERT INTO dataset_changes (dataset_id, kind) VALUES (p_dataset_id, 'maps');
+    END IF;
+    RETURN made;
+END;
+$$ LANGUAGE plpgsql;
 
 -- Index advisor.
 
@@ -3105,6 +3358,9 @@ CREATE TRIGGER follower_truncate_guard BEFORE TRUNCATE ON embedding_viz_meta
     FOR EACH STATEMENT EXECUTE FUNCTION refuse_followed_truncate();
 CREATE TRIGGER follower_truncate_guard BEFORE TRUNCATE ON datasets
     FOR EACH STATEMENT EXECUTE FUNCTION refuse_followed_truncate();
+-- (0027) A mirror's ids of its primary's maps are written by the sync, like the map tables beside it.
+CREATE TRIGGER follower_truncate_guard BEFORE TRUNCATE ON embedding_layouts
+    FOR EACH STATEMENT EXECUTE FUNCTION refuse_followed_truncate();
 
 -- Ledger of applied migrations: the 1.0.0 baseline, then the files in backend/db/migrations/
 -- (0001_..., 0002_...) that scripts/apply_migrations.sh applies to existing databases. A fresh install
@@ -3141,5 +3397,11 @@ INSERT INTO schema_migrations (filename) VALUES
     ('0023_stuck_deletion_default_view.sql'),
     ('0024_version_saved_views.sql'),
     ('0025_version_created_by.sql'),
-    ('0026_mirror_primary_versions.sql')
+    ('0026_mirror_primary_versions.sql'),
+    ('0027_map_layouts.sql'),
+    ('0028_view_updated_at.sql'),
+    ('0029_object_parent_column.sql'),
+    ('0030_object_parent_key.sql'),
+    ('0031_metadata_instant.sql'),
+    ('0032_datetime_index_rebuilds.sql')
 ON CONFLICT (filename) DO NOTHING;

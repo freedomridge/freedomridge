@@ -9,8 +9,9 @@ from pydantic import BaseModel
 
 from .. import public_settings
 from ..access import check_dataset_access, missing_unless_allowed, require_dataset_access
+from ..api_errors import CodedHTTPException
 from ..database import db
-from ..models import View, ViewCreate
+from ..models import View, ViewContentUpdate, ViewCreate
 from ..security import private_guest, public_mode
 from ..validation import clean_name
 from .auth import get_current_user, get_optional_user
@@ -174,7 +175,7 @@ async def create_view(id: int, view: ViewCreate, user: dict = Depends(get_curren
 async def list_dataset_views(id: int, user: dict = Depends(get_current_user)):
     query = """
         SELECT id, dataset_id, user_id, name, description, slug, content, is_public, shared_with_user_ids, created_at,
-               EXISTS (SELECT 1 FROM mirror_views m WHERE m.view_id = views.id) AS from_primary
+               updated_at, EXISTS (SELECT 1 FROM mirror_views m WHERE m.view_id = views.id) AS from_primary
         FROM views
         WHERE dataset_id = $1 AND (
             user_id = $2 OR
@@ -206,7 +207,8 @@ async def get_view(slug: str, request: Request):
     row = await db.fetchrow(
         """
         SELECT id, dataset_id, user_id, name, description, slug, content,
-               is_public, shared_with_user_ids, created_at
+               is_public, shared_with_user_ids, created_at, updated_at,
+               EXISTS (SELECT 1 FROM mirror_views m WHERE m.view_id = views.id) AS from_primary
         FROM views
         WHERE slug = $1
     """,
@@ -276,6 +278,75 @@ async def remove_view(id: int, user: dict, *, check_access: bool = True):
     if not row:
         raise HTTPException(status_code=404, detail="View not found")
     return {"message": "View deleted"}
+
+
+@router.patch(
+    "/datasets/{id}/views/{view_id}/content",
+    response_model=View,
+    dependencies=[Depends(require_dataset_access)],
+)
+async def update_view_content(id: int, view_id: int, update: ViewContentUpdate, user: dict = Depends(get_current_user)):
+    """Replace a saved view's filters with new ones: the app's "Update this view", after a lasso in it was redrawn, say.
+    The keys of `content` given replace the view's (`filters`, `viewStages`); the others stay. Its name, slug, sharing
+    and default-view status stay too; `updated_at` says when (the database stamps it: stamp_view_updated_at). Its owner
+    or an admin may, as for deleting or sharing it. With the `updated_at` the client read, a view whose filters changed
+    since is refused (409 view_changed) rather than overwritten; without it the last writer wins. A mirror's copy of a
+    view on its primary changes there. Followers take the new filters (views_log_update)."""
+    if _has_temporary_selection(update.content):
+        raise HTTPException(status_code=422, detail=TEMPORARY_SELECTION_DETAIL)
+    async with db.pool.acquire() as connection, connection.transaction():
+        view = await connection.fetchrow(
+            "SELECT * FROM views WHERE id = $1 AND dataset_id = $2 FOR UPDATE",
+            view_id,
+            id,
+        )
+        if view is None:
+            raise HTTPException(status_code=404, detail="View not found")
+        if view['user_id'] != user['id'] and user['role'] != 'admin':
+            raise HTTPException(status_code=403, detail="Not authorized to update this view")
+        if await connection.fetchval('SELECT 1 FROM mirror_views WHERE view_id = $1', view_id):
+            from .. import mirror_writes  # here: it imports the routers
+
+            host = mirror_writes.host_of(await mirror_writes.mirror_of(connection, id))
+            raise CodedHTTPException(
+                409,
+                f"This view is a copy of one on {host}: update it there, or save these filters as a new view here.",
+                'view_on_primary',
+            )
+        if 'updated_at' in update.model_fields_set and view['updated_at'] != update.updated_at:
+            raise CodedHTTPException(
+                409,
+                "This view changed since you opened it. Open it again to see its filters now, or save yours as a new "
+                "view.",
+                'view_changed',
+            )
+        # Keys not given stay: a sort saved with the SDK, and who made it on a follower (FOLLOWER_MARKS), which
+        # nobody sets here.
+        given = {key: value for key, value in update.content.items() if key not in FOLLOWER_MARKS}
+        content = {**_decode_content(view['content']), **given}
+        if private_guest(user):
+            # As create_view: one owner's quota checks and writes in turn.
+            await connection.fetchval('SELECT id FROM users WHERE id=$1 FOR UPDATE', user['id'])
+            others = await connection.fetchval(
+                """SELECT COALESCE(sum(octet_length(content::text) + octet_length(name) +
+                       octet_length(COALESCE(description,''))),0) FROM views WHERE user_id = $1 AND id <> $2""",
+                user['id'],
+                view_id,
+            )
+            size = await connection.fetchval(
+                "SELECT octet_length($1::jsonb::text) + octet_length($2::text) + octet_length($3::text)",
+                content,
+                view['name'],
+                view['description'] or '',
+            )
+            if others + size > public_settings.settings.guest_view_bytes:
+                raise HTTPException(413, 'Guest saved-view storage quota reached. Delete saved views to free space.')
+        row = await connection.fetchrow(
+            "UPDATE views SET content = $2 WHERE id = $1 RETURNING *",
+            view_id,
+            content,
+        )
+    return {**dict(row), 'content': _decode_content(row['content'])}
 
 
 async def _require_known_users(user_ids: List[int]) -> None:

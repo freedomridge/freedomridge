@@ -3,6 +3,7 @@ import { useQuery } from '@tanstack/react-query';
 import { ViewStage, ComplexFilter, SchemaField, getDatasetCoverage, derivedFieldNames, formatFilterQuery, parseFilterQuery, FilterQueryProblem } from '@/lib/api';
 import { PlusIcon, TrashIcon, CodeIcon } from '@radix-ui/react-icons';
 import { offsetOf } from '@/lib/filter-query';
+import { utcMinute } from '@/lib/datetimes';
 import { SearchableSelect } from './searchable-select';
 
 // Datetime rule value input. `<input type="datetime-local">` only emits a value once BOTH the
@@ -27,13 +28,19 @@ function DatetimeFilterInput({ node, path, onChange, fieldDef }: {
             onChange(path, { ...node, value: defaultVal });
         }
     }, [isEmpty, defaultVal, node, path, onChange]);
+    // The picker's value has no offset, which the server reads as UTC; a value written with an offset (typed in Query
+    // mode, or opened from a link) is shown as its UTC time too.
     return (
-        <input
-            type="datetime-local"
-            className="w-full bg-zinc-800 border border-zinc-700 rounded px-2 py-1 text-xs text-zinc-200 outline-none focus:border-cyan-500 placeholder-zinc-600"
-            value={node.value ? String(node.value).slice(0, 16) : defaultVal}
-            onChange={(e) => onChange(path, { ...node, value: e.target.value })}
-        />
+        <div className="flex items-center gap-1.5">
+            <input
+                type="datetime-local"
+                aria-label="Date and time (UTC)"
+                className="w-full bg-zinc-800 border border-zinc-700 rounded px-2 py-1 text-xs text-zinc-200 outline-none focus:border-cyan-500 placeholder-zinc-600"
+                value={node.value ? utcMinute(String(node.value)) : defaultVal}
+                onChange={(e) => onChange(path, { ...node, value: e.target.value })}
+            />
+            <span className="text-[10px] text-zinc-500" title="The date and time are read as UTC">UTC</span>
+        </div>
     );
 }
 

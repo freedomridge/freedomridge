@@ -256,6 +256,8 @@ class DatasetArrayColumns(set):
         registered=(),
         list_fields=(),
         promoted_numeric=(),
+        datetime_fields=(),
+        promoted_datetime=(),
     ):
         super().__init__(columns)
         self.label_fields = set(label_fields)
@@ -267,6 +269,10 @@ class DatasetArrayColumns(set):
         # Promoted numeric fields (as datasets.get_promoted_numeric_fields): every value is a number, so the filter
         # compiler compares a numeric string with them as a number, whether or not its caller passed that set.
         self.promoted_numeric = set(promoted_numeric)
+        # Fields declared datetime (a mirror's `@local.` ones included): the compiler compares their instants
+        # (backend/datetimes.py). Promoted ones have their index on the instant and are compared through it.
+        self.datetime_fields = set(datetime_fields)
+        self.promoted_datetime = set(promoted_datetime)
 
 
 def label_path(field, columns=None):
@@ -287,7 +293,10 @@ async def label_context(connection, dataset_id, columns=()):
     )
     lists = {row['field_name'] for row in registered if row['field_type'] == 'list'}
     numbers = ('number', 'float', 'int', 'integer')
+    promoted = {row['field_name'] for row in registered if row['is_promoted']}
     promoted_numeric = {row['field_name'] for row in registered if row['is_promoted'] and row['field_type'] in numbers}
+    datetimes = {row['field_name'] for row in registered if row['field_type'] == 'datetime'}
+    promoted_datetime = {name for name in datetimes if name in promoted}
     rows = await connection.fetch(
         'SELECT field_name, unique_values FROM dataset_field_stats WHERE dataset_id=$1 AND field_name=ANY($2::text[])',
         dataset_id,
@@ -305,4 +314,6 @@ async def label_context(connection, dataset_id, columns=()):
         registered=[row['field_name'] for row in registered],
         list_fields=lists,
         promoted_numeric=promoted_numeric,
+        datetime_fields=datetimes,
+        promoted_datetime=promoted_datetime,
     )

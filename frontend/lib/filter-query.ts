@@ -36,10 +36,11 @@ export function isLassoStage(stage: ViewStage): boolean {
 }
 
 /** A chip the bar never lets anyone edit: a map region, an embeddings lasso, a similarity search, a selection, a
- * concept score, a duplicate collapse. */
+ * concept score, a duplicate collapse, the objects with no image. */
 export function isReadOnlyStage(stage: ViewStage): boolean {
     return stage.type === 'map_region' || stage.type === 'similarity' || stage.type === 'selection' || isLassoStage(stage)
-        || !!stage.metadata?.collapse || !!stage.metadata?.dupGroupCollapse || !!stage.metadata?.concept;
+        || !!stage.metadata?.collapse || !!stage.metadata?.dupGroupCollapse || !!stage.metadata?.concept
+        || !!stage.metadata?.unlinked;
 }
 
 /** The character offset of a 1-based line and column in `text`, to put the cursor on a mistake. */

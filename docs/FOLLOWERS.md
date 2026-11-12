@@ -228,8 +228,9 @@ With the **views** option both ways:
 - deleting a copied view deletes it on the primary, which allows it only for views the follower made;
 - private views, and views shared with some users only, stay on the mirror.
 
-With views from the primary only, views made on the mirror stay there. Either way, a copied view's sample ids
-are translated, so a saved search (patch search included, which saves its results) shows the same samples on
+With views from the primary only, views made on the mirror stay there. Either way, a copied view's filters are
+updated on the primary only ("Update this view" is refused on the copy, naming the primary, and the copy takes the
+primary's update with the next sync, which moves its `updated_at`), and a copied view's sample ids are translated, so a saved search (patch search included, which saves its results) shows the same samples on
 both. Every other edit of the primary's fields on a mirror (bulk set, rename, clear or delete) is refused before
 it's queued.
 

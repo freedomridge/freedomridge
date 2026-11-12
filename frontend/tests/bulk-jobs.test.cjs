@@ -48,6 +48,13 @@ test('bulk history reports exact counts and the committed prefix with authorized
     assert.match(render('succeeded', false, {updated_count: 500000}), /500,000 samples updated/);
     assert.match(render('cancelled', true, {deleted_count: 1000}), /1,000 samples deleted.*Completed chunks.*Resume/);
     assert.doesNotMatch(render('failed', false, {deleted_count: 1000}), /<button/);
+    // Deleting an image deletes its objects: the ones the job didn't select are named apart.
+    assert.match(
+        render('succeeded', false, {deleted_count: 1200, objects_deleted: 9840}),
+        /1,200 samples deleted, and 9,840 objects with their images\./,
+    );
+    assert.match(render('succeeded', false, {deleted_count: 1, objects_deleted: 1}), /and 1 object with their images/);
+    assert.match(render('succeeded', false, {deleted_count: 3, objects_deleted: 0}), /3 samples deleted\. /);
 });
 
 test('bulk discard uses the authenticated endpoint and history records it without actions', async () => {

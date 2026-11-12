@@ -1,23 +1,21 @@
-"""Facet requests and #138's refusals (SQLSTATE 55000 -> 409): a concept being rescored or a lasso drawn on
-a re-fitted map refuses the request before its stream starts (a 409), and refuses each field not yet
-answered once it has started (a refusal line carrying the same 409 body), never "cached values".
+"""Facet requests and #138's refusals (SQLSTATE 55000 -> 409): a concept being rescored refuses the request before
+its stream starts (a 409), and refuses each field not yet answered once it has started (a refusal line carrying the
+same 409 body), never "cached values". (A lasso drawn before its map was re-fitted was refused too until 2.11; it now
+filters, and the app warns.)
 """
 
 import asyncio
 import json
-import uuid
 
 import asyncpg
 import pytest
 
-from backend import main
 from backend.routers import datasets
 from backend.tests.test_field_registry_postgres import registry_database  # noqa: F401
 from backend.tests.test_sidebar_facet_stream import allow_access, lines_of, stream_post
 from backend.tests.test_sidebar_on_open import SELECTIVE, seed
 
 RESCORED = 'Concept "sky" is being rescored; use it again when its scoring job finishes'
-LASSO_FIELD = 'clip_img'
 
 
 def select_sky():
@@ -91,42 +89,6 @@ def test_a_concept_rescored_mid_stream_refuses_each_field_not_yet_answered(
         assert all(refusal == {'status': 409, 'detail': RESCORED} for refusal in refused.values())
         assert entries[-1] == {'done': True}
         assert database.pool.get_idle_size() == database.pool.get_size()  # the other fields were stopped
-
-    registry_database(scenario)
-
-
-def test_a_lasso_refused_mid_stream_tells_the_ui_which_lasso_to_drop(registry_database, monkeypatch):  # noqa: F811
-    async def scenario(database):
-        await seed(database, monkeypatch)
-        allow_access(monkeypatch)
-        model = uuid.uuid4()
-        await database.execute(
-            "INSERT INTO embedding_map_state (dataset_id, field_name, model_id, artifact_location, refitted_at) "
-            "VALUES (1, $1, $2, 'models/x', '2026-10-21 08:58+00')",
-            LASSO_FIELD,
-            model,
-        )
-
-        async def refitted():  # the real refusal, with its DETAIL
-            await database.fetchval("SELECT require_current_map(1, $1, 'the old model')", LASSO_FIELD)
-
-        refused_mid_stream(database, monkeypatch, 'brightness', refitted)
-        body = {'filters': SELECTIVE, 'lightning_mode': True, 'fields': ['score', 'brightness'], 'stream': True}
-        _, _, chunks = await stream_post(body)
-        entries = {entry.get('name'): entry for _, entry in lines_of(chunks)}
-        refusal = entries['brightness']['refusal']
-        assert (refusal['status'], refusal['code'], refusal['dataset_id'], refusal['field']) == (
-            409,
-            'map_refitted',
-            1,
-            LASSO_FIELD,
-        )
-        assert refusal['model_id'] == str(model) and 're-fitted' in refusal['detail']
-        # The same body the app's 409 handler gives for this refusal.
-        with pytest.raises(asyncpg.ObjectNotInPrerequisiteStateError) as error:
-            await refitted()
-        response = await main.dataset_lifecycle_error(None, error.value)  # type: ignore[arg-type]
-        assert {**json.loads(bytes(response.body)), 'status': response.status_code} == refusal
 
     registry_database(scenario)
 

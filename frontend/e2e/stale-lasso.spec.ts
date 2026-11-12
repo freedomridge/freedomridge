@@ -2,19 +2,22 @@ import { test, expect, type Page } from '@playwright/test';
 import { AUTH_STATE, expectTotal } from './helpers';
 import { adminLogin, apiFetch, deleteDatasetAndWait } from './api';
 
-// After a map re-fit, a lasso polygon drawn on the old map is refused by the server (it would select
-// other samples). An applied "Embeddings Region" stage and a saved view holding one must not leave the
-// grid and the scatter failing: the stale lasso is dropped with a notice, the map renders, and the
-// selection is drawn again.
+// A lasso polygon is drawn on one layout of its map, and records it (layout_id). Once the map is laid out again (a
+// reduce, a re-fit), the same polygon may select other samples: the lasso keeps filtering on the current map, its chip
+// turns amber with the reason, and a toast says so once. Nothing is removed until the user removes it.
 //
-// The panel turns a lasso into an `embedding_polygon` stage only on a sampled scatter (over 100,000
-// points); on this small map it would select ids, which no re-fit changes. So the polygon stage is
-// put in place as the app persists an applied stage (its saved filter state), then saved as a view.
+// The panel turns a lasso into an `embedding_polygon` stage only on a sampled scatter (over 100,000 points); on this
+// small map it would select ids, which no new layout changes. So the polygon stage is put in place as the app persists
+// an applied stage (its saved filter state), then saved as a view.
 test.use({ storageState: AUTH_STATE });
 
 const FIELD = 'e2e_lasso';
 // Coordinates x = i % 10, y = floor(i / 10): this polygon holds x 0..4, y 0..5 = 30 of the 60 points.
 const POLYGON = [[-0.5, -0.5], [4.5, -0.5], [4.5, 5.5], [-0.5, 5.5]];
+const WARNING = 'This map was laid out again after this selection was drawn. It may select different samples now. Redraw it or remove it.';
+// When the filters came from a saved view the viewer may update.
+const WARNING_IN_VIEW = `${WARNING.slice(0, -1)}, then use Update this view to save it.`;
+const TOAST = `A lasso on the ${FIELD} map`;
 let cookie = '';
 let dsId = 0;
 let sampleIds: number[] = [];
@@ -29,61 +32,81 @@ test.beforeAll(async () => {
     }));
     const { ids } = await apiFetch(cookie, `/datasets/${dsId}/samples`, { method: 'POST', body: JSON.stringify({ samples }) });
     sampleIds = ids as number[];
-    const coordinates = sampleIds.map((sampleId, i) => ({ sample_id: sampleId, x: i % 10, y: Math.floor(i / 10) }));
+    // Placed as projections (with each vector's version), which never make a new layout: the map has no layout id, as
+    // a map has after the upgrade until it is laid out again.
+    const waiting = await apiFetch(cookie, `/datasets/${dsId}/embeddings/vectors?field_name=${FIELD}&pending_only=true&limit=100`);
+    const version = new Map((waiting.items as { sample_id: number; vector_version: string }[]).map((item) => [item.sample_id, item.vector_version]));
+    const coordinates = sampleIds.map((sampleId, i) => ({
+        sample_id: sampleId, x: i % 10, y: Math.floor(i / 10), vector_version: version.get(sampleId),
+    }));
     await apiFetch(cookie, `/datasets/${dsId}/embeddings/coordinates?field_name=${FIELD}`, {
         method: 'POST', body: JSON.stringify(coordinates),
     });
     await apiFetch(cookie, `/datasets/${dsId}/embeddings/recompute-viz-rank?field_name=${FIELD}&full=true`, { method: 'POST' });
+    expect((await apiFetch(cookie, `/datasets/${dsId}`)).map_layouts).toEqual({});
 });
 
 test.afterAll(async () => {
     if (dsId) await deleteDatasetAndWait(cookie, dsId, 120_000);
 });
 
-async function applyPolygonStage(page: Page, modelId: string | null, polygon: number[][] = POLYGON) {
+// With keepSource, the filters stay those of the saved view they came from, as when the lasso is redrawn in the app.
+async function applyPolygonStage(page: Page, layoutId?: string | null, polygon: number[][] = POLYGON, keepSource = false) {
     // Written from another page: on the dataset page the app's own (debounced) save could overwrite it.
     await page.goto('/');
-    await page.evaluate(({ key, stage }) => {
+    await page.evaluate(({ key, stage, keepSource }) => {
+        const sourceView = keepSource ? JSON.parse(localStorage.getItem(key) ?? '{}').sourceView : undefined;
         localStorage.setItem(key, JSON.stringify({
             viewStages: [stage], filterMode: 'simple', simpleFilters: {}, advancedFilters: { logic: 'AND', filters: [] },
-            brushedIds: [], selectedIds: [], currentPolygon: null, selectionSource: 'Embeddings',
+            brushedIds: [], selectedIds: [], currentPolygon: null, selectionSource: 'Embeddings', sourceView,
         }));
     }, {
+        keepSource,
         key: `fridge-filters-${dsId}`,
         stage: {
             type: 'filter', description: 'Embeddings Region',
-            filter: { field: FIELD, operator: 'embedding_polygon', value: polygon, model_id: modelId },
+            filter: { field: FIELD, operator: 'embedding_polygon', value: polygon, ...(layoutId === undefined ? {} : { layout_id: layoutId }) },
         },
     });
     await page.goto(`/datasets/${dsId}`);
 }
 
-// Lasso the whole canvas: the re-fitted map's layout is UMAP's, so a lasso over part of the canvas may
-// hold no point. On this unsampled scatter the lasso selects the visible points by id.
-async function drawLasso(page: Page): Promise<number> {
-    const canvas = page.getByTestId('embeddings-canvas');
-    await canvas.scrollIntoViewIfNeeded();
-    const box = await canvas.boundingBox();
-    if (!box) throw new Error('embeddings canvas has no bounding box');
-    const x = (fx: number) => box.x + box.width * fx;
-    const y = (fy: number) => box.y + box.height * fy;
-    await page.mouse.move(x(0.02), y(0.02));
-    await page.keyboard.down('Shift');
-    await page.mouse.down();
-    await page.mouse.move(x(0.98), y(0.02), { steps: 8 });
-    await page.mouse.move(x(0.98), y(0.98), { steps: 8 });
-    await page.mouse.move(x(0.02), y(0.98), { steps: 8 });
-    await page.mouse.move(x(0.02), y(0.02), { steps: 8 });
-    await page.mouse.up();
-    await page.keyboard.up('Shift');
-    const chip = page.getByTestId('embeddings-selected-count');
-    await expect(chip).toBeVisible({ timeout: 10_000 });
-    const selected = parseInt((await chip.textContent() || '').replace(/[^0-9]/g, ''), 10);
-    expect(selected).toBeGreaterThan(0);
-    return selected;
+// What the polygon selects on the map as it is now.
+async function inside(polygon: number[][] = POLYGON): Promise<number> {
+    const lasso = { field: FIELD, operator: 'embedding_polygon', value: polygon };
+    return (await apiFetch(cookie, `/datasets/${dsId}/samples/query`, {
+        method: 'POST', body: JSON.stringify({ limit: 0, filters: { logic: 'AND', filters: [lasso] } }),
+    })).total;
 }
 
-// Before the re-fit test below, which makes every polygon on this map stale.
+async function currentLayout(): Promise<string> {
+    return (await apiFetch(cookie, `/datasets/${dsId}`)).map_layouts[FIELD];
+}
+
+// Each toast that says so, counted as it appears (a toast goes after 10 s), from this page load on.
+async function countToasts(page: Page) {
+    await page.addInitScript((text) => {
+        const counted = window as unknown as { lassoToasts: number };
+        counted.lassoToasts = 0;
+        new MutationObserver((records) => {
+            for (const record of records) {
+                for (const node of record.addedNodes) {
+                    if (node instanceof HTMLElement && node.textContent?.includes(text)) counted.lassoToasts += 1;
+                }
+            }
+        }).observe(document, { subtree: true, childList: true });
+    }, TOAST);
+    return () => page.evaluate(() => (window as unknown as { lassoToasts: number }).lassoToasts);
+}
+
+async function expectWarns(page: Page, title = WARNING) {
+    const chip = page.getByTestId('query-stage-chip');
+    await expect(chip).toHaveAttribute('data-stale-lasso', 'true', { timeout: 30_000 });
+    await expect(chip.locator(`[title="${title}"]`)).toHaveCount(1);
+    await expect(chip).toContainText(`Embeddings region · ${FIELD} map`);
+}
+
+// Before the tests below, which lay the map out again.
 test('a lasso chip says which map it is on, opens no form, and a click excludes it', async ({ page }) => {
     await page.goto(`/datasets/${dsId}`);
     await expect(page.getByTestId('embeddings-point-count')).toHaveText(/^60(\s|\/|$).*points/, { timeout: 30_000 });
@@ -99,6 +122,7 @@ test('a lasso chip says which map it is on, opens no form, and a click excludes 
     await expectTotal(page, 48);
     await chip.click();
     await expectTotal(page, 12);
+    await expect(chip).not.toHaveAttribute('data-stale-lasso', 'true');
 });
 
 // A lasso on a sampled scatter keeps its polygon as the selection and only its visible points as ids. The saved
@@ -113,7 +137,7 @@ test('a lasso comes back after a reload as its whole region, not its visible poi
             // Two of the region's points were on screen; x 0..1, y 0..5 holds 12.
             brushedIds: sampleIds.slice(0, 2), selectedIds: [], currentPolygon: null, selectionSource: 'Embeddings',
             currentEmbeddingRegion: {
-                field: FIELD, polygon: [[-0.5, -0.5], [1.5, -0.5], [1.5, 5.5], [-0.5, 5.5]], token: '', total: 12, modelId: null,
+                field: FIELD, polygon: [[-0.5, -0.5], [1.5, -0.5], [1.5, 5.5], [-0.5, 5.5]], token: '', total: 12, layoutId: null,
             },
         },
     });
@@ -123,30 +147,47 @@ test('a lasso comes back after a reload as its whole region, not its visible poi
     await expectTotal(page, 12);
 });
 
-test('a lasso drawn on the previous map is dropped, the map renders, and the selection is drawn again', async ({ page }) => {
+test('a lasso saved before the upgrade stays as it is until its map is laid out again, then warns and keeps filtering', async ({ page }) => {
+    test.setTimeout(180_000);
+    const toasts = await countToasts(page);
+    // No layout id: drawn before the upgrade, on the map as it was then.
+    await applyPolygonStage(page);
+    await expectTotal(page, 30);
+    await expect(page.getByTestId('query-stage-chip')).not.toHaveAttribute('data-stale-lasso', 'true');
+    expect(await toasts()).toBe(0);
+
+    // The map is laid out again (Run UMAP reduction, or the API).
+    await apiFetch(cookie, `/datasets/${dsId}/embeddings/reduce`, { method: 'POST', body: JSON.stringify({ field_name: FIELD }) });
+    expect(await currentLayout()).toBeTruthy();
+    const now = await inside();
+    await page.reload();
+    await expectWarns(page);
+    await expect.poll(toasts, { timeout: 15_000 }).toBe(1);
+    await expectTotal(page, now);  // still filtering, on the map as it is now
+    // Excluded, it is the same lasso: still amber, and no second toast.
+    await page.getByTestId('query-stage-chip').click();
+    await expectTotal(page, 60 - now);
+    await expectWarns(page);
+    expect(await toasts()).toBe(1);
+
+    // One drawn on the current layout doesn't warn.
+    await applyPolygonStage(page, await currentLayout());
+    await expectTotal(page, now);
+    await expect(page.getByTestId('query-stage-chip')).not.toHaveAttribute('data-stale-lasso', 'true');
+});
+
+test('after a re-fit, a lasso drawn on the map before it warns and keeps filtering, in a view too, until the view is updated', async ({ page }) => {
     test.setTimeout(300_000);
-    // The stale lasso may be dropped as soon as the app refetches after the re-fit (the jobs indicator
-    // invalidates the scatter) or only after the reload below: record the refusals and the warning
-    // across reloads, so the test holds in either order.
-    await page.addInitScript(() => {
-        const log = (key: string, value: string) => {
-            const seen = JSON.parse(sessionStorage.getItem(key) || '[]');
-            seen.push(value);
-            sessionStorage.setItem(key, JSON.stringify(seen));
-        };
-        window.addEventListener('fridge:map-refitted', (event) => log('e2e-refitted', JSON.stringify((event as CustomEvent).detail)));
-        new MutationObserver(() => {
-            if (document.body?.innerText.includes('was re-fitted, so the lasso selection drawn on the old map was removed')) log('e2e-warned', 'yes');
-        }).observe(document, { subtree: true, childList: true, characterData: true });
-    });
-    const recorded = (key: string) => page.evaluate((k) => JSON.parse(sessionStorage.getItem(k) || '[]').length, key);
+    const toasts = await countToasts(page);
     await page.goto(`/datasets/${dsId}`);
     await expect(page.getByTestId('embeddings-point-count')).toHaveText(/^60(\s|\/|$).*points/, { timeout: 30_000 });
 
-    // A lasso on the never-re-fitted map (no model id), applied as a view stage and saved in a view.
-    await applyPolygonStage(page, null);
-    await expectTotal(page, 30);
+    // A lasso on the map's current layout, applied as a view stage and saved in a view.
+    const before = await currentLayout();
+    await applyPolygonStage(page, before);
+    await expectTotal(page, await inside());
     await expect(page.getByTestId('query-stage-chip')).toHaveCount(1);
+    await expect(page.getByTestId('query-stage-chip')).not.toHaveAttribute('data-stale-lasso', 'true');
     await page.getByRole('button', { name: 'Saved Views' }).click();
     await page.getByPlaceholder('Enter view name...').fill('lasso-view');
     await page.getByRole('button', { name: 'Save View' }).click();
@@ -162,50 +203,64 @@ test('a lasso drawn on the previous map is dropped, the map renders, and the sel
         const items = (await apiFetch(cookie, `/datasets/${dsId}/schedules`)).items;
         return items[0]?.last_job?.state;
     }, { timeout: 180_000, intervals: [1_000] }).toBe('succeeded');
+    expect(await currentLayout()).not.toBe(before);
+    const now = await inside();
 
-    // The requests carrying the old lasso are refused; the stage is dropped with a warning, and the grid
-    // and the scatter load the new map.
+    // The lasso is kept and warns once; the grid and the scatter load the new map, filtered by it. Its filters are the
+    // view just saved, which its owner may update.
     await page.reload();
-    await expect(page.getByTestId('query-stage-chip')).toHaveCount(0, { timeout: 30_000 });
-    await expect.poll(() => recorded('e2e-refitted'), { timeout: 30_000 }).toBeGreaterThan(0);
-    await expect.poll(() => recorded('e2e-warned'), { timeout: 30_000 }).toBeGreaterThan(0);
-    await expectTotal(page, 60);
-    await expect(page.getByTestId('embeddings-point-count')).toHaveText(/^60(\s|\/|$).*points/, { timeout: 30_000 });
+    await expectWarns(page, WARNING_IN_VIEW);
+    await expect.poll(toasts, { timeout: 15_000 }).toBe(1);
+    await expectTotal(page, now);
     await expect(page.getByTestId('map-refitted-at')).toContainText('Map re-fitted on');
     await expect(page.getByText('Failed to load embeddings')).toHaveCount(0);
 
-    // The saved view's lasso is dropped the same way when the view is opened, and the panel says so.
-    const refusals = await recorded('e2e-refitted');
+    // The saved view's lasso is kept and warns the same way when the view is opened.
+    await page.getByTestId('query-stage-chip').hover();
+    await page.getByTestId('query-stage-chip').getByRole('button').click();  // removed by the user, as only the user does
+    await expect(page.getByTestId('query-stage-chip')).toHaveCount(0);
+    await expectTotal(page, 60);
     await page.getByRole('button', { name: 'Saved Views' }).click();
     await page.getByRole('button', { name: /lasso-view/ }).click();
-    await expect.poll(() => recorded('e2e-refitted'), { timeout: 30_000 }).toBeGreaterThan(refusals);
-    await expect(page.getByTestId('query-stage-chip')).toHaveCount(0, { timeout: 30_000 });
-    await expectTotal(page, 60);
     await page.getByRole('button', { name: 'Close Views' }).click();
-    await expect(page.getByTestId('map-changed-notice')).toBeVisible();
+    await expectWarns(page, WARNING_IN_VIEW);
+    await expectTotal(page, now);
 
-    // Drawn again, the lasso selects and applies as usual. The warning toast (fixed, bottom right) can
-    // still cover the scatter (it shows for 10 s from whichever request met the stale lasso first, so
-    // whether it is still up depends on timing): close it, as a user would, before drawing over it.
-    await page.getByTestId('map-changed-notice').getByRole('button', { name: 'OK' }).click();
-    await expect(page.getByTestId('map-changed-notice')).toHaveCount(0);
-    const warning = page.getByText('was re-fitted, so the lasso selection drawn on the old map was removed');
-    if (await warning.isVisible()) await warning.locator('xpath=..').getByRole('button').click();
-    await expect(warning).toHaveCount(0);
-    await expect(page.getByTestId('embeddings-point-count')).toHaveText(/^60(\s|\/|$).*points/);
-    const again = await drawLasso(page);
-    await page.getByTestId('apply-filters').click();
-    await expectTotal(page, again);
-    await expect(page.getByTestId('query-stage-chip')).toHaveCount(1);
+    // And a lasso drawn on the new layout doesn't warn. Its filters still come from the view, which they now differ
+    // from: Update this view saves them in it, and the view opens without the warning.
+    const layout = await currentLayout();
+    await applyPolygonStage(page, layout, POLYGON, true);
+    await expectTotal(page, now);
+    await expect(page.getByTestId('query-stage-chip')).not.toHaveAttribute('data-stale-lasso', 'true');
+    await page.getByRole('button', { name: 'Saved Views' }).click();
+    await expect(page.getByTestId('view-source')).toContainText('“lasso-view”');
+    page.once('dialog', dialog => void dialog.accept());
+    await page.getByTestId('view-update').click();
+    await expect(page.getByTestId('view-source')).toHaveCount(0);
+    const views = await apiFetch(cookie, `/datasets/${dsId}/views`);
+    expect(views.find((v: { name: string }) => v.name === 'lasso-view').content.viewStages[0].filter.layout_id).toBe(layout);
+    await page.getByRole('button', { name: 'Close Views' }).click();
+    await page.getByTestId('query-stage-chip').hover();
+    await page.getByTestId('query-stage-chip').getByRole('button').click();
+    await expectTotal(page, 60);
+    await page.getByRole('button', { name: 'Saved Views' }).click();
+    await page.getByRole('button', { name: /lasso-view/ }).click();
+    await page.getByRole('button', { name: 'Close Views' }).click();
+    await expectTotal(page, now);
+    await expect(page.getByTestId('query-stage-chip')).not.toHaveAttribute('data-stale-lasso', 'true');
+    expect(await toasts()).toBe(0);  // since the page loaded with the redrawn lasso
+});
 
-    // And a polygon drawn on the new map (its model id) is accepted.
-    const state = await apiFetch(cookie, `/datasets/${dsId}/embeddings/map-state?field_name=${FIELD}`);
-    const lasso = { field: FIELD, operator: 'embedding_polygon', value: POLYGON, model_id: state.model_id };
-    const inside = (await apiFetch(cookie, `/datasets/${dsId}/samples/query`, {
-        method: 'POST', body: JSON.stringify({ limit: 0, filters: { logic: 'AND', filters: [lasso] } }),
-    })).total;
-    await applyPolygonStage(page, state.model_id);
-    await expectTotal(page, inside);
-    await expect(page.getByTestId('query-stage-chip')).toHaveCount(1);
-    await expect(page.getByText('Failed to load embeddings')).toHaveCount(0);
+test('tagging a selection picked under a lasso drawn on an earlier layout says so, with the count', async ({ page }) => {
+    // Around every point, so the count doesn't hang on where the map's layout put them.
+    const everything = [[-1e6, -1e6], [1e6, -1e6], [1e6, 1e6], [-1e6, 1e6]];
+    await applyPolygonStage(page, 'an-earlier-layout', everything);
+    await expectWarns(page);
+    await expectTotal(page, 60);
+    await page.getByTestId('grid-select-all').click();
+    await expect(page.getByTestId('grid-selection-count')).toBeVisible({ timeout: 10_000 });
+    await page.getByTestId('grid-tag-button').click();
+    const warning = page.getByTestId('tag-stale-lasso-warning');
+    await expect(warning).toContainText(`earlier layout of the ${FIELD} map`);
+    await expect(warning).toContainText('Applying changes 60 samples');
 });

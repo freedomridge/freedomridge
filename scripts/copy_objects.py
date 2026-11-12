@@ -36,7 +36,8 @@ DATABASE_URL = os.getenv("DATABASE_URL", "postgres://freedomridge:password@local
 
 INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_samples_dataset_media_type ON samples (dataset_id, media_type)",
-    "CREATE INDEX IF NOT EXISTS idx_samples_parent_id ON samples ((metadata ->> 'parent_id')) "
+    # As schema.sql makes it (0029): the parent_id triggers find waiting objects by it.
+    "CREATE INDEX IF NOT EXISTS idx_samples_parent_id ON samples ((ltrim(metadata ->> 'parent_id', '0'))) "
     "WHERE media_type = 'object'",
 ]
 

@@ -14,8 +14,8 @@ require.extensions['.ts'] = (module, filename) => {
 };
 
 const {
-    DEACTIVATE_HINT, deactivationMessage, passwordChangeMessage, passwordResetMessage, RESET_PASSWORD_HINT,
-    RESET_PASSWORD_KEEP_TOKENS_HINT,
+    DEACTIVATE_HINT, deactivationMessage, editUserSaveLabel, passwordChangeMessage, passwordResetMessage,
+    RESET_PASSWORD_HINT, RESET_PASSWORD_KEEP_TOKENS_HINT,
 } = require('../lib/password-reset.ts');
 
 test('the reset says what it revoked, and names follower and worker tokens only when there were some', () => {
@@ -85,4 +85,11 @@ test('changing your own password with "Also revoke my API tokens" says what it r
         'Password changed, and 2 API tokens are revoked, including 2 follower tokens. '
         + 'Give those followers a new token (Settings → Followers).',
     );
+});
+
+test('the Edit User button says when it resets the typed password', () => {
+    assert.equal(editUserSaveLabel(false, false), 'Save Changes');
+    assert.equal(editUserSaveLabel(false, true), 'Save Changes');
+    assert.equal(editUserSaveLabel(true, false), 'Reset Password');
+    assert.equal(editUserSaveLabel(true, true), 'Save and Reset Password');
 });

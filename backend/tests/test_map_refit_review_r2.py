@@ -12,13 +12,12 @@ import time
 import uuid
 from pathlib import Path
 
-import asyncpg
 import numpy as np
 import pytest
 from fridge import map_fit
 from fridge.core import dataset as sdk_dataset
 
-from backend import field_registry, main, map_refit
+from backend import field_registry, map_refit
 from backend.map_artifacts import LocalArtifactStore, model_key
 from backend.routers import datasets
 from backend.tests import test_field_registry_postgres
@@ -52,73 +51,23 @@ def lasso(model):
     return {'logic': 'AND', 'filters': [{**leaf, 'model_id': None if model is None else str(model)}]}
 
 
-# --- one map check per request, and the query keeps its parallel plan ----------------------------
-
-
-# The call-site guard lives in test_map_refit_review_r3.py (it also catches None and aliases).
+# --- the sidebar filters by a lasso drawn before a re-fit, as the grid does -----------------------
 
 
 @needs_postgres
-def test_the_lasso_map_check_runs_once_and_keeps_the_parallel_plan(registry_database):
-    async def scenario(database):
-        await seed(database, n=2000)
-        model = await managed_map(database)
-        parallel = await database.fetchval(
-            "SELECT proparallel::text FROM pg_proc WHERE proname = 'require_current_map'",
-        )
-        assert parallel == 's'
-        args: list = [1]
-        sql, _ = datasets.parse_filter_node(lasso(model), args, 2, None, None, 1)
-        query = f'SELECT count(*) FROM samples WHERE dataset_id = $1 AND {sql}'
-        async with database.pool.acquire() as connection, connection.transaction():
-            await connection.execute("SET LOCAL track_functions = 'pl'")
-            assert await connection.fetchval(query, *args) == 2000
-            calls = await connection.fetchval(
-                "SELECT calls FROM pg_stat_xact_user_functions WHERE funcname = 'require_current_map'",
-            )
-            plan = '\n'.join(row[0] for row in await connection.fetch(f'EXPLAIN {query}', *args))
-        assert calls == 1
-        assert 'InitPlan' in plan and 'SubPlan' not in plan
+def test_the_sidebar_filters_by_a_lasso_drawn_before_a_re_fit(registry_database, monkeypatch):
+    """Until 2.11 the sidebar refused such a lasso up front (require_current_lassos); now it filters by it, on the
+    current map, as every other view does."""
 
-    registry_database(scenario)
-
-
-# --- the sidebar refuses a stale lasso instead of showing unfiltered values ---------------------
-
-
-@needs_postgres
-def test_the_sidebar_refuses_a_stale_lasso_up_front(registry_database, monkeypatch):
     async def scenario(database):
         monkeypatch.setattr(datasets, 'db', database)
         await seed(database, n=40)
-        model = await managed_map(database)
-        await datasets.require_current_lassos(1, lasso(model))  # current: accepted
-        stale = {'logic': 'NOT', 'filters': [lasso(uuid.uuid4())]}
-        for call in (
-            lambda: datasets._get_dataset_field_stats_impl(1, stale, lightning_mode=True),
-            lambda: datasets._get_dataset_field_stats_impl(1, stale, lightning_mode=False),
-            lambda: datasets._autocomplete_impl(1, 'k', '', 10, stale),
-            lambda: datasets.get_dataset_schema(1, json.dumps(stale)),
-        ):
-            with pytest.raises(asyncpg.ObjectNotInPrerequisiteStateError, match='re-fitted'):
-                await call()
-
-    registry_database(scenario)
-
-
-@needs_postgres
-def test_the_refusal_tells_the_ui_which_lasso_to_drop(registry_database):
-    async def scenario(database):
-        await seed(database, n=10)
-        model = await managed_map(database)
-        with pytest.raises(asyncpg.ObjectNotInPrerequisiteStateError) as refused:
-            await database.fetchval("SELECT require_current_map(1, $1, 'an old model')", FIELD)
-        response = await main.dataset_lifecycle_error(None, refused.value)  # type: ignore[arg-type]
-        body = json.loads(bytes(response.body))
-        assert response.status_code == 409
-        assert body['code'] == 'map_refitted' and body['dataset_id'] == 1 and body['field'] == FIELD
-        assert body['model_id'] == str(model)
-        assert 'draw the selection again' in body['detail']
+        await managed_map(database)
+        drawn_before = {'logic': 'NOT', 'filters': [lasso(uuid.uuid4())]}
+        await datasets._get_dataset_field_stats_impl(1, drawn_before, lightning_mode=True)
+        await datasets._get_dataset_field_stats_impl(1, drawn_before, lightning_mode=False)
+        await datasets._autocomplete_impl(1, 'k', '', 10, drawn_before)
+        await datasets.get_dataset_schema(1, json.dumps(drawn_before))
 
     registry_database(scenario)
 

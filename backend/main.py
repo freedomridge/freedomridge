@@ -193,9 +193,22 @@ async def data_error_handler(request: Request, exc: asyncpg.DataError):
 @app.exception_handler(asyncpg.ObjectNotInPrerequisiteStateError)
 async def dataset_lifecycle_error(request: Request, exc: asyncpg.ObjectNotInPrerequisiteStateError):
     # The same body a facet stream gives the fields it had not answered when the refusal came
-    # (datasets._refusal): require_current_map names the stale lasso's field and the map's
-    # current model, so the UI can drop that lasso instead of leaving every view of it failing.
+    # (datasets._refusal).
     return JSONResponse(status_code=409, content=datasets._refusal(exc))
+
+
+@app.exception_handler(asyncpg.ForeignKeyViolationError)
+async def foreign_key_error(request: Request, exc: asyncpg.ForeignKeyViolationError):
+    """An object written while its image is deleted (0030's key): the object's trigger found the image, and the key
+    found it gone once the delete committed. Nothing was written; written again, the object has no image. Any other
+    key is a fault, as before."""
+    if exc.constraint_name != 'samples_parent_fkey':
+        return await unhandled_exception_handler(request, exc)
+    return JSONResponse(
+        status_code=409,
+        content={'detail': 'An image these object samples name was deleted while they were written; retry'},
+        headers={'Retry-After': '1'},
+    )
 
 
 @app.exception_handler(Exception)

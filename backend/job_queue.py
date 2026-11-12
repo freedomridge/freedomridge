@@ -53,6 +53,21 @@ class QueueContended(QueueBusy):
     """Database lock contention should defer work without consuming its failure budget."""
 
 
+# An exclusive resource (resources {'exclusive': <name>}): at most one started, unfinished job holds it, on any
+# dataset or none. A job owns it from its claim until it finishes, put back after it started included (queued with
+# started_at), the rule a dataset lane follows; one that never started waits, holding nothing, until no job owns it.
+# EXCLUSIVE_LOCK (with hashtext(<name>)) orders the claims of one resource; work outside the queue that must not
+# overlap the resource's jobs holds it too, then checks exclusive_owned.
+EXCLUSIVE_LOCK = 20261065
+_EXCLUSIVE_OWNED = """EXISTS(SELECT 1 FROM jobs WHERE resources->>'exclusive'=$1 AND id IS DISTINCT FROM $2
+    AND (state='running' OR (state='queued' AND started_at IS NOT NULL)))"""
+
+
+async def exclusive_owned(connection: asyncpg.Connection, resource: str, job_id: UUID | None = None) -> bool:
+    """Whether a job other than `job_id` owns the exclusive `resource` (started, unfinished)."""
+    return bool(await connection.fetchval(f'SELECT {_EXCLUSIVE_OWNED}', resource, job_id))
+
+
 # asyncpg reports a session that is gone with client errors that carry no SQL state.
 _SESSION_LOST = ('connection is closed', 'connection was closed', 'released back to the pool')
 
@@ -330,6 +345,11 @@ async def claim_job(
         candidates = await connection.fetch(
             f"""WITH owners AS MATERIALIZED (
                     SELECT dataset_id,lane,resources->>'exclusive' AS exclusive FROM jobs WHERE dataset_id IS NOT NULL
+                      AND (state='running' OR (state='queued' AND started_at IS NOT NULL))
+                    -- A job of no dataset owns no lane, only its exclusive resource (an index restore's).
+                    UNION ALL
+                    SELECT NULL,NULL,resources->>'exclusive' FROM jobs
+                    WHERE dataset_id IS NULL AND resources ? 'exclusive'
                       AND (state='running' OR (state='queued' AND started_at IS NOT NULL)))
                 SELECT {JOB_COLUMNS} FROM {JOB_TABLE}
                 WHERE placement=ANY($1::text[]) AND ($2::text[] IS NULL OR kind=ANY($2::text[]))
@@ -387,18 +407,13 @@ async def claim_job(
                     continue
             exclusive = candidate['resources'].get('exclusive')
             if exclusive is not None and candidate['started_at'] is None:
-                # At most one started, unfinished dataset job per exclusive resource (one map fit at a
+                # At most one started, unfinished job per exclusive resource (one map fit, one index build at a
                 # time). The lock orders competing claims; the recheck sees any claim that committed.
                 if not await connection.fetchval(
-                    'SELECT pg_try_advisory_xact_lock(20261065, hashtext($1))',
+                    'SELECT pg_try_advisory_xact_lock($1, hashtext($2))',
+                    EXCLUSIVE_LOCK,
                     exclusive,
-                ) or await connection.fetchval(
-                    """SELECT EXISTS(SELECT 1 FROM jobs WHERE dataset_id IS NOT NULL AND id<>$2
-                       AND (state='running' OR (state='queued' AND started_at IS NOT NULL))
-                       AND resources->>'exclusive'=$1)""",
-                    exclusive,
-                    candidate['id'],
-                ):
+                ) or await exclusive_owned(connection, exclusive, candidate['id']):
                     continue
             policy = (policies or {}).get(candidate['kind'], JobPolicy())
             row = await connection.fetchrow(

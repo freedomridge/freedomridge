@@ -7,6 +7,7 @@ import { useMutation, useQueryClient } from '@tanstack/react-query';
 import {
     DEACTIVATE_HINT,
     deactivationMessage,
+    editUserSaveLabel,
     passwordResetMessage,
     RESET_PASSWORD_HINT,
     RESET_PASSWORD_KEEP_TOKENS_HINT,
@@ -47,63 +48,69 @@ export function EditUserModal({ user, onClose }: EditUserModalProps) {
         }
     }, [user]);
 
-    const updateMutation = useMutation({
-        mutationFn: async () => {
-            if (!user) return;
-            const res = await fetch(`/api/users/${user.id}`, {
-                method: 'PATCH',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ role, is_active: isActive })
-            });
+    const otherChanges = !!user && (role !== user.role || isActive !== user.is_active);
+    const passwordTyped = resetPassword !== '';
 
-            if (!res.ok) {
-                const data = await res.json();
-                throw new Error(data.detail || 'Failed to update user');
+    // One save for the whole dialog. A typed password is reset first: if the server refuses it (the password rules),
+    // nothing else has changed yet. The role and the active flag follow, only when they changed.
+    const saveMutation = useMutation({
+        mutationFn: async () => {
+            if (!user) return [];
+            const messages: string[] = [];
+            if (passwordTyped) {
+                const res = await fetch(`/api/users/${user.id}/reset-password`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ password: resetPassword, revoke_tokens: revokeTokens }),
+                });
+                const data = await res.json().catch(() => ({}));
+                if (!res.ok) {
+                    throw new Error(`The password was not reset: ${data.detail || res.statusText}. Nothing was saved.`);
+                }
+                setResetPassword('');
+                messages.push(passwordResetMessage(data.revoked_tokens as RevokedTokens | undefined, revokeTokens));
             }
-            return (await res.json()) as { revoked_tokens?: RevokedTokens };
+            if (otherChanges) {
+                const res = await fetch(`/api/users/${user.id}`, {
+                    method: 'PATCH',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ role, is_active: isActive }),
+                });
+                const data = await res.json().catch(() => ({}));
+                if (!res.ok) {
+                    const detail = data.detail || res.statusText;
+                    throw new Error(passwordTyped
+                        ? `The password was reset, but the other changes were not saved: ${detail}`
+                        : detail || 'Failed to update user');
+                }
+                // Deactivating revoked the account's API tokens: say how many.
+                const revoked = data.revoked_tokens as RevokedTokens | undefined;
+                if (revoked && (user.is_active || Object.values(revoked).some(n => n))) {
+                    messages.push(deactivationMessage(revoked));
+                }
+            }
+            return messages;
         },
-        onSuccess: (answer) => {
+        onSuccess: (messages) => {
             queryClient.invalidateQueries({ queryKey: ['users'] });
-            // Deactivating revoked the account's API tokens: stay open to say how many.
-            const revoked = answer?.revoked_tokens;
-            if (revoked && (user?.is_active || Object.values(revoked).some(n => n))) {
-                setSuccessMessage(deactivationMessage(revoked));
+            // A reset or a deactivation stays open to say what it revoked; anything else closes.
+            if (messages?.length) {
+                setError('');
+                setSuccessMessage(messages.join(' '));
                 return;
             }
             onClose();
         },
         onError: (err: Error) => {
+            queryClient.invalidateQueries({ queryKey: ['users'] });
+            setSuccessMessage('');
             setError(err.message);
-        }
-    });
-
-    const resetPasswordMutation = useMutation({
-        mutationFn: async (revoke: boolean) => {
-            if (!user || !resetPassword) return;
-            const res = await fetch(`/api/users/${user.id}/reset-password`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ password: resetPassword, revoke_tokens: revoke })
-            });
-
-            if (!res.ok) {
-                const data = await res.json();
-                throw new Error(data.detail || 'Failed to reset password');
-            }
-            return (await res.json()) as { revoked_tokens?: RevokedTokens };
         },
-        onSuccess: (answer, revoke) => {
-            setSuccessMessage(passwordResetMessage(answer?.revoked_tokens, revoke));
-            setResetPassword('');
-        },
-        onError: (err: Error) => {
-            setError(err.message);
-        }
     });
 
     const handleSubmit = (e: React.FormEvent) => {
         e.preventDefault();
-        updateMutation.mutate();
+        saveMutation.mutate();
     };
 
     if (!user) return null;
@@ -169,23 +176,14 @@ export function EditUserModal({ user, onClose }: EditUserModalProps) {
                             <p data-testid="reset-password-hint" className="text-xs text-zinc-500 mb-3">
                                 {revokeTokens ? RESET_PASSWORD_HINT : RESET_PASSWORD_KEEP_TOKENS_HINT}
                             </p>
-                            <div className="flex gap-2">
-                                <input
-                                    type="password"
-                                    placeholder="New password"
-                                    value={resetPassword}
-                                    onChange={(e) => setResetPassword(e.target.value)}
-                                    className="flex-1 bg-zinc-800 border border-zinc-700 rounded px-3 py-2 text-white focus:outline-none focus:border-cyan-500 transition-colors text-sm"
-                                />
-                                <button
-                                    type="button"
-                                    onClick={() => resetPasswordMutation.mutate(revokeTokens)}
-                                    disabled={!resetPassword || resetPasswordMutation.isPending}
-                                    className="px-3 py-2 bg-zinc-800 hover:bg-zinc-700 text-white rounded text-sm font-medium transition-colors disabled:opacity-50"
-                                >
-                                    Reset
-                                </button>
-                            </div>
+                            <input
+                                type="password"
+                                placeholder="New password"
+                                aria-label="New password"
+                                value={resetPassword}
+                                onChange={(e) => setResetPassword(e.target.value)}
+                                className="w-full bg-zinc-800 border border-zinc-700 rounded px-3 py-2 text-white focus:outline-none focus:border-cyan-500 transition-colors text-sm"
+                            />
                             <div className="flex items-center gap-2 mt-2">
                                 <input
                                     type="checkbox"
@@ -208,10 +206,11 @@ export function EditUserModal({ user, onClose }: EditUserModalProps) {
                             </button>
                             <button
                                 type="submit"
-                                disabled={updateMutation.isPending}
+                                data-testid="edit-user-save"
+                                disabled={saveMutation.isPending}
                                 className="px-4 py-2 bg-cyan-600 hover:bg-cyan-500 text-white rounded font-medium transition-colors disabled:opacity-50"
                             >
-                                {updateMutation.isPending ? 'Saving...' : 'Save Changes'}
+                                {saveMutation.isPending ? 'Saving...' : editUserSaveLabel(passwordTyped, otherChanges)}
                             </button>
                         </div>
                     </form>
