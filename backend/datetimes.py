@@ -168,6 +168,41 @@ def instant_expr(text_sql: str, indexed: bool) -> str:
     return indexed_instant_sql(text_sql) if indexed else instant_sql(text_sql)
 
 
+def date_sql(text_sql: str) -> str:
+    """A value's written date (its first ten characters), compared as bytes."""
+    return f'pg_catalog.left({text_sql}, 10) COLLATE "C"'
+
+
+def instants_from(text_sql: str, rows_sql: str, columns: tuple = ()) -> str:
+    """A FROM item for a reader of a field without an index that scans many rows: the rows of ``rows_sql`` (such as
+    ``samples WHERE ...``) with `columns`, the field's text as ``_text`` and its instant as ``_instant``.
+
+    :func:`instant_sql` names its text a dozen times, and the planner copies a subquery's output into every reference
+    unless the subquery is fenced (OFFSET 0). Each copy of ``metadata->>'field'`` reads the metadata again, which for
+    a sample whose metadata is stored compressed (over about 2 kB: a COCO image's detections) means decompressing all
+    of it: a sidebar's earliest and latest values read it 33 times a row. Here the text is read once a row, and the
+    instant computed once from it (measured: COCO's dates 1.3 s -> 0.14 s, 98,000 small iNat records 0.34 -> 0.22 s).
+
+    Filters (:func:`window_sql`) are a WHERE clause's part and still read it a few times a row: reading it once there
+    takes a subquery per row, which halved COCO's (0.30 -> 0.15 s) but doubled small records' (iNat 0.04 -> 0.08 s).
+    """
+    keep = ''.join(f'{column}, ' for column in columns)
+    return (
+        f"(SELECT {keep}_text, {instant_sql('_text')} AS _instant"
+        f" FROM (SELECT {keep}{text_sql} AS _text FROM {rows_sql} OFFSET 0) AS _texts OFFSET 0) AS _instants"
+    )
+
+
+def read_once(text_sql: str, name: str = '_text') -> str:
+    """A join to put after ``samples`` that gives each row `text_sql` once, as `name`, for a sort on its instant.
+
+    A function scan, as the histogram reads its values: the planner doesn't copy it into every reference, and unlike
+    :func:`instants_from`'s fenced subqueries, the plan can still sort in parallel workers. Measured on a sort's
+    instants: COCO's dates 0.66 -> 0.14 s, KITTI's 0.18 -> 0.06 s, and 98,000 small iNat records 0.15-0.16 ->
+    0.17-0.18 s, where reading twelve times costs less than the join."""
+    return f"CROSS JOIN LATERAL pg_catalog.unnest(ARRAY[{text_sql}]) AS _read_once({name})"
+
+
 # No offset moves an instant more than 15:59 from its written date and time: a value written on date W names an
 # instant in [W - 15:59, W + 1 day + 15:59). So against an instant on UTC date D, a value written on D + 2 or later is
 # certainly after, and one written on D - 2 or earlier certainly before; only D - 1 to D + 1 need the instant.
