@@ -699,7 +699,7 @@ class Dataset:
         self._array_field_names = [f['name'] for f in fields]
         return list(self._array_field_names)
 
-    def add_samples(self, samples: List[Sample], on_duplicate: str = 'error'):
+    def add_samples(self, samples: List[Sample], on_duplicate: str = 'error', *, replace_tags: bool = False):
         """Add samples and return the response (includes 'ids' of created samples).
 
         Embeddings AND hashes set on a Sample ride inline in the same request, written
@@ -712,21 +712,34 @@ class Dataset:
                 'error' — add new samples and return duplicate conflicts with ids + existing (default)
                 'skip'  — silently skip duplicates
                 'update' — replace an existing sample's metadata, location, heading and array fields; its
-                tags are merged (tags it had stay, so removing one takes untag_samples), and the embeddings
-                and hashes given replace those of the same name, leaving its others
+                tags are merged (tags it had stay) unless replace_tags, and the embeddings and hashes given
+                replace those of the same name, leaving its others
+            replace_tags: With 'update', an existing sample's tags become exactly the ones given, so tags
+                added in the app are removed too, and a sample sent with no tags has its tags cleared. Off by
+                default.
 
         In 'error' mode, a duplicate HTTP 409 is returned as a dictionary, not raised.
         Validation and write failures still raise and roll back the request.
         """
+        if replace_tags and on_duplicate != 'update':
+            raise ValueError(
+                "replace_tags works only with on_duplicate='update': other modes never change an existing sample",
+            )
         if not samples:
             return {"ids": []}
 
         payload = [s.to_dict() for s in samples]
-        result = self.client.add_samples(self._id, payload, on_duplicate=on_duplicate)
+        result = self.client.add_samples(self._id, payload, on_duplicate=on_duplicate, replace_tags=replace_tags)
 
         sample_ids = result.get("ids", [])
         if sample_ids:
             self._dirty = True
+        if replace_tags and not result.get("replace_tags"):
+            raise RuntimeError(
+                "The server merged the tags of these samples instead of replacing them: it is older than "
+                "replace_tags. The rest of the update was written. Upgrade the server, or take the extra tags "
+                "off with untag_samples.",
+            )
         added = len(sample_ids)
         skipped = result.get("skipped", 0)
         existing = result.get("existing", {})
@@ -1370,6 +1383,17 @@ class Dataset:
                 view._filters = {"logic": "AND", "filters": all_conditions}
 
         return view
+
+    def count(self) -> int:
+        """Number of samples in the dataset (counted in the database)."""
+        return self.all().count()
+
+    def __len__(self) -> int:
+        return self.count()
+
+    def __bool__(self) -> bool:
+        # A dataset is always true, as before __len__: `if dataset:` asks no count and an empty one isn't false.
+        return True
 
     def all(self) -> DatasetView:
         """

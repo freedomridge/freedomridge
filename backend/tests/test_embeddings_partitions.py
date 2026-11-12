@@ -320,6 +320,43 @@ def test_the_apps_connections_and_the_database_plan_each_statement_for_its_value
     registry_database(scenario)
 
 
+def test_the_apps_connections_never_compile_a_statement_to_machine_code(registry_database, monkeypatch):
+    """The API's pool and the job runner's (its heartbeat connections take its settings) run with jit off: a
+    statement the planner thinks costly is never JIT-compiled first, whatever jit_above_cost says. A connection
+    without the setting would compile it, where the server can."""
+    from backend import database as database_module
+    from backend import job_runner
+
+    async def scenario(database):
+        settings = []
+
+        async def create_pool(*args, **kwargs):
+            settings.append(kwargs['server_settings'])
+            raise RuntimeError('stop here')
+
+        monkeypatch.setattr(asyncpg, 'create_pool', create_pool)
+        with pytest.raises(RuntimeError, match='stop here'):
+            await database_module.Database().connect()
+        with pytest.raises(RuntimeError, match='stop here'):
+            async with job_runner.local_runner(os.environ['FRIDGE_TEST_POSTGRES_DSN'], {}, slots=1):
+                pass
+        assert [server['jit'] for server in settings] == ['off', 'off']
+        explain = "EXPLAIN (ANALYZE, FORMAT JSON) SELECT count(*) FROM generate_series(1, 1000)"
+        async with database.pool.acquire() as connection:  # the fixture's pool, with database.PLANNING
+            await connection.execute('SET jit_above_cost = 0')
+            assert '"JIT"' not in await connection.fetchval(explain)
+            await connection.execute('RESET jit_above_cost')
+        bare = await asyncpg.connect(os.environ['FRIDGE_TEST_POSTGRES_DSN'])
+        try:
+            if await bare.fetchval('SELECT pg_jit_available()'):
+                await bare.execute('SET jit_above_cost = 0')
+                assert '"JIT"' in await bare.fetchval(explain)
+        finally:
+            await bare.close()
+
+    registry_database(scenario)
+
+
 def test_statements_run_often_and_the_coordinates_trigger_lock_one_datasets_partition(registry_database):
     async def scenario(database):
         # A generic plan, which a prepared statement switches to after five runs, would lock all 22 partitions.

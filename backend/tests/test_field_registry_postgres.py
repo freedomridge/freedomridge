@@ -245,6 +245,38 @@ def test_duplicate_updates_preserve_first_creation_and_last_metadata(registry_da
     registry_database(scenario)
 
 
+def test_replace_tags_makes_an_existing_samples_tags_the_ones_sent(registry_database):
+    async def scenario(database):
+        await datasets.add_samples(1, {'samples': [{'filepath': 'a.jpg', 'tags': ['old', 'kept']}]}, user=USER)
+        await run_refresh(database)
+        result = await datasets.add_samples(
+            1,
+            {
+                'on_duplicate': 'update',
+                'replace_tags': True,
+                'samples': [{'filepath': 'a.jpg', 'tags': ['new', 'kept']}, {'filepath': 'b.jpg', 'tags': ['b']}],
+            },
+            user=USER,
+        )
+        assert result['replace_tags'] is True
+        assert dict(await database.fetch('SELECT filepath, tags FROM samples')) == {
+            'a.jpg': ['kept', 'new'],
+            'b.jpg': ['b'],
+        }
+        stored = await database.fetchval("SELECT unique_values FROM dataset_field_stats WHERE field_name = 'tags'")
+        assert 'old' not in (stored or []), f'the tag statistics still list a tag no sample has: {stored}'
+        for mode in ('skip', 'error'):
+            with pytest.raises(HTTPException) as refused:
+                await datasets.add_samples(
+                    1,
+                    {'on_duplicate': mode, 'replace_tags': True, 'samples': [{'filepath': 'a.jpg'}]},
+                    user=USER,
+                )
+            assert refused.value.status_code == 400
+
+    registry_database(scenario)
+
+
 def test_incremental_refresh_merges_values_before_certifying_preview(registry_database):
     async def scenario(database):
         await ingest([{'label': 'old'}])

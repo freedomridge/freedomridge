@@ -66,6 +66,34 @@ def test_duplicate_conflict_raises_outside_error_mode(monkeypatch, mode):
     assert ds._dirty is False
 
 
+def test_replace_tags_is_sent_and_a_server_that_merged_instead_is_reported(monkeypatch):
+    ds = dataset()
+    send = Mock(return_value=response(200, {'ids': [1], 'replace_tags': True}))
+    monkeypatch.setattr(requests.Session, 'request', send)
+    ds.add_samples([Sample('old.jpg')], on_duplicate='update', replace_tags=True)
+    assert send.call_args.kwargs['json']['replace_tags'] is True
+    send.return_value = response(200, {'ids': [1]})  # a server before replace_tags ignores it and merges
+    with pytest.raises(RuntimeError, match='merged the tags'):
+        ds.add_samples([Sample('old.jpg')], on_duplicate='update', replace_tags=True)
+
+
+@pytest.mark.parametrize('mode', ['error', 'skip'])
+def test_replace_tags_outside_update_mode_is_refused_before_sending(monkeypatch, mode):
+    ds = dataset()
+    send = Mock()
+    monkeypatch.setattr(requests.Session, 'request', send)
+    with pytest.raises(ValueError, match='replace_tags'):
+        ds.add_samples([Sample('old.jpg')], on_duplicate=mode, replace_tags=True)
+    send.assert_not_called()
+
+
+def test_a_dataset_is_true_without_asking_the_server(monkeypatch):
+    send = Mock()
+    monkeypatch.setattr(requests.Session, 'request', send)
+    assert bool(dataset())
+    send.assert_not_called()
+
+
 @pytest.mark.parametrize('failure', [requests.ConnectionError, requests.ConnectTimeout, requests.ReadTimeout])
 def test_add_propagates_transport_failure_without_hidden_retries(monkeypatch, failure):
     ds = dataset()
