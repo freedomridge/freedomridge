@@ -12,6 +12,7 @@ from backend.filter_query import DATETIME, parse_query
 from backend.routers import datasets, versions
 from backend.tests import test_field_registry_postgres
 from backend.tests.statistics_helpers import run_refresh
+from backend.tests.test_filtered_query_plans import record_queries
 from backend.tests.test_histogram_postgres import MISSING, seed
 
 registry_database = test_field_registry_postgres.registry_database
@@ -42,6 +43,7 @@ NOT_DATETIMES = ['unknown', 'empty', 'impossible', 'number', 'null', 'missing']
 OLDEST_FIRST = ['e', 'f', 'g', 'a', 'b', 'c', 'd', 'i', 'h', *NOT_DATETIMES]
 NEWEST_FIRST = ['h', 'i', 'a', 'b', 'c', 'd', 'g', 'f', 'e', *NOT_DATETIMES]
 INDEX = 'idx_samples_meta_1_observed_at'
+FIELD = 'observed_at'
 
 
 def leaf(operator, value, field='observed_at'):
@@ -222,5 +224,38 @@ def test_an_indexed_sort_reads_the_index_and_still_puts_missing_values_last(regi
         assert f'"Index Name": "idx_samples_meta_1_{field}"' in plan(first_part)
         assert '"Scan Direction": "Backward"' in plan(first_part)
         assert '"Sort Method"' not in plan(first_part) and '"Node Type": "Sort"' not in plan(first_part)
+
+    registry_database(scenario)
+
+
+def test_the_readers_that_scan_a_field_without_an_index_read_its_text_once_a_sample(registry_database, monkeypatch):
+    """The sidebar's and /stats' earliest and latest values, the two passes of a sorted page and the full sort they
+    fall back to, and /aggregate's values in instant order read the field once a sample: their plans name
+    `metadata->>'observed_at'` once (the second pass twice, see below). The instant names its text a dozen times,
+    and each read decompresses metadata stored compressed (a COCO image's): the sidebar's bounds read it 33 times a
+    sample, 1.3 s for 5,000 COCO images against 0.14 s. Their answers are the tests above."""
+
+    async def scenario(database):
+        await setup(database, False)
+        queries = record_queries(database, monkeypatch)
+        others = {'field': 'filepath', 'operator': '!=', 'value': 'none'}  # a filter, so the sidebar computes
+        await datasets._get_dataset_field_stats_impl(1, others, lightning_mode=False)
+        await datasets.get_sample_stats(1)
+        for order in ('asc', 'desc'):
+            await names(sort_order=order, limit=4)  # the two passes over the written dates
+            await names(sort_order=order, limit=4, offset=12)  # past the datetimes: the full sort
+        specs = [datasets.AggregationSpec(field=FIELD, op=op) for op in ('values', 'distinct')]
+        await datasets.run_aggregations(1, specs, 'WHERE dataset_id = $1', [1])
+        reads = {}
+        for _, sql, args in queries:
+            if sql.lstrip().startswith('EXPLAIN'):  # the page's planning probe
+                continue
+            if "metadata->>'observed_at'" in sql or ('metadata->>$' in sql and 'observed_at' in args):
+                plan = '\n'.join(row[0] for row in await database.fetch(f'EXPLAIN (VERBOSE) {sql}', *args))
+                # The second pass reads it in its filter on the written date, then once more for the samples near it.
+                once = 2 if 'near_count' in sql else 1
+                reads[' '.join(sql.split())] = (plan.count("->> 'observed_at'::text)"), once)
+        assert len(reads) >= 7, reads
+        assert all(count == once for count, once in reads.values()), reads
 
     registry_database(scenario)

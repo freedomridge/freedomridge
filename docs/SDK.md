@@ -172,7 +172,7 @@ dataset.created_at     # Creation timestamp (ISO-8601 string)
 
 #### Dataset Methods
 
-##### `add_samples(samples: list[Sample], on_duplicate="error") -> dict`
+##### `add_samples(samples: list[Sample], on_duplicate="error", *, replace_tags=False) -> dict`
 
 Add samples to the dataset. Always takes a **list** (there is no `add_sample`
 singular — wrap a single sample in a list). Returns a dict including the created
@@ -180,7 +180,8 @@ sample `ids`. `on_duplicate` is one of `"error"` (default), `"skip"`, or
 `"update"`. In `"update"` mode, `metadata`/`location`/array fields are **replaced**
 (the uploader owns derived data) but `tags` are **merged** (union) — re-ingesting a
 sample never erases tags added in the app. Use a sample `save()` or bulk-set to
-deliberately clear tags.
+deliberately clear tags, or pass `replace_tags=True` with `on_duplicate="update"` to make
+an existing sample's tags exactly the ones sent, removing any others (tags added in the app too).
 
 ```python
 from fridge import Sample
@@ -505,10 +506,8 @@ it (`timeout=1800`); `wait=False` returns the `Job`. If the job stops part-way,
 
 ##### Counting samples
 
-`Dataset` has no `len()`. Count through a view:
-
 ```python
-count = dataset.all().count()   # or len(dataset.all())
+count = dataset.count()   # or len(dataset)
 print(f"Dataset has {count} samples")
 ```
 
@@ -2134,7 +2133,8 @@ class Dataset:
     created_at: str | None   # ISO-8601
 
     # Sample operations
-    def add_samples(samples: list[Sample], on_duplicate="error") -> dict  # {"ids": [...]}
+    def add_samples(samples: list[Sample], on_duplicate="error", *, replace_tags=False) -> dict  # {"ids": [...]}
+    def count() -> int                               # also len(dataset)
     def iter_samples(selected_fields=None, progress=False, batch_size=1000, filters=None) -> Iterator[Sample]
     def delete_sample(sample_id: int) -> dict     # an image's objects with it: {"objects_deleted": n, ...}
     def get_or_create(filepath: str, **kwargs) -> tuple[Sample, bool]

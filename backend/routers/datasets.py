@@ -24,10 +24,13 @@ from pydantic import BaseModel, Field, TypeAdapter, ValidationError, field_valid
 
 from backend.datetimes import (
     UTC_TEXT_SQL,
+    date_sql,
     instant_expr,
     instant_sql,
+    instants_from,
     literal_window,
     parse_instant,
+    read_once,
     utc_text,
     window_sql,
 )
@@ -2210,10 +2213,12 @@ async def _get_dataset_field_stats_impl(
         if not _queryable_field(field_name):
             return (field_name, 'datetime', 'cached', None, stat)
         # The earliest and latest instants (an indexed field's index answers), as the statistics write them.
-        instant = instant_expr(_field_text_sql(field_name), bool(stat.get('is_promoted')))
+        # Without an index, each row's text is read once (instants_from), and MIN and MAX skip rows without an instant.
+        promoted, text = bool(stat.get('is_promoted')), _field_text_sql(field_name)
+        instant = instant_expr(text, True) if promoted else '_instant'
         args = [id]
         arg_idx = 2
-        conditions = ["dataset_id = $1", f"{instant} IS NOT NULL"]
+        conditions = ["dataset_id = $1", f"{instant} IS NOT NULL"] if promoted else ["dataset_id = $1"]
         if filter_obj:
             sql, arg_idx = parse_filter_node(
                 filter_obj,
@@ -2226,13 +2231,14 @@ async def _get_dataset_field_stats_impl(
             if sql and sql != "TRUE":
                 conditions.append(sql)
         where = " AND ".join(conditions)
+        source = f"samples WHERE {where}" if promoted else instants_from(text, f"samples WHERE {where}")
         earliest, latest = UTC_TEXT_SQL.format(f'MIN({instant})'), UTC_TEXT_SQL.format(f'MAX({instant})')
         with field_usage.measure(id, {'facet': [field_name]}):
             state, row = await _facet_query(
                 db.fetchrow(
                     f"""
                 SELECT {earliest} as min_val, {latest} as max_val
-                FROM samples WHERE {where}
+                FROM {source}
             """,
                     *args,
                 ),
@@ -3454,6 +3460,45 @@ async def get_dataset_schema(id: int, filters: Optional[str] = None, lightning_m
     return deduped
 
 
+# A patch field's tile ('clip_patch_4x4_r0c1'), folded into the patch field ('clip_patch_4x4') by /coverage, as the
+# missing filter's SQL pattern folds it: ASCII digits only, matched to the end (fullmatch, so no trailing newline).
+_PATCH_TILE = re.compile(r'(.*_patch_[0-9]+x[0-9]+)_r[0-9]+c[0-9]+', re.DOTALL)
+
+
+async def _embedding_coverage(dataset_id: int) -> list[tuple[str, int]]:
+    """How many samples carry each embedding field, by name, a patch field's tiles folded into one entry (one row
+    per patch field instead of 64 noisy per-tile rows). The dataset's partition is counted once per stored name,
+    with nothing computed per row: the unique key (dataset_id, sample_id, field_name) makes that one row per sample,
+    and the (dataset_id, sample_id) key to samples means every row is a sample's. Only a patch field counts distinct
+    samples, over its own tiles' names (and a vector stored under the patch field's own name, as the fold counted it).
+    The counts are separate statements, so under live ingest a patch count can be a moment newer than the rest: fine
+    for a coverage signal. Folding every one of a million rows' names with a regex, joined to samples, took 4.9 s on
+    1 million vectors (production, 2026-11-12); this takes about 0.6 s."""
+    rows = await db.fetch(
+        'SELECT field_name, count(*) AS present FROM embeddings WHERE dataset_id = $1 GROUP BY field_name',
+        dataset_id,
+    )
+    present: dict[str, int] = {}
+    tiles: dict[str, list[str]] = {}
+    for row in rows:
+        tile = _PATCH_TILE.fullmatch(row['field_name'])
+        if tile:
+            tiles.setdefault(tile.group(1), []).append(row['field_name'])
+        else:
+            present[row['field_name']] = row['present']
+    for patch, names in tiles.items():
+        # A sample counts once however many of its tiles are stored.
+        if patch in present:  # a vector stored under the patch field's own name too: folded with its tiles
+            del present[patch]
+            names = [*names, patch]
+        present[patch] = await db.fetchval(
+            'SELECT count(DISTINCT sample_id) FROM embeddings WHERE dataset_id = $1 AND field_name = ANY($2::text[])',
+            dataset_id,
+            names,
+        )
+    return sorted(present.items())
+
+
 @router.get("/datasets/{id}/coverage", dependencies=[Depends(require_dataset_access)])
 @guest_heavy
 async def dataset_coverage(id: int):
@@ -3473,25 +3518,7 @@ async def dataset_coverage(id: int):
             "FROM samples WHERE dataset_id = $1",
             id,
         ),
-        db.fetch(
-            """
-            -- Collapse patch tiles ('..._patch_NxN_rRcC') into one virtual '..._patch_NxN' entry, so
-            -- coverage shows one row per patch field instead of 64 noisy per-tile rows. count(DISTINCT
-            -- sample_id) = samples carrying the field; it equals count(*) for one-row-per-sample
-            -- fields, so non-patch coverage is unchanged.
-            SELECT
-                CASE
-                    WHEN e.field_name ~ '_patch_[0-9]+x[0-9]+_r[0-9]+c[0-9]+$'
-                    THEN regexp_replace(e.field_name, '_r[0-9]+c[0-9]+$', '')
-                    ELSE e.field_name
-                END AS field_name,
-                count(DISTINCT e.sample_id) AS present
-            FROM embeddings e JOIN samples s ON s.dataset_id = e.dataset_id AND s.id = e.sample_id
-            WHERE s.dataset_id = $1
-            GROUP BY 1 ORDER BY 1
-        """,
-            id,
-        ),
+        _embedding_coverage(id),
         db.fetch(
             """
             SELECT h.field_name, count(*) AS present
@@ -3513,7 +3540,7 @@ async def dataset_coverage(id: int):
     return {
         "total_samples": total,
         "total_objects": objects,
-        "embeddings": [_entry(r['field_name'], r['present']) for r in emb],
+        "embeddings": [_entry(name, present) for name, present in emb],
         "hashes": [_entry(r['field_name'], r['present']) for r in hsh],
         "location": {"present": loc_present, "missing": max(0, total - loc_present)},
     }
@@ -4116,14 +4143,15 @@ async def _datetime_page_ids(text, direction, where_clause, args, limit, offset)
     When at least offset+limit of them are datetimes written within a day of D or beyond, every sample further
     away is later in the order than all of those (newest first: it names an instant before D - 3 + 15:59, they
     after D - 1 - 15:59), so the page is exact. Otherwise (values that look like dates but aren't, or fewer
-    datetimes than the page needs) it falls back to the full sort."""
+    datetimes than the page needs) it falls back to the full sort.
+
+    Each pass reads a sample's text once (instants_from, read_once)."""
     n = len(args)
-    date = f'pg_catalog.left({text}, 10) COLLATE "C"'
-    instant = instant_sql(text)
+    rows_sql = f"samples {where_clause}"
     newest = direction == 'DESC'
     cutoff = await db.fetchval(
-        f"SELECT {date} FROM samples {where_clause} AND {date} BETWEEN '0001-01-01' AND '9999-12-31' "
-        f"ORDER BY 1 {direction} LIMIT 1 OFFSET ${n + 1}",
+        f"SELECT _date FROM (SELECT {date_sql(text)} AS _date FROM {rows_sql} OFFSET 0) AS _dates "
+        f"WHERE _date BETWEEN '0001-01-01' AND '9999-12-31' ORDER BY 1 {direction} LIMIT 1 OFFSET ${n + 1}",
         *args,
         offset + limit - 1,
     )
@@ -4135,10 +4163,12 @@ async def _datetime_page_ids(text, direction, where_clause, args, limit, offset)
         far = near = None
     if far is not None:
         side = '>=' if newest else '<='
+        # The written date picks the candidates before the fence: a sample further away is read once, as before.
+        candidates = instants_from(text, f"{rows_sql} AND {date_sql(text)} {side} '{far}'", ('id',))
         rows = await db.fetch(
             f"SELECT id, count(*) FILTER (WHERE near) OVER () AS near_count FROM ("
-            f"SELECT id, {instant} AS instant, {date} {side} '{near}' AS near FROM samples {where_clause} "
-            f"AND {date} {side} '{far}') candidates WHERE instant IS NOT NULL "
+            f"SELECT id, _instant AS instant, {date_sql('_text')} {side} '{near}' AS near FROM {candidates}"
+            f") candidates WHERE instant IS NOT NULL "
             f"ORDER BY instant {direction}, id LIMIT ${n + 1} OFFSET ${n + 2}",
             *args,
             limit,
@@ -4147,8 +4177,8 @@ async def _datetime_page_ids(text, direction, where_clause, args, limit, offset)
         if rows and rows[0]['near_count'] >= offset + limit:
             return [row['id'] for row in rows]
     rows = await db.fetch(
-        f"SELECT id FROM samples {where_clause} ORDER BY {instant} {direction} NULLS LAST, id "
-        f"LIMIT ${n + 1} OFFSET ${n + 2}",
+        f"SELECT id FROM samples {read_once(text)} {where_clause} ORDER BY {instant_sql('_text')} {direction} "
+        f"NULLS LAST, id LIMIT ${n + 1} OFFSET ${n + 2}",
         *args,
         limit,
         offset,
@@ -4367,6 +4397,21 @@ def _realiased(field_mapping: Optional[Dict[str, str]], alias: str) -> Dict[str,
     """`field_mapping` for a subquery over samples aliased `alias`: every mapped column on the inner alias. A
     cross-grain subquery that kept the outer `s.created_at` compared the outer row's date on every partner."""
     return {key: f"{alias}.{column.rsplit('.', 1)[-1]}" for key, column in (field_mapping or {}).items()}
+
+
+def _id_list_bound(node: Any) -> Optional[list]:
+    """The ids of an `id in [...]` that every row matching `node` must have (a leaf of it, or of ANDs around it, as a
+    selection or a search's results), or None when no such list bounds it."""
+    if not isinstance(node, dict):
+        return None
+    if 'logic' in node or 'filters' in node:
+        if str(node.get('logic', 'AND')).upper() != 'AND':
+            return None
+        return next((ids for ids in map(_id_list_bound, node.get('filters') or []) if ids is not None), None)
+    values = node.get('value')
+    if node.get('field') == 'id' and str(node.get('operator', '=')).lower() == 'in' and isinstance(values, list):
+        return values if all(type(value) is int for value in values) else None
+    return None
 
 
 def parse_filter_node(
@@ -4655,10 +4700,24 @@ def _compile_filter_node(
                 array_columns=array_columns,
                 concepts=concepts,
             )
-            return (
+            link = (
                 f"EXISTS (SELECT 1 FROM samples s2 WHERE {ds_scope}s2.id = {outer_tbl}.parent_id "
                 f"AND s2.media_type != 'object' AND ({sub_sql}))"
-            ), arg_idx
+            )
+            # A sub-filter within an id list (a selection, a search's results) matches only images of that list, so
+            # the object's image must be one of those ids. Said again on the row, `parent_id = ANY(ids)` lets the
+            # planner find those objects by idx_samples_dataset_parent, and the grid's `id in ids OR ...` by two
+            # index scans. EXISTS alone is a condition on every object of the dataset, which the planner costs as
+            # one probe per object (cost 1.2M on a 37,000-object copy): past jit_inline_above_cost, so each count and
+            # page was JIT-compiled, 0.2 to 0.3 s for a 15 ms scan (measured). The rows are the same and never
+            # NULL: an unlinked object's NULL = ANY(...) is ANDed with its FALSE EXISTS. The list is a constant, so
+            # a plan that still reads every object looks it up in a hash table. has_matching_object can't say its
+            # images without a sub-query, and an array from one is searched element by element on every row.
+            ids = _id_list_bound(strict)
+            if ids is None:
+                return link, arg_idx
+            args.append(ids)
+            return f"({outer_tbl}.parent_id = ANY(${arg_idx}) AND {link})", arg_idx + 1
 
         # `field` is the only user-controlled token interpolated into SQL below
         # (as a column name or JSON key); every value is parameterized. Validate
@@ -6772,12 +6831,11 @@ async def get_sample_stats(id: int, sample_ids: Optional[str] = None):
                 value = f"jsonb_array_elements_text(metadata->{field_param})"
                 condition = f"jsonb_typeof(metadata->{field_param}) = 'array'"
             if field_type == 'datetime':
-                # The earliest and latest instants, written as the statistics write them.
-                instant = instant_sql(value)
+                # The earliest and latest instants, written as the statistics write them; each row's text read once.
+                rows_sql = f"samples WHERE dataset_id = $1 {id_condition} AND {condition}"
                 row = await db.fetchrow(
-                    f"SELECT {UTC_TEXT_SQL.format(f'MIN({instant})')} AS min_val, "
-                    f"{UTC_TEXT_SQL.format(f'MAX({instant})')} AS max_val "
-                    f"FROM samples WHERE dataset_id = $1 {id_condition} AND {condition}",
+                    f"SELECT {UTC_TEXT_SQL.format('MIN(_instant)')} AS min_val, "
+                    f"{UTC_TEXT_SQL.format('MAX(_instant)')} AS max_val FROM {instants_from(value, rows_sql)}",
                     *args,
                     field,
                 )
@@ -6978,15 +7036,24 @@ async def add_samples(id: int, payload: Any = Body(...), user: dict = Depends(re
 
     # Extract on_duplicate from wrapper dict if present
     on_duplicate = 'error'  # 'error' | 'skip' | 'update'
+    replace_tags = False  # update mode: an existing sample's tags become the ones sent, instead of both
     raw_samples = payload
     if isinstance(payload, dict):
         on_duplicate = payload.get('on_duplicate', 'error')
+        replace_tags = payload.get('replace_tags', False)
         raw_samples = payload.get('samples', payload)
 
     if on_duplicate not in ('error', 'skip', 'update'):
         raise HTTPException(
             status_code=400,
             detail=f"Invalid on_duplicate: {on_duplicate}. Must be 'error', 'skip', or 'update'.",
+        )
+    if not isinstance(replace_tags, bool):
+        raise HTTPException(status_code=400, detail=f"Invalid replace_tags: {replace_tags!r}. Must be true or false.")
+    if replace_tags and on_duplicate != 'update':
+        raise HTTPException(
+            status_code=400,
+            detail="replace_tags works only with on_duplicate 'update': other modes never change an existing sample.",
         )
 
     adapter: TypeAdapter[List[SampleCreate]] = TypeAdapter(List[SampleCreate])
@@ -7041,6 +7108,7 @@ async def add_samples(id: int, payload: Any = Body(...), user: dict = Depends(re
                 samples,
                 on_duplicate,
                 batch_array_fields,
+                replace_tags,
             )
             measured = await conn.fetchval('SELECT initialized FROM dataset_stats_state WHERE dataset_id = $1', id)
 
@@ -7157,6 +7225,8 @@ async def add_samples(id: int, payload: Any = Body(...), user: dict = Depends(re
     result: Dict[str, Any] = {"message": f"Added {len(set(sample_ids))} samples", "ids": sample_ids}
     if skipped > 0:
         result["skipped"] = skipped
+    if replace_tags:
+        result["replace_tags"] = True  # the SDK checks it: a server before replace_tags ignores it and merges
     return result
 
 
@@ -8552,6 +8622,13 @@ async def run_aggregations(
             def order(column):
                 return f"{instant_sql(column)} NULLS LAST, {column}" if datetime_field else column
 
+            # A datetime's text read once a sample: values sort on each one's instant, which would name it a dozen
+            # times (read_once); distinct reads it for its key and its filter (fenced: a join there costs more).
+            values = (
+                f"v FROM samples {read_once(value_expr, 'v')}" if datetime_field else f"{value_expr} AS v FROM samples"
+            )
+            fence = " OFFSET 0" if datetime_field else ""
+
             args = list(base_args)
             limit_sql = ""
             if spec.limit is not None:
@@ -8570,7 +8647,7 @@ async def run_aggregations(
             elif op == "distinct":
                 rows = await db.fetch(
                     f"{with_clause}SELECT value FROM (SELECT DISTINCT v AS value FROM "
-                    f"(SELECT {value_expr} AS v FROM samples {where_clause}) sub "
+                    f"(SELECT {value_expr} AS v FROM samples {where_clause}{fence}) sub "
                     f"WHERE v IS NOT NULL) found ORDER BY {order('value')}{limit_sql}",
                     *args,
                 )
@@ -8578,7 +8655,7 @@ async def run_aggregations(
             else:  # values — every value, not deduped (unlike distinct)
                 rows = await db.fetch(
                     f"{with_clause}SELECT v AS value FROM "
-                    f"(SELECT {value_expr} AS v FROM samples {where_clause}) sub "
+                    f"(SELECT {values} {where_clause}) sub "
                     f"WHERE v IS NOT NULL ORDER BY {order('v')}{limit_sql}",
                     *args,
                 )

@@ -23,7 +23,12 @@ DATABASE_URL = os.getenv("DATABASE_URL", "postgres://freedomridge:password@local
 # coordinate writes check their foreign key into embeddings row by row. The database has the same default
 # (schema.sql); the app sets it on its own connections as well. The cost: row triggers are planned for every row too,
 # about 30 µs a row on a bulk insert into samples (150,000 rows: 4 s with generic plans, 9 s, measured).
-PLANNING = {'plan_cache_mode': 'force_custom_plan'}
+# No JIT compilation: a statement whose estimated cost passes jit_above_cost is compiled to machine code before it
+# runs, again at every execution, since custom plans aren't kept. The app's filters often look costly to the
+# planner and run in milliseconds: in production, 2.11.0's object-grid count took 651 ms, 539 ms of it compiling,
+# and 21 ms without JIT. No query measured ran faster with it (a broad cross-grain count on 304,000 objects: 0.68 to
+# 0.82 s with JIT, 0.43 s without).
+PLANNING = {'plan_cache_mode': 'force_custom_plan', 'jit': 'off'}
 
 
 def application_name() -> str:

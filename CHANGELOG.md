@@ -4,6 +4,73 @@ Freedom Ridge has one version for the server, the web app and the Python SDK (th
 file), following [Semantic Versioning](https://semver.org). A release lists **upgrade notes** when
 it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
 
+## 2.11.1 (2026-11-12)
+
+2.11.1 fixes the slowdowns 2.11.0 brought to the public demo and one older one: the object grid after Find Similar or
+a selection, datetime fields without an index, a dataset page's coverage counts, and the server pausing for the first
+map reduction after a start. The app's database connections no longer compile queries (JIT), the production compose
+file passes `FRIDGE_MEDIA_RENDERS`, and the SDK gains `dataset.count()` and `add_samples(..., replace_tags=True)`. No
+migrations: the standard upgrade steps. The first searches after the restart are slower while caches warm; run one
+search on each dataset after upgrading.
+
+### Added
+
+- **`dataset.count()` and `len(dataset)`** give the number of samples in a dataset, as `dataset.all().count()` did.
+- **`add_samples(..., on_duplicate="update", replace_tags=True)`** makes an existing sample's tags exactly the ones
+  sent, removing the others, tags added in the app included. Tags are still merged by default. The API takes it as
+  `"replace_tags": true` next to `"on_duplicate": "update"`, and refuses it with any other mode. With a server older
+  than this, the SDK raises after the write, saying the tags were merged.
+
+### Changed
+
+- **The server no longer compiles queries to machine code (JIT) before running them.** PostgreSQL compiled any query
+  it estimated to be costly, again at every run, and the app's filters often look costly while running in
+  milliseconds: in production, the object grid's count took 651 ms, 539 ms of it compiling, and 21 ms without. No
+  query measured ran faster with JIT. The app's own connections (the API and the job runner) now turn it off;
+  scripts and other clients of the database keep the server's setting.
+
+### Fixed
+
+- **The object grid shows a selection or a search's results quickly again.** Since 2.11.0, when the object grid
+  showed the results of Find Similar, or any other list of samples, its count and its page read every object of the
+  dataset, and PostgreSQL first compiled each of them to machine code (JIT) because it overestimated their cost. Both
+  now find the listed objects and the objects of the listed images directly. Measured on copies, the database
+  answers each of them in:
+  - COCO (37,000 objects): 0.1 to 0.2 ms instead of 0.2 to 0.3 s;
+  - Open Images (304,000 objects): 8 to 15 ms instead of 0.3 to 0.4 s.
+
+  The rows are the same.
+
+- **Datetime fields without an index are read once a sample again** by the sidebar's and `/stats`' earliest and
+  latest values, a grid sorted by such a field, and `/aggregate`'s values. Since 2.11.0 each read the field's text
+  for every one of the dozen times the instant rule names it, and for a sample with large metadata (stored
+  compressed, such as an image with many detections) each read decompresses all of it. Measured on copies of COCO,
+  KITTI and iNaturalist: the sidebar's bounds take 0.14 s instead of 1.3 s on COCO's 5,000 images (0.09 s instead
+  of 0.5 s on KITTI, 0.22 s instead of 0.33 s on iNaturalist), and a newest-first page 0.29 s instead of 0.82 s on
+  COCO. On a dataset with small metadata a sorted page can take a few milliseconds longer (iNaturalist: 0.12 s
+  instead of 0.10 s). The answers are the same. Filters on such a field still read it a few times a sample.
+
+- **The first Run UMAP reduction after the server starts no longer stops the app for about 5 seconds.** The server
+  loaded the UMAP library on the loop that answers every request, so until it had loaded (about 5 s, measured), no
+  page, filter or sign-in got an answer. It now loads in the background with the fit, and the longest wait measured
+  for another request during a first reduction went from 5 to 10 s down to about 0.2 s.
+
+- **A dataset page opens without waiting seconds for its coverage counts.** The counts of samples with each vector
+  field (the "N of M embedded" signal and the grid's missing-vectors warning) folded every vector row's field name
+  with a regular expression and joined each row to its sample: about 5 seconds on a million vectors, every time a
+  dataset page opened, longer on the public demo while guests' requests queued. They now count each stored field
+  once and only fold a patch field's tiles: about 0.6 s on the same dataset, with the same numbers.
+
+- **`FRIDGE_MEDIA_RENDERS` works in the production compose file.** `.env.example` documents it (how many thumbnails,
+  crops and overlays each backend process renders at once), but `docker-compose.prod.yml` didn't pass it to the
+  backend, so setting it did nothing. Unset, each process still renders as many as it has CPUs.
+
+- **The database image builds again.** `Dockerfile.db` pinned PostgreSQL 18.6 but took the newest PostGIS, and the
+  newest (3.7.0+dfsg-1.pgdg12+2, built for PostgreSQL 18.7) needs a server function 18.6 lacks: a fresh build's
+  database refused to load PostGIS ("undefined symbol: heap_datum_check"). PostGIS is now pinned with the base, to the
+  build 2.11.0's released image has. An image built from an earlier release's `Dockerfile.db` since that PostGIS was
+  published (2026-11-11) has the same fault: rebuild it from 2.11.1; the database's data is untouched.
+
 ## 2.11.0 (2026-11-11)
 
 2.11.0 gives each object sample its image in a column of its own, `samples.parent_id`, so deleting an image

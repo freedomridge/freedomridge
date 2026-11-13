@@ -14,7 +14,7 @@ services:
   # PostgreSQL Database with PostGIS and pgvector
   db:
     logging: *default-logging
-    image: ghcr.io/freedomridge/db:2.11.0
+    image: ghcr.io/freedomridge/db:2.11.1
     build:
       context: .
       dockerfile: Dockerfile.db
@@ -52,7 +52,7 @@ services:
   # Backend API (FastAPI)
   backend:
     logging: *default-logging
-    image: ghcr.io/freedomridge/backend:2.11.0
+    image: ghcr.io/freedomridge/backend:2.11.1
     build:
       context: .
       dockerfile: Dockerfile.backend
@@ -102,6 +102,8 @@ services:
       FRIDGE_DB_ACQUIRE_TIMEOUT_SECONDS: ${FRIDGE_DB_ACQUIRE_TIMEOUT_SECONDS:-5}
       # Media-cache byte budget; the backend tracks it on write and the worker prunes to it.
       FRIDGE_CACHE_MAX_BYTES: ${FRIDGE_CACHE_MAX_BYTES:-10737418240}
+      # Thumbnails, crops and overlays each backend process renders at once (.env.example); empty: its CPU count.
+      FRIDGE_MEDIA_RENDERS: ${FRIDGE_MEDIA_RENDERS:-}
       # The login throttle reads X-Real-IP only from these peers. The API is reached only
       # through nginx on the compose bridge (no host port below), so every peer here is a container.
       FRIDGE_TRUSTED_PROXIES: ${FRIDGE_TRUSTED_PROXIES:-172.16.0.0/12,10.0.0.0/8,192.168.0.0/16}
@@ -126,7 +128,7 @@ services:
   # Database upkeep runs in job-runner. Shares the cache volume with the backend.
   worker:
     logging: *default-logging
-    image: ghcr.io/freedomridge/worker:2.11.0
+    image: ghcr.io/freedomridge/worker:2.11.1
     build:
       context: .
       dockerfile: Dockerfile.worker
@@ -147,7 +149,7 @@ services:
 
   job-runner:
     logging: *default-logging
-    image: ghcr.io/freedomridge/worker:2.11.0
+    image: ghcr.io/freedomridge/worker:2.11.1
     build:
       context: .
       dockerfile: Dockerfile.worker
@@ -187,7 +189,7 @@ services:
   # instance role for off-box copies. The application Backups card is separate.
   backup:
     logging: *default-logging
-    image: ghcr.io/freedomridge/backup:2.11.0
+    image: ghcr.io/freedomridge/backup:2.11.1
     build:
       context: .
       dockerfile: Dockerfile.backup
@@ -211,7 +213,7 @@ services:
     # Frontend (Next.js)
   frontend:
     logging: *default-logging
-    image: ghcr.io/freedomridge/frontend:2.11.0
+    image: ghcr.io/freedomridge/frontend:2.11.1
     build:
       context: .
       dockerfile: Dockerfile.frontend
