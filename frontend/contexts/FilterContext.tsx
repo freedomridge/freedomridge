@@ -1,12 +1,11 @@
 'use client';
 
 import React, { createContext, useContext, useState, useCallback, useMemo, useEffect, useRef } from 'react';
-import { useSearchParams } from 'next/navigation';
 import type { Feature, Polygon } from 'geojson';
 import { ComplexFilter, ViewStage } from '@/lib/api';
 import { convertSimpleFiltersToComplex, describeFilter, upgradeDraftKeys } from '@/lib/filter-utils';
 import { type DefaultView, defaultViewStages, isDefaultViewStage, opensOnDefaultView } from '@/lib/default-view';
-import { type DatasetLink, linkSetsFilters, readLink, withoutLinkParameters } from '@/lib/links';
+import { type DatasetLink, type LinkSort, linkSetsFilters, openingOf, withSample, withSort } from '@/lib/links';
 import { type ExpiredSelection, expiredSelection, filterHasInSelection } from '@/lib/filter-query';
 import { lassoFilter } from '@/lib/stale-lasso';
 import { type SourceView, sourceOf } from '@/lib/source-view';
@@ -131,6 +130,63 @@ function historyStateSig(s: {
     return JSON.stringify([s.viewStages, s.brushedIds, s.selectedIds, s.currentPolygon, s.selectionSource, s.currentEmbeddingRegion ?? null, s.expiredSelections ?? []]);
 }
 
+// Every entry we write KEEPS the app router's own keys (__NA + its tree). Next reloads the page
+// on Back/Forward to an entry without them, and ours never had them: the router stamps the entry
+// in an insertion effect, then this mount-time replaceState overwrote it with a bare object
+// (Next's history patch, which would copy the keys, is installed in a later effect), and every
+// push copied from that bare entry. So every Back was a full reload landing on the latest,
+// persisted filters.
+const withRouterState = (snap: object) => ({ ...(window.history.state ?? {}), ...snap });
+
+// A default view is public (the server takes no other as one), which the dataset's answer doesn't say: applied as it
+// is, its address is ?view=<slug>.
+const publicView = (view: DefaultView) => ({ ...view, is_public: true });
+
+// The address the browser shows: its path and query.
+const shownAddress = () => `${window.location.pathname}${window.location.search}`;
+
+// An id for each entry written: an address computed for one entry lands only on that entry, never on a later one with
+// the same filters (A, then B, then A again) or another sort. (crypto.randomUUID needs https.)
+const newEntryId = () => `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+
+/** What the address of a state is made from (the page's AddressOf): its applied stages, expired chips and source view. */
+export interface AddressState {
+    stages: ViewStage[];
+    expired: ExpiredSelection[];
+    source: SourceView | null;
+}
+
+/** The address of a state, as a path and query (lib/links.ts datasetAddress). */
+export type AddressOf = (state: AddressState) => Promise<string>;
+
+/**
+ * The sample whose view is open, as a history entry records it: the row opened (an object in an object grid, which
+ * shows as its parent image) and the grid it was opened from, whose rows next and previous walk (null: another panel;
+ * unset: not known yet, a link's sample before it is shown).
+ */
+export interface OpenSample {
+    id: number;
+    panelId?: string | null;
+}
+
+// The entry the address is written for: its id, its state as the address takes it, and the sample open in it.
+type AddressEntry = AddressState & { id: string; sample: number | null };
+
+// The sample an entry has open, from the entry.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any -- history.state, as the browser gives it back
+const sampleOf = (state: any): OpenSample | null => (Number.isSafeInteger(state?.sample?.id) ? state.sample : null);
+
+// An entry's state as its address takes it, from the entry (a snapshot holds no selection that can't be kept: its chip
+// is among the expired ones).
+// eslint-disable-next-line @typescript-eslint/no-explicit-any -- history.state, as the browser gives it back
+const addressEntryOf = (state: any): AddressEntry => ({
+    id: state.entryId,
+    stages: state.viewStages ?? [],
+    expired: state.expiredSelections ?? [],
+    source: state.sourceView ?? null,
+    sample: sampleOf(state)?.id ?? null,
+});
+
 interface FilterContextType {
     // Global filters - derived from view stages (+ the grain predicate)
     globalFilters: ComplexFilter;
@@ -184,15 +240,37 @@ interface FilterContextType {
     showResultsAsView: (stage: ViewStage) => void;
     hasUnappliedChanges: boolean;
 
-    // The link the page was opened with (lib/links.ts), read once as it opened; null without one. The page opens
-    // it and hands its filter stages to settleLink (null when the link sets none or can't be opened), which puts
-    // them in place of the restored filters and removes the link from the address.
+    // The link the page was opened with (lib/links.ts), read once as it opened; null without one, and when the page
+    // reopened one of its own history entries. The page opens it and hands its filter stages to settleLink (null
+    // when the link sets none or can't be opened), which puts them in place of the restored filters.
     // A `?view=` link's stages come with their view, which becomes the source view.
     link: DatasetLink | null;
     settleLink: (stages: ViewStage[] | null, source?: SourceView | null) => void;
     // A link that sets the filters is still being opened: the page holds its panels back, so the restored filters
     // aren't queried (and shown) only to be replaced.
     linkPending: boolean;
+    // The grids' sort the address opened with (lib/links.ts openingOf): the page gives it to the grids before they
+    // open. Undefined: they keep the one they had.
+    openingSort: LinkSort | undefined;
+
+    // The address (issue #391): each history entry this page writes gets the address of its state, and so does the
+    // entry Back or Forward restores. The page says how it is made (setAddressOf: lib/links.ts datasetAddress, with
+    // the grids' sort in this tab) and gives each new sort (setAddressSort), which the current address names at once.
+    setAddressOf: (addressOf: AddressOf) => void;
+    setAddressSort: (sort: { by?: string; order?: 'asc' | 'desc' }) => void;
+
+    // The sample whose view is open is in the address too (`sample=`), recorded on each entry. The page says what the
+    // user does with the view: opening a sample is an entry of its own (openSample); next and previous rewrite it
+    // (stepSample); closing it goes Back to the entry it was opened over, or rewrites the entry without it when there
+    // is none (closeSample). A view the page closes itself (a search showing its results), or a link's sample shown
+    // or not found, rewrites the entry (replaceSample), never going Back; the search's results then take its place.
+    openSample: (sample: OpenSample) => void;
+    stepSample: (sample: OpenSample) => void;
+    closeSample: () => void;
+    replaceSample: (sample: OpenSample | null) => void;
+    // The sample (null: none) the entry Back, Forward or a reload went to has open, when it isn't the one open before:
+    // the page shows it, fetched by id, or closes its view. A new object at each such step.
+    restoredSample: { sample: OpenSample | null } | null;
 
     // Selection state (from embeddings/map - part of staged filters)
     selectedIds: number[];
@@ -335,19 +413,47 @@ export function withGrain(
     return { logic: 'AND', filters: parts };
 }
 
-export function FilterProvider({ children, datasetId }: { children: React.ReactNode; datasetId?: number }): React.ReactNode {
-    // Load persisted state (runs once per datasetId)
-    const savedState = useMemo(() => loadFilterState(datasetId), [datasetId]);
+// `search`: the query the router opened the page with, read once by the page (not window.location: after login the app
+// navigates here, and the address still shows the login page while this page first renders).
+export function FilterProvider({ children, datasetId, search }: { children: React.ReactNode; datasetId?: number; search: string }): React.ReactNode {
+    // How the page opens (lib/links.ts openingOf), decided at its first render so nothing is fetched for a state about
+    // to be replaced: on one of its own history entries (a reload, or Back or Forward into a page that was unloaded),
+    // whose state it restores; on the link in the address; or on the filters the browser saved for the dataset. The
+    // link is kept: the address changes with the filters, and nothing reads it from there later.
+    const [opening] = useState(() => openingOf(
+        typeof window === 'undefined' ? null : window.history.state,
+        typeof window === 'undefined' ? '' : shownAddress(),
+        `/datasets/${datasetId}${search ? `?${search}` : ''}`,
+    ));
+    const link: DatasetLink | null = opening.link;
 
-    // A link to this dataset, read once as the page opens and kept: the address loses it when the page has opened
-    // it (settleLink), so nothing reads it from the address later. Read from the router, not window.location: after
-    // login the app navigates here, and the address still shows the login page while this page first renders.
-    const searchParams = useSearchParams();
-    const [link] = useState<DatasetLink | null>(() => readLink(searchParams));
+    // Load persisted state (runs once per datasetId). Reopening one of its entries, the page takes the entry's state
+    // (what Back or Forward to it would restore), and from the saved state only what the entry doesn't hold: the draft.
+    const savedState = useMemo((): Partial<PersistedFilterState> | null => {
+        const saved = loadFilterState(datasetId);
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any -- history.state, as the browser gives it back
+        const entry = opening.entry as any;
+        if (!entry) return saved;
+        return {
+            ...saved,
+            viewStages: entry.viewStages ?? [],
+            expiredSelections: entry.expiredSelections ?? [],
+            brushedIds: entry.brushedIds ?? [],
+            currentEmbeddingRegion: entry.currentEmbeddingRegion ?? null,
+            selectedIds: entry.selectedIds ?? [],
+            selectionGrain: entry.selectionGrain ?? null,
+            currentPolygon: entry.currentPolygon ?? null,
+            selectionSource: entry.selectionSource ?? 'Manual',
+            sourceView: entry.sourceView ?? null,
+        };
+    }, [datasetId, opening]);
+
     // While a link that sets the filters is opened, the default view waits: it isn't put on top of the link's
     // filters, and a link that can't be opened leaves the dataset as it would open without it.
     const [linkPending, setLinkPending] = useState(() => linkSetsFilters(link));
-    const linkAppliedRef = useRef(false);
+    // The filters came from the address (a link's, or the reopened entry's): the default view isn't put on top.
+    const linkAppliedRef = useRef(opening.entry !== null);
+    const linkSettledRef = useRef(link === null);
 
     // View Stages - The source of truth for global filters
     const [viewStages, setViewStages] = useState<ViewStage[]>(savedState?.viewStages ?? []);
@@ -439,9 +545,13 @@ export function FilterProvider({ children, datasetId }: { children: React.ReactN
 
     // Persist filter state on changes (debounced)
     const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+    // The history write due (below), written before the filters are saved: a reload reopens its entry, which is then
+    // never older than the filters this browser saved.
+    const writeHistoryNowRef = useRef<(() => void) | null>(null);
     useEffect(() => {
         if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
         saveTimerRef.current = setTimeout(() => {
+            writeHistoryNowRef.current?.();
             saveFilterState(datasetId, {
                 viewStages, filterMode, simpleFilters, advancedFilters,
                 brushedIds, currentEmbeddingRegion, selectedIds, selectionGrain, currentPolygon, selectionSource, dismissedDefaultViewId,
@@ -461,8 +571,95 @@ export function FilterProvider({ children, datasetId }: { children: React.ReactN
     const historyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
     const historyInitializedRef = useRef(false);
     const suppressPushUntilRef = useRef(0);
-    // The default view applied on opening replaces the opening entry: Back doesn't step to "no filters".
+    // The default view applied on opening, or a link's filters, replace the opening entry: Back doesn't step to "no
+    // filters", nor to filters the address never said.
     const replaceHistoryRef = useRef(false);
+
+    // --- The address of each entry (issue #391) ---
+    // An entry's address is made from its own state, never the reverse (except a link, which opens as a link). It is
+    // computed after the entry is written (asynchronously: q= text is asked of the server) and put on the entry while
+    // it is still the current one. The entry is the page's own once the opening is decided: a link settled, the
+    // default view applied or not. Before that it records no address, so a reload (or Back from the login page) opens
+    // the dataset as it would have, and nothing is written over the link being opened.
+    const ownedRef = useRef(opening.entry !== null);
+    const [addressOf, setAddressOfState] = useState<AddressOf | null>(null);
+    const setAddressOf = useCallback((of: AddressOf) => setAddressOfState(() => of), []);
+    const [addressEntry, setAddressEntry] = useState<AddressEntry | null>(null);
+
+    // The sample whose view is open, which each entry written records (a link's from the start, so its address keeps
+    // it while the sample is fetched). `samplePushed` marks the entry that opening it pushed, over the same state
+    // without it: only from that one does closing the view go Back. Any other write of an entry drops the mark.
+    const sampleRef = useRef<OpenSample | null>(
+        sampleOf(opening.entry) ?? (Number.isSafeInteger(Number(link?.sample)) ? { id: Number(link!.sample) } : null),
+    );
+    // The view's own entry was just rewritten without it by the page (a search from the view, Find similar): the next
+    // filters' push takes its place instead, so Back from the search's results goes straight to the state before the
+    // view, not to a copy of it. Any other entry write, or Back or Forward, ends it.
+    const collapseNextPushRef = useRef(false);
+
+    // Writes `snap` as the current entry (replace) or a new one (push), with its id, the sample open, and the address it
+    // holds as written (a push holds the previous entry's until its own arrives), then asks for its own address.
+    const writeEntry = useCallback((snap: object, push: boolean, state: AddressState, samplePushed = false) => {
+        collapseNextPushRef.current = false;
+        const sample = sampleRef.current;
+        const entry = { ...snap, sample, samplePushed: samplePushed && !!sample, entryId: newEntryId(), address: ownedRef.current ? shownAddress() : null };
+        if (push) window.history.pushState(withRouterState(entry), '');
+        else window.history.replaceState(withRouterState(entry), '');
+        if (ownedRef.current) setAddressEntry({ id: entry.entryId, ...state, sample: sample?.id ?? null });
+    }, []);
+
+    // Puts `address` on the entry `id`, if it is still the current one. The state goes in without the router's own mark
+    // (__NA): Next's replaceState then takes the new address as its own and copies its keys back beside our snapshot.
+    // With the mark it would pass the call through unseen, keep the old address, and write that back at its next state
+    // change. The entry records the address it then holds, as the browser shows it: a reload tells its own entry by it.
+    const writeAddress = useCallback((id: string, address: string) => {
+        const state = window.history.state;
+        if (!state?._fridge || state.entryId !== id || window.location.pathname !== `/datasets/${datasetId}`) return;
+        const shown = shownAddress();
+        const url = new URL(address, window.location.href);
+        const to = `${url.pathname}${url.search}`;
+        try {
+            if (to !== shown) {
+                const next = { ...state, address: to };
+                delete next.__NA;
+                window.history.replaceState(next, '', to);
+            } else if (state.address !== shown) {
+                // The URL stays, so the router isn't told: only the entry's record of it changes.
+                window.history.replaceState({ ...state, address: shown }, '');
+            }
+        } catch (e) {
+            console.warn('Skipped the address write:', e);
+        }
+    }, [datasetId]);
+
+    // The sort changed (it isn't history): the current address names it at once, its filters as they are, so a reload
+    // right after opens on it. The entry's address is then made again: one in flight may hold the sort before.
+    const setAddressSort = useCallback((sort: { by?: string; order?: 'asc' | 'desc' }) => {
+        const state = window.history.state;
+        if (!ownedRef.current || !state?._fridge || !state.entryId) return;
+        writeAddress(state.entryId, withSort(shownAddress(), sort));
+        setAddressEntry(entry => entry && { ...entry });
+    }, [writeAddress]);
+
+    useEffect(() => {
+        if (!addressEntry || !addressOf) return;
+        let current = true;  // a later entry, sort or way of writing it takes over
+        addressOf(addressEntry).then(
+            (address) => { if (current) writeAddress(addressEntry.id, withSample(address, addressEntry.sample)); },
+            (error: unknown) => console.warn("Couldn't make the address:", error),
+        );
+        return () => { current = false; };
+    }, [addressEntry, addressOf, writeAddress]);
+
+    // The opening is decided (a link settled, the default view applied or not) and no replace of the opening entry is
+    // due, which would give the entry its state: from here the entry is the page's, and its address is written.
+    const openedRef = useRef(false);  // the default-view decision below has run
+    const ownIfOpened = useCallback(() => {
+        if (ownedRef.current || !linkSettledRef.current || !openedRef.current || replaceHistoryRef.current) return;
+        ownedRef.current = true;
+        const state = window.history.state;
+        if (state?._fridge && state.entryId) setAddressEntry(addressEntryOf(state));
+    }, []);
 
     const buildHistorySnapshot = useCallback(() => ({
         _fridge: true,  // marker to distinguish our entries from Next.js'
@@ -481,61 +678,167 @@ export function FilterProvider({ children, datasetId }: { children: React.ReactN
         sourceView,
     }), [viewStages, expiredSelections, brushedIds, currentEmbeddingRegion, selectedIds, selectionGrain, currentPolygon, selectionSource, sourceView]);
 
-    // Every entry we write KEEPS the app router's own keys (__NA + its tree). Next reloads the page
-    // on Back/Forward to an entry without them, and ours never had them: the router stamps the entry
-    // in an insertion effect, then this mount-time replaceState overwrote it with a bare object
-    // (Next's history patch, which would copy the keys, is installed in a later effect), and every
-    // push copied from that bare entry. So every Back was a full reload landing on the latest,
-    // persisted filters.
-    const withRouterState = (snap: object) => ({ ...(window.history.state ?? {}), ...snap });
-
-    // Set initial history entry on mount
+    // Set initial history entry on mount (its address too, when the page reopened one of its own entries, which keeps its
+    // sample and whether opening it pushed the entry)
     useEffect(() => {
         if (typeof window === 'undefined' || historyInitializedRef.current) return;
         historyInitializedRef.current = true;
-        window.history.replaceState(withRouterState(buildHistorySnapshot()), '');
+        writeEntry(buildHistorySnapshot(), false, { stages: viewStages, expired: expiredSelections, source: sourceView }, opening.entry?.samplePushed === true);
     }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
     // Push to history on meaningful state changes (debounced)
     useEffect(() => {
         if (typeof window === 'undefined' || !historyInitializedRef.current) return;
         if (historyTimerRef.current) clearTimeout(historyTimerRef.current);
-        historyTimerRef.current = setTimeout(() => {
-            // Don't record the cascade of updates a Back/Forward restore just triggered.
-            if (Date.now() < suppressPushUntilRef.current) {
-                replaceHistoryRef.current = false;  // or the next real change would replace an entry
-                return;
-            }
+        const write = () => {
+            writeHistoryNowRef.current = null;
             const snap = buildHistorySnapshot();
-            if (replaceHistoryRef.current) {
-                replaceHistoryRef.current = false;
-                window.history.replaceState(withRouterState(snap), '');
+            const state = { stages: viewStages, expired: expiredSelections, source: sourceView };
+            const cur = window.history.state;
+            const same = !!cur?._fridge && historyStateSig(cur) === historyStateSig(snap);
+            // The opening's own replace (a link's filters, the default view): the entry is the page's from here.
+            const opening = replaceHistoryRef.current;
+            replaceHistoryRef.current = false;  // or the next real change would replace an entry
+            if (opening && linkSettledRef.current && openedRef.current) ownedRef.current = true;
+            // Right after a Back/Forward restore, its cascade of updates isn't recorded. A real change in that window
+            // (a chip removed at once) replaces the restored entry rather than pushing over the forward history:
+            // dropped, it left the entry and its address on the old state, which a reload brought back.
+            if (opening || Date.now() < suppressPushUntilRef.current) {
+                if (opening || !same) writeEntry(snap, false, state);
                 return;
             }
-            const cur = window.history.state;
             // Don't push a duplicate of the current entry (mount echo / no-op churn). The same filters from another
             // source view (just saved as one, say) replace it: Back goes to other filters, not to the same ones.
-            if (cur && cur._fridge && historyStateSig(cur) === historyStateSig(snap)) {
-                if ((cur.sourceView?.id ?? null) !== (snap.sourceView?.id ?? null)) window.history.replaceState(withRouterState(snap), '');
+            if (same) {
+                if ((cur.sourceView?.id ?? null) !== (snap.sourceView?.id ?? null)) writeEntry(snap, false, state);
                 return;
             }
             // pushState can still throw if the snapshot is unexpectedly large (browser
             // history.state cap) — never let a history push crash the app.
             try {
-                window.history.pushState(withRouterState(snap), '');
+                writeEntry(snap, !collapseNextPushRef.current, state);  // a replace in place of a view the page closed
             } catch (e) {
                 console.warn('Skipped history push (state too large):', e);
             }
-        }, 400);
-        return () => { if (historyTimerRef.current) clearTimeout(historyTimerRef.current); };
-    }, [viewStages, expiredSelections, brushedIds, currentEmbeddingRegion, selectedIds, currentPolygon, selectionSource, sourceView, buildHistorySnapshot]);
+        };
+        historyTimerRef.current = setTimeout(write, 400);
+        writeHistoryNowRef.current = () => {
+            if (historyTimerRef.current) clearTimeout(historyTimerRef.current);
+            write();
+        };
+        return () => {
+            if (historyTimerRef.current) clearTimeout(historyTimerRef.current);
+            writeHistoryNowRef.current = null;
+        };
+    }, [viewStages, expiredSelections, brushedIds, currentEmbeddingRegion, selectedIds, currentPolygon, selectionSource, sourceView, buildHistorySnapshot, writeEntry]);
+
+    // --- The sample whose view is open (issue #391) ---
+    // A reload of an entry with a sample open reopens it.
+    const [restoredSample, setRestoredSample] = useState<{ sample: OpenSample | null } | null>(() => {
+        const sample = sampleOf(opening.entry);
+        return sample ? { sample } : null;
+    });
+    // Next and previous rewrite the entry once the stepping pauses: browsers refuse (WebKit) or drop (Chrome) history
+    // calls past about a hundred in a short while, and each address is two, ours and the router's.
+    const sampleStepRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+    // A close that went Back, until its popstate arrives: an open meanwhile waits for it (a push before it would put the
+    // entry after the one being left, and Back would then land on the wrong entry).
+    const closingRef = useRef(false);
+    const openAfterCloseRef = useRef<OpenSample | null>(null);
+
+    // Writes `sample` (null: none) on the current entry, or on a new entry after it (`push`: opening it), the filters'
+    // write due going first so the entry holds them. A step due is superseded.
+    const writeSample = useCallback((sample: OpenSample | null, push: boolean) => {
+        if (sampleStepRef.current) clearTimeout(sampleStepRef.current);
+        sampleStepRef.current = null;
+        writeHistoryNowRef.current?.();
+        sampleRef.current = sample;
+        const cur = window.history.state;
+        if (!cur?._fridge) return;
+        const { stages, expired, source } = addressEntryOf(cur);
+        try {
+            writeEntry(cur, push, { stages, expired, source }, push || cur.samplePushed === true);
+        } catch (e) {
+            console.warn('Skipped the history write:', e);
+        }
+    }, [writeEntry]);
+
+    const openSample = useCallback((sample: OpenSample) => {
+        if (closingRef.current) openAfterCloseRef.current = sample;
+        else writeSample(sample, true);
+    }, [writeSample]);
+
+    const stepSample = useCallback((sample: OpenSample) => {
+        if (closingRef.current) {
+            if (openAfterCloseRef.current) openAfterCloseRef.current = sample;
+            return;
+        }
+        sampleRef.current = sample;  // a filter entry written meanwhile (Space) records it
+        if (sampleStepRef.current) clearTimeout(sampleStepRef.current);
+        sampleStepRef.current = setTimeout(() => writeSample(sampleRef.current, false), 300);
+    }, [writeSample]);
+
+    // Only the entry opening the sample pushed goes Back: from any other (a selection toggled in the view pushed its own,
+    // or the page opened on a sample= link) Back would undo something else, or leave the page.
+    const closeSample = useCallback(() => {
+        if (closingRef.current) {
+            openAfterCloseRef.current = null;
+            return;
+        }
+        if (sampleStepRef.current) writeSample(sampleRef.current, false);  // Forward reopens the sample last shown
+        else writeHistoryNowRef.current?.();
+        if (window.history.state?._fridge && window.history.state.samplePushed === true) {
+            sampleRef.current = null;
+            closingRef.current = true;
+            window.history.back();
+        } else {
+            writeSample(null, false);
+        }
+    }, [writeSample]);
+
+    // Never Back: the page closing the view itself goes on to set new filters, which a Back arriving after would undo.
+    const replaceSample = useCallback((sample: OpenSample | null) => {
+        if (closingRef.current) {
+            openAfterCloseRef.current = null;
+            return;
+        }
+        if (!sample && !sampleRef.current && !sampleStepRef.current) return;
+        writeHistoryNowRef.current?.();
+        const collapse = !sample && window.history.state?.samplePushed === true;
+        writeSample(sample, false);
+        collapseNextPushRef.current = collapse;
+    }, [writeSample]);
+
+    useEffect(() => () => { if (sampleStepRef.current) clearTimeout(sampleStepRef.current); }, []);
 
     // Listen for popstate (back/forward)
     useEffect(() => {
         if (typeof window === 'undefined') return;
         const handler = (event: PopStateEvent) => {
+            collapseNextPushRef.current = false;
+            // A step due was for the entry left.
+            if (sampleStepRef.current) clearTimeout(sampleStepRef.current);
+            sampleStepRef.current = null;
+            const closing = closingRef.current;
+            closingRef.current = false;
             const state = event.state;
             if (!state || !state._fridge) return;  // Not our entry
+            const sample = sampleOf(state);
+            const opened = sampleRef.current;
+            sampleRef.current = sample;
+            if (closing) {
+                // The Back of a close: the entry the sample was opened over, with the state on screen (nothing to
+                // restore, so nothing done since the close is undone). An open asked for meanwhile goes after it now.
+                // It isn't the entry a Back or Forward just before restored: a change from here is pushed after it,
+                // not put in its place.
+                suppressPushUntilRef.current = 0;
+                if (ownedRef.current && state.entryId) setAddressEntry(addressEntryOf(state));
+                const open = openAfterCloseRef.current;
+                openAfterCloseRef.current = null;
+                if (open) writeSample(open, true);
+                return;
+            }
+            if ((sample?.id ?? null) !== (opened?.id ?? null)) setRestoredSample({ sample });
             // Suppress pushes briefly so the re-renders/refetches this restore triggers
             // don't re-push the restored state and clobber the forward history.
             suppressPushUntilRef.current = Date.now() + 600;
@@ -548,10 +851,13 @@ export function FilterProvider({ children, datasetId }: { children: React.ReactN
             setCurrentPolygon(state.currentPolygon ?? null);
             setSelectionSource(state.selectionSource ?? 'Manual');
             setSourceView(state.sourceView ?? null);
+            // Its address again, made from its state with the sort the grids have now (the sort isn't history), and
+            // made at all if its own was dropped (Back before it arrived). Unchanged, nothing is written.
+            if (ownedRef.current && state.entryId) setAddressEntry(addressEntryOf(state));
         };
         window.addEventListener('popstate', handler);
         return () => window.removeEventListener('popstate', handler);
-    }, []);  
+    }, [writeSample]);
 
     // Keep track of the last meaningful source to handle race conditions where
     // source might flip to 'Manual' just before applying (e.g. focus/blur events)
@@ -746,7 +1052,7 @@ export function FilterProvider({ children, datasetId }: { children: React.ReactN
         // Preserve draft sidebar filters and selections
         const stages = defaultViewStages(defaultView);
         setViewStages(stages);
-        setSourceView(defaultView && stages.length ? sourceOf(defaultView, stages) : null);
+        setSourceView(defaultView && stages.length ? sourceOf(publicView(defaultView), stages) : null);
         setExpiredSelections([]);
         setDismissedDefaultViewId(null);
     }, [defaultView]);
@@ -761,36 +1067,35 @@ export function FilterProvider({ children, datasetId }: { children: React.ReactN
     // Open on the default view once the dataset's answer says which it is (see opensOnDefaultView), and once a link
     // that sets the filters has settled: never on top of the link's filters, nor under an expired selection's chip.
     // Decided once per visit: removing that chip later, or Back/Forward (which restore their entry), never applies it.
-    const openedRef = useRef(false);
+    // The opening is then decided, and the entry becomes the page's (ownIfOpened): its address is written once, for
+    // the state it opened on, not first for the saved filters and then for the default view.
     useEffect(() => {
         if (defaultView === undefined || openedRef.current || linkPending) return;
         openedRef.current = true;
-        if (linkAppliedRef.current) return;
-        if (defaultView && opensOnDefaultView(viewStages, dismissedDefaultViewId, defaultView, expiredSelections)) {
+        if (!linkAppliedRef.current && defaultView && opensOnDefaultView(viewStages, dismissedDefaultViewId, defaultView, expiredSelections)) {
             replaceHistoryRef.current = true;
-            // eslint-disable-next-line react-hooks/set-state-in-effect -- once per visit, when the dataset's answer arrives
-            openView(defaultView, defaultViewStages(defaultView));
+            openView(publicView(defaultView), defaultViewStages(defaultView));
         }
+        ownIfOpened();
     }, [defaultView, linkPending]); // eslint-disable-line react-hooks/exhaustive-deps -- once, with the filters this visit opened with
 
-    // The link's stages replace the restored ones; the history push that follows (debounced, like any filter change)
-    // leaves the restored filters one Back away. The parameters leave the address in the same step, before that
-    // push: the entry Back returns to gets the clean address, the pushed one inherits it, and a reload there doesn't
-    // open the link again. The state goes in without the router's own mark (__NA): Next's replaceState then takes
-    // the new address as its own and copies its keys back beside our snapshot. With the mark it would pass the call
-    // through unseen, keep the address with the link, and write that back at its next state change.
+    // The link's stages replace the restored ones in the opening entry (replaced, as the default view's are, not
+    // pushed): its address is then its own, and Back doesn't step to filters the address never said. The filters the
+    // browser saved for the dataset become the link's at the next save, as at any change. Settled, and the opening
+    // decided, the entry is the page's and gets the address of the state it shows, the link's own parameters giving
+    // way to it, also when the link couldn't be opened.
     const settleLink = useCallback((stages: ViewStage[] | null, source: SourceView | null = null) => {
         if (stages) {
             linkAppliedRef.current = true;
+            replaceHistoryRef.current = true;
             setViewStages(stages);
             setSourceView(source);
             setExpiredSelections([]);
         }
-        const state = { ...window.history.state };
-        delete state.__NA;
-        window.history.replaceState(state, '', withoutLinkParameters(window.location.href));
+        linkSettledRef.current = true;
         setLinkPending(false);
-    }, []);
+        ownIfOpened();
+    }, [ownIfOpened]);
 
     // A search's result set becomes THE view. It replaces the applied stages AND every other
     // input the grid would otherwise AND with it: draft sidebar / Query Builder filters, the
@@ -872,6 +1177,14 @@ export function FilterProvider({ children, datasetId }: { children: React.ReactN
         link,
         settleLink,
         linkPending,
+        openingSort: opening.sort,
+        setAddressOf,
+        setAddressSort,
+        openSample,
+        stepSample,
+        closeSample,
+        replaceSample,
+        restoredSample,
     };
 
     return (

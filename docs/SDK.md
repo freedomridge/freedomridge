@@ -1697,6 +1697,12 @@ search their paths/tags/metadata, and view their annotations. Images, masks, hea
 and display settings come from the selected version. Diff links open the saved state
 for removed/modified samples, including samples that no longer exist in the live dataset.
 
+The snapshot page's address is a link to what it shows: `search=` (the search), `view=` (a saved
+view the version recorded, by name), `page=` and `sample=` (the open sample, one of that page's).
+A bookmark or a reload opens the same samples, and since a version doesn't change, so does the
+link for as long as the version exists. Back and Forward step through searches, views, pages and
+opening a sample; Previous and Next in a sample's view stay on one history entry.
+
 To inspect the saved dataset schema and display configuration through the SDK:
 
 ```python

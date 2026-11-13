@@ -15,9 +15,9 @@ require.extensions['.ts'] = (module, filename) => {
 };
 
 const {
-    readLink, linkSetsFilters, withoutLinkParameters, encodeStages, decodeStages, loginPath, safeNext,
+    readLink, linkSetsFilters, openingOf, withSort, withSample, encodeStages, decodeStages, loginPath, safeNext,
     LinkError, MAX_INFLATED_BYTES, UNKNOWN_VERSION_NOTICE, BROKEN_LINK_NOTICE, OVERSIZED_LINK_NOTICE,
-    datasetLink, viewLink, mayBeText, MAX_LINK_LENGTH, TOO_LONG_NOTICE,
+    datasetLink, datasetAddress, viewLink, mayBeText, MAX_LINK_LENGTH, TOO_LONG_NOTICE,
 } = require('../lib/links.ts');
 const FIXTURES = require('./link-fixtures.json');
 
@@ -120,10 +120,42 @@ test('the link is read from the query string; a sample or a sort alone sets no f
     for (const search of ['sample=5', 'sort=idx&dir=asc', '']) assert.equal(linkSetsFilters(readLink(new URLSearchParams(search))), false, search);
 });
 
-test('removing the link keeps the rest of the address', () => {
-    assert.equal(withoutLinkParameters('http://x.test/datasets/5?q=a&f=1.b&view=c&sort=d&dir=asc&sample=9'), '/datasets/5');
-    assert.equal(withoutLinkParameters('http://x.test/datasets/5?keep=1&q=a#top'), '/datasets/5?keep=1#top');
-    assert.equal(withoutLinkParameters('http://x.test/datasets/5'), '/datasets/5');
+test('the page reopens its own entry only when the entry holds the address shown, which the router opened', () => {
+    const ours = (address, more = {}) => ({ _fridge: true, entryId: 'e1', address, viewStages: [], __NA: true, ...more });
+    const page = '/datasets/5?q=split+%3D+%22train%22&sort=idx&dir=desc';
+    // Ours, with the address shown: the entry, with the address's sort.
+    const entry = openingOf(ours(page), page, page);
+    assert.equal(entry.entry.entryId, 'e1');
+    assert.equal(entry.link, null);
+    assert.deepEqual(entry.sort, { by: 'idx', order: 'desc' });
+    // An entry's address without a sort is the default order (not whatever another tab chose since).
+    assert.deepEqual(openingOf(ours('/datasets/5?q='), '/datasets/5?q=', '/datasets/5?q=').sort, { by: undefined, order: 'asc' });
+    // No state, Next's own entry, ours without an address (written before the page owned it) or with another one
+    // (the page shown before a navigation inside the app): the address opens as a link, or as no link at all.
+    for (const state of [null, undefined, 'x', { __NA: true, __PRIVATE_NEXTJS_INTERNALS_TREE: {} }, ours(null), ours('/datasets/5?q=other')]) {
+        const opening = openingOf(state, page, page);
+        assert.equal(opening.entry, null, JSON.stringify(state));
+        assert.deepEqual(opening.link, { q: 'split = "train"', sort: 'idx', dir: 'desc' }, JSON.stringify(state));
+        assert.deepEqual(opening.sort, { by: 'idx', order: 'desc' });
+    }
+    assert.deepEqual(openingOf(ours('/datasets/5?q=other'), '/datasets/5?q=other', '/datasets/5'), { entry: null, link: null, sort: undefined });
+    // An entry whose address names no filters (its state can't be held by a link: a big Select All) is still the
+    // entry, not "no link" and the saved filters; with a sort, the address's sort.
+    assert.equal(openingOf(ours('/datasets/5'), '/datasets/5', '/datasets/5').entry.entryId, 'e1');
+    const sorted = openingOf(ours('/datasets/5?sort=idx&dir=asc'), '/datasets/5?sort=idx&dir=asc', '/datasets/5?sort=idx&dir=asc');
+    assert.equal(sorted.entry.entryId, 'e1');
+    assert.equal(sorted.link, null);
+    assert.deepEqual(sorted.sort, { by: 'idx', order: 'asc' });
+    // A link without a sort leaves the grids' own.
+    assert.equal(openingOf(null, '/datasets/5?q=a', '/datasets/5?q=a').sort, undefined);
+    // The router's query, written again, may encode a space as + where the address has %20: still the same address.
+    // A + in a value is %2B, and that isn't a space.
+    assert.equal(openingOf(ours('/datasets/5?q=a%20b'), '/datasets/5?q=a%20b', '/datasets/5?q=a+b').entry.entryId, 'e1');
+    assert.equal(openingOf(ours('/datasets/5?q=a%2Bb'), '/datasets/5?q=a%2Bb', '/datasets/5?q=a%2Bb').entry.entryId, 'e1');
+    assert.equal(openingOf(ours('/datasets/5?q=a+b'), '/datasets/5?q=a%2Bb', '/datasets/5?q=a%2Bb').entry, null);
+    assert.equal(openingOf(ours('/datasets/5?q=a%2Bb'), '/datasets/5?q=a%2Bb', '/datasets/5?q=a+b').entry, null);
+    // Another dataset's entry, still current while the router opens this one.
+    assert.equal(openingOf(ours('/datasets/4?q='), '/datasets/4?q=', '/datasets/5?q=').entry, null);
 });
 
 test('the login page is told where to come back to, except to itself or the home page', () => {
@@ -258,6 +290,82 @@ test('+, &, #, = and text outside ASCII in a value come back as they were', asyn
     assert.equal(params(link).get('q'), part);
     assert.equal(params(link).get('sample'), '7');
     assert.deepEqual(readLink(params(link)), { q: part, sample: '7' });
+});
+
+test('the stages of a public view, as it was opened, link to the view; changed, or of a private view, to the filters', async () => {
+    const stages = asStages([{ field: 'idx', operator: '<', value: 3 }]);
+    const view = { id: 7, slug: 'first-three', name: 'first three', userId: 1, fromPrimary: false, isPublic: true, stages, updatedAt: null };
+    const parts = ['idx < 3'];
+    const sort = { by: 'idx', order: 'desc' };
+    const linked = await datasetLink({ origin: ORIGIN, datasetId: 5, stages, source: view, parts, sort });
+    assert.deepEqual(readLink(params(linked)), { view: 'first-three', sort: 'idx', dir: 'desc' });
+    // The default view's mark on a stage doesn't count as a change.
+    const marked = stages.map((stage) => ({ ...stage, metadata: { defaultViewId: 7 } }));
+    assert.deepEqual(readLink(params(await datasetLink({ origin: ORIGIN, datasetId: 5, stages: marked, source: view, parts }))), { view: 'first-three' });
+    for (const [what, source, applied] of [
+        ['private', { ...view, isPublic: false }, stages],
+        ['kept before views said whether they are public', { ...view, isPublic: undefined }, stages],
+        ['changed', view, [...stages, ...asStages([{ field: 'split', operator: '=', value: 'val' }])]],
+    ]) {
+        const link = await datasetLink({ origin: ORIGIN, datasetId: 5, stages: applied, source, parts: applied.length === 1 ? parts : [...parts, 'split = "val"'] });
+        assert.equal(params(link).get('view'), null, what);
+        assert.ok(params(link).get('q'), what);
+    }
+    // A view's link still holds no selection the server forgets.
+    await assert.rejects(
+        datasetLink({ origin: ORIGIN, datasetId: 5, stages, source: view, expired: [{ expired: true, description: 'Grid (60000 Selected)', count: 60000 }], parts }),
+        (error) => error instanceof LinkError,
+    );
+});
+
+test('a new sort goes in an address in place of the one it names, its filters as they are', () => {
+    assert.equal(withSort('/datasets/5?q=idx+%3E%3D+6&sort=idx&dir=desc', { by: 'score', order: 'asc' }), '/datasets/5?q=idx+%3E%3D+6&sort=score&dir=asc');
+    assert.equal(withSort('/datasets/5?q=idx+%3E%3D+6&sort=idx&dir=desc', {}), '/datasets/5?q=idx+%3E%3D+6');
+    assert.equal(withSort('/datasets/5?q=', { by: 'idx', order: 'desc' }), '/datasets/5?q=&sort=idx&dir=desc');
+    // An address that names no filters (a state no link holds) keeps naming none.
+    assert.equal(withSort('/datasets/5?sort=idx&dir=asc', { by: undefined, order: 'asc' }), '/datasets/5');
+    assert.equal(withSort('/datasets/5', { by: 'idx', order: 'asc' }), '/datasets/5?sort=idx&dir=asc');
+});
+
+test('the page\'s address is its link without the origin; a state no link holds names no filters, only the sort', async () => {
+    const sort = { by: 'idx', order: 'desc' };
+    const plain = asStages([{ field: 'idx', operator: '>=', value: 6 }]);
+    assert.equal(await datasetAddress({ origin: ORIGIN, datasetId: 5, stages: plain, parts: ['idx >= 6'], sort }), '/datasets/5?q=idx+%3E%3D+6&sort=idx&dir=desc');
+    assert.equal(await datasetAddress({ origin: ORIGIN, datasetId: 5, stages: [], parts: null }), '/datasets/5?q=');
+    const token = {
+        type: 'selection', description: 'Grid (60000 Selected)',
+        filter: { logic: 'AND', filters: [{ field: 'id', operator: 'in_selection', value: 'tok' }] },
+    };
+    const expired = [{ expired: true, description: 'Grid (60000 Selected)', count: 60000 }];
+    const long = asStages([{}]);
+    for (const [what, link] of [
+        ['a temporary selection', { stages: [...plain, token], parts: null }],
+        ['an expired selection', { stages: plain, expired, parts: ['idx >= 6'] }],
+        ['a link over the cap', { stages: long, parts: [`note = "${'x'.repeat(MAX_LINK_LENGTH)}"`] }],
+    ]) {
+        assert.equal(await datasetAddress({ origin: ORIGIN, datasetId: 5, sort, ...link }), '/datasets/5?sort=idx&dir=desc', what);
+        assert.equal(await datasetAddress({ origin: ORIGIN, datasetId: 5, ...link }), '/datasets/5', what);
+    }
+});
+
+test('the sample whose view is open goes last in the address, as the view\'s Copy link writes it, also with no filters', async () => {
+    const sort = { by: 'idx', order: 'desc' };
+    const plain = asStages([{ field: 'idx', operator: '>=', value: 6 }]);
+    const state = { origin: ORIGIN, datasetId: 5, stages: plain, parts: ['idx >= 6'], sort };
+    const address = withSample(await datasetAddress(state), 7);
+    assert.equal(address, '/datasets/5?q=idx+%3E%3D+6&sort=idx&dir=desc&sample=7');
+    assert.equal(address, (await datasetLink({ ...state, sample: 7 })).slice(ORIGIN.length));
+    assert.equal(withSample('/datasets/5?q=', 7), '/datasets/5?q=&sample=7');
+    assert.equal(withSample('/datasets/5?q=a+%2B+b', 7), '/datasets/5?q=a+%2B+b&sample=7');
+    // A state no link holds names no filters; the sample stays, like the sort.
+    const expired = [{ expired: true, description: 'Grid (60000 Selected)', count: 60000 }];
+    assert.equal(withSample(await datasetAddress({ ...state, expired }), 7), '/datasets/5?sort=idx&dir=desc&sample=7');
+    assert.equal(withSample('/datasets/5', 7), '/datasets/5?sample=7');
+    // No sample: the address as it is.
+    assert.equal(withSample('/datasets/5?q=a%20b', null), '/datasets/5?q=a%20b');
+    // A reload with the view open reopens its entry.
+    const ours = { _fridge: true, entryId: 'e1', address, sample: { id: 7, panelId: 'center' }, samplePushed: true };
+    assert.equal(openingOf(ours, address, address).entry.entryId, 'e1');
 });
 
 test('a view link names the view by its slug', () => {

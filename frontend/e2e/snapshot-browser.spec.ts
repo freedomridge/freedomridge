@@ -1,4 +1,4 @@
-import { test, expect } from '@playwright/test';
+import { test, expect, type Page } from '@playwright/test';
 
 const savedSample = {
     id: 7,
@@ -26,6 +26,8 @@ const snapshot = {
     },
 };
 
+const PIXEL = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a+XcAAAAASUVORK5CYII=', 'base64');
+
 test.beforeEach(async ({ page }) => {
     await page.route('**/api/**', async route => {
         const url = new URL(route.request().url());
@@ -42,7 +44,7 @@ test.beforeEach(async ({ page }) => {
         } else if (url.pathname === '/api/samples/7/media' && url.searchParams.get('version_id') === '41') {
             await route.fulfill({
                 contentType: 'image/png',
-                body: Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a+XcAAAAASUVORK5CYII=', 'base64'),
+                body: PIXEL,
             });
         } else {
             await route.fulfill({ status: 404, json: { detail: 'No live data in this test' } });
@@ -98,4 +100,158 @@ test('hash-only snapshots explain why historical browsing is unavailable', async
     await page.goto('/datasets/1/versions/41');
     await expect(page.getByRole('alert').filter({ hasText: 'Hash-only versions cannot be browsed' })).toBeVisible();
     await expect(page.getByRole('textbox', { name: 'Search snapshot' })).toHaveCount(0);
+});
+
+// --- The address is a link to what the page shows: search, view, page and sample ---
+
+const param = (page: Page, name: string) => new URL(page.url()).searchParams.get(name);
+
+// A version of 130 samples, ids 1 to 130 in pages of 60, whatever the search or view; each has a 1 × 1 image.
+async function manySamples(page: Page): Promise<string[]> {
+    const requests: string[] = [];
+    await page.route('**/api/datasets/1/versions/41/samples?**', async route => {
+        const url = new URL(route.request().url());
+        requests.push(url.search);
+        const offset = Number(url.searchParams.get('offset'));
+        const ids = Array.from({ length: Math.min(60, 130 - offset) }, (_, index) => offset + index + 1);
+        await route.fulfill({ json: { items: ids.map(id => ({ ...savedSample, id, metadata: {} })), total: 130 } });
+    });
+    await page.route('**/api/samples/*/media?**', route => route.fulfill({ contentType: 'image/png', body: PIXEL }));
+    return requests;
+}
+
+test('the address holds the search, the saved view, the page and the open sample, and a reload keeps them', async ({ page }) => {
+    const requests = await manySamples(page);
+    await page.goto('/datasets/1/versions/41');
+    const search = page.getByRole('textbox', { name: 'Search snapshot' });
+    await search.fill('train');
+    await search.press('Enter');
+    await expect.poll(() => param(page, 'search')).toBe('train');
+    await search.fill('accepted');
+    await search.press('Enter');
+    await expect.poll(() => param(page, 'search')).toBe('accepted');
+
+    // Back steps through the searches, and the box shows the one the address names.
+    await page.goBack();
+    await expect(search).toHaveValue('train');
+    expect(param(page, 'search')).toBe('train');
+
+    await page.getByLabel('Saved view of this version').selectOption('rejected');
+    await page.getByRole('button', { name: 'Next page' }).click();
+    await expect(page.getByText('Page 2')).toBeVisible();
+    await page.getByRole('button', { name: 'Open saved sample 61' }).click();
+    await expect(page.getByRole('dialog')).toBeVisible();
+    expect(new URL(page.url()).search).toBe('?search=train&view=rejected&page=2&sample=61');
+
+    await page.reload();
+    await expect(page.getByRole('dialog')).toBeVisible();
+    const last = new URLSearchParams(requests[requests.length - 1]);
+    expect([last.get('q'), last.get('view'), last.get('offset')]).toEqual(['train', 'rejected', '60']);
+
+    // With the sample closed, the page behind it shows the same search, view and page.
+    await page.keyboard.press('Escape');
+    await expect(search).toHaveValue('train');
+    await expect(page.getByLabel('Saved view of this version')).toHaveValue('rejected');
+    await expect(page.getByText('Page 2')).toBeVisible();
+
+    // A new search starts on the first page with no sample open.
+    await search.fill('val');
+    await search.press('Enter');
+    await expect.poll(() => new URL(page.url()).search).toBe('?search=val&view=rejected');
+});
+
+test('Back closes the open sample, closing it goes back, and Previous and Next stay on its history entry', async ({ page }) => {
+    await manySamples(page);
+    await page.goto('/datasets/1/versions/41');
+    const dialog = page.getByRole('dialog');
+    const search = page.getByRole('textbox', { name: 'Search snapshot' });
+    await search.fill('typed, not searched');
+    await page.getByRole('button', { name: 'Open saved sample 1', exact: true }).click();
+    await expect(dialog).toBeVisible();
+    const entries = await page.evaluate(() => window.history.length);
+
+    // The entry behind the sample has the same search, so the text typed there stays.
+    await page.goBack();
+    await expect(dialog).toHaveCount(0);
+    expect(param(page, 'sample')).toBeNull();
+    await expect(search).toHaveValue('typed, not searched');
+    await page.goForward();
+    await expect(dialog).toBeVisible();
+
+    // Next twice: the address follows, with no new entry.
+    await page.keyboard.press('ArrowRight');
+    await expect(dialog.getByText('Sample 2', { exact: true })).toBeVisible();
+    await page.keyboard.press('ArrowRight');
+    await expect(dialog.getByText('Sample 3', { exact: true })).toBeVisible();
+    await expect.poll(() => param(page, 'sample')).toBe('3');
+    expect(await page.evaluate(() => window.history.length)).toBe(entries);
+
+    // Closing right after a step: the history is as before the open, with the sample closed one Forward away.
+    await page.keyboard.press('ArrowRight');
+    await page.keyboard.press('Escape');
+    await expect(dialog).toHaveCount(0);
+    expect(param(page, 'sample')).toBeNull();
+    expect(await page.evaluate(() => window.history.length)).toBe(entries);
+    await page.goForward();
+    await expect(dialog).toBeVisible();
+    expect(param(page, 'sample')).toBe('4');
+});
+
+test('holding Next writes the address when the steps pause, not at each step', async ({ page }) => {
+    await manySamples(page);
+    await page.goto('/datasets/1/versions/41');
+    await page.getByRole('button', { name: 'Open saved sample 1', exact: true }).click();
+    await expect(page.getByRole('dialog')).toBeVisible();
+    // The page's own history writes from here on. Next follows each with one of its own, whose state carries its
+    // mark (__NA); those aren't counted.
+    await page.evaluate(() => {
+        const writes: string[] = [];
+        Object.assign(window, { addressWrites: writes });
+        for (const name of ['pushState', 'replaceState'] as const) {
+            const patched = window.history[name].bind(window.history);
+            window.history[name] = (state: { __NA?: boolean } | null, unused: string, url?: string | URL | null) => {
+                if (!state?.__NA) writes.push(name);
+                patched(state, unused, url);
+            };
+        }
+    });
+    const addressWrites = () => page.evaluate(() => (window as unknown as { addressWrites: string[] }).addressWrites);
+
+    for (let press = 0; press < 10; press += 1) await page.keyboard.press('ArrowRight');
+    await expect.poll(async () => (await addressWrites()).length).toBeGreaterThan(0);
+    await expect.poll(() => param(page, 'sample')).not.toBe('1');
+    // One write for the ten steps. A stall between two presses longer than the pause would add one.
+    const writes = await addressWrites();
+    expect(writes.length).toBeLessThanOrEqual(2);
+    expect(new Set(writes)).toEqual(new Set(['replaceState']));
+});
+
+test('a Compare link opened on a sample closes without leaving the page, and a search keeps its parameters', async ({ page }) => {
+    const requests: string[] = [];
+    page.on('request', request => {
+        if (request.url().includes('/versions/41/samples')) requests.push(new URL(request.url()).search);
+    });
+    await page.goto('/datasets/1/versions/41?change_type=removed&diff_base=40&diff_target=41&sample=7');
+    await expect(page.getByRole('dialog')).toBeVisible();
+    const entries = await page.evaluate(() => window.history.length);
+
+    await page.keyboard.press('Escape');
+    await expect(page.getByRole('dialog')).toHaveCount(0);
+    expect(new URL(page.url()).search).toBe('?change_type=removed&diff_base=40&diff_target=41');
+    expect(await page.evaluate(() => window.history.length)).toBe(entries);
+    await expect(page.getByText('Showing removed samples as they were in this saved version.')).toBeVisible();
+
+    const search = page.getByRole('textbox', { name: 'Search snapshot' });
+    await search.fill('train');
+    await search.press('Enter');
+    await expect.poll(() => new URL(page.url()).search).toBe('?change_type=removed&diff_base=40&diff_target=41&search=train');
+    await expect.poll(() => requests[requests.length - 1]).toContain('q=train');
+    const last = new URLSearchParams(requests[requests.length - 1]);
+    expect([last.get('change_type'), last.get('diff_base'), last.get('diff_target')]).toEqual(['removed', '40', '41']);
+});
+
+test('a sample that is not on its page says so', async ({ page }) => {
+    await page.goto('/datasets/1/versions/41?sample=99');
+    await expect(page.getByRole('alert').filter({ hasText: 'Sample 99 is not on this page of the snapshot, so it is not open.' })).toBeVisible();
+    await expect(page.getByRole('dialog')).toHaveCount(0);
 });

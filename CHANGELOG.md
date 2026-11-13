@@ -4,6 +4,52 @@ Freedom Ridge has one version for the server, the web app and the Python SDK (th
 file), following [Semantic Versioning](https://semver.org). A release lists **upgrade notes** when
 it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
 
+## 2.12.0 (2026-11-13)
+
+2.12.0 puts a dataset page's state in its address. The address follows the applied filters, the grid's sort and the
+open sample, so copying it, bookmarking it or refreshing the page lands on the same view, and Back and Forward step
+through applied filter changes and opening and closing a sample. A version's snapshot page keeps its search, saved
+view, page and open sample the same way. Copy link stays, and still says why when a state can't be linked; while the
+screen holds one (a big Select All), the address names no filters. No migrations: the standard upgrade steps.
+
+### Added
+
+- **The address of a dataset's page follows its filters and the grid's sort** (#391). Each applied filter change
+  puts the page's own link to the filters in the address (`?q=` text when every chip can be written so, else `?f=`,
+  `?view=<slug>` while a public view is applied as it was saved), and a sort change rewrites it without a new
+  history entry. A bookmark, a reload or the address pasted elsewhere opens the same filters and sort, and Back and
+  Forward step through the filters with their addresses. A reload reopens the entry it is on, drafts included, and
+  no longer applies the default view over a page that had none. Filters no link can hold (a big Select All, an
+  expired selection's chip, over 6,000 characters) leave the filters out of the address, which keeps only the
+  sort and the sample open: it never names filters that aren't on screen. The filter text is in the address, so
+  it is kept in browser history and in server and proxy logs.
+- **The address also holds the sample whose view is open** (`sample=<id>`, #391). Opening one is a history entry,
+  next and previous change it without new ones, Back closes the view and Forward opens it again, and a reload or the
+  address pasted elsewhere opens the same sample. A `sample=` link keeps it in the address while its view is open.
+
+- **The address of a version's snapshot page holds what it shows.** The search, the saved view (by the name the
+  version recorded), the page and the open sample are in the address (`search=`, `view=`, `page=`, `sample=`), so a
+  bookmark, a reload or the address pasted elsewhere opens the same samples; a version doesn't change, so the link
+  shows the same for as long as the version exists. Back and Forward step through searches, views, pages and
+  opening a sample. Closing a sample goes back to the entry before it was opened, and Previous and Next stay on one
+  history entry. A Compare link keeps its parameters through all of it. An address naming a sample that isn't on
+  its page says so. The search text is in the address, so it is kept in browser history and in server and proxy
+  logs.
+
+### Changed
+
+- **A link replaces the filters in the entry it opens.** The filters the browser kept for the dataset are no longer
+  one Back away after a link opens: the address there says the link's filters, and Back leaves the dataset. A link
+  that can't be opened (a view that's gone, a field that no longer exists) still says why, and the address then
+  shows what the dataset opened on. Copy link writes `?view=<slug>` for a public view applied as it was saved.
+
+### Fixed
+
+- **Copy link no longer leaves an unhandled error in the browser when it can't make the link** (a temporary or
+  expired selection, or a link too long). It says why, as before; when the browser had already refused the clipboard
+  write, the refusal was also reported as an unhandled promise rejection (in the console, and as an error overlay in
+  development).
+
 ## 2.11.3 (2026-11-13)
 
 2.11.3 makes zooming and panning a sample with a segmentation mask fast again: the mask is painted once and the view

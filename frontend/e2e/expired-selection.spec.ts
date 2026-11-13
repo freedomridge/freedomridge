@@ -75,6 +75,7 @@ test('a big Select All chip stays expired after a reload: it filters nothing, co
     await expect(expired(page)).toHaveCount(0);
     await expect.poll(() => saved(page)).toContain('"expired":true');  // what is saved is its chip, expired
     expect(await saved(page)).not.toContain('e2e-expired-token');
+    await historyHolds(page, 0, 1);  // and so does the entry a reload reopens
 
     const sent = recordRequests(page);
     await page.reload();
@@ -92,6 +93,7 @@ test('a big Select All chip stays expired after a reload: it filters nothing, co
     await expectTotal(page, TOTAL);
     expect(carrying(sent, 'e2e-expired-token', 'in_selection', '"expired"', description)).toEqual([]);
     await expect.poll(() => saved(page)).not.toContain('"expired":true');
+    await historyHolds(page, 0, 0);
     await page.reload();
     await expectTotal(page, TOTAL);
     await expect(page.getByTestId('no-filters')).toBeVisible();
@@ -232,6 +234,7 @@ test.describe('a dataset with a default view', () => {
         await expect(chips(page)).toHaveCount(1);
         const description = (await chips(page).first().textContent())!.trim();
         await expect.poll(() => saved(page, datasetId)).toContain('"expired":true');
+        await historyHolds(page, 0, 1);  // the entry a reload reopens holds it too
         // An administrator makes the view the dataset's default.
         await apiFetch(cookie, `/datasets/${datasetId}`, { method: 'PATCH', body: JSON.stringify({ default_view_id: viewId }) });
 
@@ -246,9 +249,10 @@ test.describe('a dataset with a default view', () => {
         await expect(chips(page)).toHaveCount(0);
         await expect(page.getByTestId('default-view-label')).toHaveCount(0);
 
-        // With no expired chip kept, the next visit opens on the default view.
+        // With no expired chip kept, the next visit opens on the default view. (A reload reopens this entry, whose
+        // address says "no filters".)
         await expect.poll(() => saved(page, datasetId)).not.toContain('"expired":true');
-        await page.reload();
+        await gotoDataset(page, datasetId);
         await expectTotal(page, 6);
         await expect(page.getByTestId('default-view-label')).toBeVisible();
         await expect(chips(page)).toHaveCount(1);

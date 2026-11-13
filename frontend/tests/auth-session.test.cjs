@@ -76,7 +76,8 @@ function harness(t) {
     const { Providers } = load('app/providers.tsx', {
         react, '@tanstack/react-query': query, '@/contexts/UserContext': { UserProvider },
         '@/contexts/ToastContext': { ToastProvider: () => null },
-        '@/lib/api': api, '@/lib/query-notify': { coalesceQueryNotifications() {} }, '@/lib/links': load('lib/links.ts', { './filter-query': load('lib/filter-query.ts') }),
+        '@/lib/api': api, '@/lib/query-notify': { coalesceQueryNotifications() {} },
+        '@/lib/links': load('lib/links.ts', { './filter-query': load('lib/filter-query.ts'), './source-view': load('lib/source-view.ts') }),
     });
     t.after(() => {
         slots.forEach(slot => slot?.cleanup?.());
