@@ -108,6 +108,16 @@ def test_every_nginx_zone_uses_client_key():
     assert config.index('geo $fridge_ip_allowlisted') < config.index('limit_req_zone')
 
 
+def test_compose_passes_the_render_limit_to_the_backend():
+    # .env.example documents FRIDGE_MEDIA_RENDERS, but production's compose didn't pass it, so setting it did nothing.
+    # Empty when unset: the backend then renders its CPU count at once (main.py's `or`).
+    compose = (ROOT / 'docker-compose.prod.yml').read_text()
+    backend = re.search(r'^  backend:\n(.*?)(?=^  \S|\Z)', compose, re.M | re.S)
+    assert backend is not None
+    assert 'FRIDGE_MEDIA_RENDERS: ${FRIDGE_MEDIA_RENDERS:-}' in backend.group(1)
+    assert '# FRIDGE_MEDIA_RENDERS=' in (ROOT / '.env.example').read_text()
+
+
 def test_compose_renderer_mounts_and_shared_environment():
     compose = (ROOT / 'docker-compose.prod.yml').read_text()
     for name in ('backend', 'nginx'):

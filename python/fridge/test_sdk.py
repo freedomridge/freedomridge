@@ -126,6 +126,26 @@ def run_tests():
 
     _()
 
+    @test("add_samples update-mode replace_tags makes the tags exactly the ones sent")
+    def _():
+        fp = 's3://test/dup_replace_tags.jpg'
+        ds.add_samples([Sample(filepath=fp, tags=['stream'])])
+        s = ds[fp]
+        s.tags = s.tags + ['user-curated']
+        s.save()
+        ds.add_samples([Sample(filepath=fp, tags=['stream', 'v2'])], on_duplicate='update', replace_tags=True)
+        s = ds[fp]
+        assert sorted(s.tags) == ['stream', 'v2'], f"tags not replaced: {s.tags}"
+        ds.delete_sample(s.id)
+
+    _()
+
+    @test("dataset count() and len() count every sample")
+    def _():
+        assert ds.count() == len(ds) == ds.all().count() > 0
+
+    _()
+
     @test("update_sample via save()")
     def _():
         s = ds['s3://test/img_2.jpg']

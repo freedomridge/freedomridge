@@ -636,7 +636,7 @@ class Client:
         _warn_stale_lassos(answer)
         return answer
 
-    def add_samples(self, dataset_id, samples, on_duplicate='error'):
+    def add_samples(self, dataset_id, samples, on_duplicate='error', replace_tags=False):
         """Add samples to a dataset.
 
         Args:
@@ -646,8 +646,11 @@ class Client:
                          'skip' (silently skip duplicates),
                          'update' (replace an existing sample's metadata, location, heading and array
                          fields; tags are merged, and embeddings and hashes replace only those of the same name)
+            replace_tags: with 'update', an existing sample's tags become the ones sent instead of being merged
         """
         payload = {"samples": samples, "on_duplicate": on_duplicate}
+        if replace_tags:
+            payload["replace_tags"] = True
         resp = self.session.post(f"{self.base_url}/datasets/{dataset_id}/samples", json=payload)
         if resp.status_code == 409 and on_duplicate == 'error':
             try:

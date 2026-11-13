@@ -21,7 +21,8 @@ def media_type(filepath):
     return 'unknown'
 
 
-async def insert_samples(connection, dataset_id, samples, on_duplicate, array_fields):
+async def insert_samples(connection, dataset_id, samples, on_duplicate, array_fields, replace_tags=False):
+    """replace_tags (update mode only): an existing sample's tags become the ones sent, instead of both."""
     previous_keys = set()
     if on_duplicate == 'update':
         previous_keys = set(
@@ -43,7 +44,8 @@ async def insert_samples(connection, dataset_id, samples, on_duplicate, array_fi
             grouped[sample.filepath] = row
         elif on_duplicate == 'update':
             row['created_at'] = previous['created_at']
-            row['tags'] = sorted(set(previous['tags'] or []) | set(row['tags'] or []))
+            if not replace_tags:
+                row['tags'] = sorted(set(previous['tags'] or []) | set(row['tags'] or []))
             row['embeddings'] = {**(previous['embeddings'] or {}), **(row['embeddings'] or {})}
             row['hashes'] = {**(previous['hashes'] or {}), **(row['hashes'] or {})}
             grouped[sample.filepath] = row
@@ -58,8 +60,9 @@ async def insert_samples(connection, dataset_id, samples, on_duplicate, array_fi
     if on_duplicate == 'update':
         assignments = [
             'media_type = EXCLUDED.media_type',
-            "tags = ARRAY(SELECT DISTINCT tag FROM unnest(COALESCE(samples.tags, '{}') || EXCLUDED.tags) tag "
-            "ORDER BY tag)",
+            "tags = ARRAY(SELECT DISTINCT tag FROM unnest("
+            + ("" if replace_tags else "COALESCE(samples.tags, '{}') || ")
+            + "EXCLUDED.tags) tag ORDER BY tag)",
             'metadata = EXCLUDED.metadata',
             'location = EXCLUDED.location',
             'heading = EXCLUDED.heading',
@@ -143,7 +146,8 @@ async def insert_samples(connection, dataset_id, samples, on_duplicate, array_fi
                 )
             },
         )
-        if on_duplicate == 'update' and name != 'tags':
+        # Merged tags only add values to the list; replaced ones may take some away, so it is counted again.
+        if on_duplicate == 'update' and (name != 'tags' or replace_tags):
             await connection.execute(
                 'DELETE FROM dataset_field_stats WHERE dataset_id = $1 AND field_name = $2',
                 dataset_id,

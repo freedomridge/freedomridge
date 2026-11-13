@@ -3460,6 +3460,45 @@ async def get_dataset_schema(id: int, filters: Optional[str] = None, lightning_m
     return deduped
 
 
+# A patch field's tile ('clip_patch_4x4_r0c1'), folded into the patch field ('clip_patch_4x4') by /coverage, as the
+# missing filter's SQL pattern folds it: ASCII digits only, matched to the end (fullmatch, so no trailing newline).
+_PATCH_TILE = re.compile(r'(.*_patch_[0-9]+x[0-9]+)_r[0-9]+c[0-9]+', re.DOTALL)
+
+
+async def _embedding_coverage(dataset_id: int) -> list[tuple[str, int]]:
+    """How many samples carry each embedding field, by name, a patch field's tiles folded into one entry (one row
+    per patch field instead of 64 noisy per-tile rows). The dataset's partition is counted once per stored name,
+    with nothing computed per row: the unique key (dataset_id, sample_id, field_name) makes that one row per sample,
+    and the (dataset_id, sample_id) key to samples means every row is a sample's. Only a patch field counts distinct
+    samples, over its own tiles' names (and a vector stored under the patch field's own name, as the fold counted it).
+    The counts are separate statements, so under live ingest a patch count can be a moment newer than the rest: fine
+    for a coverage signal. Folding every one of a million rows' names with a regex, joined to samples, took 4.9 s on
+    1 million vectors (production, 2026-11-12); this takes about 0.6 s."""
+    rows = await db.fetch(
+        'SELECT field_name, count(*) AS present FROM embeddings WHERE dataset_id = $1 GROUP BY field_name',
+        dataset_id,
+    )
+    present: dict[str, int] = {}
+    tiles: dict[str, list[str]] = {}
+    for row in rows:
+        tile = _PATCH_TILE.fullmatch(row['field_name'])
+        if tile:
+            tiles.setdefault(tile.group(1), []).append(row['field_name'])
+        else:
+            present[row['field_name']] = row['present']
+    for patch, names in tiles.items():
+        # A sample counts once however many of its tiles are stored.
+        if patch in present:  # a vector stored under the patch field's own name too: folded with its tiles
+            del present[patch]
+            names = [*names, patch]
+        present[patch] = await db.fetchval(
+            'SELECT count(DISTINCT sample_id) FROM embeddings WHERE dataset_id = $1 AND field_name = ANY($2::text[])',
+            dataset_id,
+            names,
+        )
+    return sorted(present.items())
+
+
 @router.get("/datasets/{id}/coverage", dependencies=[Depends(require_dataset_access)])
 @guest_heavy
 async def dataset_coverage(id: int):
@@ -3479,25 +3518,7 @@ async def dataset_coverage(id: int):
             "FROM samples WHERE dataset_id = $1",
             id,
         ),
-        db.fetch(
-            """
-            -- Collapse patch tiles ('..._patch_NxN_rRcC') into one virtual '..._patch_NxN' entry, so
-            -- coverage shows one row per patch field instead of 64 noisy per-tile rows. count(DISTINCT
-            -- sample_id) = samples carrying the field; it equals count(*) for one-row-per-sample
-            -- fields, so non-patch coverage is unchanged.
-            SELECT
-                CASE
-                    WHEN e.field_name ~ '_patch_[0-9]+x[0-9]+_r[0-9]+c[0-9]+$'
-                    THEN regexp_replace(e.field_name, '_r[0-9]+c[0-9]+$', '')
-                    ELSE e.field_name
-                END AS field_name,
-                count(DISTINCT e.sample_id) AS present
-            FROM embeddings e JOIN samples s ON s.dataset_id = e.dataset_id AND s.id = e.sample_id
-            WHERE s.dataset_id = $1
-            GROUP BY 1 ORDER BY 1
-        """,
-            id,
-        ),
+        _embedding_coverage(id),
         db.fetch(
             """
             SELECT h.field_name, count(*) AS present
@@ -3519,7 +3540,7 @@ async def dataset_coverage(id: int):
     return {
         "total_samples": total,
         "total_objects": objects,
-        "embeddings": [_entry(r['field_name'], r['present']) for r in emb],
+        "embeddings": [_entry(name, present) for name, present in emb],
         "hashes": [_entry(r['field_name'], r['present']) for r in hsh],
         "location": {"present": loc_present, "missing": max(0, total - loc_present)},
     }
@@ -7015,15 +7036,24 @@ async def add_samples(id: int, payload: Any = Body(...), user: dict = Depends(re
 
     # Extract on_duplicate from wrapper dict if present
     on_duplicate = 'error'  # 'error' | 'skip' | 'update'
+    replace_tags = False  # update mode: an existing sample's tags become the ones sent, instead of both
     raw_samples = payload
     if isinstance(payload, dict):
         on_duplicate = payload.get('on_duplicate', 'error')
+        replace_tags = payload.get('replace_tags', False)
         raw_samples = payload.get('samples', payload)
 
     if on_duplicate not in ('error', 'skip', 'update'):
         raise HTTPException(
             status_code=400,
             detail=f"Invalid on_duplicate: {on_duplicate}. Must be 'error', 'skip', or 'update'.",
+        )
+    if not isinstance(replace_tags, bool):
+        raise HTTPException(status_code=400, detail=f"Invalid replace_tags: {replace_tags!r}. Must be true or false.")
+    if replace_tags and on_duplicate != 'update':
+        raise HTTPException(
+            status_code=400,
+            detail="replace_tags works only with on_duplicate 'update': other modes never change an existing sample.",
         )
 
     adapter: TypeAdapter[List[SampleCreate]] = TypeAdapter(List[SampleCreate])
@@ -7078,6 +7108,7 @@ async def add_samples(id: int, payload: Any = Body(...), user: dict = Depends(re
                 samples,
                 on_duplicate,
                 batch_array_fields,
+                replace_tags,
             )
             measured = await conn.fetchval('SELECT initialized FROM dataset_stats_state WHERE dataset_id = $1', id)
 
@@ -7194,6 +7225,8 @@ async def add_samples(id: int, payload: Any = Body(...), user: dict = Depends(re
     result: Dict[str, Any] = {"message": f"Added {len(set(sample_ids))} samples", "ids": sample_ids}
     if skipped > 0:
         result["skipped"] = skipped
+    if replace_tags:
+        result["replace_tags"] = True  # the SDK checks it: a server before replace_tags ignores it and merges
     return result
 
 

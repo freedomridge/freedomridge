@@ -79,7 +79,7 @@ print(response.json())  # {"message": ..., "ids": [new sample ids], ...}
 |------|-------------------|----------|
 | `"error"` (default) | left unchanged | **409**, but new samples in the same request **are committed**; the body has `ids` for them and an `existing` filepath-to-id map |
 | `"skip"` | left unchanged | 200; `ids` lists only the new samples, `skipped` counts the rest |
-| `"update"` | metadata, location and array fields replaced; tags merged | 200 |
+| `"update"` | metadata, location and array fields replaced; tags merged, or replaced with `"replace_tags": true` | 200 |
 
 Use `"skip"` for a script you may re-run. Send smaller batches if you get HTTP 413
 (the shipped nginx allows 100 MB on this route).

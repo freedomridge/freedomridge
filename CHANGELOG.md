@@ -4,7 +4,30 @@ Freedom Ridge has one version for the server, the web app and the Python SDK (th
 file), following [Semantic Versioning](https://semver.org). A release lists **upgrade notes** when
 it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
 
-## Unreleased
+## 2.11.1 (2026-11-12)
+
+2.11.1 fixes the slowdowns 2.11.0 brought to the public demo and one older one: the object grid after Find Similar or
+a selection, datetime fields without an index, a dataset page's coverage counts, and the server pausing for the first
+map reduction after a start. The app's database connections no longer compile queries (JIT), the production compose
+file passes `FRIDGE_MEDIA_RENDERS`, and the SDK gains `dataset.count()` and `add_samples(..., replace_tags=True)`. No
+migrations: the standard upgrade steps. The first searches after the restart are slower while caches warm; run one
+search on each dataset after upgrading.
+
+### Added
+
+- **`dataset.count()` and `len(dataset)`** give the number of samples in a dataset, as `dataset.all().count()` did.
+- **`add_samples(..., on_duplicate="update", replace_tags=True)`** makes an existing sample's tags exactly the ones
+  sent, removing the others, tags added in the app included. Tags are still merged by default. The API takes it as
+  `"replace_tags": true` next to `"on_duplicate": "update"`, and refuses it with any other mode. With a server older
+  than this, the SDK raises after the write, saying the tags were merged.
+
+### Changed
+
+- **The server no longer compiles queries to machine code (JIT) before running them.** PostgreSQL compiled any query
+  it estimated to be costly, again at every run, and the app's filters often look costly while running in
+  milliseconds: in production, the object grid's count took 651 ms, 539 ms of it compiling, and 21 ms without. No
+  query measured ran faster with JIT. The app's own connections (the API and the job runner) now turn it off;
+  scripts and other clients of the database keep the server's setting.
 
 ### Fixed
 
@@ -31,6 +54,16 @@ it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
   loaded the UMAP library on the loop that answers every request, so until it had loaded (about 5 s, measured), no
   page, filter or sign-in got an answer. It now loads in the background with the fit, and the longest wait measured
   for another request during a first reduction went from 5 to 10 s down to about 0.2 s.
+
+- **A dataset page opens without waiting seconds for its coverage counts.** The counts of samples with each vector
+  field (the "N of M embedded" signal and the grid's missing-vectors warning) folded every vector row's field name
+  with a regular expression and joined each row to its sample: about 5 seconds on a million vectors, every time a
+  dataset page opened, longer on the public demo while guests' requests queued. They now count each stored field
+  once and only fold a patch field's tiles: about 0.6 s on the same dataset, with the same numbers.
+
+- **`FRIDGE_MEDIA_RENDERS` works in the production compose file.** `.env.example` documents it (how many thumbnails,
+  crops and overlays each backend process renders at once), but `docker-compose.prod.yml` didn't pass it to the
+  backend, so setting it did nothing. Unset, each process still renders as many as it has CPUs.
 
 ## 2.11.0 (2026-11-11)
 
