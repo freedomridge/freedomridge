@@ -4369,6 +4369,21 @@ def _realiased(field_mapping: Optional[Dict[str, str]], alias: str) -> Dict[str,
     return {key: f"{alias}.{column.rsplit('.', 1)[-1]}" for key, column in (field_mapping or {}).items()}
 
 
+def _id_list_bound(node: Any) -> Optional[list]:
+    """The ids of an `id in [...]` that every row matching `node` must have (a leaf of it, or of ANDs around it, as a
+    selection or a search's results), or None when no such list bounds it."""
+    if not isinstance(node, dict):
+        return None
+    if 'logic' in node or 'filters' in node:
+        if str(node.get('logic', 'AND')).upper() != 'AND':
+            return None
+        return next((ids for ids in map(_id_list_bound, node.get('filters') or []) if ids is not None), None)
+    values = node.get('value')
+    if node.get('field') == 'id' and str(node.get('operator', '=')).lower() == 'in' and isinstance(values, list):
+        return values if all(type(value) is int for value in values) else None
+    return None
+
+
 def parse_filter_node(
     node: Dict[str, Any],
     args: List[Any],
@@ -4655,10 +4670,24 @@ def _compile_filter_node(
                 array_columns=array_columns,
                 concepts=concepts,
             )
-            return (
+            link = (
                 f"EXISTS (SELECT 1 FROM samples s2 WHERE {ds_scope}s2.id = {outer_tbl}.parent_id "
                 f"AND s2.media_type != 'object' AND ({sub_sql}))"
-            ), arg_idx
+            )
+            # A sub-filter within an id list (a selection, a search's results) matches only images of that list, so
+            # the object's image must be one of those ids. Said again on the row, `parent_id = ANY(ids)` lets the
+            # planner find those objects by idx_samples_dataset_parent, and the grid's `id in ids OR ...` by two
+            # index scans. EXISTS alone is a condition on every object of the dataset, which the planner costs as
+            # one probe per object (cost 1.2M on a 37,000-object copy): past jit_inline_above_cost, so each count and
+            # page was JIT-compiled, 0.2 to 0.3 s for a 15 ms scan (measured). The rows are the same and never
+            # NULL: an unlinked object's NULL = ANY(...) is ANDed with its FALSE EXISTS. The list is a constant, so
+            # a plan that still reads every object looks it up in a hash table. has_matching_object can't say its
+            # images without a sub-query, and an array from one is searched element by element on every row.
+            ids = _id_list_bound(strict)
+            if ids is None:
+                return link, arg_idx
+            args.append(ids)
+            return f"({outer_tbl}.parent_id = ANY(${arg_idx}) AND {link})", arg_idx + 1
 
         # `field` is the only user-controlled token interpolated into SQL below
         # (as a column name or JSON key); every value is parameterized. Validate

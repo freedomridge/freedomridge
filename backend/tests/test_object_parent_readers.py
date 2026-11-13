@@ -4,6 +4,7 @@ object grids, and the object grid ranked by its images. A linked object answers 
 joins nothing, as before, and a number beyond INTEGER no longer fails the request. metadata.parent_id is what
 clients filter by and receive, as before."""
 
+import json
 import os
 
 import pytest
@@ -11,6 +12,7 @@ import pytest
 from backend import index_advisor
 from backend.routers import datasets
 from backend.tests import test_field_registry_postgres as registry_helpers
+from backend.tests.test_filtered_query_plans import record_queries
 from backend.tests.test_object_parent_column import add, ids
 
 registry_database = registry_helpers.registry_database
@@ -144,5 +146,92 @@ def test_the_index_advisor_never_offers_the_index_the_parent_trigger_reads(regis
         assert needed['idx_samples_parent_id'] == [
             "finds the objects waiting for a new image (samples.parent_id's trigger)",
         ]
+
+    registry_database(scenario)
+
+
+def listed(*sample_ids: int) -> dict:
+    """A selection, or a search's results, as the web app filters by them."""
+    return {'field': 'id', 'operator': 'in', 'value': list(sample_ids)}
+
+
+def test_the_object_grid_of_an_id_list_shows_the_listed_objects_and_the_objects_of_listed_images(registry_database):
+    """A selection or a search's results on the object grid. An unlinked object comes only when it is listed itself,
+    an image of another dataset brings none of the objects naming it, and the NOT around the coupled list keeps every
+    object it doesn't match, as before."""
+
+    async def scenario(database):
+        made = await every_kind(database)
+        found = sorted([made['on_corn'], made['junk']])
+        assert await rows(grid('object', listed(made['corn'], made['junk'], made['on_corn']))) == (found, 2)
+        assert await rows(grid('object', CORN, listed(made['corn'], made['soy']))) == ([made['on_corn']], 1)
+        other = await database.fetchval("SELECT id FROM samples WHERE dataset_id = 2")
+        assert await rows(grid('object', listed(other))) == ([], 0)
+        for kind in UNLINKED:
+            assert await rows(grid('object', listed(made[kind]))) == ([made[kind]], 1), kind
+        excluded = {
+            'logic': 'AND',
+            'filters': [
+                {'field': 'media_type', 'operator': '=', 'value': 'object'},
+                {'logic': 'NOT', 'filters': [grid('object', listed(made['corn']))['filters'][1]]},
+            ],
+        }
+        kept = [made['on_soy'], *(made[kind] for kind in UNLINKED)]
+        assert await rows(excluded) == (sorted(kept), len(kept))
+
+    registry_database(scenario)
+
+
+def _rows_read(plan: dict) -> float:
+    """The rows a plan read from the samples table: those its scans of it returned or filtered out, in every loop."""
+    nodes, read = [plan], 0.0
+    for node in nodes:
+        nodes.extend(node.get('Plans', []))
+        if node.get('Relation Name') == 'samples':
+            read += (node['Actual Rows'] + node.get('Rows Removed by Filter', 0)) * node['Actual Loops']
+    return read
+
+
+def test_the_object_grid_of_an_id_list_reads_the_listed_rows_and_their_objects_alone(registry_database, monkeypatch):
+    """The object grid after Find Similar (its results, an id list) finds its rows by index: the listed objects, and
+    the objects of listed images. 2.11.0 read every object of the dataset, and the planner costs that link as one
+    probe per object (cost 1.2M on a 37,000-object copy), so each count and page was JIT-compiled: 0.2 to 0.3 s for a
+    15 ms scan, measured."""
+
+    async def scenario(database):
+        async with registry_helpers.bulk_setup(database) as connection:
+            await connection.execute(
+                "INSERT INTO samples (dataset_id, filepath, media_type, metadata) "
+                "SELECT 1, 'img-' || n, 'image', '{}' FROM generate_series(1, 4000) n",
+            )
+            await connection.execute(
+                "INSERT INTO samples (dataset_id, filepath, media_type, metadata) "
+                "SELECT 1, 'obj-' || i.id || '-' || k, 'object', jsonb_build_object('parent_id', i.id) "
+                "FROM samples i, generate_series(1, 5) k WHERE i.dataset_id = 1 ORDER BY i.id, k",
+            )
+            await connection.execute('ANALYZE samples')
+        assert await database.fetchval("SELECT count(parent_id) FROM samples WHERE media_type = 'object'") == 20_000
+        objects = [
+            row['id']
+            for row in await database.fetch(
+                "SELECT id FROM samples WHERE parent_id IN (SELECT id FROM samples ORDER BY id LIMIT 4) ORDER BY id",
+            )
+        ]
+        images = [
+            row['id']
+            for row in await database.fetch(
+                "SELECT id FROM samples WHERE media_type = 'image' ORDER BY id DESC LIMIT 5",
+            )
+        ]
+        children = [
+            row['id'] for row in await database.fetch('SELECT id FROM samples WHERE parent_id = ANY($1::int[])', images)
+        ]
+        queries = record_queries(database, monkeypatch)
+        found, total = await rows(grid('object', listed(*objects, *images)), order_by_ids=[*objects, *images])
+        assert (sorted(found), total) == (sorted(objects + children), 45)
+        count, args = next((sql, args) for _, sql, args in queries if sql.startswith('SELECT count(*) FROM samples'))
+        plan = json.loads(await database.fetchval(f'EXPLAIN (ANALYZE, FORMAT JSON) {count}', *args))[0]['Plan']
+        assert _rows_read(plan) < 1_000  # 2.11.0: every object, 20,000
+        assert plan['Total Cost'] < 100_000  # jit_above_cost, under which nothing is JIT-compiled
 
     registry_database(scenario)
