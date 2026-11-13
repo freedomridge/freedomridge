@@ -132,7 +132,9 @@ coordinates), and commits them with the job's progress in one transaction. Each 
 up to `RANK_SECONDS` (25 minutes). When one statement of a two-block step passes 120 s, or the step passes 10 minutes,
 it is rolled back and the rest of that sync job writes one block at a time. A single block that still takes longer, or
 a step of vectors or a ranking that does, is reported as that mirror's error (`Block 3 of this dataset took longer
-than 120 s to write here`), and the mirror is tried again on a later sync; the others of the primary carry on.
+than 120 s to write here`), and the mirror is tried again on a later sync; the others of the primary carry on. A step
+that spent most of its time reading from the primary says that instead (`could not be written here in the 1 s left
+after 1,690 s preparing it`): a slow connection to the primary, not the follower's disk.
 
 While a step writes a mirror, some changes to that dataset on the follower wait for it, for at most the step's limit
 (10 minutes, or 25 for a ranking): editing one of the samples being written (a `@local.` field, this server's tags),

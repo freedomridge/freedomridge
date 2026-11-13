@@ -1896,8 +1896,10 @@ async def write_in_step(pool, job, mirror, before: dict, result: OwnWrite, start
     client every second and ends a transaction idle for 60 s, as in a map re-fit's swap."""
     progress = result.checkpoint if result.checkpoint is not None else dict(before)
     bound = result.seconds if result.seconds is not None else BLOCK_SECONDS
-    room = POLICY.max_unit_seconds - (time.monotonic() - started) - UNIT_MARGIN
-    limit = max(1.0, min(result.limit if result.limit is not None else STEP_SECONDS, room))
+    prepared = time.monotonic() - started
+    room = POLICY.max_unit_seconds - prepared - UNIT_MARGIN
+    wanted = result.limit if result.limit is not None else STEP_SECONDS
+    limit = max(1.0, min(wanted, room))
     outran = expired = False
     connection = await pool.acquire()
 
@@ -1949,7 +1951,9 @@ async def write_in_step(pool, job, mirror, before: dict, result: OwnWrite, start
         if outran or expired:
             if not expired:
                 job_queue._terminate_connection(connection)  # a client-side timeout may leave it mid-query
-            return narrowed(before, mirror, result, limit if expired else bound)
+            # Past a deadline that the unit's time set, not the step's own limit: the time went before the write.
+            slow = prepared if expired and room < wanted else None
+            return narrowed(before, mirror, result, limit if expired else bound, prepared=slow)
         passing = (asyncpg.InterfaceError, job_queue.LeaseLost, job_queue.CancelRequested)
         if job_queue.is_transient(error) or isinstance(error, passing):
             raise
@@ -1966,27 +1970,41 @@ async def write_in_step(pool, job, mirror, before: dict, result: OwnWrite, start
     return Committed(done=result.done, total=result.total, message=result.message, result=result.result)
 
 
-def narrowed(before: dict, mirror, result: OwnWrite, bound: float) -> StepResult:
+def narrowed(before: dict, mirror, result: OwnWrite, bound: float, *, prepared: float | None = None) -> StepResult:
     """A step's write outran its bound and was rolled back (write_in_step): several blocks are taken again one at a
     time; one block, or any other write, fails the mirror with what and how long, and the others of this primary go
-    on."""
+    on. `prepared` is the time the step spent before its write when that, not the write, left it too little of the
+    unit: the message says so, instead of blaming a write given a second."""
     dataset_id = mirror['dataset_id']
     if len(result.blocks) > 1:
         checkpoint = copy.deepcopy(before)
         checkpoint['narrow'] = sorted({*checkpoint.get('narrow', []), dataset_id})
+        took = f'took longer than {bound:.0f} s'
+        if prepared is not None:
+            took = (
+                f'did not fit in the {bound:.0f} s left after {prepared:,.0f} s preparing them '
+                '(reading from the primary)'
+            )
         return StepResult(
             checkpoint=checkpoint,
-            message=f'Writing {len(result.blocks)} blocks took longer than {bound:.0f} s: one at a time now',
+            message=f'Writing {len(result.blocks)} blocks {took}: one at a time now',
         )
     if result.blocks:
         head = f'{result.what} of block' if result.what else 'Block'
         what = f'{head} {result.blocks[0]} of this dataset'
     else:
         what = result.what or 'A step'
-    reason = (
-        f'{what} took longer than {bound:.0f} s to write here, so it was not copied. '
-        'The next sync tries again; a faster database disk or more memory helps.'
-    )
+    if prepared is None:
+        reason = (
+            f'{what} took longer than {bound:.0f} s to write here, so it was not copied. '
+            'The next sync tries again; a faster database disk or more memory helps.'
+        )
+    else:
+        reason = (
+            f'{what} could not be written here in the {bound:.0f} s left after {prepared:,.0f} s preparing it '
+            '(reading from the primary), so it was not copied. The next sync tries again; a slow connection to the '
+            'primary causes this.'
+        )
 
     async def note(connection):
         await note_failure(connection, dataset_id, reason)

@@ -1,7 +1,8 @@
 'use client';
 
-import React, { useRef, useEffect, useState } from 'react';
+import React, { useRef, useEffect, useMemo, useState } from 'react';
 import type { FieldColorConfig } from '@/lib/api';
+import { maskColorKey, maskColorTable, paintMask } from '@/lib/mask-paint';
 import { getSampleMediaUrl } from '@/lib/media-utils';
 
 const HEX_COLOR_RE = /^#[0-9a-fA-F]{6}$/;
@@ -20,42 +21,6 @@ function isRgbMaskTargets(targets?: Record<string, string>): boolean {
 
 function rgbToHex(r: number, g: number, b: number): string {
     return '#' + [r, g, b].map(c => c.toString(16).padStart(2, '0')).join('');
-}
-
-/** An index mask's class colour, as a class-probability overlay draws its classes too: the field's colour for the
- * class ID, then for its name, then a built-in palette. */
-export function classColor(
-    id: number,
-    colorConfig?: FieldColorConfig,
-    maskTargets?: Record<string, string>,
-): [number, number, number] {
-    const idStr = String(id);
-    const label = maskTargets?.[idStr] || idStr;
-
-    // 1. Check ID-based colors first (stable when labels change)
-    let hex = colorConfig?.idColors?.[idStr];
-
-    // 2. Fallback to label-based colors (legacy)
-    if (!hex) {
-        hex = colorConfig?.valueColors?.[label];
-    }
-
-    // 3. Fallback to ID-based default color palette
-    if (!hex) {
-        const palette = [
-            '#e6194B', '#3cb44b', '#ffe119', '#4363d8', '#f58231',
-            '#911eb4', '#42d4f4', '#f032e6', '#bfef45', '#fabed4',
-            '#469990', '#dcbeff', '#9A6324', '#fffac8', '#800000',
-            '#aaffc3', '#808000', '#ffd8b1', '#000075', '#a9a9a9'
-        ];
-        hex = palette[id % palette.length] || '#888888';
-    }
-
-    // Hex to RGB
-    const r = parseInt(hex.slice(1, 3), 16);
-    const g = parseInt(hex.slice(3, 5), 16);
-    const b = parseInt(hex.slice(5, 7), 16);
-    return [r, g, b];
 }
 
 interface Props {
@@ -123,107 +88,64 @@ export function MaskRenderer({
         return () => { cancelled = true; };
     }, [sampleId, fieldName, versionId]);
 
-    // Draw the mask on canvas
+    // The mask's pixels, decoded once per mask: the paint below and hover lookups both read them.
+    const maskDataRef = useRef<Uint8ClampedArray | null>(null);
+    const [maskData, setMaskData] = useState<ImageData | null>(null);
+    useEffect(() => {
+        if (!maskImage) {
+            maskDataRef.current = null;
+            // eslint-disable-next-line react-hooks/set-state-in-effect -- derived from the loaded bitmap
+            setMaskData(null);
+            return;
+        }
+        const offCanvas = document.createElement('canvas');
+        offCanvas.width = maskImage.width;
+        offCanvas.height = maskImage.height;
+        const ctx = offCanvas.getContext('2d', { willReadFrequently: true });
+        if (!ctx) return;
+        ctx.drawImage(maskImage, 0, 0);
+        const imageData = ctx.getImageData(0, 0, maskImage.width, maskImage.height);
+        maskDataRef.current = imageData.data;
+        setMaskData(imageData);
+    }, [maskImage]);
+
+    // Colours by value, not by object: the settings objects are made again on every render of the sample view (each
+    // pan and zoom step), and repainting on each of them made moving around a masked image crawl.
+    const rgbMode = isRgbMaskTargets(maskTargets);
+    const colorKey = maskColorKey(colorConfig, maskTargets);
+    const hiddenKey = hiddenIds ? [...hiddenIds].sort((a, b) => a - b).join(',') : '';
+    const table = useMemo(
+        () => (rgbMode ? null : maskColorTable(colorKey, hiddenKey ? hiddenKey.split(',').map(Number) : [], opacity)),
+        [rgbMode, colorKey, hiddenKey, opacity],
+    );
+
+    // Paint the mask once per mask and colour setting: at the mask's own resolution offscreen, then stretched onto the
+    // image (one drawImage, nearest-neighbour), so a mask of another size or shape covers its image as before. The
+    // canvas is the image's natural size, which zooming and panning don't change: the view scales it, never repaints.
     useEffect(() => {
         const canvas = canvasRef.current;
         if (!canvas) return;
-
-        const ctx = canvas.getContext('2d', { willReadFrequently: true });
+        const ctx = canvas.getContext('2d');
         if (!ctx) return;
-        if (!maskImage || imageSize.width === 0 || imageSize.height === 0) {
+        if (!maskData || imageSize.width === 0 || imageSize.height === 0) {
             // Nothing to paint (e.g. between samples while the new mask loads) —
             // wipe any prior overlay so it doesn't linger over the new image.
             ctx.clearRect(0, 0, canvas.width, canvas.height);
             return;
         }
-
-        // Match canvas size to display image size
+        const off = document.createElement('canvas');
+        off.width = maskData.width;
+        off.height = maskData.height;
+        const offCtx = off.getContext('2d');
+        if (!offCtx) return;
+        const overlay = offCtx.createImageData(maskData.width, maskData.height);
+        paintMask(maskData.data, overlay.data, table, opacity);
+        offCtx.putImageData(overlay, 0, 0);
         canvas.width = imageSize.width;
         canvas.height = imageSize.height;
-
-        // Draw offscreen first to access pixel data
-        const offCanvas = document.createElement('canvas');
-        offCanvas.width = maskImage.width;
-        offCanvas.height = maskImage.height;
-        const offCtx = offCanvas.getContext('2d');
-        if (!offCtx) return;
-
-        offCtx.drawImage(maskImage, 0, 0);
-        const imageData = offCtx.getImageData(0, 0, maskImage.width, maskImage.height);
-        const data = imageData.data;
-
-        // Create new image data for the overlay
-        const overlayData = ctx.createImageData(canvas.width, canvas.height);
-        const output = overlayData.data;
-
-        const getColor = (id: number) => classColor(id, colorConfig, maskTargets);
-
-        // Process pixels
-        // We need to scale from mask coordinates to canvas coordinates
-        const scaleX = canvas.width / maskImage.width;
-        const scaleY = canvas.height / maskImage.height;
-
-        // Nearest-neighbor scaling for sharp edges
         ctx.imageSmoothingEnabled = false;
-
-        const rgbMode = isRgbMaskTargets(maskTargets);
-
-        // We'll iterate over the OUTPUT pixels to avoid holes
-        for (let y = 0; y < canvas.height; y++) {
-            for (let x = 0; x < canvas.width; x++) {
-                // Map back to mask coordinate
-                const maskX = Math.floor(x / scaleX);
-                const maskY = Math.floor(y / scaleY);
-
-                const maskIdx = (maskY * maskImage.width + maskX) * 4;
-                const alpha = data[maskIdx + 3];
-
-                let r: number, g: number, b: number;
-                if (rgbMode) {
-                    // Paint the pixel's own RGB. Background is transparent or pure black.
-                    r = data[maskIdx];
-                    g = data[maskIdx + 1];
-                    b = data[maskIdx + 2];
-                    if (alpha === 0 || (r === 0 && g === 0 && b === 0)) continue;
-                } else {
-                    // Red channel is the category ID for index masks.
-                    const id = data[maskIdx];
-                    if (alpha === 0 || id === 0) continue;
-                    if (hiddenIds?.has(id)) continue;
-                    [r, g, b] = getColor(id);
-                }
-
-                const outIdx = (y * canvas.width + x) * 4;
-                output[outIdx] = r;
-                output[outIdx + 1] = g;
-                output[outIdx + 2] = b;
-                output[outIdx + 3] = opacity * 255;
-            }
-        }
-
-        ctx.putImageData(overlayData, 0, 0);
-
-    }, [maskImage, imageSize, maskTargets, colorConfig, opacity, hiddenIds]);
-
-
-
-    // Cache the mask pixel data for efficient hover lookups
-    const maskDataRef = useRef<Uint8ClampedArray | null>(null);
-    useEffect(() => {
-        if (!maskImage) {
-            maskDataRef.current = null;
-            return;
-        }
-        const offCanvas = document.createElement('canvas');
-        offCanvas.width = maskImage.width;
-        offCanvas.height = maskImage.height;
-        const ctx = offCanvas.getContext('2d');
-        if (ctx) {
-            ctx.drawImage(maskImage, 0, 0);
-            const imageData = ctx.getImageData(0, 0, maskImage.width, maskImage.height);
-            maskDataRef.current = imageData.data;
-        }
-    }, [maskImage]);
+        ctx.drawImage(off, 0, 0, imageSize.width, imageSize.height);
+    }, [maskData, table, opacity, imageSize.width, imageSize.height]);
 
     // Handle Hover
     const handleMouseMove = (e: React.MouseEvent<HTMLCanvasElement>) => {
@@ -233,16 +155,18 @@ export function MaskRenderer({
         const x = e.clientX - rect.left;
         const y = e.clientY - rect.top;
 
-        // The canvas renders with object-fit: contain, so the mask bitmap occupies
-        // a letterboxed sub-rect of the element — not the full box. Map the cursor
-        // through that contained rect (uniform scale + centered offsets), or hover
-        // reads the wrong pixel / is offset from the image.
-        const scale = Math.min(rect.width / maskImage.width, rect.height / maskImage.height);
-        const offsetX = (rect.width - maskImage.width * scale) / 2;
-        const offsetY = (rect.height - maskImage.height * scale) / 2;
+        // The canvas is the image's size, shown with object-fit: contain, so the image occupies a letterboxed
+        // sub-rect of the element. Map the cursor through the image's contained rect, then to the mask per axis (the
+        // mask is stretched onto the image, so its shape may differ): fitting by the mask's shape read the wrong
+        // pixel whenever the two differed.
+        const imgW = imageSize.width || maskImage.width;
+        const imgH = imageSize.height || maskImage.height;
+        const scale = Math.min(rect.width / imgW, rect.height / imgH);
+        const offsetX = (rect.width - imgW * scale) / 2;
+        const offsetY = (rect.height - imgH * scale) / 2;
 
-        const maskX = Math.floor((x - offsetX) / scale);
-        const maskY = Math.floor((y - offsetY) / scale);
+        const maskX = Math.floor(((x - offsetX) / (imgW * scale)) * maskImage.width);
+        const maskY = Math.floor(((y - offsetY) / (imgH * scale)) * maskImage.height);
 
         // Check bounds
         if (maskX < 0 || maskX >= maskImage.width || maskY < 0 || maskY >= maskImage.height) {
@@ -296,7 +220,8 @@ export function MaskRenderer({
             onMouseLeave={handleMouseLeave}
             style={{
                 objectFit: 'contain',
-                objectPosition: 'center'
+                objectPosition: 'center',
+                imageRendering: 'pixelated'
             }}
         />
     );
