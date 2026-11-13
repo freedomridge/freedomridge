@@ -506,6 +506,15 @@ async def register_field_model(
 _MAX_IN_PROCESS_REDUCE = 200_000
 
 
+def _fit_umap(vectors: np.ndarray, n_neighbors: int, min_dist: float) -> np.ndarray:
+    """The vectors' 2-D UMAP layout. Runs in a thread: importing umap (numba, pynndescent) takes seconds the first time
+    in a process, and on the event loop it held up every other request until it finished."""
+    import umap
+
+    reducer = umap.UMAP(n_components=2, n_neighbors=n_neighbors, min_dist=min_dist, metric='cosine', verbose=True)
+    return reducer.fit_transform(vectors)
+
+
 @asynccontextmanager
 async def coordinate_write(id, fields, model_id=None, *, projected=False, wait_for_rank=False):
     """Check permanent identity refusals before waiting, then recheck under publication's fences."""
@@ -641,19 +650,9 @@ async def reduce_embeddings(id: int, req: ReduceRequest, user: dict = Depends(re
     emb_ids = [r['id'] for r in rows]
     vectors = [_parse_vector(r['vector']) for r in rows]
 
-    import asyncio
-
-    import umap
-
-    reducer = umap.UMAP(
-        n_components=2,
-        n_neighbors=min(req.n_neighbors, len(vectors) - 1),
-        min_dist=req.min_dist,
-        metric='cosine',
-        verbose=True,
-    )
-    # Run in thread pool so it doesn't block the event loop (30+ min on large datasets)
-    coords = await asyncio.to_thread(reducer.fit_transform, np.array(vectors))
+    # In a thread, so the event loop keeps answering other requests: the fit (30+ min on large datasets) and the import
+    # before it (about 5 s the first time in a process).
+    coords = await asyncio.to_thread(_fit_umap, np.array(vectors), min(req.n_neighbors, len(vectors) - 1), req.min_dist)
 
     # Write reduced coordinates separately from the vectors.
     update_values = [(float(x), float(y), emb_id) for emb_id, (x, y) in zip(emb_ids, coords)]

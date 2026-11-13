@@ -27,6 +27,11 @@ it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
   COCO. On a dataset with small metadata a sorted page can take a few milliseconds longer (iNaturalist: 0.12 s
   instead of 0.10 s). The answers are the same. Filters on such a field still read it a few times a sample.
 
+- **The first Run UMAP reduction after the server starts no longer stops the app for about 5 seconds.** The server
+  loaded the UMAP library on the loop that answers every request, so until it had loaded (about 5 s, measured), no
+  page, filter or sign-in got an answer. It now loads in the background with the fit, and the longest wait measured
+  for another request during a first reduction went from 5 to 10 s down to about 0.2 s.
+
 ## 2.11.0 (2026-11-11)
 
 2.11.0 gives each object sample its image in a column of its own, `samples.parent_id`, so deleting an image
