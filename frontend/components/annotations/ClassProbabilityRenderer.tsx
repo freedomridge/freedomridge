@@ -2,7 +2,7 @@
 
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import type { FieldColorConfig } from '@/lib/api';
-import { classColor } from './MaskRenderer';
+import { classColor } from '@/lib/mask-paint';
 import { classMap, pixelValues, planeWidth, type ClassRule, type ProbabilityView } from '@/lib/class-rules';
 import { COLORMAPS, DEFAULT_COLORMAP } from '@/lib/colormaps';
 import { getSampleMediaUrl } from '@/lib/media-utils';

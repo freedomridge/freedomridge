@@ -4,6 +4,25 @@ Freedom Ridge has one version for the server, the web app and the Python SDK (th
 file), following [Semantic Versioning](https://semver.org). A release lists **upgrade notes** when
 it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
 
+## 2.11.3 (2026-11-13)
+
+2.11.3 makes zooming and panning a sample with a segmentation mask fast again: the mask is painted once and the view
+scales it, where every pan and zoom step repainted it. A follower's sync error names a slow connection to its primary
+when that is the cause, instead of suggesting a faster disk. No migrations: the standard upgrade steps.
+
+### Fixed
+
+- **Zooming and panning a sample with a segmentation mask shown is fast again.** The mask was painted again on every
+  pan and zoom step, pixel by pixel at the displayed size, looking each pixel's class colour up anew, so moving around
+  a large masked image crawled while heatmaps and other overlays stayed smooth. It is now painted once from a table
+  of its class colours and stretched onto the image as before, and the view scales it; it is painted again only when
+  the mask, its colours, its opacity or its hidden classes change. Hovering a mask whose shape differs from its image's
+  names the class under the cursor; it read the wrong pixel before.
+
+- **A follower's sync error names a slow connection to the primary when that is the cause.** A step that spent most
+  of its time limit reading from the primary had a second or so left to write, and its error then read "took longer
+  than 1 s to write here", suggesting a faster disk. It now says how long the reading took and what time was left.
+
 ## 2.11.2 (2026-11-12)
 
 2.11.2 fixes followers that stopped syncing for good after their primary took in a large batch: a sync step that took

@@ -2990,6 +2990,34 @@ def test_a_copy_step_past_any_of_its_bounds_is_taken_one_block_at_a_time(bound, 
     registry_database(scenario)
 
 
+def test_a_step_whose_reads_left_its_write_too_little_time_says_so(monkeypatch, registry_database):
+    """When reading a step's blocks from the primary used up the unit's time, the write gets what is left (at least a
+    second) and is cut short there: the step narrows, then fails the mirror, saying the time went to reading, not
+    that a write took longer than one second."""
+
+    async def scenario(database):
+        link_id = await spread_copy(monkeypatch, database)
+        short = dataclasses.replace(follower_sync.POLICY, max_unit_seconds=follower_sync.UNIT_MARGIN + 1)
+        monkeypatch.setattr(follower_sync, 'POLICY', short)  # 1 s for reading and writing a step
+        fetch_blocks = follower_sync.fetch_blocks
+
+        async def slow_reads(*args, **kwargs):
+            await asyncio.sleep(1.5)
+            return await fetch_blocks(*args, **kwargs)
+
+        monkeypatch.setattr(follower_sync, 'fetch_blocks', slow_reads)
+        slow_statements(monkeypatch, 1.2)  # past the 1 s the write is left
+        messages = await sync_messages(database, link_id)
+        narrowing = [message for message in messages if 'one at a time now' in message]
+        assert len(narrowing) == 1 and 'did not fit in the 1 s left after' in narrowing[0], messages
+        assert 'preparing them (reading from the primary)' in narrowing[0], messages
+        error = (await mirror_of(database))['last_error']
+        assert error.startswith('Block 0 of this dataset could not be written here in the 1 s left after'), error
+        assert 'preparing it (reading from the primary)' in error, error
+
+    registry_database(scenario)
+
+
 def test_a_ranking_past_its_bound_fails_the_mirror_by_name(monkeypatch, registry_database):
     """A map's ranking has its own bound, RANK_SECONDS, inside what the runner's unit leaves a write: past it the
     mirror fails, named, instead of the unit's limit ending the step and retrying the same ranking from the same

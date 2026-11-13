@@ -2,7 +2,7 @@
 
 import { useState } from 'react';
 import type { FieldColorConfig } from '@/lib/api';
-import { classColor } from './MaskRenderer';
+import { classColor } from '@/lib/mask-paint';
 import { ARGMAX, sameRule, type ClassRule, type ProbabilityView, type ThresholdRule } from '@/lib/class-rules';
 
 interface Props {
