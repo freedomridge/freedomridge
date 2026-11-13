@@ -4,6 +4,51 @@ Freedom Ridge has one version for the server, the web app and the Python SDK (th
 file), following [Semantic Versioning](https://semver.org). A release lists **upgrade notes** when
 it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
 
+## 2.11.2 (2026-11-12)
+
+2.11.2 fixes followers that stopped syncing for good after their primary took in a large batch: a sync step that took
+more than 5 seconds to write was cancelled and retried the same way forever, for samples and, found on the way, for
+vectors and map coordinates. A follower now writes new samples about seven times faster, writes each step in a
+transaction of its own with a deadline, and runs one sync of a primary at a time. While a slow step runs (at most 10
+minutes), creating a dataset on that follower answers 503 and field changes and deletes wait. It also brings back the
+index lookups the image grid used for a selection or a search's results before 2.11.0. No migrations: the standard
+upgrade steps. A follower stuck on this resumes at its next sync after upgrading.
+
+### Fixed
+
+- **Two syncs of one primary can no longer run at once on a follower.** A sync was queued only when none was waiting
+  or running, but two requests at the same moment (the once-a-minute schedule and a tag sent to the primary, say)
+  could each queue one, and the second could start while the first ran. Both then wrote the same copies, which can
+  fail a copy with a duplicate-sample error. Now the second waits for the first to finish; the jobs list shows it as
+  waiting for that primary's running sync. Syncs of different primaries still run side by side.
+
+- **A follower no longer stops for good when a step of its sync takes more than 5 seconds to write.** Its steps
+  wrote their rows inside the job queue's own publication, which has 5 s: two blocks of new COCO samples (8,192, with
+  their vectors) took longer on a desktop, every retry rebuilt the same step, and the copy stopped there with "Operation
+  exceeded its database time budget" until someone noticed. A ranking of a large map, or 2,000 changed vectors written
+  into a mirror's own vector indexes on a small server, would stop it the same way. Now the steps that write samples,
+  vectors and map coordinates (while copying and from the feed), and the step that ranks a map, write in a transaction
+  of their own and commit the job's progress in it: each statement may take 120 s and the whole step 10 minutes (a
+  ranking 25 minutes). Two blocks that take longer are written one at a time for the rest of that sync; one block, a
+  step of vectors or a ranking that does is shown as the mirror's error on the Primaries page, by name, and tried again
+  on a later sync. The follower's other steps (its settings and shared views, the feed's page acknowledgements, and
+  resuming into a copy kept after a primary restore) still write within the 5 s.
+
+- **A follower writes a large batch of new samples about seven times faster.** After its primary took in thousands of
+  samples at once, the follower inserted the new ones, then matched each to the primary's sample by comparing it with
+  every other new one: 45 s for a batch of 8,192 COCO samples, measured. It now asks once which samples it already
+  has, gives each statement only its own rows, and matches them in one pass: 7 s for the same batch. The rows
+  written are the same.
+
+- **The image grid, the top bar's count and the sidebar show a selection or a search's results quickly again.**
+  Since 2.11.0 the images of a list of samples (the images listed and the images of the objects listed) were found
+  by reading every image of the dataset. For a list of up to 1,000 samples they are found by index again. Measured
+  on copies, with JIT off as in 2.11.1, the count takes:
+  - COCO (5,000 images): 0.1 ms instead of 7 ms for 25 samples, 2.3 ms instead of 9 ms for 1,000;
+  - Open Images (41,620 images): 0.1 ms instead of 84 ms for 25 samples, 3.6 ms instead of 84 ms for 1,000.
+
+  A longer list is read as before. The rows are the same.
+
 ## 2.11.1 (2026-11-12)
 
 2.11.1 fixes the slowdowns 2.11.0 brought to the public demo and one older one: the object grid after Find Similar or

@@ -3,7 +3,9 @@ the primary's; the sync copies it into a mirror beside it through the real follo
 client bound to the app), then applies the primary's feed to it."""
 
 import asyncio
+import dataclasses
 import io
+import json
 import os
 import uuid
 from typing import cast
@@ -15,10 +17,11 @@ import numpy as np
 import pytest
 from fastapi import HTTPException, Request
 
-from backend import access, follower_sync, sample_ids
+from backend import access, follower_sync, job_queue, sample_ids
 from backend.crypto import decrypt_secret, encrypt_secret
 from backend.models import ViewCreate
 from backend.routers import auth, datasets, followers, primaries, schedules, versions, views
+from backend.routers import jobs as jobs_router
 from backend.tests import test_bulk_jobs
 from backend.tests import test_field_registry_postgres as registry_helpers
 
@@ -57,18 +60,48 @@ async def setup(monkeypatch, database):
     return created, link_id
 
 
+QUEUE_SYNC = follower_sync.queue_sync  # the real one: some tests replace it to keep their own syncs out
+
+
+async def sync_job(database, link_id):
+    """The link's sync job, claimed with a lease as a runner slot claims it (queued first unless one is waiting)."""
+    await QUEUE_SYNC(database.pool, link_id)
+    job = await job_queue.claim_job(database.pool, 'follower-tests', kinds=[follower_sync.KIND], lease_seconds=600)
+    assert job is not None, 'no sync job to claim'
+    return job
+
+
+async def publish(database, job, result, *, release=False):
+    """A step's result published as a runner slot publishes it (job_queue.publish_step, with its 5 s publication):
+    the job as stored after it."""
+    return await job_queue.publish_step(
+        database.pool,
+        job['id'],
+        job['lease_token'],
+        checkpoint=result.checkpoint,
+        done=result.done,
+        total=result.total,
+        message=result.message,
+        result=result.result,
+        finished=result.finished,
+        release=release and not result.finished,
+        publisher=result.publish,
+    )
+
+
+async def run_step(database, step, job):
+    """One step of a claimed sync job, measured and published as a runner slot runs it: the job after it, and the
+    step's result."""
+    result = await step(job)
+    return await publish(database, job, result), result
+
+
 async def sync(database, link_id):
-    """One sync job, step by step, as the runner runs it (with its own pool, not the routers' db): each step's
-    publish commits in its own transaction."""
+    """One sync job, step by step, as the runner runs it (with its own pool, not the routers' db)."""
     step = follower_sync.handler(database.pool)
-    checkpoint: dict = {}
+    job = await sync_job(database, link_id)
     for _ in range(200):
-        result = await step({'args': {'link_id': link_id}, 'checkpoint': checkpoint})
-        if result.publish is not None:
-            async with database.pool.acquire() as connection, connection.transaction():
-                await result.publish(connection)
-        if result.checkpoint is not None:
-            checkpoint = result.checkpoint
+        job, result = await run_step(database, step, job)
         if result.finished:
             return result
     raise AssertionError('The sync did not finish')
@@ -419,7 +452,8 @@ def test_tags_and_shared_views_made_on_a_mirror_go_to_the_primary_when_they_sync
         # Made there as the follower's own account.
         account = await database.fetchval('SELECT user_id FROM followers')
         assert await database.fetchval('SELECT modified_by_user_id FROM samples WHERE id = $1', corn) == account
-        assert await database.fetchval("SELECT count(*) FROM jobs WHERE kind = 'follower_sync'") == 1  # queued at once
+        queued = "SELECT count(*) FROM jobs WHERE kind = 'follower_sync' AND state = 'queued'"
+        assert await database.fetchval(queued) == 1  # queued at once
         await sync(database, link_id)
         assert await database.fetchval('SELECT tags FROM samples WHERE id = $1', local[corn]) == ['weedy']
 
@@ -474,6 +508,81 @@ def test_tags_and_shared_views_made_on_a_mirror_go_to_the_primary_when_they_sync
         with pytest.raises(HTTPException) as bulk:
             await datasets._bulk_response(mirror, USER, 'set', {})
         assert bulk.value.status_code == 409 and 'read-only mirror' in bulk.value.detail
+
+    registry_database(scenario)
+
+
+class RacingPool:
+    """A pool for queue_sync whose check ran before another caller's job existed: two callers racing, each saw none."""
+
+    def __init__(self, pool):
+        self.pool = pool
+
+    async def fetchval(self, *args, **kwargs):
+        return False
+
+    def __getattr__(self, name):
+        return getattr(self.pool, name)
+
+
+def test_two_sync_jobs_of_one_link_never_run_at_once_while_two_links_do(monkeypatch, registry_database):
+    """queue_sync checks, then enqueues, and the enqueue joins only a job that hasn't started: two callers racing (each
+    checked before the other's job existed) can queue a second job while the first runs. The link's exclusive resource
+    keeps the second waiting, also while the first is given back and claimed again, until the first ends; another
+    link's sync runs meanwhile. The jobs list says what the second waits for."""
+
+    async def scenario(database):
+        _, link_id = await setup(monkeypatch, database)
+        monkeypatch.setattr(jobs_router, 'db', database)
+        first = await sync_job(database, link_id)
+        await QUEUE_SYNC(RacingPool(database.pool), link_id)
+        second = await database.fetchval(
+            "SELECT id FROM jobs WHERE kind = $1 AND state = 'queued' AND started_at IS NULL",
+            follower_sync.KIND,
+        )
+        assert second is not None and second != first['id']
+        assert await claim_again(database) is None  # the first owns the link
+        waiting = "for this primary's running sync to finish (one at a time per primary)"
+        assert (await jobs_router.get_job(second, USER)).waiting_for == waiting
+
+        # Another link's sync runs meanwhile (claiming doesn't look the link up).
+        await QUEUE_SYNC(database.pool, link_id + 1)
+        other = await claim_again(database)
+        assert other is not None and other['args'] == {'link_id': link_id + 1}
+
+        # Given back, the first still owns the link: the next claim is the first again, not the second.
+        await job_queue.publish_step(database.pool, first['id'], first['lease_token'], release=True)
+        again = await claim_again(database)
+        assert again is not None and again['id'] == first['id']
+        assert await claim_again(database) is None
+
+        # Once the first has finished, the second starts.
+        await job_queue.publish_step(database.pool, again['id'], again['lease_token'], finished=True)
+        claimed = await claim_again(database)
+        assert claimed is not None and claimed['id'] == second
+        assert (await jobs_router.get_job(second, USER)).waiting_for is None
+
+    registry_database(scenario)
+
+
+def test_a_sync_queued_before_the_upgrade_counts_as_queued(monkeypatch, registry_database):
+    """A sync job queued before syncs had their exclusive resource is a different request to the dedupe
+    (DedupeConflict). queue_sync, racing past its own check, takes it as what it is, a sync already queued, instead of
+    failing its caller (a tag request already sent to the primary)."""
+
+    async def scenario(database):
+        _, link_id = await setup(monkeypatch, database)
+        old = await job_queue.enqueue_job(  # as queue_sync queued one before: no resources
+            database.pool,
+            follower_sync.KIND,
+            lane='maintenance',
+            args={'link_id': link_id},
+            dedupe_key=f'link:{link_id}',
+        )
+        await QUEUE_SYNC(RacingPool(database.pool), link_id)
+        assert await database.fetchval('SELECT array_agg(id) FROM jobs WHERE kind = $1', follower_sync.KIND) == [
+            old['id'],
+        ]
 
     registry_database(scenario)
 
@@ -1863,17 +1972,15 @@ def test_after_a_primary_restore_a_new_copy_leaves_the_held_one_as_it_is(monkeyp
 
 
 async def sync_until(database, link_id, reached):
-    """A sync job stepped until `reached(database)` holds after a step, then left there, as a runner that stopped."""
+    """A sync job stepped until `reached(database)` holds after a step, then given back to the queue as a runner that
+    stops gives it back: the next sync resumes it from its checkpoint."""
     step = follower_sync.handler(database.pool)
-    checkpoint: dict = {}
+    job = await sync_job(database, link_id)
     for _ in range(200):
-        result = await step({'args': {'link_id': link_id}, 'checkpoint': checkpoint})
-        if result.publish is not None:
-            async with database.pool.acquire() as connection, connection.transaction():
-                await result.publish(connection)
-        if result.checkpoint is not None:
-            checkpoint = result.checkpoint
+        job, result = await run_step(database, step, job)
         if await reached(database):
+            if job['state'] == 'running':
+                await job_queue.publish_step(database.pool, job['id'], job['lease_token'], release=True)
             return
         if result.finished:
             break
@@ -2251,15 +2358,12 @@ def test_a_late_sync_step_leaves_a_stopped_mirror_stopped(monkeypatch, registry_
         follower = await database.fetchval('SELECT id FROM followers')
         await followers.follow_dataset(follower, 1, followers.FollowOptions(), user=USER)
         step = follower_sync.handler(database.pool)
-        checkpoint: dict = {}
+        job = await sync_job(database, link_id)
         for _ in range(50):
-            result = await step({'args': {'link_id': link_id}, 'checkpoint': checkpoint})
+            result = await step(job)
             if result.message == 'Copy complete; following the feed':
                 break
-            if result.publish is not None:
-                async with database.pool.acquire() as connection, connection.transaction():
-                    await result.publish(connection)
-            checkpoint = result.checkpoint if result.checkpoint is not None else checkpoint
+            job = await publish(database, job, result)
         else:
             raise AssertionError('The copy did not complete')
         # The primary is removed here while that step runs; then the step publishes.
@@ -2575,15 +2679,10 @@ def test_a_long_copy_does_not_hold_up_the_other_mirrors_of_its_primary(monkeypat
 
         # The sync job, step by step: when the later mirror has its first samples, the earlier one is still copying.
         step = follower_sync.handler(database.pool)
-        checkpoint: dict = {}
+        job = await sync_job(database, link_id)
         seen = None
         for _ in range(200):
-            result = await step({'args': {'link_id': link_id}, 'checkpoint': checkpoint})
-            if result.publish is not None:
-                async with database.pool.acquire() as connection, connection.transaction():
-                    await result.publish(connection)
-            if result.checkpoint is not None:
-                checkpoint = result.checkpoint
+            job, result = await run_step(database, step, job)
             mirrors = await database.fetch('SELECT dataset_id, state FROM mirrors ORDER BY dataset_id')
             if seen is None and len(mirrors) == 2:
                 later = await database.fetchval(
@@ -2597,5 +2696,555 @@ def test_a_long_copy_does_not_hold_up_the_other_mirrors_of_its_primary(monkeypat
         assert seen == 'copying'
         assert [row['state'] for row in mirrors] == ['following', 'following']
         assert await database.fetchval('SELECT count(*) FROM mirror_samples') == 8
+
+    registry_database(scenario)
+
+
+def test_a_block_of_new_samples_is_inserted_by_hashing_not_one_pass_per_row(monkeypatch, registry_database):
+    """Copying samples new to a mirror inserts them, then joins what it inserted back to them. The planner must know
+    how many rows it was sent: from jsonb_to_recordset (100 rows, then 1 after the anti join that found the new ones)
+    it joined them in a nested loop, a pass over the new rows per row inserted: 45 s for two blocks of 4,096 COCO
+    samples, past the 5 s a step has, so the mirror never got past them."""
+    sent = 4096
+
+    async def scenario(database):
+        _, link_id = await setup(monkeypatch, database)
+        follower = await database.fetchval('SELECT id FROM followers')
+        await ingest([{'n': n} for n in range(10)], dataset_id=1, prefix='s3://first')
+        await followers.follow_dataset(follower, 1, followers.FollowOptions(), user=USER)
+        await sync(database, link_id)  # copied: from here the feed brings the new samples, as on a primary in use
+        await database.execute(
+            "INSERT INTO samples (dataset_id, filepath, media_type, metadata) "
+            "SELECT 1, 's3://many/' || n || '.jpg', 'image', jsonb_build_object('n', n) FROM generate_series(1, $1) n",
+            sent,
+        )
+        plans = []
+        write_samples = follower_sync.write_samples
+
+        class Explained:
+            """The step's connection, explaining the statement that maps inserted samples to the primary's ids."""
+
+            def __init__(self, connection):
+                self.connection = connection
+
+            def __getattr__(self, name):
+                return getattr(self.connection, name)
+
+            async def execute(self, query, *args, **kwargs):
+                if 'INSERT INTO mirror_samples' in query:
+                    plan = await self.connection.fetchval('EXPLAIN (FORMAT JSON) ' + query, *args)
+                    plans.append((json.loads(plan) if isinstance(plan, str) else plan)[0]['Plan'])
+                return await self.connection.execute(query, *args, **kwargs)
+
+        async def explained(connection, *args, **kwargs):
+            return await write_samples(Explained(connection), *args, **kwargs)
+
+        monkeypatch.setattr(follower_sync, 'write_samples', explained)
+        await sync(database, link_id)
+        assert len(await copied(database, await mirror_of(database))) == sent + 10
+        assert plans
+        for plan in plans:
+            nodes = [plan]
+            for node in nodes:
+                nodes.extend(node.get('Plans', []))
+            joins = [
+                node
+                for node in nodes
+                if any(child.get('CTE Name') == 'inserted' for child in node.get('Plans', []))
+                and node['Node Type'] != 'Insert'
+            ]
+            assert joins, plan
+            for join in joins:
+                assert join['Node Type'] != 'Nested Loop', join
+                assert join['Plan Rows'] >= sent // 10, join  # what it was sent, within an order of magnitude
+
+    registry_database(scenario)
+
+
+def slow_blocks(monkeypatch, seconds_per_block):
+    """Every block step's write takes this long per block, in the step's own transaction (its bound applies)."""
+    write_samples = follower_sync.write_samples
+
+    async def slow(connection, dataset_id, blocks, data):
+        await connection.execute('SELECT pg_sleep($1)', seconds_per_block * len(blocks))
+        return await write_samples(connection, dataset_id, blocks, data)
+
+    monkeypatch.setattr(follower_sync, 'write_samples', slow)
+
+
+async def spread_mirror(monkeypatch, database):
+    """A mirror following dataset 1, which then gets one new sample in each of blocks 1, 2 and 3 (ids 5000, 9000,
+    13000): the feed brings them as three changed blocks."""
+    _, link_id = await setup(monkeypatch, database)
+    await ingest([{'crop': 'corn'}], dataset_id=1, prefix='s3://spread/first')
+    follower = await database.fetchval('SELECT id FROM followers')
+    await followers.follow_dataset(follower, 1, followers.FollowOptions(), user=USER)
+    await sync(database, link_id)
+    await database.execute(
+        "INSERT INTO samples (id, dataset_id, filepath, media_type) "
+        "SELECT n, 1, 's3://spread/' || n || '.jpg', 'image' FROM unnest(ARRAY[5000, 9000, 13000]) n",
+    )
+    return link_id
+
+
+def slow_statements(monkeypatch, seconds_per_block):
+    """Every block step's write takes this long per block, one statement per block: each statement fits its bound, a
+    step's total may not."""
+    write_samples = follower_sync.write_samples
+
+    async def slow(connection, dataset_id, blocks, data):
+        for _ in blocks:
+            await connection.execute('SELECT pg_sleep($1)', seconds_per_block)
+        return await write_samples(connection, dataset_id, blocks, data)
+
+    monkeypatch.setattr(follower_sync, 'write_samples', slow)
+
+
+async def spread_copy(monkeypatch, database):
+    """A follower about to copy dataset 1, whose samples are in blocks 0 to 3 (a first one, then ids 5000, 9000 and
+    13000): two copy steps of two blocks."""
+    _, link_id = await setup(monkeypatch, database)
+    await ingest([{'crop': 'corn'}], dataset_id=1, prefix='s3://spread/first')
+    await database.execute(
+        "INSERT INTO samples (id, dataset_id, filepath, media_type) "
+        "SELECT n, 1, 's3://spread/' || n || '.jpg', 'image' FROM unnest(ARRAY[5000, 9000, 13000]) n",
+    )
+    follower = await database.fetchval('SELECT id FROM followers')
+    await followers.follow_dataset(follower, 1, followers.FollowOptions(), user=USER)
+    return link_id
+
+
+async def sync_with_short_writes(database, link_id, seconds) -> list:
+    """sync_messages, with the publication of each step that writes rows ('Applied …') cut to `seconds`: on code
+    that wrote them inside it, those steps never fit. Every other step keeps the publication's 5 s."""
+    step = follower_sync.handler(database.pool)
+    job = await sync_job(database, link_id)
+    messages = []
+    usual = job_queue.PUBLISH_TIMEOUT_SECONDS
+    for _ in range(200):
+        result = await step(job)
+        messages.append(result.message)
+        job_queue.PUBLISH_TIMEOUT_SECONDS = seconds if (result.message or '').startswith('Applied') else usual
+        try:
+            job = await publish(database, job, result)
+        finally:
+            job_queue.PUBLISH_TIMEOUT_SECONDS = usual
+        if result.finished:
+            return messages
+    raise AssertionError('The sync did not finish')
+
+
+async def sync_messages(database, link_id) -> list:
+    """One sync job run to its end as a runner runs it, and the message of every step."""
+    step = follower_sync.handler(database.pool)
+    job = await sync_job(database, link_id)
+    messages = []
+    for _ in range(200):
+        job, result = await run_step(database, step, job)
+        messages.append(result.message)
+        if result.finished:
+            return messages
+    raise AssertionError('The sync did not finish')
+
+
+def test_a_block_step_longer_than_the_jobs_publication_still_lands(monkeypatch, registry_database):
+    """A step that writes blocks writes them in a transaction of its own, each statement bounded by BLOCK_SECONDS, and
+    commits the job's next checkpoint in it. In the job's publication (5 s) two blocks of dense COCO samples (7 s on a
+    desktop) never fit, and every retry rebuilt the same step: the mirror stopped there for good."""
+
+    async def scenario(database):
+        link_id = await spread_mirror(monkeypatch, database)
+        slow_blocks(monkeypatch, 0.4)  # two blocks: 0.8 s, past the 0.5 s publication their step gets here
+        await sync_with_short_writes(database, link_id, 0.5)
+        here = await copied(database, await mirror_of(database))
+        assert {5000, 9000, 13000} <= set(here)
+
+    registry_database(scenario)
+
+
+def test_blocks_that_outrun_their_bound_are_taken_one_at_a_time_for_the_rest_of_the_job(
+    monkeypatch,
+    registry_database,
+):
+    """Two blocks past BLOCK_SECONDS are rolled back and taken again one at a time, and stay at one for the rest of
+    the job: on a dataset whose every pair of blocks outruns the bound, the bound is spent once, not every other
+    step."""
+
+    async def scenario(database):
+        link_id = await spread_mirror(monkeypatch, database)
+        monkeypatch.setattr(follower_sync, 'BLOCK_SECONDS', 1)
+        slow_blocks(monkeypatch, 0.6)  # every two blocks: 1.2 s, past the bound; one: 0.6 s
+        messages = await sync_messages(database, link_id)
+        assert sum('one at a time now' in message for message in messages) == 1, messages
+        assert sum(message.startswith('Applied 1 changed samples') for message in messages) == 3, messages
+        here = await copied(database, await mirror_of(database))
+        assert {5000, 9000, 13000} <= set(here)
+        assert (await mirror_of(database))['last_error'] is None
+
+    registry_database(scenario)
+
+
+def test_one_block_past_its_bound_fails_the_mirror_by_name(monkeypatch, registry_database):
+    """One block that still outruns BLOCK_SECONDS alone has nothing smaller to try: the mirror fails, with the block
+    and the bound on the Primaries page, and waits before its next try, instead of retrying the same step."""
+
+    async def scenario(database):
+        link_id = await spread_mirror(monkeypatch, database)
+        monkeypatch.setattr(follower_sync, 'BLOCK_SECONDS', 1)
+        slow_blocks(monkeypatch, 1.5)
+        messages = await sync_messages(database, link_id)
+        assert any('one at a time now' in message for message in messages), messages
+        mirror = await mirror_of(database)
+        assert mirror['last_error'].startswith('Block 1 of this dataset took longer than 1 s to write here'), mirror
+        assert mirror['retry_after'] is not None
+        assert messages[-1].startswith('1 mirror(s) failed'), messages
+
+    registry_database(scenario)
+
+
+def test_a_step_whose_fence_is_refused_is_written_again_whole(monkeypatch, registry_database):
+    """A block step's rows commit with the job's checkpoint (job_queue.checkpoint_locked). When that fence can't be
+    had, the job is deferred and nothing of the step is kept: the next attempt writes the same blocks again, from the
+    same checkpoint. The job's row held by another session (as the job's own lease renewal on a slow disk would) is a
+    lock wait, QueueContended, not counted as a failure; a statement there past its time is QueueBusy, which is."""
+
+    async def scenario(database):
+        link_id = await spread_mirror(monkeypatch, database)
+        mirror = await mirror_of(database)
+        write_samples = follower_sync.write_samples
+        fenced_job = job_queue._fenced_job
+        holder = await database.pool.acquire()
+
+        async def holding_the_job(connection, dataset_id, blocks, data):
+            await holder.execute('BEGIN')
+            await holder.execute(
+                "SELECT 1 FROM jobs WHERE kind = $1 AND state = 'running' FOR UPDATE",
+                follower_sync.KIND,
+            )
+            return await write_samples(connection, dataset_id, blocks, data)
+
+        async def too_slow(connection, *args):
+            await connection.execute("SET LOCAL statement_timeout = '100ms'")
+            await connection.execute('SELECT pg_sleep(1)')
+            return await fenced_job(connection, *args)
+
+        try:
+            for case, expected in (('lock', job_queue.QueueContended), ('timeout', job_queue.QueueBusy)):
+                if case == 'lock':
+                    monkeypatch.setattr(follower_sync, 'write_samples', holding_the_job)
+                else:
+                    monkeypatch.setattr(follower_sync, 'write_samples', write_samples)
+                    monkeypatch.setattr(job_queue, '_fenced_job', too_slow)
+                step = follower_sync.handler(database.pool)
+                job = await sync_job(database, link_id)
+                for _ in range(20):
+                    stored = json.loads(json.dumps(job['checkpoint']))  # the step changes the page in place
+                    try:
+                        job, result = await run_step(database, step, job)
+                    except job_queue.QueueBusy as error:
+                        assert type(error) is expected, (case, error)
+                        break
+                else:
+                    raise AssertionError('no block step reached the fence')
+                if case == 'lock':
+                    await holder.execute('ROLLBACK')
+                assert not {5000, 9000, 13000} & set(await copied(database, mirror))  # nothing of it kept
+                row = await database.fetchrow('SELECT checkpoint FROM jobs WHERE id = $1', job['id'])
+                assert row['checkpoint'] == stored  # the step before the block step is where it resumes
+                await job_queue.publish_step(database.pool, job['id'], job['lease_token'], release=True)
+        finally:
+            await database.pool.release(holder)
+        monkeypatch.setattr(job_queue, '_fenced_job', fenced_job)
+        await sync(database, link_id)
+        assert {5000, 9000, 13000} <= set(await copied(database, mirror))
+
+    registry_database(scenario)
+
+
+@pytest.mark.parametrize('bound', ['statement', 'step', 'unit'])
+def test_a_copy_step_past_any_of_its_bounds_is_taken_one_block_at_a_time(bound, monkeypatch, registry_database):
+    """A copy step of two blocks that outruns a bound is rolled back, and the copy goes on one block at a time: past a
+    statement's bound (BLOCK_SECONDS); past the whole write's (STEP_SECONDS), every statement inside its own; or past
+    what the runner's unit has left (POLICY's max_unit_seconds, less UNIT_MARGIN), where the unit's limit would end
+    the step instead and retry it from the same checkpoint, for good."""
+
+    async def scenario(database):
+        link_id = await spread_copy(monkeypatch, database)
+        if bound == 'statement':
+            monkeypatch.setattr(follower_sync, 'BLOCK_SECONDS', 1)
+            slow_blocks(monkeypatch, 0.6)  # one statement: two blocks 1.2 s, past it; one block 0.6 s
+        elif bound == 'step':
+            monkeypatch.setattr(follower_sync, 'STEP_SECONDS', 1)
+            slow_statements(monkeypatch, 0.6)  # 0.6 s each: two blocks 1.2 s, past the step's 1 s
+        else:
+            short = dataclasses.replace(follower_sync.POLICY, max_unit_seconds=follower_sync.UNIT_MARGIN + 1.5)
+            monkeypatch.setattr(follower_sync, 'POLICY', short)  # leaves the write 1.5 s, less the step's fetch
+            slow_statements(monkeypatch, 0.8)  # two blocks 1.6 s; one 0.8 s
+        messages = await sync_messages(database, link_id)
+        assert sum('one at a time now' in message for message in messages) == 1, messages
+        assert sum(message.startswith('Copying:') for message in messages) == 4, messages
+        mirror = await mirror_of(database)
+        assert mirror['last_error'] is None
+        assert {5000, 9000, 13000} <= set(await copied(database, mirror))
+
+    registry_database(scenario)
+
+
+def test_a_ranking_past_its_bound_fails_the_mirror_by_name(monkeypatch, registry_database):
+    """A map's ranking has its own bound, RANK_SECONDS, inside what the runner's unit leaves a write: past it the
+    mirror fails, named, instead of the unit's limit ending the step and retrying the same ranking from the same
+    checkpoint, half an hour at a time, with the primary's other mirrors waiting behind it."""
+    unit = follower_sync.POLICY.max_unit_seconds - follower_sync.UNIT_MARGIN
+    assert follower_sync.RANK_SECONDS + 60 <= unit and follower_sync.STEP_SECONDS <= unit
+
+    async def scenario(database):
+        _, link_id = await setup(monkeypatch, database)
+        await ingest([{'crop': 'corn'}, {'crop': 'soy'}], dataset_id=1, prefix='s3://images/a')
+        ids = [row['id'] for row in await database.fetch('SELECT id FROM samples WHERE dataset_id = 1 ORDER BY id')]
+        for index, sample_id in enumerate(ids):
+            await database.execute(
+                "INSERT INTO embeddings (dataset_id, sample_id, field_name, vector) VALUES (1, $1, 'clip', $2::vector)",
+                sample_id,
+                f'[{index},1]',
+            )
+            await database.execute(
+                "INSERT INTO embedding_coordinates (sample_id, field_name, x, y) VALUES ($1, 'clip', $2, $3)",
+                sample_id,
+                float(index),
+                float(-index),
+            )
+        await database.execute("SELECT recompute_viz_rank(1, 'clip', TRUE)")
+        follower = await database.fetchval('SELECT id FROM followers')
+        await followers.follow_dataset(follower, 1, followers.FollowOptions(), user=USER)
+        monkeypatch.setattr(follower_sync, 'RANK_SECONDS', 1)
+        write_in_step = follower_sync.write_in_step
+
+        async def slow_ranking(pool, job, mirror, before, result, started):
+            if result.what.startswith('Ranking'):
+                ranking = result.publish
+
+                async def slower(connection):
+                    await connection.execute('SELECT pg_sleep(2)')  # past its bound, RANK_SECONDS
+                    await ranking(connection)
+
+                result = dataclasses.replace(result, publish=slower)
+            return await write_in_step(pool, job, mirror, before, result, started)
+
+        monkeypatch.setattr(follower_sync, 'write_in_step', slow_ranking)
+        messages = await sync_messages(database, link_id)
+        mirror = await mirror_of(database)
+        assert mirror['last_error'].startswith('Ranking the map of clip took longer than 1 s to write here'), mirror
+        assert mirror['retry_after'] is not None
+        assert messages[-1].startswith('1 mirror(s) failed'), messages
+
+    registry_database(scenario)
+
+
+def test_a_steps_own_write_does_not_outlive_its_runner(monkeypatch, registry_database):
+    """A runner killed mid-step (a deploy restarting its container) leaves no session holding the step's locks: the
+    server checks for the client every second and ends a transaction left idle for 60 s, as in a map re-fit's swap."""
+
+    async def scenario(database):
+        link_id = await spread_mirror(monkeypatch, database)
+        write_samples = follower_sync.write_samples
+        seen = []
+
+        async def watched(connection, dataset_id, blocks, data):
+            row = await connection.fetchrow(
+                "SELECT current_setting('idle_in_transaction_session_timeout') AS idle, "
+                "current_setting('client_connection_check_interval') AS checking",
+            )
+            seen.append(dict(row))
+            return await write_samples(connection, dataset_id, blocks, data)
+
+        monkeypatch.setattr(follower_sync, 'write_samples', watched)
+        await sync(database, link_id)
+        assert seen and all(row == {'idle': '1min', 'checking': '1s'} for row in seen), seen
+
+    registry_database(scenario)
+
+
+def test_a_row_lock_wait_in_a_step_defers_the_job_without_counting_a_failure(monkeypatch, registry_database):
+    """A sample of the step held here meanwhile (a long bulk edit of its tags, or of a `@local.` field) makes the
+    step's write wait past its lock_timeout: as a publication's lock wait, that is QueueContended (the job deferred,
+    not counted towards its failures), and the step is written whole on a later attempt."""
+
+    async def scenario(database):
+        link_id = await spread_mirror(monkeypatch, database)
+        mirror = await mirror_of(database)
+        corn = await database.fetchval("SELECT id FROM samples WHERE dataset_id = 1 AND metadata->>'crop' = 'corn'")
+        local = (await copied(database, mirror))[corn]['id']
+        await database.execute(
+            """UPDATE samples SET metadata = metadata || '{"crop": "maize"}' WHERE id = $1""",
+            corn,
+        )
+        write_samples = follower_sync.write_samples
+
+        async def impatient(connection, dataset_id, blocks, data):
+            await connection.execute("SET LOCAL lock_timeout = '300ms'")  # 5 s in the step, waited out sooner here
+            return await write_samples(connection, dataset_id, blocks, data)
+
+        monkeypatch.setattr(follower_sync, 'write_samples', impatient)
+        holder = await database.pool.acquire()
+        try:
+            await holder.execute('BEGIN')
+            await holder.execute('SELECT 1 FROM samples WHERE id = $1 FOR UPDATE', local)
+            step = follower_sync.handler(database.pool)
+            job = await sync_job(database, link_id)
+            with pytest.raises(job_queue.QueueContended):
+                for _ in range(20):
+                    job, result = await run_step(database, step, job)
+            await holder.execute('ROLLBACK')
+        finally:
+            await database.pool.release(holder)
+        await job_queue.publish_step(database.pool, job['id'], job['lease_token'], release=True)
+        await sync(database, link_id)
+        here = await copied(database, mirror)
+        assert here[corn]['metadata']['crop'] == 'maize'
+        assert {5000, 9000, 13000} <= set(here)
+
+    registry_database(scenario)
+
+
+def test_a_client_side_timeout_narrows_like_the_servers(monkeypatch, registry_database):
+    """Should a bound ever exceed the runner pool's command_timeout, asyncpg's TimeoutError comes first, not the
+    server's cancel: it narrows the step the same way, instead of retrying the same two blocks for good."""
+
+    async def scenario(database):
+        link_id = await spread_mirror(monkeypatch, database)
+        write_samples = follower_sync.write_samples
+
+        async def timing_out(connection, dataset_id, blocks, data):
+            if len(blocks) > 1:
+                raise TimeoutError
+            return await write_samples(connection, dataset_id, blocks, data)
+
+        monkeypatch.setattr(follower_sync, 'write_samples', timing_out)
+        messages = await sync_messages(database, link_id)
+        assert sum('one at a time now' in message for message in messages) == 1, messages
+        assert {5000, 9000, 13000} <= set(await copied(database, await mirror_of(database)))
+
+    registry_database(scenario)
+
+
+async def claim_again(database):
+    """The sync job claimed by another runner, as after the first one's lease ran out."""
+    return await job_queue.claim_job(database.pool, 'follower-tests-2', kinds=[follower_sync.KIND], lease_seconds=600)
+
+
+def test_a_runner_that_dies_after_a_steps_own_commit_resumes_at_the_next_blocks(monkeypatch, registry_database):
+    """A block step commits its rows and the job's next checkpoint itself; the runner's publication after it only
+    records progress. A runner that dies between the two leaves the job running under a lease that expires: the next
+    claim resumes at the next blocks, with the rows written once, neither redone nor skipped."""
+
+    async def scenario(database):
+        link_id = await spread_mirror(monkeypatch, database)
+        step = follower_sync.handler(database.pool)
+        job = await sync_job(database, link_id)
+        written = []
+        died = False
+        for _ in range(50):
+            result = await step(job)
+            if isinstance(result, follower_sync.Committed):
+                written.append(result.message)
+                if not died:
+                    died = True  # no publication: the lease runs out, and another runner claims the job
+                    await database.execute(
+                        "UPDATE jobs SET lease_expires_at = clock_timestamp() - interval '1 second' WHERE id = $1",
+                        job['id'],
+                    )
+                    assert await claim_again(database) is None  # requeued, to wait its retry delay
+                    await database.execute('UPDATE jobs SET available_at = clock_timestamp() WHERE id = $1', job['id'])
+                    job = await claim_again(database)
+                    assert job is not None
+                    continue
+            job = await publish(database, job, result)
+            if result.finished:
+                break
+        assert written == ['Applied 2 changed samples', 'Applied 1 changed samples'], written
+        here = await database.fetch(
+            'SELECT origin_id, count(*) FROM mirror_samples WHERE dataset_id = $1 GROUP BY 1 HAVING count(*) > 1',
+            (await mirror_of(database))['dataset_id'],
+        )
+        assert here == []
+        assert {5000, 9000, 13000} <= set(await copied(database, await mirror_of(database)))
+
+    registry_database(scenario)
+
+
+def test_one_block_at_a_time_survives_the_job_being_given_back_and_claimed_again(monkeypatch, registry_database):
+    """The narrowing is in the job's checkpoint: a runner that gives the job back after it (a stop, a yield) and
+    another that claims it go on one block at a time, without outrunning the bound again."""
+
+    async def scenario(database):
+        link_id = await spread_mirror(monkeypatch, database)
+        monkeypatch.setattr(follower_sync, 'BLOCK_SECONDS', 1)
+        slow_blocks(monkeypatch, 0.6)
+        step = follower_sync.handler(database.pool)
+        job = await sync_job(database, link_id)
+        messages = []
+        for _ in range(50):
+            result = await step(job)
+            messages.append(result.message)
+            narrowed = 'one at a time now' in (result.message or '')
+            job = await publish(database, job, result, release=narrowed)
+            if narrowed:
+                job = await sync_job(database, link_id)
+                assert job['checkpoint']['narrow'] == [(await mirror_of(database))['dataset_id']]
+            if result.finished:
+                break
+        assert sum('one at a time now' in (message or '') for message in messages) == 1, messages
+        assert sum((message or '').startswith('Applied 1 changed samples') for message in messages) == 3, messages
+
+    registry_database(scenario)
+
+
+def test_vector_and_coordinate_steps_longer_than_the_jobs_publication_still_land(monkeypatch, registry_database):
+    """The feed's vector steps (2,000 samples' vectors, into a mirror's own vector indexes) and coordinate steps
+    write in a transaction of their own too: in the job's publication (5 s) a slow one stopped the mirror for good,
+    as a block step did."""
+
+    async def scenario(database):
+        _, link_id = await setup(monkeypatch, database)
+        await ingest([{'crop': 'corn'}], dataset_id=1, prefix='s3://slow/a')
+        corn = await database.fetchval('SELECT id FROM samples WHERE dataset_id = 1')
+        follower = await database.fetchval('SELECT id FROM followers')
+        await followers.follow_dataset(follower, 1, followers.FollowOptions(), user=USER)
+        await sync(database, link_id)
+        await database.execute(
+            "INSERT INTO embeddings (dataset_id, sample_id, field_name, vector) VALUES (1, $1, 'clip', '[0.5,0.25]')",
+            corn,
+        )
+        await database.execute(
+            "INSERT INTO embedding_coordinates (sample_id, field_name, x, y, dataset_id) VALUES ($1, 'clip', 3, 4, 1)",
+            corn,
+        )
+        for name in ('write_vectors', 'write_coordinates'):
+            original = getattr(follower_sync, name)
+
+            async def slow(connection, *args, original=original):
+                await connection.execute('SELECT pg_sleep(0.8)')
+                return await original(connection, *args)
+
+            monkeypatch.setattr(follower_sync, name, slow)
+        messages = await sync_with_short_writes(database, link_id, 0.5)  # each 0.8 s, past it
+        assert any(message.startswith('Applied 1 changed vectors') for message in messages), messages
+        assert any(message.startswith('Applied 1 changed map coordinates') for message in messages), messages
+        mirror = (await mirror_of(database))['dataset_id']
+        here = await copied(database, await mirror_of(database))
+        local = here[corn]['id']
+        assert (
+            await database.fetchval(
+                "SELECT count(*) FROM embeddings WHERE dataset_id = $1 AND sample_id = $2 AND field_name = 'clip'",
+                mirror,
+                local,
+            )
+            == 1
+        )
+        assert await database.fetchval(
+            "SELECT (x, y) = (3::float8, 4::float8) FROM embedding_coordinates "
+            "WHERE sample_id = $1 AND field_name = 'clip'",
+            local,
+        )
 
     registry_database(scenario)

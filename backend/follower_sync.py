@@ -7,12 +7,16 @@ restart resumes where it stopped. A mirror is written only here, in transactions
 dataset id (migration 0009); everything the primary didn't send stays the follower's own.
 """
 
+import asyncio
 import base64
 import copy
+import dataclasses
 import io
 import logging
 import re
 import struct
+import time
+from contextlib import AsyncExitStack
 from urllib.parse import urlparse
 
 import asyncpg
@@ -20,7 +24,7 @@ import httpx
 import numpy as np
 from fastapi import HTTPException
 
-from . import job_queue, patch_search
+from . import job_heartbeat, job_queue, patch_search
 from .crypto import decrypt_secret
 from .diskspace import INGEST_ROW_BYTES, require_free_space
 from .field_registry import LOCAL_PREFIX, lock_field_lifecycle
@@ -34,9 +38,19 @@ logger = logging.getLogger(__name__)
 KIND = 'follower_sync'
 # A step can re-rank a whole map, as the primary's own re-rank does (up to 1800 s there).
 POLICY = job_queue.JobPolicy(max_unit_seconds=1800, max_failures=5, retry_seconds=30, max_retry_seconds=900)
-RANK_SECONDS = 1800
+# A ranking's bound, under the unit's (POLICY's): past it the mirror fails, named, instead of the unit limit retrying
+# the same ranking from the same checkpoint.
+RANK_SECONDS = 1500
 BLOCK = followers.BLOCK
-COPY_BLOCKS = 2  # blocks per step: up to 8192 samples and their vectors
+COPY_BLOCKS = 2  # blocks per step: up to 8192 samples and their vectors; one after a step of two outran BLOCK_SECONDS
+# A step that writes blocks writes them in a transaction of its own (write_in_step), each statement bounded by this,
+# not in the job's publication, which has 5 s (job_queue.PUBLISH_TIMEOUT_SECONDS): two blocks of dense COCO samples
+# took 7 s on a desktop.
+BLOCK_SECONDS = 120
+# Such a step's whole write, so it ends here, narrowed or named, before POLICY's max_unit_seconds would end it and
+# retry the same step from the same checkpoint.
+STEP_SECONDS = 600
+UNIT_MARGIN = 120  # of the unit's wall time, kept after a step's write for its fence and COMMIT
 RESTORE_ROWS = 2000  # rows per step when a held copy is resumed into after a primary restore
 HELD_REASON = 'The primary was restored into a new database: choose on the Primaries page whether this copy resumes'
 OLDER_PRIMARY_REASON = (
@@ -124,7 +138,10 @@ async def call(client, method: str, path: str, *, params=None, body=None):
 
 async def queue_sync(pool, link_id: int) -> None:
     """Queue a sync of this link unless one is waiting or running: one job at a time writes a link's mirrors, and a
-    running one that has caught up picks later changes up on its next run."""
+    running one that has caught up picks later changes up on its next run. The check and the enqueue are separate,
+    and the enqueue joins only a job that hasn't started, so two callers can still queue two; the link's exclusive
+    resource keeps the second from starting until the first has finished (job_queue.claim_job), since every write
+    here assumes it is the only one to the link's mirrors."""
     busy = await pool.fetchval(
         """SELECT EXISTS (SELECT 1 FROM jobs WHERE kind = $1 AND state IN ('queued', 'running')
                           AND args->>'link_id' = $2)""",
@@ -132,13 +149,20 @@ async def queue_sync(pool, link_id: int) -> None:
         str(link_id),
     )
     if not busy:
-        await job_queue.enqueue_job(
-            pool,
-            KIND,
-            lane='maintenance',
-            args={'link_id': link_id},
-            dedupe_key=f'link:{link_id}',
-        )
+        try:
+            await job_queue.enqueue_job(
+                pool,
+                KIND,
+                lane='maintenance',
+                args={'link_id': link_id},
+                dedupe_key=f'link:{link_id}',
+                resources={'exclusive': f'{KIND}:{link_id}'},
+            )
+        except job_queue.DedupeConflict:
+            # A sync of this link queued meanwhile as a different request (one queued before an upgrade gave syncs
+            # their resource): a sync is queued, which is all this asks. Callers (a tag already sent to the primary)
+            # mustn't fail for it.
+            logger.info('A sync of link %s was already queued', link_id)
 
 
 async def schedule_sync(pool) -> None:
@@ -375,7 +399,7 @@ async def write_samples(connection, dataset_id: int, blocks: list, data: dict) -
                         THEN CASE WHEN (r.metadata->>'parent_id')::bigint BETWEEN 1 AND 2147483647
                                   THEN (r.metadata->>'parent_id')::int END
                    END AS origin_parent
-            FROM jsonb_to_recordset($2::jsonb) AS r({_record_type(arrays)})
+            FROM unnest($2::jsonb[]) AS e(sample), jsonb_to_record(e.sample) AS r({_record_type(arrays)})
         ),
         translated AS (
             SELECT i.*,
@@ -390,7 +414,40 @@ async def write_samples(connection, dataset_id: int, blocks: list, data: dict) -
     array_old = ''.join(f', s."{name}"' for name in arrays)
     array_new = ''.join(f', COALESCE(t."{name}", \'{{}}\')' for name in arrays)
     array_fresh = ''.join(f', COALESCE(fresh."{name}", \'{{}}\')' for name in arrays)
-    rows = samples  # the connection's jsonb codec encodes it
+    # Which samples are here already, asked once by the key: each statement then gets only its own rows (the
+    # connection's jsonb codec encodes them). With all of them, the insert found its new rows with an anti join the
+    # planner can't estimate (one row, for thousands), and joined what it inserted back to them in a nested loop:
+    # 45 s for two blocks of 4,096 COCO samples, past the 5 s a step has, so the mirror never got past them.
+    known = {
+        row['origin_id']
+        for row in await connection.fetch(
+            'SELECT origin_id FROM mirror_samples WHERE dataset_id = $1 AND origin_id = ANY($2::int[])',
+            dataset_id,
+            present,
+        )
+    }
+    rows = [sample for sample in samples if sample['id'] in known]
+    fresh_rows = [sample for sample in samples if sample['id'] not in known]
+    if rows:
+        await _update_known(connection, dataset_id, source, rows, array_set, array_old, array_new)
+    if fresh_rows:
+        await _insert_fresh(connection, dataset_id, source, fresh_rows, arrays, array_fresh)
+    # A parent that arrived in this batch, or a child whose parent is here: point the child at the local parent.
+    await connection.execute(
+        """UPDATE samples s SET metadata = jsonb_set(s.metadata, '{parent_id}', to_jsonb(p.sample_id))
+           FROM mirror_samples c
+           JOIN mirror_samples p ON p.dataset_id = c.dataset_id AND p.origin_id = c.origin_parent_id
+           WHERE c.dataset_id = $1 AND c.sample_id = s.id
+             AND (c.origin_id = ANY($2::int[]) OR c.origin_parent_id = ANY($2::int[]))
+             AND s.metadata->'parent_id' IS DISTINCT FROM to_jsonb(p.sample_id)""",
+        dataset_id,
+        present,
+    )
+    return present
+
+
+async def _update_known(connection, dataset_id: int, source: str, rows: list, array_set, array_old, array_new):
+    """The samples the mirror has already: their fields and their primary's parent, where they changed."""
     await connection.execute(
         f"""WITH {source}
             UPDATE samples s SET filepath = t.filepath, media_type = t.media_type, tags = COALESCE(t.tags, '{{}}'),
@@ -413,13 +470,15 @@ async def write_samples(connection, dataset_id: int, blocks: list, data: dict) -
         dataset_id,
         rows,
     )
+
+
+async def _insert_fresh(connection, dataset_id: int, source: str, rows: list, arrays: list, array_fresh: str):
+    """The samples new here, and their rows in mirror_samples. The planner knows how many there are (unnest of the
+    array), so it joins what it inserted back to them by hashing."""
     array_columns = ''.join(f', "{name}"' for name in arrays)
     await connection.execute(
         f"""WITH {source},
-            fresh AS (
-                SELECT t.* FROM translated t
-                WHERE NOT EXISTS (SELECT 1 FROM mirror_samples m WHERE m.dataset_id = $1 AND m.origin_id = t.id)
-            ),
+            fresh AS (SELECT t.* FROM translated t),
             inserted AS (
                 INSERT INTO samples (dataset_id, filepath, media_type, tags, metadata, location, heading, created_at,
                                      last_modified_at{array_columns})
@@ -433,18 +492,6 @@ async def write_samples(connection, dataset_id: int, blocks: list, data: dict) -
         dataset_id,
         rows,
     )
-    # A parent that arrived in this batch, or a child whose parent is here: point the child at the local parent.
-    await connection.execute(
-        """UPDATE samples s SET metadata = jsonb_set(s.metadata, '{parent_id}', to_jsonb(p.sample_id))
-           FROM mirror_samples c
-           JOIN mirror_samples p ON p.dataset_id = c.dataset_id AND p.origin_id = c.origin_parent_id
-           WHERE c.dataset_id = $1 AND c.sample_id = s.id
-             AND (c.origin_id = ANY($2::int[]) OR c.origin_parent_id = ANY($2::int[]))
-             AND s.metadata->'parent_id' IS DISTINCT FROM to_jsonb(p.sample_id)""",
-        dataset_id,
-        present,
-    )
-    return present
 
 
 async def write_hashes(connection, dataset_id: int, present: list, hashes: list) -> None:
@@ -1559,7 +1606,8 @@ async def copy_step(pool, link, client, mirror, checkpoint: dict) -> StepResult:
         result = await apply_state(pool, link, client, mirror, checkpoint, views=True, after_write=following)
         result.message = 'Copy complete; following the feed'
         return result
-    blocks, rest = remaining[:COPY_BLOCKS], remaining[COPY_BLOCKS:]
+    size = step_blocks(checkpoint, mirror)
+    blocks, rest = remaining[:size], remaining[size:]
 
     async def progress(connection):
         await connection.execute(
@@ -1571,12 +1619,13 @@ async def copy_step(pool, link, client, mirror, checkpoint: dict) -> StepResult:
 
     count, publish = await apply_blocks(pool, client, mirror, blocks, progress)
     done = mirror['copy_total'] - len(rest)
-    return StepResult(
+    return OwnWrite(
         checkpoint=checkpoint,
         done=done,
         total=mirror['copy_total'],
         message=f'Copying: {done:,} of {mirror["copy_total"]:,} blocks ({count:,} samples in this step)',
         publish=publish,
+        blocks=blocks,
     )
 
 
@@ -1614,7 +1663,14 @@ async def rank_step(pool, mirror, checkpoint: dict):
                 timeout=RANK_SECONDS,
             )
 
-        return StepResult(checkpoint=checkpoint, message=f'Ranked the map of {field}', publish=publish)
+        return OwnWrite(
+            checkpoint=checkpoint,
+            message=f'Ranked the map of {field}',
+            publish=publish,
+            seconds=RANK_SECONDS,
+            limit=RANK_SECONDS + 60,
+            what=f'Ranking the map of {field}',
+        )
     return None
 
 
@@ -1698,9 +1754,15 @@ async def feed_step(pool, link, client, mirror, checkpoint: dict) -> StepResult:
         )
 
     if page['blocks']:
-        blocks, page['blocks'] = page['blocks'][:COPY_BLOCKS], page['blocks'][COPY_BLOCKS:]
+        size = step_blocks(checkpoint, mirror)
+        blocks, page['blocks'] = page['blocks'][:size], page['blocks'][size:]
         count, publish = await apply_blocks(pool, client, mirror, blocks, new_only=True)
-        return StepResult(checkpoint=checkpoint, message=f'Applied {count:,} changed samples', publish=publish)
+        return OwnWrite(
+            checkpoint=checkpoint,
+            message=f'Applied {count:,} changed samples',
+            publish=publish,
+            blocks=blocks,
+        )
     if page['vectors']:
         part, page['vectors'] = page['vectors'][: followers.VECTOR_SAMPLES], page['vectors'][followers.VECTOR_SAMPLES :]
         vectors = decode_vectors(await fetch_vector_pairs(client, origin, part))
@@ -1709,19 +1771,29 @@ async def feed_step(pool, link, client, mirror, checkpoint: dict) -> StepResult:
             await begin_mirror_write(connection, dataset_id)
             await write_vectors(connection, dataset_id, [tuple(pair) for pair in part], vectors)
 
-        return StepResult(checkpoint=checkpoint, message=f'Applied {len(part):,} changed vectors', publish=publish)
+        # Its own transaction too (write_in_step): on a mirror with its own vector indexes, 2,000 inserts into them
+        # can outlast the job's 5 s publication on a small server.
+        return OwnWrite(
+            checkpoint=checkpoint,
+            message=f'Applied {len(part):,} changed vectors',
+            publish=publish,
+            what=f'Applying {len(part):,} changed vectors',
+        )
     if page['maps']:
-        blocks, page['maps'] = page['maps'][:COPY_BLOCKS], page['maps'][COPY_BLOCKS:]
+        size = step_blocks(checkpoint, mirror)
+        blocks, page['maps'] = page['maps'][:size], page['maps'][size:]
         coordinates = await fetch_coordinates(client, origin, blocks)
 
         async def publish(connection):
             await begin_mirror_write(connection, dataset_id)
             await write_coordinates(connection, dataset_id, blocks, coordinates)
 
-        return StepResult(
+        return OwnWrite(
             checkpoint=checkpoint,
             message=f'Applied {len(coordinates):,} changed map coordinates',
             publish=publish,
+            blocks=blocks,
+            what='The map coordinates',
         )
     if page['state']:
         page['state'] = False
@@ -1771,6 +1843,156 @@ def isolated(mirror, before: dict, result: StepResult) -> StepResult:
         finished=result.finished,
         publish=guarded,
     )
+
+
+@dataclasses.dataclass
+class OwnWrite(StepResult):
+    """A step whose writes outgrow the job's publication (5 s): the handler runs them in a transaction of their own
+    (write_in_step), each statement bounded by `seconds` and the whole write by `limit`. `blocks` names the blocks a
+    block step writes, which a timeout narrows (narrowed); `what` names the write in the mirror's error (a block's
+    samples when empty)."""
+
+    seconds: float | None = None  # BLOCK_SECONDS when None
+    blocks: list = dataclasses.field(default_factory=list)
+    what: str = ''
+    limit: float | None = None  # STEP_SECONDS when None
+
+
+@dataclasses.dataclass
+class Committed(StepResult):
+    """A step whose writes and next checkpoint already committed together (write_in_step). The runner publishes only
+    its progress, and keeps the checkpoint it stored (a publication without a checkpoint keeps the one stored)."""
+
+
+def step_blocks(checkpoint: dict, mirror) -> int:
+    """Blocks per step for this mirror: COPY_BLOCKS, or one for the rest of this job once two outran their bound."""
+    return 1 if mirror['dataset_id'] in checkpoint.get('narrow', []) else COPY_BLOCKS
+
+
+async def write_in_step(pool, job, mirror, before: dict, result: OwnWrite, started: float) -> StepResult:
+    """Write the step's rows in a transaction of the step's own, and commit the job's next checkpoint in it
+    (job_queue.checkpoint_locked, fenced by the job's lease, as a map re-fit's swap does): the rows and the step that
+    wrote them are one commit, so a runner that stops after it resumes at the next step, and one that stops before it
+    writes them again (every write here replaces by the primary's ids). The job's lease is renewed meanwhile; its
+    renewals wait only from the fence on the job row to the COMMIT.
+
+    Two bounds end a write that outgrows them here, so the runner's unit limit (POLICY's max_unit_seconds), which
+    would retry the same step from the same checkpoint, never does: each statement has `result.seconds`
+    (BLOCK_SECONDS), and the whole write `result.limit` (STEP_SECONDS), cut to what the unit has left after `started`
+    less room for the fence (UNIT_MARGIN); at that deadline the connection is terminated. Past either, a block step of
+    several blocks is taken again one block at a time, for the rest of this job (a dataset dense in one place is often
+    dense throughout, and a step that outruns its bound every other time would cost that bound each time); one block
+    that still outruns them, or any other write, fails the mirror, named, on the Primaries page, which then waits
+    before its next try (note_failure's retry_after). So a block that never fits costs each new sync job two bounds,
+    at two blocks and at one, before the mirror is marked failed: that is the price of not narrowing for good, and the
+    backoff keeps it rare; don't make it retry the same step instead.
+
+    Until its COMMIT the step holds what its writes take: its rows, RowExclusive on samples and embeddings, the shared
+    field-lifecycle lock and a key share on the dataset's row (on a copy's first block, the mirror's row too). Here,
+    an edit of one of its samples (a `@local.` field, this server's tags) waits for it; so do a new dataset, an array
+    column, a field definition, deleting samples or a dataset, and removing the primary, for at most the step's limit.
+    A row lock this step waits for past its lock_timeout defers the job (QueueContended), as in a publication, instead
+    of counting a failure. A runner killed meanwhile leaves no session holding any of it: the server checks for the
+    client every second and ends a transaction idle for 60 s, as in a map re-fit's swap."""
+    progress = result.checkpoint if result.checkpoint is not None else dict(before)
+    bound = result.seconds if result.seconds is not None else BLOCK_SECONDS
+    room = POLICY.max_unit_seconds - (time.monotonic() - started) - UNIT_MARGIN
+    limit = max(1.0, min(result.limit if result.limit is not None else STEP_SECONDS, room))
+    outran = expired = False
+    connection = await pool.acquire()
+
+    def expire():
+        nonlocal expired
+        expired = True
+        job_queue._terminate_connection(connection)  # the statement running and the transaction end with it
+
+    deadline = asyncio.get_running_loop().call_later(limit, expire)
+    try:
+        async with AsyncExitStack() as quiet:
+            async with connection.transaction():
+                await connection.execute(
+                    f"SET LOCAL statement_timeout = '{int(bound * 1000)}ms'; "
+                    "SET LOCAL idle_in_transaction_session_timeout = '60s'; "
+                    "SET LOCAL client_connection_check_interval = '1s'",
+                )
+                try:
+                    if result.publish is not None:
+                        await result.publish(connection)
+                except (asyncpg.QueryCanceledError, TimeoutError):
+                    # The server's statement_timeout, or the pool's command_timeout should a bound ever exceed it:
+                    # either way the step outran its bound, whatever the rollback after it then raises.
+                    outran = True
+                    raise
+                except asyncpg.LockNotAvailableError as error:
+                    raise job_queue.QueueContended('Rows of this step were busy here; it is written again') from error
+                # Only the fence and the COMMIT are left, and they are never cut short: a deadline that passed while
+                # the last statement returned still counts.
+                deadline.cancel()
+                if expired:
+                    raise TimeoutError('The step reached its deadline')
+                # From the fence on the job row to the COMMIT, the job's own lease renewal waits, so it is not
+                # mid-commit on the row when the fence arrives.
+                await quiet.enter_async_context(job_heartbeat.renewals_paused())
+                await connection.execute("SET LOCAL lock_timeout = '2s'; SET LOCAL statement_timeout = '5s'")
+                try:
+                    # A lock wait at the fence is QueueContended already (_fenced_job): deferred, not counted.
+                    await job_queue.checkpoint_locked(
+                        connection,
+                        job['id'],
+                        job['lease_token'],
+                        checkpoint=progress,
+                        message=result.message,
+                    )
+                except asyncpg.QueryCanceledError as error:
+                    raise job_queue.QueueBusy('The step could not be recorded in time; it is written again') from error
+    except Exception as error:
+        if outran or expired:
+            if not expired:
+                job_queue._terminate_connection(connection)  # a client-side timeout may leave it mid-query
+            return narrowed(before, mirror, result, limit if expired else bound)
+        passing = (asyncpg.InterfaceError, job_queue.LeaseLost, job_queue.CancelRequested)
+        if job_queue.is_transient(error) or isinstance(error, passing):
+            raise
+        reason = describe(error)
+
+        async def note(connection):
+            await note_failure(connection, mirror['dataset_id'], reason)
+
+        logger.warning('Mirror %s failed this run: %s', mirror['dataset_id'], reason)
+        return StepResult(checkpoint=passed_over(before, mirror), message=f'A mirror failed: {reason}', publish=note)
+    finally:
+        deadline.cancel()
+        await pool.release(connection)
+    return Committed(done=result.done, total=result.total, message=result.message, result=result.result)
+
+
+def narrowed(before: dict, mirror, result: OwnWrite, bound: float) -> StepResult:
+    """A step's write outran its bound and was rolled back (write_in_step): several blocks are taken again one at a
+    time; one block, or any other write, fails the mirror with what and how long, and the others of this primary go
+    on."""
+    dataset_id = mirror['dataset_id']
+    if len(result.blocks) > 1:
+        checkpoint = copy.deepcopy(before)
+        checkpoint['narrow'] = sorted({*checkpoint.get('narrow', []), dataset_id})
+        return StepResult(
+            checkpoint=checkpoint,
+            message=f'Writing {len(result.blocks)} blocks took longer than {bound:.0f} s: one at a time now',
+        )
+    if result.blocks:
+        head = f'{result.what} of block' if result.what else 'Block'
+        what = f'{head} {result.blocks[0]} of this dataset'
+    else:
+        what = result.what or 'A step'
+    reason = (
+        f'{what} took longer than {bound:.0f} s to write here, so it was not copied. '
+        'The next sync tries again; a faster database disk or more memory helps.'
+    )
+
+    async def note(connection):
+        await note_failure(connection, dataset_id, reason)
+
+    logger.warning('Mirror %s failed this run: %s', dataset_id, reason)
+    return StepResult(checkpoint=passed_over(before, mirror), message=f'A mirror failed: {reason}', publish=note)
 
 
 async def note_failure(connection, dataset_id: int, reason: str) -> None:
@@ -1839,6 +2061,7 @@ async def report_step(pool, client, mirror, checkpoint: dict) -> StepResult:
 
 def handler(pool):
     async def step(job):
+        started = time.monotonic()  # the unit's start, near enough: a step's own write gets what is left of it
         link = await pool.fetchrow('SELECT * FROM primary_links WHERE id = $1', job['args']['link_id'])
         if link is None:
             return StepResult(finished=True, message='This primary was removed here')
@@ -1940,6 +2163,8 @@ def handler(pool):
                     )
                 if result.committed:
                     return result
+                if isinstance(result, OwnWrite):
+                    return await write_in_step(pool, job, mirror, before, result, started)
                 return isolated(mirror, before, result)
             except (PrimaryUnavailable, PrimaryRefused) as error:
                 # Shown on Settings → Primary as well as on the job.

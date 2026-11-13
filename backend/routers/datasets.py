@@ -4399,6 +4399,15 @@ def _realiased(field_mapping: Optional[Dict[str, str]], alias: str) -> Dict[str,
     return {key: f"{alias}.{column.rsplit('.', 1)[-1]}" for key, column in (field_mapping or {}).items()}
 
 
+# has_matching_object finds the images of up to this many listed ids by index (an array of them), and those of a
+# longer list as before (an EXISTS on every image of the dataset). The array reads the listed objects first, so it
+# costs more than the EXISTS when the list is most of the dataset: measured, an 8,200-sample dataset listed whole
+# took 6 ms against 2. Up to 1,000 ids it was never more than 0.3 ms slower (1,000 of a 1,160-sample dataset), and
+# on COCO and Open Images a count took 0.1 ms instead of 7 and 84 ms for 25 ids, 2.3 and 3.6 ms instead of 9 and 84
+# for 1,000 (jit off).
+_IMAGES_OF_LISTED_OBJECTS_MAX = 1000
+
+
 def _id_list_bound(node: Any) -> Optional[list]:
     """The ids of an `id in [...]` that every row matching `node` must have (a leaf of it, or of ANDs around it, as a
     selection or a search's results), or None when no such list bounds it."""
@@ -4683,9 +4692,20 @@ def _compile_filter_node(
                     concepts=concepts,
                 )
                 scope = int(ds) if ds is not None else f"{outer_tbl}.dataset_id"
+                ids = _id_list_bound(strict)
+                if ds is None or ids is None or len(ids) > _IMAGES_OF_LISTED_OBJECTS_MAX:
+                    return (
+                        f"EXISTS (SELECT 1 FROM samples o WHERE o.dataset_id = {scope} AND o.parent_id = {id_col} "
+                        f"AND o.media_type = 'object' AND ({sub_sql}))"
+                    ), arg_idx
+                # Within a short id list (a selection, a search's results) the matching objects are few, so their
+                # images are found first, once, and the row is looked up among them: an index condition, so the
+                # grid's `id in ids OR ...` is two index scans. The EXISTS is a condition on every image of the
+                # dataset. The array holds exactly the images the EXISTS accepts, and no NULL, so it decides alone:
+                # ANDed with the EXISTS, each matching image would also be searched for in it element by element.
                 return (
-                    f"EXISTS (SELECT 1 FROM samples o WHERE o.dataset_id = {scope} AND o.parent_id = {id_col} "
-                    f"AND o.media_type = 'object' AND ({sub_sql}))"
+                    f"{id_col} = ANY(ARRAY(SELECT o.parent_id FROM samples o WHERE o.dataset_id = {scope} "
+                    f"AND o.parent_id IS NOT NULL AND o.media_type = 'object' AND ({sub_sql})))"
                 ), arg_idx
             # parent_matches: OBJECT row matches if its parent image satisfies the sub-filter.
             ds_scope = f"s2.dataset_id = {int(ds)} AND " if ds is not None else ""

@@ -28,9 +28,10 @@ _EXCLUSIVE_WAITING = (
     "AND owner.id <> jobs.id "
     "AND (owner.state = 'running' OR (owner.state = 'queued' AND owner.started_at IS NOT NULL))))"
 )
-_WAITING_FOR = {
+_WAITING_FOR = {  # by the resource's name before any ':' (a follower's sync has one per primary)
     'index_build': 'for another index build to finish (one index build at a time)',
     'map_fit': 'for another map re-fit to finish (one at a time)',
+    'follower_sync': "for this primary's running sync to finish (one at a time per primary)",
 }
 _PUBLIC_COLUMNS = (
     'id, kind, dataset_id, placement, lane, resources, state, progress_done, progress_total, message, '
@@ -137,7 +138,7 @@ def waiting_for(job, user: dict) -> str | None:
         return None
     if job.get('exclusive_waiting'):
         resource = job['resources'].get('exclusive')
-        return _WAITING_FOR.get(resource, f'for another job using {resource} to finish')
+        return _WAITING_FOR.get(resource.split(':')[0], f'for another job using {resource} to finish')
     error = job.get('error')
     if isinstance(error, dict) and error.get('code') == 'fields_held':
         if private_guest(user):

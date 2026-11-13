@@ -112,7 +112,8 @@ server keeps its installation id. One reinstalled from scratch gets a new one: *
 Followers page lets the next installation that calls take the token over.
 
 The job runner then syncs once a minute (`FOLLOWER_SYNC_SECONDS`, default 60). Each sync is one background job per
-primary that resumes where it stopped:
+primary that resumes where it stopped. Only one runs per primary at a time: another queued meanwhile waits for it
+(the jobs list says so), while the syncs of different primaries run side by side.
 
 1. It reads the config. A dataset newly shared and ready gets a local dataset, its **mirror**, with the primary's
    name, or `<name> (from <primary host>)` when a dataset here already has that name. The mirror is private: admins
@@ -123,6 +124,21 @@ primary that resumes where it stopped:
 
 The Primaries page shows each mirror's state (copying, following, or no longer following), the copy's progress,
 its last sync, and any error. The job's successful runs are pruned from the job history like other automatic jobs.
+
+A block is the samples whose ids fall in one range of 4,096. A step writes two blocks, with their vectors and
+coordinates (or, from the feed, up to 2,000 changed vectors, one per sample and field, or two blocks' changed map
+coordinates), and commits them with the job's progress in one transaction. Each statement in it may take up to
+`follower_sync.BLOCK_SECONDS` (120 s) and the whole step up to `STEP_SECONDS` (10 minutes); a map's ranking may take
+up to `RANK_SECONDS` (25 minutes). When one statement of a two-block step passes 120 s, or the step passes 10 minutes,
+it is rolled back and the rest of that sync job writes one block at a time. A single block that still takes longer, or
+a step of vectors or a ranking that does, is reported as that mirror's error (`Block 3 of this dataset took longer
+than 120 s to write here`), and the mirror is tried again on a later sync; the others of the primary carry on.
+
+While a step writes a mirror, some changes to that dataset on the follower wait for it, for at most the step's limit
+(10 minutes, or 25 for a ranking): editing one of the samples being written (a `@local.` field, this server's tags),
+changing a field's definition, deleting samples or the dataset, and removing the primary. Creating a dataset on the
+follower meanwhile can fail after 10 s as busy (503), and adding an array column as a conflict (409); try again once
+the step is done.
 
 ### Reaching the primary
 

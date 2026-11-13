@@ -182,6 +182,34 @@ def test_the_object_grid_of_an_id_list_shows_the_listed_objects_and_the_objects_
     registry_database(scenario)
 
 
+async def four_thousand_images(database) -> tuple[list, list]:
+    """4,000 images of five objects each in dataset 1. Returns the objects of the first four images (20) and the last
+    five images."""
+    async with registry_helpers.bulk_setup(database) as connection:
+        await connection.execute(
+            "INSERT INTO samples (dataset_id, filepath, media_type, metadata) "
+            "SELECT 1, 'img-' || n, 'image', '{}' FROM generate_series(1, 4000) n",
+        )
+        await connection.execute(
+            "INSERT INTO samples (dataset_id, filepath, media_type, metadata) "
+            "SELECT 1, 'obj-' || i.id || '-' || k, 'object', jsonb_build_object('parent_id', i.id) "
+            "FROM samples i, generate_series(1, 5) k WHERE i.dataset_id = 1 ORDER BY i.id, k",
+        )
+        await connection.execute('ANALYZE samples')
+    assert await database.fetchval("SELECT count(parent_id) FROM samples WHERE media_type = 'object'") == 20_000
+    objects = [
+        row['id']
+        for row in await database.fetch(
+            "SELECT id FROM samples WHERE parent_id IN (SELECT id FROM samples ORDER BY id LIMIT 4) ORDER BY id",
+        )
+    ]
+    images = [
+        row['id']
+        for row in await database.fetch("SELECT id FROM samples WHERE media_type = 'image' ORDER BY id DESC LIMIT 5")
+    ]
+    return objects, images
+
+
 def _rows_read(plan: dict) -> float:
     """The rows a plan read from the samples table: those its scans of it returned or filtered out, in every loop."""
     nodes, read = [plan], 0.0
@@ -199,30 +227,7 @@ def test_the_object_grid_of_an_id_list_reads_the_listed_rows_and_their_objects_a
     15 ms scan, measured."""
 
     async def scenario(database):
-        async with registry_helpers.bulk_setup(database) as connection:
-            await connection.execute(
-                "INSERT INTO samples (dataset_id, filepath, media_type, metadata) "
-                "SELECT 1, 'img-' || n, 'image', '{}' FROM generate_series(1, 4000) n",
-            )
-            await connection.execute(
-                "INSERT INTO samples (dataset_id, filepath, media_type, metadata) "
-                "SELECT 1, 'obj-' || i.id || '-' || k, 'object', jsonb_build_object('parent_id', i.id) "
-                "FROM samples i, generate_series(1, 5) k WHERE i.dataset_id = 1 ORDER BY i.id, k",
-            )
-            await connection.execute('ANALYZE samples')
-        assert await database.fetchval("SELECT count(parent_id) FROM samples WHERE media_type = 'object'") == 20_000
-        objects = [
-            row['id']
-            for row in await database.fetch(
-                "SELECT id FROM samples WHERE parent_id IN (SELECT id FROM samples ORDER BY id LIMIT 4) ORDER BY id",
-            )
-        ]
-        images = [
-            row['id']
-            for row in await database.fetch(
-                "SELECT id FROM samples WHERE media_type = 'image' ORDER BY id DESC LIMIT 5",
-            )
-        ]
+        objects, images = await four_thousand_images(database)
         children = [
             row['id'] for row in await database.fetch('SELECT id FROM samples WHERE parent_id = ANY($1::int[])', images)
         ]
@@ -232,6 +237,66 @@ def test_the_object_grid_of_an_id_list_reads_the_listed_rows_and_their_objects_a
         count, args = next((sql, args) for _, sql, args in queries if sql.startswith('SELECT count(*) FROM samples'))
         plan = json.loads(await database.fetchval(f'EXPLAIN (ANALYZE, FORMAT JSON) {count}', *args))[0]['Plan']
         assert _rows_read(plan) < 1_000  # 2.11.0: every object, 20,000
+        assert plan['Total Cost'] < 100_000  # jit_above_cost, under which nothing is JIT-compiled
+
+    registry_database(scenario)
+
+
+def test_the_image_grid_of_an_id_list_shows_the_listed_images_and_the_images_of_listed_objects(registry_database):
+    """A selection or a search's results on the image grid: the images listed and the images of the objects listed.
+    An object with no image (of any kind), one naming another object, another dataset's sample and an empty list
+    bring none; a list within another filter keeps both; and the NOT around the coupled list keeps every image it
+    doesn't match, as before."""
+
+    async def scenario(database):
+        made = await every_kind(database)
+        corn, soy, on_corn, on_soy = made['corn'], made['soy'], made['on_corn'], made['on_soy']
+        other = await database.fetchval("SELECT id FROM samples WHERE dataset_id = 2")
+        for base, images in (
+            (listed(on_corn), [corn]),
+            (listed(on_corn, on_soy), [corn, soy]),
+            (listed(soy), [soy]),
+            (listed(corn, on_soy), [corn, soy]),
+            (listed(), []),
+            (listed(other), []),
+            (listed(*(made[kind] for kind in UNLINKED)), []),
+            (listed(on_corn, other, made['on_other_dataset']), [corn]),
+            (listed(on_corn, *range(1_000_000_000, 1_000_001_000)), [corn]),  # a list too long for the array
+        ):
+            assert await rows(grid('image', base)) == (sorted(images), len(images)), base
+        assert await rows(grid('image', WEED, listed(on_corn, soy))) == ([corn], 1)  # the listed weeds' images
+        assert await rows(grid('image', CORN, listed(on_corn, soy))) == ([], 0)  # soy isn't corn, on_corn no image
+        excluded = {
+            'logic': 'AND',
+            'filters': [
+                {'field': 'media_type', 'operator': '!=', 'value': 'object'},
+                {'logic': 'NOT', 'filters': [grid('image', listed(on_corn))['filters'][1]]},
+            ],
+        }
+        assert await rows(excluded) == ([soy], 1)
+
+    registry_database(scenario)
+
+
+def test_the_image_grid_of_an_id_list_reads_the_listed_rows_and_their_images_alone(registry_database, monkeypatch):
+    """The image grid (and the top bar's count, and the sidebar) of a selection or a search's results finds its rows
+    by index: the images listed, and the images of the objects listed. 2.11.0 read every image of the dataset: 7 ms
+    on COCO's 5,000 images and 84 ms on Open Images' 41,000 for 25 ids, against 0.1 ms, measured with jit off."""
+
+    async def scenario(database):
+        objects, images = await four_thousand_images(database)
+        parents = sorted(
+            {
+                row['parent_id']
+                for row in await database.fetch('SELECT parent_id FROM samples WHERE id = ANY($1::int[])', objects)
+            },
+        )
+        queries = record_queries(database, monkeypatch)
+        found, total = await rows(grid('image', listed(*objects, *images)))
+        assert (sorted(found), total) == (sorted(parents + images), 9)
+        count, args = next((sql, args) for _, sql, args in queries if sql.startswith('SELECT count(*) FROM samples'))
+        plan = json.loads(await database.fetchval(f'EXPLAIN (ANALYZE, FORMAT JSON) {count}', *args))[0]['Plan']
+        assert _rows_read(plan) < 1_000  # 2.11.0: every image, and the objects the scan passed on the way
         assert plan['Total Cost'] < 100_000  # jit_above_cost, under which nothing is JIT-compiled
 
     registry_database(scenario)
