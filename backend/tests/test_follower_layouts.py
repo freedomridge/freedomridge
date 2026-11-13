@@ -10,7 +10,7 @@ import pytest
 from backend import follower_sync
 from backend.routers import followers
 from backend.tests import test_field_registry_postgres as registry_helpers
-from backend.tests.test_follower_sync import mirror_of, setup, sync
+from backend.tests.test_follower_sync import mirror_of, run_step, setup, sync, sync_job
 
 registry_database = registry_helpers.registry_database
 ingest, USER = registry_helpers.ingest, registry_helpers.USER
@@ -116,15 +116,10 @@ def test_a_new_layout_s_id_waits_until_the_feed_has_passed_it_and_the_copy_makes
         # The sync step by step, as the runner runs it: after every committed step, the mirror names the new layout
         # only once its feed has passed the transaction that made it, and then has all of its points.
         step = follower_sync.handler(database.pool)
-        checkpoint: dict = {}
+        job = await sync_job(database, link_id)
         waited = False
         for _ in range(200):
-            result = await step({'args': {'link_id': link_id}, 'checkpoint': checkpoint})
-            if result.publish is not None:
-                async with database.pool.acquire() as connection, connection.transaction():
-                    await result.publish(connection)
-            if result.checkpoint is not None:
-                checkpoint = result.checkpoint
+            job, result = await run_step(database, step, job)
             row = await database.fetchrow(
                 "SELECT layout_id::text AS layout_id, pending_layout_id::text AS pending FROM embedding_layouts "
                 "WHERE dataset_id = $1 AND field_name = 'clip'",
@@ -299,15 +294,10 @@ def test_two_layouts_committed_out_of_order_reach_the_mirror_only_with_all_their
         assert older < newer
 
         step = follower_sync.handler(database.pool)
-        checkpoint: dict = {}
+        job = await sync_job(database, link_id)
         waited = False
         for _ in range(400):
-            result = await step({'args': {'link_id': link_id}, 'checkpoint': checkpoint})
-            if result.publish is not None:
-                async with database.pool.acquire() as connection, connection.transaction():
-                    await result.publish(connection)
-            if result.checkpoint is not None:
-                checkpoint = result.checkpoint
+            job, result = await run_step(database, step, job)
             row = await database.fetchrow(
                 "SELECT layout_id::text AS named, pending_layout_id::text AS pending FROM embedding_layouts "
                 "WHERE dataset_id = $1 AND field_name = 'clip'",

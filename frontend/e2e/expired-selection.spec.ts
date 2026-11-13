@@ -25,6 +25,12 @@ function recordRequests(page: Page): string[] {
 
 const carrying = (sent: string[], ...marks: string[]) => sent.filter((line) => marks.some((mark) => line.includes(mark)));
 
+// The Back tests add an idx stage, then go Back to the state without it. A request that carries the idx stage is for
+// the state before Back (its selection still live), sent late: not one of those the test is about.
+const decoded = (line: string) => { try { return decodeURIComponent(line); } catch { return line; } };  // a body, or a query string
+const forStateBeforeBack = (line: string) => ['"field":"idx"', '"operator":">="'].every((part) => decoded(line).includes(part));
+const afterBack = (sent: string[]) => sent.filter((line) => !forStateBeforeBack(line));
+
 async function addIdxStage(page: Page, op: string, value: string) {
     await page.getByRole('button', { name: 'Add Filter' }).click();
     await page.getByPlaceholder('Search fields to filter by...').fill('idx');
@@ -116,10 +122,7 @@ test('a big Select All chip stays expired after Back', async ({ page }) => {
 
     await removeExpired(page);
     await expectTotal(page, TOTAL);
-    const decoded = (line: string) => { try { return decodeURIComponent(line); } catch { return line; } };  // a body, or a query string
-    const forStateBeforeBack = (line: string) => ['"field":"idx"', '"operator":">="'].every((part) => decoded(line).includes(part));
-    const afterBack = sent.filter((line) => !forStateBeforeBack(line));
-    expect(carrying(afterBack, 'e2e-expired-token', 'in_selection', '"expired"', description)).toEqual([]);
+    expect(carrying(afterBack(sent), 'e2e-expired-token', 'in_selection', '"expired"', description)).toEqual([]);
 });
 
 test.describe('an applied id list over 50,000', () => {
@@ -181,13 +184,16 @@ test.describe('an applied id list over 50,000', () => {
         await expect(chips(page)).toHaveCount(2);
         await historyHolds(page, 1, 1);
 
+        // As in the Select All test above: the state before Back holds the live list, and the sidebar may still owe
+        // a request for it.
+        await page.waitForLoadState('networkidle');
         const sent = recordRequests(page);
         await page.goBack();
         await expectTotal(page, TOTAL);
         await expectExpired(page, description);
         await removeExpired(page);
         await expectTotal(page, TOTAL);
-        expect(carrying(sent, String(ids[ids.length - 1]), '"expired"', description)).toEqual([]);
+        expect(carrying(afterBack(sent), String(ids[ids.length - 1]), '"expired"', description)).toEqual([]);
     });
 });
 
