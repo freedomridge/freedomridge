@@ -18,6 +18,15 @@ it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
 
   The rows are the same.
 
+- **Datetime fields without an index are read once a sample again** by the sidebar's and `/stats`' earliest and
+  latest values, a grid sorted by such a field, and `/aggregate`'s values. Since 2.11.0 each read the field's text
+  for every one of the dozen times the instant rule names it, and for a sample with large metadata (stored
+  compressed, such as an image with many detections) each read decompresses all of it. Measured on copies of COCO,
+  KITTI and iNaturalist: the sidebar's bounds take 0.14 s instead of 1.3 s on COCO's 5,000 images (0.09 s instead
+  of 0.5 s on KITTI, 0.22 s instead of 0.33 s on iNaturalist), and a newest-first page 0.29 s instead of 0.82 s on
+  COCO. On a dataset with small metadata a sorted page can take a few milliseconds longer (iNaturalist: 0.12 s
+  instead of 0.10 s). The answers are the same. Filters on such a field still read it a few times a sample.
+
 ## 2.11.0 (2026-11-11)
 
 2.11.0 gives each object sample its image in a column of its own, `samples.parent_id`, so deleting an image

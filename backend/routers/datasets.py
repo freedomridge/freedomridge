@@ -24,10 +24,13 @@ from pydantic import BaseModel, Field, TypeAdapter, ValidationError, field_valid
 
 from backend.datetimes import (
     UTC_TEXT_SQL,
+    date_sql,
     instant_expr,
     instant_sql,
+    instants_from,
     literal_window,
     parse_instant,
+    read_once,
     utc_text,
     window_sql,
 )
@@ -2210,10 +2213,12 @@ async def _get_dataset_field_stats_impl(
         if not _queryable_field(field_name):
             return (field_name, 'datetime', 'cached', None, stat)
         # The earliest and latest instants (an indexed field's index answers), as the statistics write them.
-        instant = instant_expr(_field_text_sql(field_name), bool(stat.get('is_promoted')))
+        # Without an index, each row's text is read once (instants_from), and MIN and MAX skip rows without an instant.
+        promoted, text = bool(stat.get('is_promoted')), _field_text_sql(field_name)
+        instant = instant_expr(text, True) if promoted else '_instant'
         args = [id]
         arg_idx = 2
-        conditions = ["dataset_id = $1", f"{instant} IS NOT NULL"]
+        conditions = ["dataset_id = $1", f"{instant} IS NOT NULL"] if promoted else ["dataset_id = $1"]
         if filter_obj:
             sql, arg_idx = parse_filter_node(
                 filter_obj,
@@ -2226,13 +2231,14 @@ async def _get_dataset_field_stats_impl(
             if sql and sql != "TRUE":
                 conditions.append(sql)
         where = " AND ".join(conditions)
+        source = f"samples WHERE {where}" if promoted else instants_from(text, f"samples WHERE {where}")
         earliest, latest = UTC_TEXT_SQL.format(f'MIN({instant})'), UTC_TEXT_SQL.format(f'MAX({instant})')
         with field_usage.measure(id, {'facet': [field_name]}):
             state, row = await _facet_query(
                 db.fetchrow(
                     f"""
                 SELECT {earliest} as min_val, {latest} as max_val
-                FROM samples WHERE {where}
+                FROM {source}
             """,
                     *args,
                 ),
@@ -4116,14 +4122,15 @@ async def _datetime_page_ids(text, direction, where_clause, args, limit, offset)
     When at least offset+limit of them are datetimes written within a day of D or beyond, every sample further
     away is later in the order than all of those (newest first: it names an instant before D - 3 + 15:59, they
     after D - 1 - 15:59), so the page is exact. Otherwise (values that look like dates but aren't, or fewer
-    datetimes than the page needs) it falls back to the full sort."""
+    datetimes than the page needs) it falls back to the full sort.
+
+    Each pass reads a sample's text once (instants_from, read_once)."""
     n = len(args)
-    date = f'pg_catalog.left({text}, 10) COLLATE "C"'
-    instant = instant_sql(text)
+    rows_sql = f"samples {where_clause}"
     newest = direction == 'DESC'
     cutoff = await db.fetchval(
-        f"SELECT {date} FROM samples {where_clause} AND {date} BETWEEN '0001-01-01' AND '9999-12-31' "
-        f"ORDER BY 1 {direction} LIMIT 1 OFFSET ${n + 1}",
+        f"SELECT _date FROM (SELECT {date_sql(text)} AS _date FROM {rows_sql} OFFSET 0) AS _dates "
+        f"WHERE _date BETWEEN '0001-01-01' AND '9999-12-31' ORDER BY 1 {direction} LIMIT 1 OFFSET ${n + 1}",
         *args,
         offset + limit - 1,
     )
@@ -4135,10 +4142,12 @@ async def _datetime_page_ids(text, direction, where_clause, args, limit, offset)
         far = near = None
     if far is not None:
         side = '>=' if newest else '<='
+        # The written date picks the candidates before the fence: a sample further away is read once, as before.
+        candidates = instants_from(text, f"{rows_sql} AND {date_sql(text)} {side} '{far}'", ('id',))
         rows = await db.fetch(
             f"SELECT id, count(*) FILTER (WHERE near) OVER () AS near_count FROM ("
-            f"SELECT id, {instant} AS instant, {date} {side} '{near}' AS near FROM samples {where_clause} "
-            f"AND {date} {side} '{far}') candidates WHERE instant IS NOT NULL "
+            f"SELECT id, _instant AS instant, {date_sql('_text')} {side} '{near}' AS near FROM {candidates}"
+            f") candidates WHERE instant IS NOT NULL "
             f"ORDER BY instant {direction}, id LIMIT ${n + 1} OFFSET ${n + 2}",
             *args,
             limit,
@@ -4147,8 +4156,8 @@ async def _datetime_page_ids(text, direction, where_clause, args, limit, offset)
         if rows and rows[0]['near_count'] >= offset + limit:
             return [row['id'] for row in rows]
     rows = await db.fetch(
-        f"SELECT id FROM samples {where_clause} ORDER BY {instant} {direction} NULLS LAST, id "
-        f"LIMIT ${n + 1} OFFSET ${n + 2}",
+        f"SELECT id FROM samples {read_once(text)} {where_clause} ORDER BY {instant_sql('_text')} {direction} "
+        f"NULLS LAST, id LIMIT ${n + 1} OFFSET ${n + 2}",
         *args,
         limit,
         offset,
@@ -6801,12 +6810,11 @@ async def get_sample_stats(id: int, sample_ids: Optional[str] = None):
                 value = f"jsonb_array_elements_text(metadata->{field_param})"
                 condition = f"jsonb_typeof(metadata->{field_param}) = 'array'"
             if field_type == 'datetime':
-                # The earliest and latest instants, written as the statistics write them.
-                instant = instant_sql(value)
+                # The earliest and latest instants, written as the statistics write them; each row's text read once.
+                rows_sql = f"samples WHERE dataset_id = $1 {id_condition} AND {condition}"
                 row = await db.fetchrow(
-                    f"SELECT {UTC_TEXT_SQL.format(f'MIN({instant})')} AS min_val, "
-                    f"{UTC_TEXT_SQL.format(f'MAX({instant})')} AS max_val "
-                    f"FROM samples WHERE dataset_id = $1 {id_condition} AND {condition}",
+                    f"SELECT {UTC_TEXT_SQL.format('MIN(_instant)')} AS min_val, "
+                    f"{UTC_TEXT_SQL.format('MAX(_instant)')} AS max_val FROM {instants_from(value, rows_sql)}",
                     *args,
                     field,
                 )
@@ -8581,6 +8589,13 @@ async def run_aggregations(
             def order(column):
                 return f"{instant_sql(column)} NULLS LAST, {column}" if datetime_field else column
 
+            # A datetime's text read once a sample: values sort on each one's instant, which would name it a dozen
+            # times (read_once); distinct reads it for its key and its filter (fenced: a join there costs more).
+            values = (
+                f"v FROM samples {read_once(value_expr, 'v')}" if datetime_field else f"{value_expr} AS v FROM samples"
+            )
+            fence = " OFFSET 0" if datetime_field else ""
+
             args = list(base_args)
             limit_sql = ""
             if spec.limit is not None:
@@ -8599,7 +8614,7 @@ async def run_aggregations(
             elif op == "distinct":
                 rows = await db.fetch(
                     f"{with_clause}SELECT value FROM (SELECT DISTINCT v AS value FROM "
-                    f"(SELECT {value_expr} AS v FROM samples {where_clause}) sub "
+                    f"(SELECT {value_expr} AS v FROM samples {where_clause}{fence}) sub "
                     f"WHERE v IS NOT NULL) found ORDER BY {order('value')}{limit_sql}",
                     *args,
                 )
@@ -8607,7 +8622,7 @@ async def run_aggregations(
             else:  # values — every value, not deduped (unlike distinct)
                 rows = await db.fetch(
                     f"{with_clause}SELECT v AS value FROM "
-                    f"(SELECT {value_expr} AS v FROM samples {where_clause}) sub "
+                    f"(SELECT {values} {where_clause}) sub "
                     f"WHERE v IS NOT NULL ORDER BY {order('v')}{limit_sql}",
                     *args,
                 )
