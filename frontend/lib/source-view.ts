@@ -10,6 +10,9 @@ export interface SourceView {
     userId: number | null;
     // A mirror's copy of a view on its primary: it changes there, so only "save as new" is offered.
     fromPrimary: boolean;
+    // Anyone who can open the dataset can open it: the address and Copy link name it (`?view=`) while it is applied
+    // as it was opened. Absent in a source kept before 2.12, which is then taken as private.
+    isPublic?: boolean;
     // The view's stages as they were opened, to tell whether the applied ones differ.
     stages: ViewStage[];
     // Its updated_at as it was opened: an update names it, and is refused if the view's filters changed since.
@@ -18,7 +21,10 @@ export interface SourceView {
 
 /** The view a set of stages was opened from. */
 export function sourceOf(
-    view: { id: number; slug: string; name: string; user_id?: number | null; from_primary?: boolean; updated_at?: string | null },
+    view: {
+        id: number; slug: string; name: string; user_id?: number | null; from_primary?: boolean; is_public?: boolean;
+        updated_at?: string | null;
+    },
     stages: ViewStage[],
 ): SourceView {
     return {
@@ -27,6 +33,7 @@ export function sourceOf(
         name: view.name,
         userId: view.user_id ?? null,
         fromPrimary: !!view.from_primary,
+        isPublic: !!view.is_public,
         stages,
         updatedAt: view.updated_at ?? null,
     };

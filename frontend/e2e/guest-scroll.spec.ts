@@ -62,7 +62,7 @@ test('a demo guest scrolls the default grid without media 503s or logout', async
     expect(mediaStatuses[503] || 0).toBe(0);
     expect(apiFailures).toEqual({});
     expect(logout).toBe(false);
-    await expect(page).toHaveURL(`/datasets/${datasetId}`);
+    await expect(page).toHaveURL(new RegExp(`/datasets/${datasetId}(\\?|$)`));  // the address holds the filters
 });
 
 test('an initial auth/me 503 retries without redirecting the demo guest to login', async ({ page }) => {
@@ -80,5 +80,5 @@ test('an initial auth/me 503 retries without redirecting the demo guest to login
     await expect.poll(() => checks, { timeout: 15_000 }).toBeGreaterThanOrEqual(2);
     await expect(page.getByTestId('grid-cell').first()).toBeVisible();
     expect(logout).toBe(false);
-    await expect(page).toHaveURL(`/datasets/${datasetId}`);
+    await expect(page).toHaveURL(new RegExp(`/datasets/${datasetId}(\\?|$)`));  // the address holds the filters
 });

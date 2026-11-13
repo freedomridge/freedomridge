@@ -7,7 +7,7 @@ import type { Feature, Polygon } from 'geojson';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { ApiError, isRescoringRefusal, getSamples, getDatasetSchema, getDataset, getEmbeddingFields, searchSimilar, searchByImage, searchObjectToPatches, updateDataset, setClassRule, sampleDuplicates, notifySamplesMutated, createSelectionToken, getView, parseFilterQuery, formatFilterQuery, FilterQueryProblem, type Dataset, type Filters, type Sample, type SchemaField, type ComplexFilter, type ViewStage } from '@/lib/api';
 import { describeFilter, convertSimpleFiltersToComplex } from '@/lib/filter-utils';
-import { copyLink, datasetLink, decodeStages, joinQueryParts, LinkError, mayBeText, type DatasetLink } from '@/lib/links';
+import { copyLink, datasetAddress, datasetLink, decodeStages, joinQueryParts, LinkError, mayBeText, type DatasetLink } from '@/lib/links';
 import { useToast } from '@/contexts/ToastContext';
 import { STALE_LASSO_WARNING, lassoFilter, lassoKey, staleLasso } from '@/lib/stale-lasso';
 import { type SourceView, mayUpdateView, sameStages, sourceOf } from '@/lib/source-view';
@@ -15,7 +15,7 @@ import { defaultViewStages } from '@/lib/default-view';
 import { usePatchState } from '@/hooks/usePatchState';
 import { useSampleCount } from '@/hooks/useSampleCount';
 import Link from 'next/link';
-import { useParams } from 'next/navigation';
+import { useParams, useSearchParams } from 'next/navigation';
 import { FilterSidebar } from '@/components/filter-sidebar';
 import { SampleModal } from '@/components/sample-modal';
 import { DatasetSettingsModal } from '@/components/dataset-settings-modal';
@@ -40,12 +40,12 @@ import { EmbeddingsPanel } from '@/components/embeddings-panel';
 import { DuplicatesPanel } from '@/components/duplicates-panel';
 import { ConceptsPanel } from '@/components/concepts-panel';
 import { HistogramPanel } from '@/components/histogram-panel';
-import { GridPanel, readGridSort, rememberGridSort } from '@/components/grid-panel';
+import { GridPanel, readGridSort, rememberGridSort, subscribeGridSort } from '@/components/grid-panel';
 import type { GridMore } from '@/components/dataset-grid';
 import { SparseSamplePanel } from '@/components/sparse-sample-panel';
 import { ExportDialog } from '@/components/export-dialog';
 import { PanelType } from '@/components/panel-content';
-import { FilterProvider, useFilters, withGrain, type Grain } from '@/contexts/FilterContext';
+import { FilterProvider, useFilters, withGrain, type AddressState, type Grain } from '@/contexts/FilterContext';
 import { useUser } from '@/contexts/UserContext';
 
 import { ProtectedRoute } from '@/components/ProtectedRoute';
@@ -110,20 +110,33 @@ async function encodedStages(datasetId: number, link: DatasetLink): Promise<View
 }
 
 // Each applied filter as query text for a link (datasetLink), or null when the link takes them encoded: a chip that
-// isn't text, or text that doesn't read back as the same filters on this dataset (the language writes a field name
-// it doesn't read, such as the coverage warning's embeddings.<field>, so such a link wouldn't open).
-async function linkQueryParts(datasetId: number, stages: ViewStage[]): Promise<string[] | null> {
+// isn't text, or text that doesn't read back as the same filter on this dataset (the language writes a field name
+// it doesn't read, such as the coverage warning's embeddings.<field>, so such a link wouldn't open). The address is
+// made at every change, so each filter is asked about once: `known` keeps the answers, by the filter.
+async function linkQueryParts(datasetId: number, stages: ViewStage[], known: Map<string, string | null>): Promise<(string | null)[] | null> {
     if (!mayBeText(stages)) return null;
-    const filters = stages.map(stage => stage.filter);
-    const { parts } = await formatFilterQuery(datasetId, filters);
-    if (!parts.every((part): part is string => !!part)) return null;
-    try {
-        const { reuse } = await parseFilterQuery(datasetId, joinQueryParts(parts), filters);
-        return reuse.length === filters.length && reuse.every((index, i) => index === i) ? parts : null;
-    } catch (error) {
-        if (error instanceof FilterQueryProblem) return null;
-        throw error;
+    const keys = stages.map(stage => JSON.stringify(stage.filter));
+    const asked = [...new Set(keys.filter(key => !known.has(key)))];
+    if (asked.length) {
+        const filters: ComplexFilter[] = asked.map(key => JSON.parse(key));
+        const { parts } = await formatFilterQuery(datasetId, filters);
+        // Whether the parts at `at` read back as their filters, joined as a link joins them.
+        const readBack = async (at: number[]) => {
+            if (!at.every(i => parts[i])) return false;
+            try {
+                const { reuse } = await parseFilterQuery(datasetId, joinQueryParts(at.map(i => parts[i]!)), at.map(i => filters[i]));
+                return reuse.length === at.length && reuse.every((index, j) => index === j);
+            } catch (error) {
+                if (error instanceof FilterQueryProblem) return false;
+                throw error;
+            }
+        };
+        // Together, in one request; when they don't, one by one, to find the ones that don't.
+        const all = asked.map((_, i) => i);
+        const fit = await readBack(all) ? all.map(() => true) : await Promise.all(all.map(i => readBack([i])));
+        asked.forEach((key, i) => known.set(key, fit[i] ? parts[i] : null));
     }
+    return keys.map(key => known.get(key) ?? null);
 }
 
 // The ids a grid of the other grain than the selection's is given: one empty array, so its memoized id sets stay put.
@@ -164,13 +177,17 @@ export default function DatasetPage() {
     const idParam = params?.id;
     const datasetId = idParam ? parseInt(Array.isArray(idParam) ? idParam[0] : idParam) : undefined;
 
-    return (
-        <FilterProvider datasetId={datasetId}>
+    // The query the page opened with, read once, from the router (FilterContext says why). The address then follows
+    // the filters, and the router reports each change here: the provider's element is kept, so that renders only this.
+    const searchParams = useSearchParams();
+    const [search] = useState(() => searchParams.toString());
+    return useMemo(() => (
+        <FilterProvider datasetId={datasetId} search={search}>
             <ProtectedRoute>
                 <DatasetPageContent />
             </ProtectedRoute>
         </FilterProvider>
-    );
+    ), [datasetId, search]);
 }
 
 function DatasetPageContent() {
@@ -298,6 +315,14 @@ function DatasetPageContent() {
         link,
         settleLink,
         linkPending,
+        openingSort,
+        setAddressOf,
+        setAddressSort,
+        openSample,
+        stepSample,
+        closeSample,
+        replaceSample,
+        restoredSample,
     } = useFilters();
     const { addToast } = useToast();
 
@@ -577,7 +602,8 @@ function DatasetPageContent() {
                 filter: { logic: 'AND', filters: [{ field: 'id', operator: 'in', value: ids }] },
             });
         },
-        onCloseModal: () => setSelectedSample(null),
+        // Its results are the new filters: the view's entry is rewritten without it, never Back (which would undo them).
+        onCloseModal: () => { setSelectedSample(null); replaceSample(null); },
         viewStages,
     });
 
@@ -632,14 +658,122 @@ function DatasetPageContent() {
         setSelectedSample(sample);
     }, [datasetId]);
 
-    // A link to this dataset (lib/links.ts; FilterContext read it as the page opened). Its sort is the grids'
-    // before they open (they open on the next render).
-    const linkSortedRef = useRef(false);
+    // The sample view in the address (FilterContext openSample and the rest): opening a sample is a history entry, its
+    // address naming the row opened, from the grid `panelId` (null: another panel, which shows the row itself).
+    // `sampleSeqRef` counts the opens and closes, so a sample still being fetched for an entry left meanwhile isn't shown.
+    const sampleSeqRef = useRef(0);
+    const openSampleView = useCallback((row: Sample, panelId: string | null) => {
+        sampleSeqRef.current += 1;
+        if (panelId !== null) {
+            void handleSampleClick(row, panelId);
+        } else {
+            setModalSourcePanelId(null);
+            setModalSourceId(null);  // the row a grid opened before isn't this one: Space selects the sample shown
+            setSelectedSample(row);
+        }
+        openSample({ id: row.id, panelId });
+    }, [handleSampleClick, openSample]);
+    const hideSampleView = useCallback(() => {
+        sampleSeqRef.current += 1;
+        setSelectedSample(null);
+        setHighlightBox(null);
+        setHighlightCuboidId(null);
+        setTagSampleId(null);
+    }, []);
+    // The sample a link or a history entry names (the entry has it open already), fetched by id and shown: from the grid
+    // it was opened from (`panelId`; null: another panel), else, as a link's, from the grid holding it or the grid
+    // rendered last, which the entry then records. One that can't be shown says why and is left out of the entry.
+    const showSampleById = useCallback(async (id: number, panelId?: string | null) => {
+        const seq = sampleSeqRef.current;
+        const notice = (message: string) => addToast(message, 'warning', 10000);
+        let sample: Sample | undefined;
+        try {
+            if (Number.isSafeInteger(id)) {
+                const found = await getSamples(datasetId!, 1, 0, { logic: 'AND', filters: [{ field: 'id', operator: 'in', value: [id] }] }, undefined, undefined, true);
+                sample = found.items[0];
+            }
+        } catch (error) {
+            if (seq !== sampleSeqRef.current) return;
+            notice(`Couldn't open the linked sample: ${(error as Error).message}`);
+            replaceSample(null);
+            return;
+        }
+        if (seq !== sampleSeqRef.current) return;
+        if (!sample) {
+            notice("The linked sample isn't in this dataset.");
+            replaceSample(null);
+            return;
+        }
+        if (panelId === null) {
+            setModalSourcePanelId(null);
+            setModalSourceId(null);
+            setSelectedSample(sample);
+            return;
+        }
+        // The panels open once the link has settled (they wait for it): give the grid a moment to be there with its
+        // first rows, so next and previous have rows to walk (the view reads them as it renders). Without them the
+        // sample still opens.
+        const loaded = () => Object.entries(gridSamplesRefs.current).some(([key, rows]) => (!panelId || key === panelId) && rows.current.length > 0);
+        for (let waited = 0; waited < 40 && !loaded(); waited += 1) {
+            await new Promise(resolve => setTimeout(resolve, 50));
+        }
+        if (seq !== sampleSeqRef.current) return;
+        // The grid holding it, else the grid panel rendered last (a saved layout replaces the default one).
+        const grids = Object.entries(gridSamplesRefs.current);
+        const grid = panelId && gridSamplesRefs.current[panelId]
+            ? panelId
+            : (grids.find(([, rows]) => rows.current.some(row => row.id === id)) ?? grids[grids.length - 1])?.[0] ?? 'center';
+        void handleSampleClick(sample, grid);
+        if (grid !== panelId) replaceSample({ id, panelId: grid });
+    }, [datasetId, addToast, handleSampleClick, replaceSample]);
+    // Back, Forward or a reload went to an entry with another sample open, or none: the view follows.
+    const restoredRef = useRef<typeof restoredSample>(null);
     useEffect(() => {
-        if (!link || datasetId == null || linkSortedRef.current) return;
-        linkSortedRef.current = true;
-        if (link.sort !== undefined) rememberGridSort(datasetId, link.sort || undefined, link.dir ?? 'asc');
-    }, [link, datasetId]);
+        if (!restoredSample || restoredRef.current === restoredSample || datasetId == null) return;
+        restoredRef.current = restoredSample;
+        if (!restoredSample.sample) {
+            // eslint-disable-next-line react-hooks/set-state-in-effect -- the view follows the history entry restored
+            hideSampleView();
+            return;
+        }
+        sampleSeqRef.current += 1;
+        void showSampleById(restoredSample.sample.id, restoredSample.sample.panelId);
+    }, [restoredSample, datasetId, hideSampleView, showSampleById]);
+
+    // The sort the address opened with (a link's, or that of the page's own entry reopened: FilterContext read it as
+    // the page opened) is the grids' before they open (they open on the next render).
+    const openingSortedRef = useRef(false);
+    useEffect(() => {
+        if (!openingSort || datasetId == null || openingSortedRef.current) return;
+        openingSortedRef.current = true;
+        rememberGridSort(datasetId, openingSort.by, openingSort.order);
+    }, [openingSort, datasetId]);
+    // The grids' sort in this tab, which the address and Copy link name: the one remembered for the dataset is the last
+    // chosen in any tab, so another tab's choice would reach this tab's address and, on a reload, its grids.
+    const [initialSort] = useState(() => openingSort ?? (datasetId != null ? readGridSort(datasetId) : {}));
+    const gridSortRef = useRef<{ by?: string; order?: 'asc' | 'desc' }>(initialSort);
+    useEffect(() => subscribeGridSort((id, by, order) => {
+        const sort = gridSortRef.current;
+        if (id !== datasetId || ((sort.by || undefined) === (by || undefined) && (!by || sort.order === order))) return;
+        gridSortRef.current = { by, order };
+        setAddressSort({ by, order });
+    }), [datasetId, setAddressSort]);
+    // The address of each history entry (FilterContext writes it, lib/links.ts datasetAddress): the link Copy link
+    // would copy for its state, with the grids' sort as it is when the address is made. Text the server didn't answer
+    // for goes in f=, which opens the same filters.
+    const linkTexts = useRef(new Map<string, string | null>());
+    const addressOf = useCallback(async ({ stages, expired, source }: AddressState) => datasetAddress({
+        origin: window.location.origin,
+        datasetId: datasetId!,
+        stages,
+        expired,
+        source,
+        parts: await linkQueryParts(datasetId!, stages, linkTexts.current).catch(() => null),
+        sort: gridSortRef.current,
+    }), [datasetId]);
+    useEffect(() => {
+        if (datasetId != null) setAddressOf(addressOf);
+    }, [datasetId, addressOf, setAddressOf]);
     // Once the dataset has answered (a dataset the reader can't open answers as it does without a link), the link's
     // filter replaces the restored one, then its sample opens, with next/previous walking the grid as it loads.
     const linkOpenedRef = useRef(false);
@@ -655,33 +789,10 @@ function DatasetPageContent() {
                 notice(error instanceof LinkError ? error.message : `Couldn't open the link: ${(error as Error).message}`);
             }
             settleLink(opened.stages, opened.source);
-            if (link.sample === undefined) return;
-            const id = Number(link.sample);
-            let sample: Sample | undefined;
-            try {
-                if (Number.isSafeInteger(id)) {
-                    const found = await getSamples(datasetId, 1, 0, { logic: 'AND', filters: [{ field: 'id', operator: 'in', value: [id] }] }, undefined, undefined, true);
-                    sample = found.items[0];
-                }
-            } catch (error) {
-                notice(`Couldn't open the linked sample: ${(error as Error).message}`);
-                return;
-            }
-            if (!sample) {
-                notice("The linked sample isn't in this dataset.");
-                return;
-            }
-            // The panels open once the link has settled (they wait for it): give a grid a moment to be there, so
-            // next and previous have rows to walk. Without one the sample still opens.
-            for (let waited = 0; waited < 40 && Object.keys(gridSamplesRefs.current).length === 0; waited += 1) {
-                await new Promise(resolve => setTimeout(resolve, 50));
-            }
-            // The grid holding it, else the grid panel rendered last (a saved layout replaces the default one).
-            const grids = Object.entries(gridSamplesRefs.current);
-            const grid = grids.find(([, rows]) => rows.current.some(row => row.id === id)) ?? grids[grids.length - 1];
-            void handleSampleClick(sample, grid?.[0] ?? 'center');
+            // The entry the link opened has its sample open (FilterContext): the address keeps it while it is shown.
+            if (link.sample !== undefined) await showSampleById(Number(link.sample));
         })();
-    }, [link, dataset, datasetId, settleLink, addToast, handleSampleClick]);
+    }, [link, dataset, datasetId, settleLink, addToast, showSampleById]);
     // A dataset that doesn't answer has nothing to open the link on: the page shows why, without the link.
     useEffect(() => {
         if (!link || !datasetError || linkOpenedRef.current) return;
@@ -1160,7 +1271,7 @@ function DatasetPageContent() {
                         otherSelection={!owns && selectionGrain ? { count: selectionCount, grain: selectionGrain } : undefined}
                         activeOverlayFields={activeOverlayFields}
                         overlayConfigs={overlayConfigs}
-                        onSampleClick={(s) => handleSampleClick(s, panelId)}
+                        onSampleClick={(s) => openSampleView(s, panelId)}
                         onToggleSelection={(sid) => {
                             setSelectionSource('Grid');
                             if (claimSelection(g.grain)) toggleSampleSelected(sid);
@@ -1356,7 +1467,7 @@ function DatasetPageContent() {
                                 setCurrentEmbeddingRegion(null);
                                 setBrushedIds(ids);
                             }}
-                            onSampleClick={(s) => { setModalSourcePanelId(null); setSelectedSample(s); }}
+                            onSampleClick={(s) => openSampleView(s, null)}
                             onToggleSelection={(id) => {
                                 setSelectionSource('Duplicates');
                                 // The panel's groups are images.
@@ -1375,7 +1486,7 @@ function DatasetPageContent() {
                     <div className="h-full w-full overflow-hidden bg-zinc-900">
                         <ConceptsPanel
                             datasetId={datasetId!}
-                            onSampleClick={(s) => { setModalSourcePanelId(null); setSelectedSample(s); }}
+                            onSampleClick={(s) => openSampleView(s, null)}
                         />
                     </div>
                 );
@@ -1432,8 +1543,9 @@ function DatasetPageContent() {
             datasetId,
             stages,
             expired: expiredSelections,
-            parts: await linkQueryParts(datasetId, stages),
-            sort: readGridSort(datasetId),
+            source: sourceView,
+            parts: await linkQueryParts(datasetId, stages, linkTexts.current),
+            sort: gridSortRef.current,
             sample: sampleId,
         }))();
         const copied = sampleId !== undefined ? 'Link to this sample copied' : stages.length ? 'Link to these filters copied' : 'Link to this dataset copied';
@@ -1726,6 +1838,11 @@ function DatasetPageContent() {
                         ? getGrain(modalSourcePanelId).grain
                         : selectedSample.media_type === 'object' ? 'object' : 'image';
                     const sampleIsSelected = ownsSelection(modalGrain) && isSampleSelected(selectionTarget);
+                    // Next and previous rewrite the view's history entry (its address names the row shown).
+                    const step = (row: Sample) => {
+                        void handleSampleClick(row, modalSourcePanelId!);
+                        stepSample({ id: row.id, panelId: modalSourcePanelId });
+                    };
                     return (
                         <SampleModal
                             sample={selectedSample}
@@ -1746,17 +1863,17 @@ function DatasetPageContent() {
                             highlightBox={highlightBox}
                             highlightCuboidField={highlightCuboidField}
                             highlightCuboidId={highlightCuboidId}
-                            onClose={() => { setSelectedSample(null); setHighlightBox(null); setHighlightCuboidId(null); setTagSampleId(null); }}
+                            onClose={() => { closeSample(); hideSampleView(); }}
                             hasPrevious={idx > 0}
                             hasNext={(idx >= 0 && idx < samples.length - 1) || canLoadNext}
-                            onPrevious={idx > 0 ? () => { handleSampleClick(samples[idx - 1], modalSourcePanelId!); } : undefined}
+                            onPrevious={idx > 0 ? () => step(samples[idx - 1]) : undefined}
                             onNext={idx >= 0 && idx < samples.length - 1
-                                ? () => { handleSampleClick(samples[idx + 1], modalSourcePanelId!); }
+                                ? () => step(samples[idx + 1])
                                 : canLoadNext
                                     ? async () => {
                                         const longer = await more!.loadNextPage();
                                         const next = longer[longer.findIndex(s => s.id === modalSourceId) + 1];
-                                        if (next) handleSampleClick(next, modalSourcePanelId!);
+                                        if (next) step(next);
                                     }
                                     : undefined}
                             isSelected={sampleIsSelected}
@@ -1769,6 +1886,7 @@ function DatasetPageContent() {
                                 // Seed with the CLICKED row (an object in object grain), like Space does.
                                 const seed = samples[idx] ?? selectedSample;
                                 setSelectedSample(null);
+                                replaceSample(null);  // its search then sets new filters: never Back, which would undo them
                                 setSimilaritySeedIds(null);
                                 setSimilaritySearchSample(seed);
                             } : undefined}

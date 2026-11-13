@@ -264,7 +264,11 @@ requests.patch(
 
 ## Links to a filter, a view or a sample
 
-The web app copies a link that opens a dataset as you see it:
+The address of a dataset's page is a link to what it shows: the applied filters, the grid's sort and the
+sample whose view is open. It changes as they do, so a bookmark, a reload or the address pasted elsewhere
+opens the same filters and sample. Back and Forward step through the filters applied, each with its address,
+and through opening a sample's view: Back closes it and Forward opens it again. Next and previous in the
+view change the sample in the address without adding to the history. The web app also copies links:
 
 - **Copy link**, beside **Saved Views**: the applied filters and the grid's sort.
 - The link icon on a view in **Saved Views**: that view.
@@ -276,15 +280,20 @@ A link is `/datasets/<id>?<parameters>`, each optional:
 |---|---|
 | `q=<text>` | The filters in the [filter query language](FILTER_QUERY.md), one chip per top-level `AND` part. Empty (`q=`) means no filters, which is what Copy link writes when none are applied. |
 | `f=<version>.<data>` | The filters encoded, when a chip has no text form: a map region, a lasso, picked samples, a search, a concept, a duplicate collapse. |
-| `view=<slug>` | A saved view. |
+| `view=<slug>` | A saved view. The address and Copy link write it while a public view's filters are applied as it was saved. |
 | `sort=<field>`, `dir=asc` or `desc` | The grid's sort. |
 | `sample=<id>` | The sample whose view opens. |
 
 Copy link writes `q=` when every chip can be written as text, so a person or a script can read, edit or
 write one: `/datasets/12?q=split = train AND score > 0.5` (the browser encodes the spaces; write `+`, `&`
 and `#` in a value as `%2B`, `%26` and `%23`). The link's
-filters replace the ones the browser kept for the dataset, which are one Back away, and the address loses
-the parameters once the page has opened them.
+filters replace the ones the browser kept for the dataset; Back doesn't return to those. The address then
+shows the page's own link to the same filters (the query as the app writes it). A link that can't be opened
+says why, and the dataset opens, with its address, as it would without the link.
+
+The filter text is in the address, so it is kept in the browser's history and in the access logs of the
+server and of any proxy in between, and it travels wherever the address is pasted. Don't put secrets in
+filter values.
 
 A link doesn't carry:
 
@@ -298,6 +307,11 @@ A link doesn't carry:
 - **Another server.** A link names this server's dataset, samples and views by their ids and slugs (the
   ids inside `f=` too). A follower's copies have their own.
 - **A snapshot.** A link shows what matches its filters when it is opened.
+
+While the applied filters hold a selection no link can carry (a big Select All, one too large for a link, or an
+expired selection's chip), the address names no filters, only the sort and the sample whose view is open: opened
+elsewhere it opens the dataset as it would without a link. A reload still shows the page as it was, the
+selection's chip expired.
 
 An `f=` made by a version of Freedom Ridge that encodes filters differently says so, and the dataset opens
 without it.

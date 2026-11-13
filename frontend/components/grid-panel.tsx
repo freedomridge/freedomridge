@@ -29,9 +29,20 @@ const dismissCoverage = (datasetId: number) => {
 };
 
 const gridSortKey = (datasetId: number) => `fridge:gridSort:${datasetId}`;
+type GridSortListener = (datasetId: number, by: string | undefined, order: 'asc' | 'desc') => void;
+const gridSortListeners = new Set<GridSortListener>();
 /** The sort the dataset's grids open on (a link to the dataset sets it before they open). */
 export function rememberGridSort(datasetId: number, by: string | undefined, order: 'asc' | 'desc') {
     try { localStorage.setItem(gridSortKey(datasetId), JSON.stringify({ by, order })); } catch { /* ignore */ }
+    gridSortListeners.forEach(listener => listener(datasetId, by, order));
+}
+/**
+ * Calls `listener` with each sort a grid in this tab is set to (the page's address names it): the remembered one is the
+ * last chosen in any tab. Returns the unsubscribe.
+ */
+export function subscribeGridSort(listener: GridSortListener): () => void {
+    gridSortListeners.add(listener);
+    return () => { gridSortListeners.delete(listener); };
 }
 /** The sort the dataset's grids are on (the last one changed); `by` unset is the default order. */
 export function readGridSort(datasetId: number): { by?: string; order?: 'asc' | 'desc' } {

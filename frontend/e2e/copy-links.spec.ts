@@ -36,14 +36,15 @@ async function openWithStages(page: Page, stages: Stage[]) {
     await gotoDataset(page);
 }
 
-// The link opened in a new browser context: signed in, nothing else kept.
+// The link opened in a new browser context: signed in, nothing else kept. The address then holds the page's own link
+// to what it shows (e2e/live-address.spec.ts).
 async function openFresh(browser: Browser, link: string, check: (page: Page) => Promise<void>) {
     const context = await browser.newContext({ storageState: AUTH_STATE });
     try {
         const page = await context.newPage();
         await page.goto(link);
         await check(page);
-        await expect(page).toHaveURL(new RegExp(`/datasets/${datasetId}$`));
+        await expect(page).toHaveURL(new RegExp(`/datasets/${datasetId}\\?`));
     } finally {
         await context.close();
     }
@@ -68,6 +69,7 @@ test('plain filters copy as q=, without the draft, and open on the same chips an
         await expectTotal(fresh, fixture.count!);
         await expect(chips(fresh)).toHaveCount(fixture.filters.length);
         await expect(chips(fresh).first()).toHaveText(/split = val/);
+        await expect(fresh).toHaveURL(link.href);  // the same chips, the same link
     });
 });
 
@@ -110,6 +112,9 @@ test('a chip written as text that the dataset does not read back copies as f=', 
 });
 
 test('a big Select All chip copies nothing and says which chip stops the link', async ({ page }) => {
+    // The refusal is a message, never an unhandled rejection (next dev showed one as an error overlay).
+    const pageErrors: string[] = [];
+    page.on('pageerror', error => pageErrors.push(error.message));
     await gotoDataset(page);
     await bigSelectAll(page);
     await page.getByTestId('apply-filters').click();
@@ -121,6 +126,7 @@ test('a big Select All chip copies nothing and says which chip stops the link', 
     await expect(page.getByText(`Can't copy a link: “${description}” is a temporary selection, kept for 2 hours only. Save a view and copy its link instead.`)).toBeVisible();
     await page.waitForTimeout(500);
     expect(await clipboard(page)).toBe('nothing copied');
+    expect(pageErrors).toEqual([]);
 });
 
 test('a saved view\'s Copy link opens the view', async ({ page, browser }) => {

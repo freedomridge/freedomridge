@@ -1,5 +1,6 @@
 import type { ViewStage } from './api';
 import { type ExpiredSelection, filterHasInSelection, isReadOnlyStage } from './filter-query';
+import { type SourceView, sameStages } from './source-view';
 
 // A link that opens a dataset: /datasets/<id>?<parameters>, each optional.
 //   view=<slug>          a saved view, as choosing it in Saved Views does
@@ -8,9 +9,9 @@ import { type ExpiredSelection, filterHasInSelection, isReadOnlyStage } from './
 //                        selections, searches, concepts)
 //   sort=<field>, dir=asc|desc   the grid's sort
 //   sample=<id>          the sample whose view opens
-// `view` wins over `f`, and `f` over `q`. The page removes the parameters once it has opened them. Copy link
-// (datasetLink, viewLink) writes one of view, q or f, never two.
-export const LINK_PARAMETERS = ['view', 'q', 'f', 'sort', 'dir', 'sample'] as const;
+// `view` wins over `f`, and `f` over `q`. The dataset page's address is such a link to what it shows (FilterContext
+// writes it on each history entry). Copy link (datasetLink, viewLink) and the address write one of view, q or f,
+// never two.
 
 export interface DatasetLink {
     view?: string;
@@ -38,11 +39,61 @@ export function linkSetsFilters(link: DatasetLink | null): boolean {
     return !!link && (link.view !== undefined || link.f !== undefined || link.q !== undefined);
 }
 
-/** `href` without the link's parameters, as the path, query and hash history.replaceState takes. */
-export function withoutLinkParameters(href: string): string {
-    const url = new URL(href);
-    for (const name of LINK_PARAMETERS) url.searchParams.delete(name);
-    return `${url.pathname}${url.search}${url.hash}`;
+// --- Opening the dataset page ---
+
+/** The grids' sort an address opens with; `by` unset is the default order. */
+export interface LinkSort {
+    by: string | undefined;
+    order: 'asc' | 'desc';
+}
+
+/**
+ * How the dataset page opens (FilterContext), decided at its first render:
+ * - `entry`: on one of its own history entries, reopened by a reload or by Back or Forward into a page that was
+ *   unloaded. The entry is the page's (`_fridge`) and records the address it holds (`address`, as the browser shows
+ *   it), which is the address shown (`shown`) and the one the router opened (`opened`). While a navigation inside the
+ *   app has yet to write its own entry, history.state and the address shown are still the previous page's.
+ * - `link`: else on the link in the address, when it has one.
+ * - neither: on the filters the browser saved for the dataset.
+ * `sort` is the grids' sort the address gives: an entry's, which its address always says (none: the default order,
+ * not the sort another tab chose since), or a link's when it names one.
+ */
+export function openingOf(state: unknown, shown: string, opened: string): {
+    entry: Record<string, unknown> | null;
+    link: DatasetLink | null;
+    sort?: LinkSort;
+} {
+    const params = new URL(opened, 'http://x').searchParams;
+    const sort = { by: params.get('sort') || undefined, order: params.get('dir') === 'desc' ? 'desc' as const : 'asc' as const };
+    if (isObject(state) && state._fridge === true && typeof state.address === 'string' && state.address === shown
+        && sameAddress(shown, opened)) {
+        return { entry: state, link: null, sort };
+    }
+    return { entry: null, link: readLink(params), sort: params.has('sort') ? sort : undefined };
+}
+
+/** `address` (a path and query) with `sort` in place of the sort it names: its filters as they are. */
+export function withSort(address: string, sort: { by?: string; order?: 'asc' | 'desc' }): string {
+    const url = new URL(address, 'http://x');
+    url.searchParams.delete('sort');
+    url.searchParams.delete('dir');
+    setSort(url.searchParams, sort);
+    return `${url.pathname}${url.search}`;
+}
+
+/** `address` (a path and query) with the sample whose view is open (null: none), last, as Copy link in the view writes it. */
+export function withSample(address: string, sample: number | null): string {
+    if (sample === null) return address;
+    const url = new URL(address, 'http://x');
+    url.searchParams.set('sample', String(sample));
+    return `${url.pathname}${url.search}`;
+}
+
+// Two addresses (path and query) name the same page and parameters, however each is encoded (`+` or `%20`).
+function sameAddress(a: string, b: string): boolean {
+    const one = new URL(a, 'http://x');
+    const two = new URL(b, 'http://x');
+    return one.pathname === two.pathname && one.searchParams.toString() === two.searchParams.toString();
 }
 
 // --- f=: the stages encoded ---
@@ -155,16 +206,18 @@ export function joinQueryParts(parts: string[]): string {
 /**
  * The link to a dataset on its applied stages, its grid's sort (`by` unset is the default order) and optionally a
  * sample. `parts` holds each stage's filter as query text, null for one the language can't write (or null when
- * they weren't asked for): `q=` when every stage may be text and has its part (empty with no stages: "no
- * filters"), else `f=` with every stage. Throws a
+ * they weren't asked for): `view=` while the stages are exactly those of the public saved view they came from
+ * (`source`; a private one wouldn't open for others), else `q=` when every stage may be text and has its part
+ * (empty with no stages: "no filters"), else `f=` with every stage. Throws a
  * LinkError, saying why, for a stage the server forgets (a big Select All), for an expired selection's chip in the
  * bar (`expired`: the link couldn't hold the selection it names) and for a link over MAX_LINK_LENGTH.
  */
-export async function datasetLink({ origin, datasetId, stages, expired = [], parts, sort, sample }: {
+export async function datasetLink({ origin, datasetId, stages, expired = [], source = null, parts, sort, sample }: {
     origin: string;
     datasetId: number;
     stages: ViewStage[];
     expired?: ExpiredSelection[];
+    source?: SourceView | null;
     parts: (string | null)[] | null;
     sort?: { by?: string; order?: 'asc' | 'desc' };
     sample?: number;
@@ -181,7 +234,9 @@ export async function datasetLink({ origin, datasetId, stages, expired = [], par
             + `Select the samples again, or remove ${expired.length === 1 ? 'it' : 'them'}.`);
     }
     const params = new URLSearchParams();  // `+` in a value is written %2B: a raw + reads as a space
-    if (mayBeText(stages) && parts?.length === stages.length && parts.every(part => part)) {
+    if (source?.isPublic && sameStages(stages, source.stages)) {
+        params.set('view', source.slug);
+    } else if (mayBeText(stages) && parts?.length === stages.length && parts.every(part => part)) {
         params.set('q', joinQueryParts(parts as string[]));
     } else if (stages.length) {
         params.set('f', await encodeStages(stages));
@@ -190,15 +245,37 @@ export async function datasetLink({ origin, datasetId, stages, expired = [], par
         // dataset's default view don't open in its place.
         params.set('q', '');
     }
-    if (typeof sort?.by === 'string' && sort.by) {
-        params.set('sort', sort.by);
-        params.set('dir', sort.order === 'desc' ? 'desc' : 'asc');
-    }
+    setSort(params, sort);
     if (sample !== undefined) params.set('sample', String(sample));
     const query = params.toString();
     const link = `${origin}/datasets/${datasetId}${query ? `?${query}` : ''}`;
     if (link.length > MAX_LINK_LENGTH) throw new LinkError(TOO_LONG_NOTICE);
     return link;
+}
+
+function setSort(params: URLSearchParams, sort: { by?: string; order?: 'asc' | 'desc' } | undefined) {
+    if (typeof sort?.by === 'string' && sort.by) {
+        params.set('sort', sort.by);
+        params.set('dir', sort.order === 'desc' ? 'desc' : 'asc');
+    }
+}
+
+/**
+ * The dataset page's address for a state (FilterContext puts it on the state's history entry): its link, as a path and
+ * query. A state no link can hold (datasetLink refuses it: a temporary or expired selection, over MAX_LINK_LENGTH)
+ * gets an address with no filters, only the sort, so the address never names filters that aren't on screen. Opened
+ * elsewhere it opens the dataset as it would without a link; a reload of its entry still restores the entry.
+ */
+export async function datasetAddress(link: Omit<Parameters<typeof datasetLink>[0], 'sample'>): Promise<string> {
+    try {
+        return (await datasetLink(link)).slice(link.origin.length);
+    } catch (error) {
+        if (!(error instanceof LinkError)) throw error;
+        const params = new URLSearchParams();
+        setSort(params, link.sort);
+        const query = params.toString();
+        return `/datasets/${link.datasetId}${query ? `?${query}` : ''}`;
+    }
 }
 
 /** The link to a saved view. It opens only for people who can see the view. */
@@ -219,6 +296,9 @@ export async function copyLink(link: Promise<string>, copied: string, say: Say):
     if (typeof ClipboardItem !== 'undefined' && navigator.clipboard?.write) {
         try {
             const blob = link.then(text => new Blob([text], { type: 'text/plain' }));
+            // Handled here too: when the browser refuses the write before reading the item, nothing else ever reads
+            // `blob`, and a link that can't be made then rejected it unhandled (the awaits below cover `link` only).
+            blob.catch(() => {});
             await navigator.clipboard.write([new ClipboardItem({ 'text/plain': blob })]);
             done = true;
         } catch {
