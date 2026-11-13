@@ -65,6 +65,12 @@ search on each dataset after upgrading.
   crops and overlays each backend process renders at once), but `docker-compose.prod.yml` didn't pass it to the
   backend, so setting it did nothing. Unset, each process still renders as many as it has CPUs.
 
+- **The database image builds again.** `Dockerfile.db` pinned PostgreSQL 18.6 but took the newest PostGIS, and the
+  newest (3.7.0+dfsg-1.pgdg12+2, built for PostgreSQL 18.7) needs a server function 18.6 lacks: a fresh build's
+  database refused to load PostGIS ("undefined symbol: heap_datum_check"). PostGIS is now pinned with the base, to the
+  build 2.11.0's released image has. An image built from an earlier release's `Dockerfile.db` since that PostGIS was
+  published (2026-11-11) has the same fault: rebuild it from 2.11.1; the database's data is untouched.
+
 ## 2.11.0 (2026-11-11)
 
 2.11.0 gives each object sample its image in a column of its own, `samples.parent_id`, so deleting an image

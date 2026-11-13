@@ -7,10 +7,14 @@ FROM pgvector/pgvector:pg18-bookworm@sha256:2358fcba361ed2233a5ed81b5fe4ca779ccb
 # mounted at /var/lib/postgresql/data. Every compose file and procedure mounts it there, so keep it.
 ENV PGDATA=/var/lib/postgresql/data
 
-# Install PostGIS
+# Install PostGIS, pinned like the base: the newest build in the PostgreSQL apt repository is made for the newest
+# PostgreSQL 18 minor, and one built for 18.7 (3.7.0+dfsg-1.pgdg12+2) needs a server function the pinned 18.6 lacks,
+# so a fresh build's database refused to load PostGIS ("undefined symbol: heap_datum_check", 2026-11-12). Move this
+# pin with the base's.
+ARG POSTGIS_VERSION=3.7.0+dfsg-1.pgdg12+1
 USER root
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-    postgresql-18-postgis-3 \
-    postgresql-18-postgis-3-scripts \
+    postgresql-18-postgis-3=${POSTGIS_VERSION} \
+    postgresql-18-postgis-3-scripts=${POSTGIS_VERSION} \
     && rm -rf /var/lib/apt/lists/*
