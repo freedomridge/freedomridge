@@ -255,3 +255,48 @@ test('a sample that is not on its page says so', async ({ page }) => {
     await expect(page.getByRole('alert').filter({ hasText: 'Sample 99 is not on this page of the snapshot, so it is not open.' })).toBeVisible();
     await expect(page.getByRole('dialog')).toHaveCount(0);
 });
+
+test('with the live address off, the address stays the page\'s path; Back, Forward and a reload still restore each entry', async ({ page }) => {
+    // FRIDGE_LIVE_ADDRESS=off: the frontend server's real answer, with liveAddress false.
+    await page.route('**/runtime-config', async route => {
+        const response = await route.fetch();
+        await route.fulfill({ response, json: { ...(await response.json()), liveAddress: false } });
+    });
+    const requests = await manySamples(page);
+    // A Compare link opens on its parameters, which then leave the address.
+    await page.goto('/datasets/1/versions/41?change_type=removed&diff_base=40&diff_target=41');
+    await expect(page.getByText('Showing removed samples as they were in this saved version.')).toBeVisible();
+    await expect.poll(() => new URL(page.url()).search).toBe('');
+    const search = page.getByRole('textbox', { name: 'Search snapshot' });
+    await search.fill('train');
+    await search.press('Enter');
+    await page.getByRole('button', { name: 'Next page' }).click();
+    await expect(page.getByText('Page 2')).toBeVisible();
+    await page.getByRole('button', { name: 'Open saved sample 61' }).click();
+    const dialog = page.getByRole('dialog');
+    await expect(dialog).toBeVisible();
+    await page.keyboard.press('ArrowRight');
+    await expect(dialog.getByText('Sample 62', { exact: true })).toBeVisible();
+    await page.waitForTimeout(500);  // the step is written to the entry once Next pauses
+    expect(new URL(page.url()).search).toBe('');
+
+    // A reload reopens the entry: the Compare link's parameters, the search, the page and the sample.
+    await page.reload();
+    await expect(dialog.getByText('Sample 62', { exact: true })).toBeVisible();
+    const last = new URLSearchParams(requests[requests.length - 1]);
+    expect([last.get('change_type'), last.get('q'), last.get('offset')]).toEqual(['removed', 'train', '60']);
+
+    // Back closes the sample, then steps through the page and the search; Forward returns.
+    await page.goBack();
+    await expect(dialog).toHaveCount(0);
+    await expect(page.getByText('Page 2')).toBeVisible();
+    await page.goBack();
+    await expect(page.getByText('Page 1')).toBeVisible();
+    await expect(search).toHaveValue('train');
+    await page.goBack();
+    await expect(search).toHaveValue('');
+    await expect(page.getByText('Showing removed samples as they were in this saved version.')).toBeVisible();
+    await page.goForward();
+    await expect(search).toHaveValue('train');
+    expect(new URL(page.url()).search).toBe('');
+});

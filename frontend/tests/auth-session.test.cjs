@@ -64,7 +64,7 @@ function harness(t) {
     const cache = () => ({ subscribe: callback => { subscribers.push(callback); return () => {}; } });
     const subscribers = [];
     let options;
-    const client = { clear: t.mock.fn(), getQueryCache: cache, getMutationCache: cache };
+    const client = { clear: t.mock.fn(), getQueryCache: cache, getMutationCache: cache, prefetchQuery: t.mock.fn(async () => {}) };
     const query = {
         useQueryClient: () => client,
         QueryClient: function (config) { options = config; return client; },
@@ -78,6 +78,7 @@ function harness(t) {
         '@/contexts/ToastContext': { ToastProvider: () => null },
         '@/lib/api': api, '@/lib/query-notify': { coalesceQueryNotifications() {} },
         '@/lib/links': load('lib/links.ts', { './filter-query': load('lib/filter-query.ts'), './source-view': load('lib/source-view.ts') }),
+        '@/lib/runtime-config': { runtimeConfigQuery: { queryKey: ['runtime-config'] } },
     });
     t.after(() => {
         slots.forEach(slot => slot?.cleanup?.());
@@ -157,6 +158,8 @@ test('API and provider errors redirect only for 401, and queries retry 429', t =
     const h = harness(t);
     const options = h.providers();
     h.effects();
+    // The app's settings are asked for once, as the app starts.
+    assert.deepEqual(h.client.prefetchQuery.mock.calls.map(call => call.arguments[0].queryKey), [['runtime-config']]);
     for (const status of [503, 500, 429, 403]) {
         const error = new h.api.ApiError(status, 'Temporary error');
         h.subscribers.forEach(callback => callback({ type: 'updated', query: { state: { status: 'error', error } }, mutation: { state: { status: 'error', error } } }));

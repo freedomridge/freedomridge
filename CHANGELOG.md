@@ -4,6 +4,26 @@ Freedom Ridge has one version for the server, the web app and the Python SDK (th
 file), following [Semantic Versioning](https://semver.org). A release lists **upgrade notes** when
 it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
 
+## 2.12.1 (2026-11-13)
+
+2.12.1 adds a setting for deployments that would rather keep filter text out of the address bar:
+`FRIDGE_LIVE_ADDRESS=off` makes the dataset and snapshot pages leave their address as 2.11 did, while links and Copy
+link still work. On by default. The README shows the live demo. No migrations: the standard upgrade steps.
+
+### Added
+
+- **A setting switches the live address off: `FRIDGE_LIVE_ADDRESS=off`.** The address of a dataset's page names
+  the filters (field names, values, class names, map region coordinates), so 2.12.0 put that text in browser
+  history and whatever it syncs to, in the server's and proxies' access logs on each reload, and in screenshots.
+  With the setting off, the address stays `/datasets/<id>` and a version's snapshot page keeps its path alone.
+  Back, Forward and a reload still restore the filters and the open sample, which each history entry keeps in the
+  browser; Copy link and a view's link copy whole links as before, and a link still opens, its parameters then
+  leaving the address. It changes only the address: an opened link is still requested once with its parameters,
+  and the snapshot page's search still goes in the URL of its samples request, so access logs have those either
+  way. The frontend reads it when it starts (`docker-compose.prod.yml` and `docker-compose.try.yml` pass it on);
+  unset, the address follows the page as in 2.12.0. When the frontend can't be asked, the pages treat the setting
+  as off.
+
 ## 2.12.0 (2026-11-13)
 
 2.12.0 puts a dataset page's state in its address. The address follows the applied filters, the grid's sort and the
@@ -14,7 +34,7 @@ screen holds one (a big Select All), the address names no filters. No migrations
 
 ### Added
 
-- **The address of a dataset's page follows its filters and the grid's sort** (#391). Each applied filter change
+- **The address of a dataset's page follows its filters and the grid's sort**. Each applied filter change
   puts the page's own link to the filters in the address (`?q=` text when every chip can be written so, else `?f=`,
   `?view=<slug>` while a public view is applied as it was saved), and a sort change rewrites it without a new
   history entry. A bookmark, a reload or the address pasted elsewhere opens the same filters and sort, and Back and
@@ -23,7 +43,7 @@ screen holds one (a big Select All), the address names no filters. No migrations
   expired selection's chip, over 6,000 characters) leave the filters out of the address, which keeps only the
   sort and the sample open: it never names filters that aren't on screen. The filter text is in the address, so
   it is kept in browser history and in server and proxy logs.
-- **The address also holds the sample whose view is open** (`sample=<id>`, #391). Opening one is a history entry,
+- **The address also holds the sample whose view is open** (`sample=<id>`). Opening one is a history entry,
   next and previous change it without new ones, Back closes the view and Forward opens it again, and a reload or the
   address pasted elsewhere opens the same sample. A `sample=` link keeps it in the address while its view is open.
 

@@ -47,8 +47,9 @@ import { ExportDialog } from '@/components/export-dialog';
 import { PanelType } from '@/components/panel-content';
 import { FilterProvider, useFilters, withGrain, type AddressState, type Grain } from '@/contexts/FilterContext';
 import { useUser } from '@/contexts/UserContext';
+import { useLiveAddress } from '@/lib/runtime-config';
 
-import { ProtectedRoute } from '@/components/ProtectedRoute';
+import { LoadingScreen, ProtectedRoute } from '@/components/ProtectedRoute';
 import { Header } from '@/components/header';
 import { DatasetJobs } from '@/components/dataset-jobs';
 import { DatasetDeletion } from '@/components/dataset-deletion';
@@ -181,13 +182,16 @@ export default function DatasetPage() {
     // the filters, and the router reports each change here: the provider's element is kept, so that renders only this.
     const searchParams = useSearchParams();
     const [search] = useState(() => searchParams.toString());
-    return useMemo(() => (
-        <FilterProvider datasetId={datasetId} search={search}>
+    // Whether the address follows the filters (FRIDGE_LIVE_ADDRESS) is known before the provider writes any: the page
+    // waits for the app's settings (lib/runtime-config.ts; usually asked for already, as the app started).
+    const liveAddress = useLiveAddress();
+    return useMemo(() => liveAddress === undefined ? <LoadingScreen /> : (
+        <FilterProvider datasetId={datasetId} search={search} liveAddress={liveAddress}>
             <ProtectedRoute>
                 <DatasetPageContent />
             </ProtectedRoute>
         </FilterProvider>
-    ), [datasetId, search]);
+    ), [datasetId, search, liveAddress]);
 }
 
 function DatasetPageContent() {

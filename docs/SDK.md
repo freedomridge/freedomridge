@@ -1701,7 +1701,9 @@ The snapshot page's address is a link to what it shows: `search=` (the search), 
 view the version recorded, by name), `page=` and `sample=` (the open sample, one of that page's).
 A bookmark or a reload opens the same samples, and since a version doesn't change, so does the
 link for as long as the version exists. Back and Forward step through searches, views, pages and
-opening a sample; Previous and Next in a sample's view stay on one history entry.
+opening a sample; Previous and Next in a sample's view stay on one history entry. With
+[`FRIDGE_LIVE_ADDRESS=off`](DATASET_MANAGEMENT.md#switching-the-live-address-off) the address stays
+the page's path, and Back, Forward and a reload still restore each step.
 
 To inspect the saved dataset schema and display configuration through the SDK:
 

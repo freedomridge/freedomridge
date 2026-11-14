@@ -15,20 +15,28 @@ require.extensions['.ts'] = (module, filename) => {
 };
 const { GET } = require(path.join(__dirname, '..', 'app', 'runtime-config', 'route.ts'));
 
-async function tokenWith(env) {
-    const saved = { MAPBOX_TOKEN: process.env.MAPBOX_TOKEN, NEXT_PUBLIC_MAPBOX_TOKEN: process.env.NEXT_PUBLIC_MAPBOX_TOKEN };
+async function configWith(env) {
+    const saved = Object.fromEntries(Object.keys(env).map((key) => [key, process.env[key]]));
     for (const [key, value] of Object.entries(env)) {
         if (value === undefined) delete process.env[key];
         else process.env[key] = value;
     }
     try {
-        return (await GET().json()).mapboxToken;
+        return await GET().json();
     } finally {
         for (const [key, value] of Object.entries(saved)) {
             if (value === undefined) delete process.env[key];
             else process.env[key] = value;
         }
     }
+}
+
+async function tokenWith(env) {
+    return (await configWith(env)).mapboxToken;
+}
+
+async function liveAddressWith(value) {
+    return (await configWith({ FRIDGE_LIVE_ADDRESS: value })).liveAddress;
 }
 
 test('the runtime MAPBOX_TOKEN wins over the one compiled in at build time', async () => {
@@ -41,4 +49,16 @@ test('without MAPBOX_TOKEN, the build-time token is used', async () => {
 
 test('with neither, there is no token, so the map says how to set one', async () => {
     assert.equal(await tokenWith({ MAPBOX_TOKEN: undefined, NEXT_PUBLIC_MAPBOX_TOKEN: undefined }), null);
+});
+
+test('the live address is on when FRIDGE_LIVE_ADDRESS is unset, empty or anything but off', async () => {
+    assert.equal(await liveAddressWith(undefined), true);
+    assert.equal(await liveAddressWith(''), true);  // what the Compose files pass when it isn't set
+    assert.equal(await liveAddressWith('on'), true);
+});
+
+test('FRIDGE_LIVE_ADDRESS=off, false, 0 or no switches the live address off, in any case', async () => {
+    for (const value of ['off', 'OFF', ' Off ', 'false', '0', 'no']) {
+        assert.equal(await liveAddressWith(value), false, value);
+    }
 });

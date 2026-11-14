@@ -11,6 +11,7 @@ import { AnnotationOverlay } from '@/components/annotations/AnnotationOverlay';
 import { SampleModal } from '@/components/sample-modal';
 import { DatasetJobs } from '@/components/dataset-jobs';
 import { versionMaker } from '@/lib/version-revert';
+import { useLiveAddress } from '@/lib/runtime-config';
 
 interface SnapshotInfo {
     id: number;
@@ -46,6 +47,11 @@ async function readSnapshot<ResponseType>(url: string): Promise<ResponseType> {
 //   page=<n>        the page of samples, from 1
 //   sample=<id>     the sample whose view is open, one of that page's
 // change_type, diff_base and diff_target come with a Compare link and are kept as they are.
+// With the live address off (FRIDGE_LIVE_ADDRESS, `live` false below), each history entry holds them instead
+// (ENTRY_QUERY) and the address is the page's path alone: a link's move onto its entry as the page opens. Writing an
+// entry's then tells the page (ENTRY_WRITTEN), as the router does for the address.
+const ENTRY_QUERY = 'fridgeSnapshotQuery';
+const ENTRY_WRITTEN = 'fridge:snapshot-entry-written';
 
 // Marks the history entry that opening a sample added. Closing the sample goes back from that entry only.
 const OPENED_SAMPLE = 'fridgeSnapshotSampleOpened';
@@ -58,9 +64,18 @@ function positiveInteger(text: string | null): number | null {
     return text !== null && /^[1-9]\d*$/.test(text) ? Number(text) : null;
 }
 
-/** The query of the address shown, written as useSearchParams writes its own. */
-function shownQuery(): string {
+/** The query of the address shown, written as useSearchParams writes its own; off, the entry's. */
+function shownQuery(live: boolean): string {
+    if (!live) return new URLSearchParams(window.history.state?.[ENTRY_QUERY] ?? '').toString();
     return new URLSearchParams(window.location.search).toString();
+}
+
+/**
+ * Off, the parameters the page opens on: the address's (a link's), else, when the router opened the page's path
+ * alone and that is the address shown, those of the entry a reload or Back or Forward reopened (none on a new entry).
+ */
+function openingQuery(path: string, opened: string): string {
+    return opened || (window.location.pathname === path && !window.location.search ? shownQuery(false) : '');
 }
 
 /** Whether the current history entry is the one that opening a sample added. */
@@ -69,30 +84,56 @@ function onOpenedSampleEntry(): boolean {
 }
 
 /**
- * Puts `changes` in the address (null removes a parameter), on a new history entry or on the current one. The state
- * is a new object each time: Next's history patch then takes the address as its own and adds its own keys. Handed its
- * own keys back, it would pass the call through and keep its old address.
+ * Puts `changes` in the address (null removes a parameter; off, in the entry's), on a new history entry or on the
+ * current one. The state is a new object each time: Next's history patch then takes the address as its own and adds
+ * its own keys. Handed its own keys back, it would pass the call through and keep its old address.
  */
-function writeAddress(changes: Record<string, string | null>, entry: 'push' | 'replace', openedSample = false) {
+function writeAddress(live: boolean, changes: Record<string, string | null>, entry: 'push' | 'replace', openedSample = false) {
     const url = new URL(window.location.href);
+    if (!live) url.search = shownQuery(false);
     for (const [name, value] of Object.entries(changes)) {
         if (value === null) url.searchParams.delete(name);
         else url.searchParams.set(name, value);
     }
-    if (url.searchParams.toString() === shownQuery()) return;
+    if (url.searchParams.toString() === shownQuery(live)) return;
     const state = openedSample ? { [OPENED_SAMPLE]: true } : null;
+    if (!live) {
+        // The address stays as it is, so the router isn't told.
+        const held = { ...state, [ENTRY_QUERY]: url.searchParams.toString() };
+        if (entry === 'push') window.history.pushState(held, '');
+        else window.history.replaceState(held, '');
+        window.dispatchEvent(new Event(ENTRY_WRITTEN));
+        return;
+    }
     if (entry === 'push') window.history.pushState(state, '', `${url.pathname}${url.search}`);
     else window.history.replaceState(state, '', `${url.pathname}${url.search}`);
 }
 
 /** A new search, saved view or page: a new history entry, on the first page unless it names one, with no sample open. */
-function show(changes: Record<string, string | null>) {
-    writeAddress({ page: null, ...changes, sample: null }, 'push');
+function show(live: boolean, changes: Record<string, string | null>) {
+    writeAddress(live, { page: null, ...changes, sample: null }, 'push');
 }
 
-function SnapshotBrowser() {
+function SnapshotBrowser({ liveAddress }: { liveAddress: boolean }) {
     const { id, versionId } = useParams<{ id: string; versionId: string }>();
-    const searchParams = useSearchParams();
+    const routerParams = useSearchParams();
+    // Off: the entry's parameters, read again when one is written and at Back or Forward (below).
+    const path = `/datasets/${id}/versions/${versionId}`;
+    const [entryQuery, setEntryQuery] = useState(() => (liveAddress ? '' : openingQuery(path, routerParams.toString())));
+    const searchParams = liveAddress ? routerParams : new URLSearchParams(entryQuery);
+    useEffect(() => {
+        if (liveAddress) return;
+        // A link's parameters move onto its entry, and the address keeps the page's path alone.
+        if (window.location.search) window.history.replaceState({ [ENTRY_QUERY]: entryQuery }, '', window.location.pathname);
+        // Not for a Back or Forward that leaves the page: it would show the page once more without its parameters.
+        const read = () => { if (window.location.pathname === path) setEntryQuery(shownQuery(false)); };
+        window.addEventListener('popstate', read);
+        window.addEventListener(ENTRY_WRITTEN, read);
+        return () => {
+            window.removeEventListener('popstate', read);
+            window.removeEventListener(ENTRY_WRITTEN, read);
+        };
+    }, []); // eslint-disable-line react-hooks/exhaustive-deps -- once, with the parameters the page opened on
     const address = searchParams.toString();
     const query = searchParams.get('search') ?? '';
     // The saved view shown, one the version recorded; '' for every saved sample.
@@ -112,10 +153,10 @@ function SnapshotBrowser() {
     useEffect(() => {
         if (!step || step.address !== address) return;
         const timer = setTimeout(() => {
-            if (shownQuery() === step.address) writeAddress({ sample: String(step.id) }, 'replace', onOpenedSampleEntry());
+            if (shownQuery(liveAddress) === step.address) writeAddress(liveAddress, { sample: String(step.id) }, 'replace', onOpenedSampleEntry());
         }, STEP_ADDRESS_DELAY_MS);
         return () => clearTimeout(timer);
-    }, [step, address]);
+    }, [step, address, liveAddress]);
     // A close that goes back is under way until its popstate: a second Escape meanwhile would leave the page.
     const closing = useRef(false);
     useEffect(() => {
@@ -123,24 +164,24 @@ function SnapshotBrowser() {
         // (a sample closed, another page) leaves the text typed there.
         const arrived = () => {
             closing.current = false;
-            const search = new URLSearchParams(window.location.search).get('search') ?? '';
+            const search = new URLSearchParams(shownQuery(liveAddress)).get('search') ?? '';
             if (search !== entrySearch.current) setDraft(search);
             entrySearch.current = search;
         };
         window.addEventListener('popstate', arrived);
         return () => window.removeEventListener('popstate', arrived);
-    }, []);
+    }, [liveAddress]);
     // Closing goes back when the current entry is the one opening the sample added, so the history is as before the
     // open, with the sample one Forward away. Otherwise (a page opened on a sample's link) the entry loses its sample.
     const closeSample = () => {
         if (closing.current) return;
         if (onOpenedSampleEntry()) {
             // The entry first takes the sample Previous or Next reached, so Forward reopens the one that was closed.
-            if (step?.address === address) writeAddress({ sample: String(step.id) }, 'replace', true);
+            if (step?.address === address) writeAddress(liveAddress, { sample: String(step.id) }, 'replace', true);
             closing.current = true;
             window.history.back();
         } else {
-            writeAddress({ sample: null }, 'replace');
+            writeAddress(liveAddress, { sample: null }, 'replace');
         }
         setStep(null);
     };
@@ -191,7 +232,7 @@ function SnapshotBrowser() {
             {error && <p role="alert" className="text-red-400">{error.message}</p>}
             {version.data?.include_metadata === false && <p role="alert">Hash-only versions cannot be browsed. Create a full snapshot to preserve historical samples.</p>}
             {version.data?.include_metadata && <>
-                <form className="flex gap-3" onSubmit={event => { event.preventDefault(); entrySearch.current = draft; show({ search: draft || null }); }}>
+                <form className="flex gap-3" onSubmit={event => { event.preventDefault(); entrySearch.current = draft; show(liveAddress, { search: draft || null }); }}>
                     <input aria-label="Search snapshot" placeholder="Search saved paths, tags, or metadata" value={draft} maxLength={1000} onChange={event => setDraft(event.target.value)} className="flex-1 rounded border border-zinc-700 bg-zinc-900 px-3 py-2" />
                     <button className="rounded bg-cyan-800 px-4 py-2" type="submit">Search</button>
                 </form>
@@ -201,7 +242,7 @@ function SnapshotBrowser() {
                         <select
                             aria-label="Saved view of this version"
                             value={viewName}
-                            onChange={event => show({ view: event.target.value || null })}
+                            onChange={event => show(liveAddress, { view: event.target.value || null })}
                             className="rounded border border-zinc-700 bg-zinc-900 px-3 py-2"
                         >
                             <option value="">All saved samples</option>
@@ -215,7 +256,7 @@ function SnapshotBrowser() {
                 {samples.data && <p>{samples.data.total.toLocaleString()} matching samples</p>}
                 {samples.data && selectedId !== null && !selected && <p role="alert">Sample {selectedId} is not on this page of the snapshot, so it is not open.</p>}
                 <div className="grid grid-cols-2 md:grid-cols-4 xl:grid-cols-6 gap-3">
-                    {items.map(sample => <button key={sample.id} onClick={() => writeAddress({ sample: String(sample.id) }, 'push', true)} className="rounded border border-zinc-800 overflow-hidden text-left hover:border-cyan-600" aria-label={`Open saved sample ${sample.id}`}>
+                    {items.map(sample => <button key={sample.id} onClick={() => writeAddress(liveAddress, { sample: String(sample.id) }, 'push', true)} className="rounded border border-zinc-800 overflow-hidden text-left hover:border-cyan-600" aria-label={`Open saved sample ${sample.id}`}>
                         <AnnotationOverlay
                             imageSrc={getSampleMediaUrl(sample.id, settings?.grid_media_field || 'filepath', undefined, undefined, undefined, Number(versionId))}
                             sampleId={sample.id}
@@ -233,9 +274,9 @@ function SnapshotBrowser() {
                     </button>)}
                 </div>
                 <div className="flex items-center gap-4">
-                    <button disabled={pageNumber === 1 || samples.isFetching} onClick={() => show({ page: pageNumber > 2 ? String(pageNumber - 1) : null })} className="disabled:opacity-40">Previous page</button>
+                    <button disabled={pageNumber === 1 || samples.isFetching} onClick={() => show(liveAddress, { page: pageNumber > 2 ? String(pageNumber - 1) : null })} className="disabled:opacity-40">Previous page</button>
                     <span>Page {pageNumber}</span>
-                    <button disabled={!samples.data || offset + limit >= samples.data.total || samples.isFetching} onClick={() => show({ page: String(pageNumber + 1) })} className="disabled:opacity-40">Next page</button>
+                    <button disabled={!samples.data || offset + limit >= samples.data.total || samples.isFetching} onClick={() => show(liveAddress, { page: String(pageNumber + 1) })} className="disabled:opacity-40">Next page</button>
                 </div>
                 {settings && <details className="text-sm text-zinc-400">
                     <summary>Saved dataset schema and display settings</summary>
@@ -262,5 +303,9 @@ function SnapshotBrowser() {
 }
 
 export default function SnapshotPage() {
-    return <Suspense fallback={<p>Loading snapshot…</p>}><SnapshotBrowser /></Suspense>;
+    // Where the parameters are kept (FRIDGE_LIVE_ADDRESS) is known before the page reads any: it waits for the app's
+    // settings, one small request a page load (lib/runtime-config.ts).
+    const liveAddress = useLiveAddress();
+    if (liveAddress === undefined) return <p>Loading snapshot…</p>;
+    return <Suspense fallback={<p>Loading snapshot…</p>}><SnapshotBrowser liveAddress={liveAddress} /></Suspense>;
 }
