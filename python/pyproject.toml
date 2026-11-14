@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "freedomridge"
-version = "2.12.0"
+version = "2.12.1"
 license = "MIT"
 license-files = ["LICENSE"]  # a copy of the repository's LICENSE: a package can hold only files under python/
 description = "Python SDK for Freedom Ridge Dataset Explorer"

@@ -7,14 +7,15 @@
 # development ones, and the ports listen on 127.0.0.1. Put images in ./data. It is mounted at the same
 # path in the containers (FRIDGE_DATA_ROOT), so paths you give the SDK on this machine work as they are.
 # Run Compose from this folder: the path comes from the shell's $PWD. MAPBOX_TOKEN in the environment or
-# a .env file turns the map on; FRIDGE_PORT and FRIDGE_API_PORT move the two ports. `npx freedomridge` runs
+# a .env file turns the map on; FRIDGE_LIVE_ADDRESS=off keeps filters out of the address (.env.example);
+# FRIDGE_PORT and FRIDGE_API_PORT move the two ports. `npx freedomridge` runs
 # this file for you. A server needs docker-compose.prod.yml (docs/DOCKER_DEPLOYMENT.md).
 # Docker needs at least 4 GB of memory for it.
 name: freedomridge-try
 
 services:
   db:
-    image: ghcr.io/freedomridge/db:2.12.0
+    image: ghcr.io/freedomridge/db:2.12.1
     environment:
       POSTGRES_USER: freedomridge
       POSTGRES_PASSWORD: password
@@ -36,7 +37,7 @@ services:
     restart: unless-stopped
 
   backend:
-    image: ghcr.io/freedomridge/backend:2.12.0
+    image: ghcr.io/freedomridge/backend:2.12.1
     environment:
       DATABASE_URL: postgresql://freedomridge:password@db:5432/freedomridge
       FRIDGE_ENV: development
@@ -58,7 +59,7 @@ services:
     restart: unless-stopped
 
   job-runner:
-    image: ghcr.io/freedomridge/worker:2.12.0
+    image: ghcr.io/freedomridge/worker:2.12.1
     command: python3 -m backend.job_service
     init: true
     environment:
@@ -76,11 +77,12 @@ services:
     stop_grace_period: 30s
 
   frontend:
-    image: ghcr.io/freedomridge/frontend:2.12.0
+    image: ghcr.io/freedomridge/frontend:2.12.1
     environment:
       # Next standalone otherwise binds to Docker's hostname and its localhost healthcheck fails.
       HOSTNAME: 0.0.0.0
       MAPBOX_TOKEN: ${MAPBOX_TOKEN:-}
+      FRIDGE_LIVE_ADDRESS: ${FRIDGE_LIVE_ADDRESS:-}
     ports:
       - "127.0.0.1:${FRIDGE_PORT:-3000}:3000"
     depends_on:

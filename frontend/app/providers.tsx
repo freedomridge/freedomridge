@@ -7,6 +7,7 @@ import { ToastProvider, useToast } from '@/contexts/ToastContext';
 import { isRescoringRefusal, rescoringRetryPeriod } from '@/lib/api';
 import { coalesceQueryNotifications } from '@/lib/query-notify';
 import { loginPath } from '@/lib/links';
+import { runtimeConfigQuery } from '@/lib/runtime-config';
 
 // Query results that arrive together render together (the sidebar's streamed fields).
 coalesceQueryNotifications();
@@ -98,6 +99,10 @@ export function Providers({ children }: { children: React.ReactNode }) {
             },
         },
     }));
+
+    // The app's settings (lib/runtime-config.ts), asked for once as the app starts: a dataset or snapshot page opened
+    // from another page then finds them here instead of waiting for them.
+    useEffect(() => { void queryClient.prefetchQuery(runtimeConfigQuery); }, [queryClient]);
 
     // Redirect to login on ANY 401 — queries AND mutations. Without this, an
     // expired session causes queries to silently fail while the user stares at

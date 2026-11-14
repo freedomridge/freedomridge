@@ -5,13 +5,13 @@ datasets. It is for teams whose image data has outgrown the tool they started wi
 samples, served whole, without sampling and without truncation.
 
 <div align="center">
-  <img src="docs/images/freedomridge_dataset_detail_readme.png" alt="Dataset view with filters, image grid, embeddings and map" width="800"/>
-  <p><em>Filters, grid, embeddings and map in sync: all 27,000 EuroSAT tiles, coloured by land-cover class</em></p>
+  <img src="docs/images/freedomridge_demo_readme.png" alt="The iNaturalist dataset filtered to phylum Chordata: image grid, embeddings plot colored by class, and a map of Europe where the photos were taken" width="800"/>
+  <p><em>Filter, grid, embeddings and map in sync on the <a href="https://freedomridge.app">live demo</a>: 23,477 iNaturalist photos of phylum Chordata, colored by class</em></p>
 </div>
 
 ## Features
 
-- **Nothing is hidden.** The view is the truth. Limits are signalled and escapable, never silent:
+- **Nothing is hidden.** The view is the truth. Limits are signaled and escapable, never silent:
   no quiet caps, no truncated counts, no "showing the first 1,000".
 - **Maps.** GPS locations, a map panel and polygon filters for aerial, satellite, street-level
   and driving imagery.
@@ -89,7 +89,7 @@ python examples/import_demo_data.py --datasets coco --limit 100
 ```
 
 [examples/README.md](examples/README.md) covers COCO, Open Images, iNaturalist, KITTI and more,
-with disk sizes, import times and each dataset's licence.
+with disk sizes, import times and each dataset's license.
 
 ## Python SDK
 
@@ -173,13 +173,13 @@ docs/           guides and design notes
 - The map panel stays empty: set `NEXT_PUBLIC_MAPBOX_TOKEN` in `frontend/.env.local` and restart
   the frontend. Everything else works without it.
 
-## Contributing, security and licence
+## Contributing, security and license
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, the full set of checks, and
 migrations. Please follow the [Code of Conduct](CODE_OF_CONDUCT.md), and report vulnerabilities
 privately as described in [SECURITY.md](SECURITY.md).
 
-MIT License; see [LICENSE](LICENSE). Third-party components and datasets keep their own licences;
+MIT License; see [LICENSE](LICENSE). Third-party components and datasets keep their own licenses;
 see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 Built with [FastAPI](https://fastapi.tiangolo.com/), [Next.js](https://nextjs.org/),

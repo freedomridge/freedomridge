@@ -264,9 +264,10 @@ requests.patch(
 
 ## Links to a filter, a view or a sample
 
-The address of a dataset's page is a link to what it shows: the applied filters, the grid's sort and the
-sample whose view is open. It changes as they do, so a bookmark, a reload or the address pasted elsewhere
-opens the same filters and sample. Back and Forward step through the filters applied, each with its address,
+The address of a dataset's page is a link to what it shows (unless [switched off](#switching-the-live-address-off)):
+the applied filters, the grid's sort and the sample whose view is open. It changes as they do, so a bookmark,
+a reload or the address pasted elsewhere opens the same filters and sample. Back and Forward step through the
+filters applied, each with its address,
 and through opening a sample's view: Back closes it and Forward opens it again. Next and previous in the
 view change the sample in the address without adding to the history. The web app also copies links:
 
@@ -291,9 +292,14 @@ filters replace the ones the browser kept for the dataset; Back doesn't return t
 shows the page's own link to the same filters (the query as the app writes it). A link that can't be opened
 says why, and the dataset opens, with its address, as it would without the link.
 
-The filter text is in the address, so it is kept in the browser's history and in the access logs of the
-server and of any proxy in between, and it travels wherever the address is pasted. Don't put secrets in
-filter values.
+An address carries what the filters name: field names, values, class names and map region coordinates (as
+text in `q=`, or in `f=`, which anyone can decode). It is kept in the browser's history, and in whatever the
+browser syncs it to; each load or reload of the page puts it in the access logs of the server and of any proxy
+in between, and the page's own requests to the server carry it as their `Referer` (which the bundled nginx and
+backend don't log, but another proxy may); it shows in screenshots; and it travels wherever it is pasted.
+Other sites the page loads from or links to receive only the origin
+(`Referrer-Policy: strict-origin-when-cross-origin`). Don't put secrets in filter values. To keep filter text
+out of the address, switch the live address off (below).
 
 A link doesn't carry:
 
@@ -315,6 +321,29 @@ selection's chip expired.
 
 An `f=` made by a version of Freedom Ridge that encodes filters differently says so, and the dataset opens
 without it.
+
+### Switching the live address off
+
+`FRIDGE_LIVE_ADDRESS=off` for the frontend (also `false`, `0` or `no`; read when it starts, see `.env.example`)
+keeps filters, searches, the sort and the open sample out of the page's address. The dataset page's address
+stays `/datasets/<id>`, and a version's snapshot page keeps its path alone, so that text stays out of the
+browser's history and whatever it syncs to, out of bookmarks and screenshots of the address bar, and out of
+the access log line a reload makes. Back, Forward and a reload still step through and restore the filters and
+the open sample, which each history entry keeps in the browser; after a reload the grid's sort is the one this
+browser last chose. Copy link, a view's link and the links they make work as before, and a link opens as
+above, its parameters then leaving the address. When the frontend can't be asked whether the setting is on,
+the pages treat it as off.
+
+It changes only the page's address, not the server's requests:
+
+- A link that is opened is still requested from the server once with its parameters, so they are in that
+  access log, as for any link, and the page's first requests, made while it opens the link, carry them as
+  their `Referer`.
+- The snapshot page sends its search and saved view in the address of the request for its samples
+  (`…/samples?…&q=<search>&view=<name>`), so the server's access log has every search whether the setting is
+  on or off.
+- The dataset page sends filter values, regions and search text in request bodies, which the bundled nginx
+  and backend don't log.
 
 ## Delete samples (admin)
 

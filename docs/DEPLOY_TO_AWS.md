@@ -266,6 +266,7 @@ The generated values include:
 | `DOMAIN_NAME` | `YOUR_DOMAIN` |
 | `LETSENCRYPT_EMAIL` | Your notification email |
 | `NEXT_PUBLIC_MAPBOX_TOKEN` | After restricting the token to `https://YOUR_DOMAIN`. The frontend reads it when it starts: after a change, `docker compose -f docker-compose.prod.yml up -d frontend` |
+| `FRIDGE_LIVE_ADDRESS` | Optional. `off` keeps filters, searches, the sort and the open sample out of the pages' address: out of browser history, bookmarks and the log line a reload makes. An opened link is still requested once with its parameters, and the snapshot page's search still goes in its samples request's URL, so the access log has those either way ([links](DATASET_MANAGEMENT.md#switching-the-live-address-off)). Read when the frontend starts, like the token. Unset: on |
 | `DATA_VOLUME_PATH`, `FRIDGE_DATA_ROOT` | Both `/data/datasets`; mounted at the **same absolute path** in backend and job-runner |
 | `POSTGRES_VOLUME_PATH` | `/data/postgres`, outside the media root |
 | `CACHE_VOLUME_PATH` | `/cache`, including `/cache/huggingface` |

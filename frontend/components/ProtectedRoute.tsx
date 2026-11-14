@@ -6,6 +6,16 @@ import { useRouter } from 'next/navigation';
 import { ChangePasswordModal } from './ChangePasswordModal';
 import { loginPath } from '@/lib/links';
 
+// What a protected page shows while it waits for the session (the dataset page also while it waits for the app's
+// settings).
+export function LoadingScreen() {
+    return (
+        <div className="min-h-screen flex items-center justify-center bg-zinc-950 text-zinc-400">
+            Loading...
+        </div>
+    );
+}
+
 export function ProtectedRoute({ children }: { children: React.ReactNode }) {
     const { user, isLoading, isAuthenticated } = useUser();
     const router = useRouter();
@@ -41,13 +51,7 @@ export function ProtectedRoute({ children }: { children: React.ReactNode }) {
         }
     }, [mustChangePassword, showPasswordModal]);
 
-    if (isLoading) {
-        return (
-            <div className="min-h-screen flex items-center justify-center bg-zinc-950 text-zinc-400">
-                Loading...
-            </div>
-        );
-    }
+    if (isLoading) return <LoadingScreen />;
 
     if (!isAuthenticated) {
         return null; // Will redirect

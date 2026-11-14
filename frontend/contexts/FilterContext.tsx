@@ -415,7 +415,9 @@ export function withGrain(
 
 // `search`: the query the router opened the page with, read once by the page (not window.location: after login the app
 // navigates here, and the address still shows the login page while this page first renders).
-export function FilterProvider({ children, datasetId, search }: { children: React.ReactNode; datasetId?: number; search: string }): React.ReactNode {
+// `liveAddress` (FRIDGE_LIVE_ADDRESS): false keeps the address at the dataset's alone. The entries are written as with it
+// on, so Back, Forward and a reload restore them, and a link still opens; only the address names nothing.
+export function FilterProvider({ children, datasetId, search, liveAddress }: { children: React.ReactNode; datasetId?: number; search: string; liveAddress: boolean }): React.ReactNode {
     // How the page opens (lib/links.ts openingOf), decided at its first render so nothing is fetched for a state about
     // to be replaced: on one of its own history entries (a reload, or Back or Forward into a page that was unloaded),
     // whose state it restores; on the link in the address; or on the filters the browser saved for the dataset. The
@@ -616,7 +618,8 @@ export function FilterProvider({ children, datasetId, search }: { children: Reac
         const state = window.history.state;
         if (!state?._fridge || state.entryId !== id || window.location.pathname !== `/datasets/${datasetId}`) return;
         const shown = shownAddress();
-        const url = new URL(address, window.location.href);
+        // Off: the dataset's alone, whatever the entry holds, so a link's parameters go too.
+        const url = new URL(liveAddress ? address : `/datasets/${datasetId}`, window.location.href);
         const to = `${url.pathname}${url.search}`;
         try {
             if (to !== shown) {
@@ -630,7 +633,7 @@ export function FilterProvider({ children, datasetId, search }: { children: Reac
         } catch (e) {
             console.warn('Skipped the address write:', e);
         }
-    }, [datasetId]);
+    }, [datasetId, liveAddress]);
 
     // The sort changed (it isn't history): the current address names it at once, its filters as they are, so a reload
     // right after opens on it. The entry's address is then made again: one in flight may hold the sort before.
@@ -642,14 +645,20 @@ export function FilterProvider({ children, datasetId, search }: { children: Reac
     }, [writeAddress]);
 
     useEffect(() => {
-        if (!addressEntry || !addressOf) return;
+        if (!addressEntry) return;
+        // Off: nothing to make (no query text asked of the server); writeAddress writes the dataset's alone.
+        if (!liveAddress) {
+            writeAddress(addressEntry.id, '');
+            return;
+        }
+        if (!addressOf) return;
         let current = true;  // a later entry, sort or way of writing it takes over
         addressOf(addressEntry).then(
             (address) => { if (current) writeAddress(addressEntry.id, withSample(address, addressEntry.sample)); },
             (error: unknown) => console.warn("Couldn't make the address:", error),
         );
         return () => { current = false; };
-    }, [addressEntry, addressOf, writeAddress]);
+    }, [addressEntry, addressOf, writeAddress, liveAddress]);
 
     // The opening is decided (a link settled, the default view applied or not) and no replace of the opening entry is
     // due, which would give the entry its state: from here the entry is the page's, and its address is written.
@@ -1177,7 +1186,8 @@ export function FilterProvider({ children, datasetId, search }: { children: Reac
         link,
         settleLink,
         linkPending,
-        openingSort: opening.sort,
+        // Off, an entry's address names no sort (not the default order): the grids keep the one they had.
+        openingSort: liveAddress || !opening.entry ? opening.sort : undefined,
         setAddressOf,
         setAddressSort,
         openSample,
