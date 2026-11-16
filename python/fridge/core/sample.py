@@ -254,6 +254,8 @@ class Sample:
 
         The sample must have been loaded from a dataset (via iteration or query)
         for this to work. Changes to tags, metadata, and location are persisted.
+        It always sends the metadata, so it needs edit in the dataset; with tag only,
+        change tags with ``dataset.tag_samples`` / ``untag_samples``.
 
         Deleting a metadata key works too — the update is a MERGE server-side, so removals are
         sent explicitly as ``remove_metadata_keys`` by diffing against the keys this sample was

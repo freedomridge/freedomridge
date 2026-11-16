@@ -1,8 +1,10 @@
 """Deletion admission, fencing and recovery on an explicitly isolated PostgreSQL database."""
 
 import asyncio
+import importlib
 import json
 import os
+import pkgutil
 import sys
 import time
 from unittest.mock import AsyncMock
@@ -11,10 +13,11 @@ from uuid import UUID
 import asyncpg
 import httpx
 import pytest
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import APIRouter, FastAPI, HTTPException, Request
 from fastapi.routing import APIRoute
 
 from backend import access, dataset_deletion, job_queue
+from backend import routers as routers_package
 from backend.routers import datasets, jobs
 from backend.tests import test_field_registry_postgres
 from backend.tests.test_field_registry_postgres import USER, ingest
@@ -614,9 +617,21 @@ def test_writer_row_lock_prevents_sealing_until_it_commits(registry_database, mo
     registry_database(scenario)
 
 
+def every_router() -> list[APIRouter]:
+    """The router of every module in backend/routers: wherever a dataset's routes are, a new router included."""
+    found = []
+    for module in pkgutil.iter_modules(routers_package.__path__):
+        router = getattr(importlib.import_module(f'{routers_package.__name__}.{module.name}'), 'router', None)
+        if isinstance(router, APIRouter):
+            found.append(router)
+    return found
+
+
 def test_http_writes_to_deleting_dataset_return_409(registry_database, monkeypatch):
+    """Every write route behind require_dataset_access, in every router, refuses a dataset being deleted (409); the
+    POSTs listed as reads still answer, and each name on that list is such a route."""
     from backend.main import dataset_lifecycle_error
-    from backend.routers import auth, concepts, embeddings, hashes, quality, versions
+    from backend.routers import auth
 
     async def scenario(database):
         await seed(database)
@@ -625,14 +640,8 @@ def test_http_writes_to_deleting_dataset_return_409(registry_database, monkeypat
         monkeypatch.setattr(auth, 'get_optional_user', AsyncMock(return_value=USER))
         app = FastAPI()
         app.add_exception_handler(asyncpg.ObjectNotInPrerequisiteStateError, dataset_lifecycle_error)
-        routers = (
-            datasets.router,
-            concepts.router,
-            embeddings.router,
-            hashes.router,
-            versions.router,
-            quality.router,
-        )
+        routers = every_router()
+        assert datasets.router in routers and len(routers) > 10
         for router in routers:
             app.include_router(router, prefix='/api')
         # Exercise every actual route dependency, including writes with empty/no-op payloads.

@@ -14,7 +14,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from pydantic import BaseModel, Field, FiniteFloat, model_validator
 
 from .. import map_placement, patch_import, patch_search
-from ..access import require_dataset_access
+from ..access import require_dataset_access, require_level
 from ..api_errors import CodedHTTPException
 from ..coordinates import (
     SAVE_COORDINATES,
@@ -336,7 +336,7 @@ async def import_patch_vectors(id: int, request: PatchVectorImport, user: dict =
 async def upload_patch_embeddings(
     id: int,
     embeddings: List[PatchEmbeddingUpload],
-    user: dict = Depends(require_role("power_user")),
+    user: dict = Depends(require_level("edit")),
 ):
     """Upload patch embeddings. The field_name encoding is handled internally —
     callers just provide sample_id, vector, scale, row, col."""
@@ -391,7 +391,7 @@ async def upload_patch_embeddings(
 async def upload_embeddings(
     id: int,
     embeddings: List[EmbeddingUpload],
-    user: dict = Depends(require_role("power_user")),
+    user: dict = Depends(require_level("edit")),
 ):
     submitted = len(embeddings)
     if not embeddings:
@@ -465,7 +465,7 @@ class FieldModelRegistration(BaseModel):
 async def register_field_model(
     id: int,
     body: FieldModelRegistration,
-    user: dict = Depends(require_role("power_user")),
+    user: dict = Depends(require_level("edit")),
 ):
     """Record which checkpoint produced an embedding field.
 
@@ -579,7 +579,7 @@ async def map_write_refusal(id, conn, error, fields):
 
 
 @router.post("/reduce")
-async def reduce_embeddings(id: int, req: ReduceRequest, user: dict = Depends(require_role("power_user"))):
+async def reduce_embeddings(id: int, req: ReduceRequest, user: dict = Depends(require_level("edit"))):
     """Server-side UMAP reduction for SMALL fields. Fitting hundreds of thousands of vectors in the
     API worker OOMs/drops the connection, so this refuses oversized fits with a 413 pointing to the
     SDK's Dataset.compute_visualization (client-side, RAM-scaled) — the scalable path."""
@@ -1844,7 +1844,7 @@ async def upload_coordinates(
     id: int,
     field_name: str,
     coordinates: List[CoordinateUpdate],
-    user: dict = Depends(require_role("power_user")),
+    user: dict = Depends(require_level("edit")),
     model_id: Optional[str] = None,
 ):
     """Store 2D layout coordinates. Managed maps require their current `model_id` for incremental
@@ -1964,7 +1964,7 @@ async def recompute_viz_rank(
     id: int,
     field_name: str,
     full: bool = True,
-    user: dict = Depends(require_role("power_user")),
+    user: dict = Depends(require_level("edit")),
 ):
     """Recompute the even-coverage scatter sample-priority (viz_cell_rank +
     embedding_viz_meta) for a field. The SDK calls this after a UMAP reduce
@@ -1994,7 +1994,7 @@ async def recompute_viz_rank(
 
 
 @router.put("/placement-hold")
-async def hold_placement(id: int, field_name: str, user: dict = Depends(require_role("power_user"))):
+async def hold_placement(id: int, field_name: str, user: dict = Depends(require_level("edit"))):
     """Hold placement of new samples on this map while a full layout of it is written over time (the SDK's
     `compute_visualization` takes it before fetching the vectors): samples that arrive meanwhile stay queued and
     are placed on the new layout once it is released, instead of from the old one. It lasts
@@ -2010,7 +2010,7 @@ async def hold_placement(id: int, field_name: str, user: dict = Depends(require_
 
 
 @router.delete("/placement-hold")
-async def release_placement(id: int, field_name: str, user: dict = Depends(require_role("power_user"))):
+async def release_placement(id: int, field_name: str, user: dict = Depends(require_level("edit"))):
     """Release a hold on this map's placement: its waiting samples are placed within seconds."""
     await map_placement.release(db, id, field_name)
     return {"field_name": field_name, "held_until": None}

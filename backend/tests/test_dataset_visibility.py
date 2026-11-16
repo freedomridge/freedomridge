@@ -31,6 +31,7 @@ def test_new_datasets_are_private_until_an_admin_opens_them(registry_database, m
 
         opened = await datasets.update_dataset(created['id'], datasets.DatasetUpdate(is_global=True), USER)
         assert opened['is_global'] is True
+        assert opened['everyone_level'] == 'view'  # made global without a level: view
         assert (await access.check_dataset_access(created['id'], GUEST))['id'] == created['id']
 
         closed = await datasets.update_dataset(created['id'], datasets.DatasetUpdate(is_global=False), USER)
@@ -39,6 +40,7 @@ def test_new_datasets_are_private_until_an_admin_opens_them(registry_database, m
             await access.check_dataset_access(created['id'], GUEST)
 
         public = await datasets.create_dataset(datasets.DatasetCreate(name='public', is_global=True), USER)
+        assert public['everyone_level'] == 'view'  # created global without a level: view
         assert (await access.check_dataset_access(public['id'], GUEST))['id'] == public['id']
 
     registry_database(scenario)

@@ -145,8 +145,9 @@ def test_private_diagnostics_follow_submitter_not_dataset_sharing(registry_datab
         monkeypatch.setattr(access, 'db', database)
         await database.execute("""INSERT INTO users(id,username,role) VALUES
             (10,'Owner','power_user'), (20,'Shared','guest'), (21,'Unshared','guest')""")
-        await database.execute('UPDATE datasets SET is_global=false,owner_id=10 WHERE id=1')
-        await database.execute('INSERT INTO dataset_access(dataset_id,user_id) VALUES (1,20)')
+        await database.execute('UPDATE datasets SET is_global=false WHERE id=1')
+        # Shared with the submitter (10) and with a guest (20) who didn't submit the job.
+        await database.execute('INSERT INTO dataset_access(dataset_id,user_id) VALUES (1,10),(1,20)')
         submitted = await job_queue.enqueue_job(database.pool, 'umap_fit', dataset_id=1, created_by=10)
         await database.execute(
             'UPDATE jobs SET error=$2,result=$3 WHERE id=$1',

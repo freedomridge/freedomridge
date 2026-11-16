@@ -5,7 +5,7 @@ import { Cross2Icon } from '@radix-ui/react-icons';
 import { useQueryClient } from '@tanstack/react-query';
 import { useToast } from '@/contexts/ToastContext';
 import { useFilters } from '@/contexts/FilterContext';
-import type { DatasetMirror } from '@/lib/api';
+import { noticeLevelRefusal, type DatasetMirror } from '@/lib/api';
 import { LOCAL_TAGS } from '@/lib/local-fields';
 
 // From the tag registry. created_at/created_by null = unknown: the tag predates
@@ -215,12 +215,10 @@ export function TagManagementModal({
                     setSaving(false);
                     return;
                 }
-                if (res.status === 403) {
-                    setError('Permission denied. You need "Power User" or "Admin" role to tag samples.');
-                    setSaving(false);
-                    return;
-                }
                 const errorData = await res.json().catch(() => ({}));
+                // The server's reason, such as "This needs tag access to the dataset"; a level refusal also has the
+                // page read the dataset again (providers.tsx), so its controls catch up.
+                noticeLevelRefusal(res.status, errorData.detail);
                 if (res.status === 410) clearSelection();  // the Select-All token expired
                 throw new Error(errorData.detail || `Failed to update tags: ${res.statusText}`);
             }

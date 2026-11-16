@@ -4,7 +4,7 @@ import { QueryClient, QueryClientProvider, useQueryClient } from '@tanstack/reac
 import { useState, useEffect } from 'react';
 import { UserProvider } from '@/contexts/UserContext';
 import { ToastProvider, useToast } from '@/contexts/ToastContext';
-import { isRescoringRefusal, rescoringRetryPeriod } from '@/lib/api';
+import { ApiError, LEVEL_REFUSED_EVENT, isLevelRefusal, isRescoringRefusal, rescoringRetryPeriod } from '@/lib/api';
 import { coalesceQueryNotifications } from '@/lib/query-notify';
 import { loginPath } from '@/lib/links';
 import { runtimeConfigQuery } from '@/lib/runtime-config';
@@ -124,9 +124,19 @@ export function Providers({ children }: { children: React.ReactNode }) {
                 if (is401(event.query.state.error)) handleSessionExpired();
             }
         });
+        // A refusal for want of a level (someone lowered it while the page was open): the datasets, which carry the
+        // user's access_level, are read again, so every control that follows it catches up without a reload.
+        function refetchLevels() {
+            void queryClient.invalidateQueries({ queryKey: ['dataset'] });
+            void queryClient.invalidateQueries({ queryKey: ['datasets'] });
+        }
+
         const unsubMutation = queryClient.getMutationCache().subscribe((event) => {
             if (event.type === 'updated' && event.mutation?.state.status === 'error') {
-                if (is401(event.mutation.state.error)) handleSessionExpired();
+                const error = event.mutation.state.error;
+                if (is401(error)) handleSessionExpired();
+                // An ApiError has announced it already (LEVEL_REFUSED_EVENT); another error carries the server's text.
+                else if (!(error instanceof ApiError) && isLevelRefusal(error?.message)) refetchLevels();
             }
         });
         // Also fire for non-react-query 401s: raw fetches and swallowed errors
@@ -134,11 +144,14 @@ export function Providers({ children }: { children: React.ReactNode }) {
         // dispatches it when /api/auth/me starts returning 401 (e.g. images 401ing
         // but no data request is in flight).
         window.addEventListener('fridge:unauthorized', handleSessionExpired);
+        // Every API call's refusal (ApiError) and the raw fetches' (noticeLevelRefusal) arrive here.
+        window.addEventListener(LEVEL_REFUSED_EVENT, refetchLevels);
 
         return () => {
             unsubQuery();
             unsubMutation();
             window.removeEventListener('fridge:unauthorized', handleSessionExpired);
+            window.removeEventListener(LEVEL_REFUSED_EVENT, refetchLevels);
         };
     }, [queryClient]);
 

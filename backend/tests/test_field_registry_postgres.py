@@ -53,9 +53,11 @@ def registry_database(monkeypatch):
                     server_settings={'search_path': f'{namespace},public', 'statement_timeout': '10000', **PLANNING},
                 )
                 await database.execute((Path(datasets.__file__).parents[1] / 'db/schema.sql').read_text())
-                # Open to every user; tests needing a private dataset set FALSE.
+                # Open to every user at edit, named here: a dataset made global without a level starts at view. Tests
+                # needing a private dataset set FALSE.
                 await database.execute(
-                    "INSERT INTO datasets (id, name, is_global) VALUES (1, 'training', TRUE), (2, 'other', TRUE)",
+                    'INSERT INTO datasets (id, name, is_global, everyone_level) '
+                    "VALUES (1, 'training', TRUE, 3), (2, 'other', TRUE, 3)",
                 )
                 for module in (datasets, embeddings, quality, versions):
                     monkeypatch.setattr(module, 'db', database)

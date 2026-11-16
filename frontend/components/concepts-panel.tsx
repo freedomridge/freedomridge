@@ -24,17 +24,21 @@ import {
 } from '@/lib/api';
 import { getSampleMediaUrl } from '@/lib/media-utils';
 import { useFilters } from '@/contexts/FilterContext';
+import { refusal, type AccessLevel } from '@/lib/access-level';
 
 interface Props {
     datasetId: number;
     onSampleClick?: (sample: Sample) => void;
+    level?: AccessLevel | null;  // the user's level in the dataset: making and changing concepts takes edit
 }
 
 // "Concepts": exclude / rank by "images like this". A concept is a saved direction in an
 // embedding field → a calibrated [0,1] score per sample. You point at examples (a selection),
 // the slider chooses the cut, and Apply adds a reversible concept_exclude stage to the view.
-export function ConceptsPanel({ datasetId, onSampleClick }: Props) {
+export function ConceptsPanel({ datasetId, onSampleClick, level = null }: Props) {
     const qc = useQueryClient();
+    // Below edit, what makes or changes a concept is disabled and says why; using one in the view is open to all.
+    const editRefusal = refusal(level, 'edit');
     const { viewStages, addStage, removeStage, updateStage, selectedIds, brushedIds } = useFilters();
     const [name, setName] = useState('');
     const [prompt, setPrompt] = useState('');
@@ -159,8 +163,8 @@ export function ConceptsPanel({ datasetId, onSampleClick }: Props) {
                     <button
                         data-testid="concept-create"
                         onClick={create}
-                        disabled={creating || !seedIds.length || !name.trim() || !field}
-                        title={seedIds.length ? `${kind === 'probe' ? 'Train probe from' : 'Seed from'} ${seedIds.length} selected sample(s)` : 'Select samples first (grid or embeddings lasso)'}
+                        disabled={creating || !seedIds.length || !name.trim() || !field || !!editRefusal}
+                        title={editRefusal ?? (seedIds.length ? `${kind === 'probe' ? 'Train probe from' : 'Seed from'} ${seedIds.length} selected sample(s)` : 'Select samples first (grid or embeddings lasso)')}
                         className="text-xs px-3 py-1.5 rounded bg-cyan-600 text-white disabled:bg-zinc-700 disabled:text-zinc-500 hover:bg-cyan-500 whitespace-nowrap"
                     >
                         {creating ? 'Creating…' : `From selection (${seedIds.length})`}
@@ -171,7 +175,7 @@ export function ConceptsPanel({ datasetId, onSampleClick }: Props) {
                         data-testid="concept-prompt-input"
                         value={prompt}
                         onChange={(e) => setPrompt(e.target.value)}
-                        onKeyDown={(e) => { if (e.key === 'Enter' && !creating) createFromText(); }}
+                        onKeyDown={(e) => { if (e.key === 'Enter' && !creating && !editRefusal) createFromText(); }}
                         placeholder='…or describe it: "an open body of water"'
                         title="Text concept: CLIP-encodes your description — no example clicks needed"
                         className="flex-1 bg-zinc-800 border border-zinc-700 text-xs text-white rounded px-2 py-1.5 focus:outline-none focus:ring-1 focus:ring-cyan-500"
@@ -179,8 +183,8 @@ export function ConceptsPanel({ datasetId, onSampleClick }: Props) {
                     <button
                         data-testid="concept-create-text"
                         onClick={createFromText}
-                        disabled={creating || !prompt.trim() || !name.trim() || !field}
-                        title={name.trim() ? 'Create a concept from the description' : 'Name the concept first'}
+                        disabled={creating || !prompt.trim() || !name.trim() || !field || !!editRefusal}
+                        title={editRefusal ?? (name.trim() ? 'Create a concept from the description' : 'Name the concept first')}
                         className="text-xs px-3 py-1.5 rounded bg-cyan-600 text-white disabled:bg-zinc-700 disabled:text-zinc-500 hover:bg-cyan-500 whitespace-nowrap"
                     >
                         From text
@@ -232,6 +236,7 @@ export function ConceptsPanel({ datasetId, onSampleClick }: Props) {
                         onSampleClick={onSampleClick}
                         onChanged={() => qc.invalidateQueries({ queryKey: ['concepts', datasetId] })}
                         selectionIds={seedIds}
+                        editRefusal={editRefusal}
                     />
                 ))}
             </div>
@@ -251,6 +256,7 @@ function ConceptCard({
     onSampleClick,
     onChanged,
     selectionIds,
+    editRefusal,
 }: {
     datasetId: number;
     concept: Concept;
@@ -261,6 +267,7 @@ function ConceptCard({
     onSampleClick?: (sample: Sample) => void;
     onChanged: () => void;
     selectionIds: number[];
+    editRefusal?: string;
 }) {
     const stageIdx = viewStages.findIndex((s) => s.metadata?.concept && s.metadata?.conceptId === concept.id);
     const applied = stageIdx >= 0;
@@ -599,8 +606,9 @@ function ConceptCard({
                         <button
                             data-testid="concept-delete"
                             onClick={() => setConfirmDel(true)}
-                            title="Delete concept"
-                            className="text-xs text-zinc-500 hover:text-red-400 shrink-0 ml-2"
+                            disabled={!!editRefusal}
+                            title={editRefusal ?? 'Delete concept'}
+                            className="text-xs text-zinc-500 hover:text-red-400 shrink-0 ml-2 disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:text-zinc-500"
                         >
                             ✕
                         </button>
@@ -615,7 +623,8 @@ function ConceptCard({
                             <button
                                 data-testid="concept-resume"
                                 onClick={resume}
-                                disabled={resuming}
+                                disabled={resuming || !!editRefusal}
+                                title={editRefusal}
                                 className="underline hover:text-amber-200 disabled:opacity-50"
                             >
                                 {resuming ? 'Resuming…' : 'Resume'}
@@ -763,8 +772,8 @@ function ConceptCard({
                                     <button
                                         data-testid="concept-recompute"
                                         onClick={recompute}
-                                        disabled={recomputing || scoring}
-                                        title="Refit the concept from your ＋/− marks (keeps your cut level)"
+                                        disabled={recomputing || scoring || !!editRefusal}
+                                        title={editRefusal ?? 'Refit the concept from your ＋/− marks (keeps your cut level)'}
                                         className="px-2 py-0.5 rounded bg-amber-600 text-white hover:bg-amber-500 disabled:opacity-50"
                                     >
                                         {recomputing ? 'Recomputing…' : `Recompute (${markCount})`}
@@ -782,8 +791,9 @@ function ConceptCard({
                                 <button
                                     data-testid="concept-rescore"
                                     onClick={rescore}
-                                    title={`Score ${unscored.toLocaleString()} newly-added image(s) with this concept`}
-                                    className="text-amber-400/80 hover:text-amber-300 ml-auto"
+                                    disabled={!!editRefusal}
+                                    title={editRefusal ?? `Score ${unscored.toLocaleString()} newly-added image(s) with this concept`}
+                                    className="text-amber-400/80 hover:text-amber-300 ml-auto disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:text-amber-400/80"
                                 >
                                     score {unscored.toLocaleString()} new
                                 </button>
@@ -801,6 +811,8 @@ function ConceptCard({
                             data-testid="concept-auto-rescore"
                             checked={concept.auto_rescore}
                             onChange={toggleAutoRescore}
+                            disabled={!!editRefusal}
+                            title={editRefusal}
                             className="accent-cyan-500 mt-0.5"
                         />
                         <span>

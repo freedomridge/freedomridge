@@ -106,7 +106,8 @@ export function PanelLayout({ initialLayout, renderPanel, getIsActive }: PanelLa
     // Load from local storage on mount
     useEffect(() => {
         if (typeof window !== 'undefined') {
-            const saved = localStorage.getItem(LAYOUT_STORAGE_KEY);
+            let saved: string | null = null;
+            try { saved = localStorage.getItem(LAYOUT_STORAGE_KEY); } catch { /* no storage: the default layout */ }
             if (saved) {
                 try {
                     const parsed = JSON.parse(saved);
@@ -135,7 +136,7 @@ export function PanelLayout({ initialLayout, renderPanel, getIsActive }: PanelLa
     const saveLayout = useCallback((newLayout: PanelNode) => {
         if (saveTimeoutRef.current) clearTimeout(saveTimeoutRef.current);
         saveTimeoutRef.current = setTimeout(() => {
-            localStorage.setItem(LAYOUT_STORAGE_KEY, JSON.stringify(newLayout));
+            try { localStorage.setItem(LAYOUT_STORAGE_KEY, JSON.stringify(newLayout)); } catch { /* ignore */ }
         }, 500);
     }, []);
 

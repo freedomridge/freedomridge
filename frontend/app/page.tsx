@@ -11,6 +11,7 @@ import { Header } from '@/components/header';
 import { DatasetDeletion } from '@/components/dataset-deletion';
 import { CreateDatasetModal } from '@/components/create-dataset-modal';
 import { useUser } from '@/contexts/UserContext';
+import { refusal } from '@/lib/access-level';
 
 export default function Home() {
   const queryClient = useQueryClient();
@@ -151,12 +152,16 @@ export default function Home() {
                   </Link>
                   {dataset.deleting && <DatasetDeletion dataset={dataset} />}
 
+                  {/* Deleting a dataset takes manage in it: below that the button is disabled and says why. */}
                   {!dataset.deleting && <button
                     type="button"
                     onClick={(e) => handleDeleteClick(dataset.id, dataset.name, e)}
-                    disabled={deletingId === dataset.id}
-                    className="absolute top-3 right-3 z-10 p-2 bg-black/40 hover:bg-red-500/20 text-zinc-400 hover:text-red-400 rounded-lg backdrop-blur opacity-0 group-hover:opacity-100 transition-all disabled:opacity-50 border border-white/5 hover:border-red-500/30"
-                    title="Delete dataset"
+                    disabled={deletingId === dataset.id || !!refusal(dataset.access_level, 'manage')}
+                    className={`absolute top-3 right-3 z-10 p-2 bg-black/40 rounded-lg backdrop-blur opacity-0 transition-all border border-white/5 ${refusal(dataset.access_level, 'manage')
+                      ? 'text-zinc-500 group-hover:opacity-60 cursor-not-allowed'
+                      : 'hover:bg-red-500/20 text-zinc-400 hover:text-red-400 group-hover:opacity-100 disabled:opacity-50 hover:border-red-500/30'}`}
+                    aria-label="Delete dataset"
+                    title={refusal(dataset.access_level, 'manage') ?? 'Delete dataset'}
                   >
                     {deletingId === dataset.id ? (
                       <div className="w-4 h-4 border-2 border-red-400 border-t-transparent rounded-full animate-spin" />

@@ -5,6 +5,7 @@ import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { getEmbeddings, getEmbeddingFields, reduceEmbeddings, selectEmbeddingRegion, lookupEmbeddingCoordinates, lookupPatchCoordinates, type Dataset, type SchemaField, type ComplexFilter, type EmbeddingsResponse } from '@/lib/api';
 import { crashedBefore, currentPageLoad, loadMarker } from '@/lib/load-marker';
 import { useUser } from '@/contexts/UserContext';
+import { refusal, type AccessLevel } from '@/lib/access-level';
 import { withGrain } from '@/contexts/FilterContext';
 
 interface Props {
@@ -20,6 +21,7 @@ interface Props {
     highlightedIds?: number[];
     patchHighlightKeys?: Set<string>;  // Set of "sampleId_fieldName" keys for patch search results
     onPatchSelection?: (patches: Map<number, Array<{ row: number; col: number; scale: string }>>) => void;
+    level?: AccessLevel | null;  // the user's level in the dataset: running the reduction takes edit
 }
 
 interface Point {
@@ -45,7 +47,7 @@ function finiteNumericValue(value: unknown): number | null {
     return Number.isFinite(numeric) ? numeric : null;
 }
 
-export function EmbeddingsPanel({ datasetId, schema, onSelection, selectedIds, filters, hasObjects = false, highlightedIds = [], patchHighlightKeys, onPatchSelection }: Props) {
+export function EmbeddingsPanel({ datasetId, schema, onSelection, selectedIds, filters, hasObjects = false, highlightedIds = [], patchHighlightKeys, onPatchSelection, level = null }: Props) {
     const canvasRef = useRef<HTMLCanvasElement>(null);
     // The lasso outline lives on its own canvas above the points, so drawing it never repaints them.
     const overlayRef = useRef<HTMLCanvasElement>(null);
@@ -74,17 +76,23 @@ export function EmbeddingsPanel({ datasetId, schema, onSelection, selectedIds, f
     const attemptKey = `fridge:samplePctAttempt:${user?.id ?? 'anon'}:${datasetId}`;
     // Only a marker from another page load is a crash (lib/load-marker.ts): this mount's init runs before the
     // previous instance's cleanup, so a remount mid-load (a Find similar search) still sees that instance's marker.
-    const [crashedWarning, setCrashedWarning] = useState<boolean>(
-        () => typeof window !== 'undefined' && crashedBefore(sessionStorage.getItem(attemptKey), currentPageLoad()),
-    );
+    // Without storage (blocked site data) nothing is remembered: no crash is seen and the sample starts at 30%.
+    const [crashedWarning, setCrashedWarning] = useState<boolean>(() => {
+        if (typeof window === 'undefined') return false;
+        try { return crashedBefore(sessionStorage.getItem(attemptKey), currentPageLoad()); } catch { return false; }
+    });
     const [samplePct, setSamplePct] = useState<number>(() => {
         if (typeof window === 'undefined') return 30;
-        if (crashedBefore(sessionStorage.getItem(attemptKey), currentPageLoad())) {
-            sessionStorage.removeItem(attemptKey);  // last load didn't finish -> recover small
-            return 5;
+        try {
+            if (crashedBefore(sessionStorage.getItem(attemptKey), currentPageLoad())) {
+                sessionStorage.removeItem(attemptKey);  // last load didn't finish -> recover small
+                return 5;
+            }
+            const stored = localStorage.getItem(storageKey);
+            return stored ? Number(stored) : 30;
+        } catch {
+            return 30;
         }
-        const stored = localStorage.getItem(storageKey);
-        return stored ? Number(stored) : 30;
     });
 
     const [samplePickerOpen, setSamplePickerOpen] = useState(false);
@@ -682,7 +690,7 @@ export function EmbeddingsPanel({ datasetId, schema, onSelection, selectedIds, f
     // leaves the sentinel set -> small-sample recovery on reload.
     useEffect(() => {
         if (!isFetching && norm.nx.length > 0) {
-            localStorage.setItem(storageKey, String(samplePct));
+            try { localStorage.setItem(storageKey, String(samplePct)); } catch { /* ignore */ }
             try { sessionStorage.removeItem(attemptKey); } catch { /* ignore */ }
         }
     }, [samplePct, storageKey, attemptKey, norm.nx.length, isFetching]);
@@ -1075,17 +1083,16 @@ ds.compute_visualization()   # UMAP → this scatter`}</pre>
                                     <div className="text-sm mb-2 text-zinc-400">
                                         <span className="font-mono">{embeddingField}</span> has vectors but no 2-D coordinates yet
                                     </div>
-                                    {/* The reduce endpoint needs power_user — don't show viewers a button that can only 403 */}
-                                    {(user?.role === 'admin' || user?.role === 'power_user') && (
+                                    {/* The reduce endpoint needs edit in the dataset: below it the button is disabled and says why */}
                                     <button
                                         onClick={runReduction}
-                                        disabled={reducing}
+                                        disabled={reducing || !!refusal(level, 'edit')}
+                                        title={refusal(level, 'edit')}
                                         data-testid="embeddings-run-reduction"
-                                        className="px-3 py-1.5 rounded bg-cyan-600 hover:bg-cyan-500 disabled:opacity-50 text-white text-sm font-medium"
+                                        className="px-3 py-1.5 rounded bg-cyan-600 hover:bg-cyan-500 disabled:opacity-50 disabled:cursor-not-allowed text-white text-sm font-medium"
                                     >
                                         {reducing ? 'Reducing… (can take minutes)' : 'Run UMAP reduction'}
                                     </button>
-                                    )}
                                     {reduceError && (
                                         <div className="text-xs text-red-300 mt-3 whitespace-pre-wrap">{reduceError}</div>
                                     )}

@@ -14,7 +14,8 @@ from backend import access
 
 class FakeDB:
     """Stub for check_dataset_access's two queries: the dataset row (fetchrow) and
-    the dataset_access grant lookup (fetchval)."""
+    the dataset_access grant lookup (fetchval): the share's level (1 view .. 4 manage), or None
+    when the user has no share."""
 
     def __init__(self, dataset_row, grant=None):
         self._dataset_row = dataset_row
@@ -27,8 +28,11 @@ class FakeDB:
         return self._grant
 
 
-GLOBAL = {"id": 1, "name": "g", "storage_config_id": None, "owner_id": 9, "is_global": True}
-PRIVATE = {"id": 2, "name": "p", "storage_config_id": None, "owner_id": 9, "is_global": False}
+EDIT = 3  # a share's level when none is given: `INSERT INTO dataset_access (dataset_id, user_id)` means edit
+# everyone_level: what every signed-in user gets on a global dataset; edit here, as the upgrade left the datasets that
+# were global then (a dataset made global since starts at view).
+GLOBAL = {"id": 1, "name": "g", "storage_config_id": None, "owner_id": 9, "is_global": True, "everyone_level": EDIT}
+PRIVATE = {"id": 2, "name": "p", "storage_config_id": None, "owner_id": 9, "is_global": False, "everyone_level": EDIT}
 GUEST = {"id": 5, "role": "guest"}
 ADMIN = {"id": 1, "role": "admin"}
 OWNER = {"id": 9, "role": "guest"}
@@ -61,8 +65,17 @@ def test_non_member_denied_for_private(monkeypatch):
     assert ei.value.status_code == 403
 
 
-def test_owner_reads_private(monkeypatch):
-    assert _access(monkeypatch, PRIVATE, OWNER)["id"] == 2
+def test_owner_with_a_share_reads_private(monkeypatch):
+    # The owner reads because of their share (creating a dataset, or the upgrade, writes one), not owner_id.
+    assert _access(monkeypatch, PRIVATE, OWNER, grant=EDIT)["id"] == 2
+
+
+def test_owner_without_a_share_is_denied_for_private(monkeypatch):
+    # owner_id only records who created the dataset: with their share removed, or owner_id set by hand, no access.
+    with pytest.raises(HTTPException) as ei:
+        _access(monkeypatch, PRIVATE, OWNER, grant=None)
+    assert ei.value.status_code == 403
+    assert ei.value.detail == "Access denied for this dataset"
 
 
 def test_granted_user_reads_private(monkeypatch):

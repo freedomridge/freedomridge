@@ -57,10 +57,14 @@ def sync(
         target_id = target_ds['id']
         print(f"Target dataset exists (id: {target_id})")
     else:
+        # The copy gives everyone what the source does. A source from before access levels names no level, and a
+        # global dataset there let every power user change it: edit.
+        level = source_ds.get('everyone_level') or ('edit' if source_ds.get('is_global') else None)
         target_ds = target.create_dataset(
             dataset_name,
             description=source_ds.get('description'),
             is_global=bool(source_ds.get('is_global')),
+            **({'everyone_level': level} if level else {}),
         )
         target_id = target_ds['id']
         print(f"Created target dataset (id: {target_id})")

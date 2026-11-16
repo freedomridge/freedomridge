@@ -36,7 +36,8 @@ async def setup(database, monkeypatch):
         "INSERT INTO users(id, username, role) VALUES (10, 'owner', 'power_user'), (12, 'other', 'power_user'), "
         "(13, 'boss', 'admin')",
     )
-    await database.execute('UPDATE datasets SET is_global = FALSE, owner_id = 12 WHERE id = 2')
+    await database.execute('UPDATE datasets SET is_global = FALSE WHERE id = 2')
+    await database.execute('INSERT INTO dataset_access (dataset_id, user_id) VALUES (2, 12)')  # shared with user 12
     headers = {}
     for user_id in (10, 12, 13):
         raw = secrets.token_urlsafe(32)

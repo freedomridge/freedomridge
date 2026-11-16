@@ -13,6 +13,8 @@ from backend import follower_sync, public_settings
 from backend.api_errors import CodedHTTPException
 from backend.models import ViewContentUpdate
 from backend.routers import datasets, versions, views
+from backend.tests import test_access_rule_spec
+from backend.tests.test_access_rule_spec import ADMIN, OTHER_POWER, POWER
 from backend.tests.test_default_view import CONTENT
 from backend.tests.test_field_registry_postgres import USER, registry_database
 
@@ -21,6 +23,7 @@ pytestmark = pytest.mark.skipif(not os.getenv('FRIDGE_TEST_POSTGRES_DSN'), reaso
 
 OWNER = {'id': 10, 'role': 'power_user'}
 OTHER = {'id': 11, 'role': 'power_user'}
+world = test_access_rule_spec.world
 # A lasso redrawn on the map as it is now, beside the view's filter.
 LASSO = {'field': 'clip', 'operator': 'embedding_polygon', 'value': [[0, 0], [2, 0], [2, 2]], 'layout_id': 'now'}
 SPLIT = {'field': 'split', 'operator': '==', 'value': 'train'}  # CONTENT's filter
@@ -102,19 +105,43 @@ def test_its_owner_replaces_its_filters_and_its_name_link_sharing_and_default_st
     view_database(scenario)
 
 
-def test_only_its_owner_or_an_admin_may_and_only_a_view_of_that_dataset(view_database):
-    async def scenario(database_):
-        view_id = await _view(database_)
-        with pytest.raises(HTTPException) as refused:
-            await update(view_id, NEW, OTHER)  # shared with them, not theirs
-        assert refused.value.status_code == 403
-        with pytest.raises(HTTPException) as missing:
-            await update(view_id, NEW, USER, dataset_id=2)
-        assert missing.value.status_code == 404
-        assert await database_.fetchval('SELECT content FROM views WHERE id = $1', view_id) == CONTENT
-        assert (await update(view_id, NEW, USER))['content'] == NEW  # an admin
+def test_its_owner_an_admin_or_for_a_public_view_an_edit_user_may_and_only_a_view_of_that_dataset(world):
+    """Another user's public view is edit to change (it was its owner's and the admins' only); a private one stays its
+    owner's and the admins' whatever the level; a view of another dataset is not found."""
 
-    view_database(scenario)
+    async def scenario(w):
+        await w.dataset(10)
+        await w.dataset(11)
+        made = 'INSERT INTO views (dataset_id, user_id, name, slug, content, is_public, shared_with_user_ids) '
+        made += 'VALUES (10, $1, $2, $2, $3, $4, $5) RETURNING id'
+        public = await w.database.fetchval(made, POWER, 'public', CONTENT, True, [OTHER_POWER])
+        private = await w.database.fetchval(made, POWER, 'private', CONTENT, False, [OTHER_POWER])
+
+        def url(view_id, dataset_id=10):
+            return f'/api/datasets/{dataset_id}/views/{view_id}/content'
+
+        await w.share(10, OTHER_POWER, 'view')  # shared with them, not theirs
+        refused = await w.call(OTHER_POWER, 'PATCH', url(public), json={'content': NEW})
+        assert (refused.status_code, refused.json()) == (403, {'detail': 'This needs edit access to the dataset'})
+        await w.database.execute(
+            'UPDATE dataset_access SET level = 4 WHERE dataset_id = 10 AND user_id = $1',
+            OTHER_POWER,
+        )
+        refused = await w.call(OTHER_POWER, 'PATCH', url(private), json={'content': NEW})
+        assert (refused.status_code, refused.json()) == (403, {'detail': 'Not authorized to update this view'})
+        for view_id in (public, private):
+            assert await w.database.fetchval('SELECT content FROM views WHERE id = $1', view_id) == CONTENT
+        await w.database.execute(
+            'UPDATE dataset_access SET level = 3 WHERE dataset_id = 10 AND user_id = $1',
+            OTHER_POWER,
+        )
+        changed = await w.call(OTHER_POWER, 'PATCH', url(public), json={'content': NEW})
+        assert changed.status_code == 200, changed.text
+        assert changed.json()['content'] == NEW
+        assert (await w.call(ADMIN, 'PATCH', url(private, dataset_id=11), json={'content': NEW})).status_code == 404
+        assert (await w.call(ADMIN, 'PATCH', url(private), json={'content': NEW})).json()['content'] == NEW
+
+    world(scenario)
 
 
 def test_a_temporary_selection_is_refused_as_when_saving_a_view(view_database):

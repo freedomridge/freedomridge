@@ -3,8 +3,8 @@
 import { segmentationLabelChoices } from '@/lib/labels';
 
 import * as Dialog from '@radix-ui/react-dialog';
-import { useState, useMemo } from 'react';
-import { Dataset, updateDataset, getDatasetSchema, promoteField, demoteField, setFieldDisplayType, setFieldType, SegmentationConfig, saveOverlayConfig, notifySamplesMutated, type DatasetMirror, type SchemaField, type DeclaredFieldType } from '@/lib/api';
+import { useState, useMemo, type ReactNode } from 'react';
+import { Dataset, updateDataset, getDatasetSchema, promoteField, demoteField, setFieldDisplayType, setFieldType, SegmentationConfig, saveOverlayConfig, notifySamplesMutated, noticeLevelRefusal, getDatasetAccess, getAccessCandidates, grantDatasetAccess, revokeDatasetAccess, type DatasetMirror, type SchemaField, type DeclaredFieldType } from '@/lib/api';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { SAMPLE_COUNT_KEY } from '@/hooks/useSampleCount';
 import { SegmentationSettingsPanel } from './SegmentationSettingsPanel';
@@ -14,6 +14,7 @@ import { useUser } from '@/contexts/UserContext';
 import { IndexAdvisor } from './index-advisor';
 import { primaryHost } from './mirror-badge';
 import { revertQuestion, versionMaker, type ViewChanges } from '@/lib/version-revert';
+import { EVERYONE_LEVELS, LEVELS, can, levelLabel, needsLevel, refusal, type AccessLevel } from '@/lib/access-level';
 
 const API_BASE = '/api';
 
@@ -70,14 +71,12 @@ function HeatmapFieldRow({ datasetId, field, readOnly, onSaved }: {
                     <span className="text-zinc-500 w-9 text-right">{opacity.toFixed(2)}</span>
                 </div>
             </div>
-            {!readOnly && (
-                <div className="flex justify-end">
-                    <button onClick={save} disabled={saving}
-                        className="px-3 py-1 text-xs bg-cyan-700 hover:bg-cyan-600 text-white rounded disabled:opacity-50">
-                        {saving ? 'Saving…' : saved ? 'Saved ✓' : 'Save'}
-                    </button>
-                </div>
-            )}
+            <div className="flex justify-end">
+                <button onClick={save} disabled={saving || readOnly} title={readOnly ? needsLevel('edit') : undefined}
+                    className="px-3 py-1 text-xs bg-cyan-700 hover:bg-cyan-600 text-white rounded disabled:opacity-50">
+                    {saving ? 'Saving…' : saved ? 'Saved ✓' : 'Save'}
+                </button>
+            </div>
         </div>
     );
 }
@@ -135,14 +134,12 @@ function MaskFieldRow({ datasetId, field, readOnly, onSaved }: {
                     <span className="text-zinc-500 w-9 text-right">{opacity.toFixed(2)}</span>
                 </div>
             </div>
-            {!readOnly && (
-                <div className="flex justify-end">
-                    <button onClick={save} disabled={saving}
-                        className="px-3 py-1 text-xs bg-cyan-700 hover:bg-cyan-600 text-white rounded disabled:opacity-50">
-                        {saving ? 'Saving…' : saved ? 'Saved ✓' : 'Save'}
-                    </button>
-                </div>
-            )}
+            <div className="flex justify-end">
+                <button onClick={save} disabled={saving || readOnly} title={readOnly ? needsLevel('edit') : undefined}
+                    className="px-3 py-1 text-xs bg-cyan-700 hover:bg-cyan-600 text-white rounded disabled:opacity-50">
+                    {saving ? 'Saving…' : saved ? 'Saved ✓' : 'Save'}
+                </button>
+            </div>
         </div>
     );
 }
@@ -197,11 +194,11 @@ function describeViewChanges(changes: ViewChanges | null | undefined): { text: s
     };
 }
 
-function VersionsPanel({ datasetId, mirror, role, onViewSamples }: { datasetId: number; mirror?: DatasetMirror | null; role?: string; onViewSamples?: (token: string, total: number, label: string) => void }) {
-    // What the server allows: anyone with the dataset browses and compares versions, a power user makes them,
-    // an admin reverts to one or deletes one. What a role can't do is disabled here and says why.
-    const isAdmin = role === 'admin';
-    const canMakeVersions = isAdmin || role === 'power_user';
+function VersionsPanel({ datasetId, mirror, level, onViewSamples }: { datasetId: number; mirror?: DatasetMirror | null; level?: AccessLevel | null; onViewSamples?: (token: string, total: number, label: string) => void }) {
+    // What the server allows: anyone with the dataset browses and compares versions, edit makes them and reverts to
+    // one, manage deletes one (it can't be undone). What the user's level can't do is disabled here and says why.
+    const editRefusal = refusal(level, 'edit');
+    const manageRefusal = refusal(level, 'manage');
     const queryClient = useQueryClient();
     const [newName, setNewName] = useState('');
     const [newDesc, setNewDesc] = useState('');
@@ -262,6 +259,7 @@ function VersionsPanel({ datasetId, mirror, role, onViewSamples }: { datasetId: 
             });
             if (!resp.ok) {
                 const err = await resp.json().catch(() => ({ detail: resp.statusText }));
+                noticeLevelRefusal(resp.status, err.detail);
                 setCreateError(err.detail || 'Failed to create version');
                 return;
             }
@@ -309,6 +307,7 @@ function VersionsPanel({ datasetId, mirror, role, onViewSamples }: { datasetId: 
             notifySamplesMutated(datasetId);
         } else {
             const err = await res.json().catch(() => ({}));
+            noticeLevelRefusal(res.status, err.detail);
             alert(err.detail || 'Revert failed');
         }
     };
@@ -320,6 +319,7 @@ function VersionsPanel({ datasetId, mirror, role, onViewSamples }: { datasetId: 
             });
             if (!res.ok) {
                 const err = await res.json().catch(() => ({}));
+                noticeLevelRefusal(res.status, err.detail);
                 throw new Error(err.detail || `status ${res.status}`);
             }
         } catch (e: unknown) {
@@ -375,8 +375,9 @@ function VersionsPanel({ datasetId, mirror, role, onViewSamples }: { datasetId: 
             )}
 
             {/* Create new version */}
-            <fieldset disabled={!canMakeVersions} title={canMakeVersions ? undefined : 'Making a version takes a power user'} className="min-w-0 border border-zinc-800 rounded-lg p-3 space-y-2 disabled:opacity-60">
-                <div className="text-sm font-medium text-zinc-200">Create Version</div>
+            <fieldset disabled={!!editRefusal} title={editRefusal} className="min-w-0 border border-zinc-800 rounded-lg p-3 space-y-2 disabled:opacity-60">
+                {/* The fieldset's name; floated, it sits inside the box as the heading did, not on its border. */}
+                <legend className="float-left w-full text-sm font-medium text-zinc-200">Create Version</legend>
                 <input
                     type="text"
                     value={newName}
@@ -444,8 +445,8 @@ function VersionsPanel({ datasetId, mirror, role, onViewSamples }: { datasetId: 
                 </div>
             )}
 
-            {/* What a revert does; a revert takes an admin, so only an admin chooses. */}
-            {!!versions?.length && isAdmin && <div className="space-y-1 text-xs text-zinc-400">
+            {/* What a revert does; a revert takes edit, so only who may revert chooses. */}
+            {!!versions?.length && !editRefusal && <div className="space-y-1 text-xs text-zinc-400">
                 <label className="flex items-center gap-2">
                     <input type="checkbox" checked={exactMembership} onChange={event => setExactMembership(event.target.checked)} />
                     A revert puts the dataset back to exactly the version: samples and public saved views added since are removed, deleted ones restored
@@ -491,8 +492,8 @@ function VersionsPanel({ datasetId, mirror, role, onViewSamples }: { datasetId: 
                             {v.include_metadata !== false && versionStatus?.current_version?.id !== v.id && (
                                 <button
                                     onClick={() => handleRevert(v)}
-                                    disabled={!isAdmin || countingRevert !== null}
-                                    title={isAdmin ? undefined : 'Reverting a dataset takes an admin: it can delete samples and saved views'}
+                                    disabled={!!editRefusal || countingRevert !== null}
+                                    title={editRefusal}
                                     className="text-xs text-zinc-400 hover:text-amber-400 border border-zinc-700 hover:border-amber-500/50 px-2 py-1 rounded transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
                                 >
                                     {countingRevert === v.id ? 'Counting…' : exactMembership ? 'Revert to this snapshot' : 'Restore sample data'}
@@ -507,8 +508,8 @@ function VersionsPanel({ datasetId, mirror, role, onViewSamples }: { datasetId: 
                                     if (!confirm(`Delete version "${v.name}"?\n\nThis cannot be undone.`)) return;
                                     handleDelete(v.id);
                                 }}
-                                disabled={!isAdmin}
-                                title={isAdmin ? undefined : 'Deleting a version takes an admin: it cannot be undone'}
+                                disabled={!!manageRefusal}
+                                title={manageRefusal}
                                 className="text-xs text-zinc-600 hover:text-red-400 transition-colors disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:text-zinc-600"
                             >
                                 Delete
@@ -588,10 +589,143 @@ function VersionsPanel({ datasetId, mirror, role, onViewSamples }: { datasetId: 
     );
 }
 
+// Asked before a manager lowers or removes their own manage share (DatasetShares).
+function lowerOwnShare(level: AccessLevel): string {
+    return `Lower your own access to this dataset from Manage to ${levelLabel(level)}?\n\n`
+        + 'Unless one of your groups gives you Manage, you will no longer be able to change who has access, delete '
+        + "versions or delete the dataset, and you can't give yourself Manage again.";
+}
+const REMOVE_OWN_SHARE = 'Remove your own share of this dataset?\n\n'
+    + 'Unless one of your groups or the everyone level gives you access, you will no longer be able to open it. Even '
+    + "then, unless a group gives you Manage, you will no longer be able to change who has access, and you can't give "
+    + 'yourself Manage again.';
+
+// Dataset Settings → Access, for a manager: the users and groups the dataset is shared with, each at a level that can
+// be changed or removed, and a picker to share it with another user or group. Each change is sent at once. A change's
+// error goes to `onError`, which the Access section shows: a refusal for the level re-reads the dataset, which can
+// replace this list with the user's own level, and the server's words must stay.
+function DatasetShares({ datasetId, onError }: { datasetId: number; onError: (message: string | null) => void }) {
+    const queryClient = useQueryClient();
+    const { user } = useUser();
+    const [target, setTarget] = useState('');  // "user:<id>" or "group:<name>"
+    const [newLevel, setNewLevel] = useState<AccessLevel>('edit');
+    const access = useQuery({
+        queryKey: ['dataset-access', datasetId],
+        queryFn: () => getDatasetAccess(datasetId),
+        retry: false,
+        meta: { errorHandledLocally: true },
+    });
+    const candidates = useQuery({
+        queryKey: ['dataset-access-candidates', datasetId],
+        queryFn: () => getAccessCandidates(datasetId),
+        retry: false,
+        meta: { errorHandledLocally: true },
+    });
+    const changed = () => {
+        queryClient.invalidateQueries({ queryKey: ['dataset-access', datasetId] });
+        // The caller's own level may be one of those changed.
+        queryClient.invalidateQueries({ queryKey: ['dataset', datasetId] });
+    };
+    const grant = useMutation({
+        mutationFn: ({ to, level }: { to: { user_id: number } | { group: string }; level: AccessLevel }) => grantDatasetAccess(datasetId, to, level),
+        onMutate: () => onError(null),
+        onSuccess: () => { setTarget(''); changed(); },
+        onError: failure => onError(failure.message),
+    });
+    const revoke = useMutation({
+        mutationFn: (from: { user_id: number } | { group_id: number }) => revokeDatasetAccess(datasetId, from),
+        onMutate: () => onError(null),
+        onSuccess: changed,
+        onError: failure => onError(failure.message),
+    });
+    const loadError = access.error ?? candidates.error;
+    const busy = grant.isPending || revoke.isPending;
+    const shared = access.data;
+    // Whoever has a share already is changed in the list, not added again.
+    const users = (candidates.data?.users ?? []).filter(user => !shared?.grants.some(grantee => grantee.user_id === user.id));
+    const groups = (candidates.data?.groups ?? []).filter(group => !shared?.group_grants.some(grantee => grantee.group_id === group.id));
+    const share = () => {
+        const [kind, value] = [target.slice(0, target.indexOf(':')), target.slice(target.indexOf(':') + 1)];
+        if (!value) return;
+        grant.mutate({ to: kind === 'user' ? { user_id: Number(value) } : { group: value }, level: newLevel });
+    };
+    const levelSelect = (label: string, value: AccessLevel, onChange: (level: AccessLevel) => void) => (
+        <select aria-label={label} value={value} disabled={busy} onChange={event => onChange(event.target.value as AccessLevel)}
+            className="bg-zinc-800 border border-zinc-700 rounded px-2 py-1 text-sm text-zinc-200 disabled:opacity-50">
+            {LEVELS.map(level => <option key={level} value={level}>{levelLabel(level)}</option>)}
+        </select>
+    );
+    // `ownManage`: the row is the caller's own manage share. Lowering or removing it can take away the Access section, or
+    // the dataset, so it is asked first. Whether one of their groups gives them manage too isn't known here (the client
+    // sees the groups' shares, not their members), so it asks whenever their own row gives manage. An administrator
+    // keeps manage everywhere and is never asked.
+    const row = (key: string, name: ReactNode, label: string, level: AccessLevel, to: { user_id: number } | { group: string }, from: { user_id: number } | { group_id: number }, ownManage = false) => (
+        <li key={key} className="flex items-center gap-2 py-1.5">
+            <span className="flex-1 min-w-0 truncate text-sm text-zinc-200">{name}</span>
+            {levelSelect(`Level for ${label}`, level, next => {
+                if (ownManage && next !== 'manage' && !confirm(lowerOwnShare(next))) return;
+                grant.mutate({ to, level: next });
+            })}
+            <button type="button" aria-label={`Remove ${label}`} title={`Remove ${label}'s access`} disabled={busy}
+                onClick={() => {
+                    if (ownManage && !confirm(REMOVE_OWN_SHARE)) return;
+                    revoke.mutate(from);
+                }}
+                className="px-2 py-1 text-xs text-zinc-400 hover:text-red-400 border border-zinc-700 rounded disabled:opacity-50">
+                Remove
+            </button>
+        </li>
+    );
+    return (
+        <div className="space-y-2">
+            <h4 className="text-sm font-medium text-zinc-400">Shared with</h4>
+            <p className="text-xs text-zinc-500">Changes here apply at once. Each person has the highest of their own level, their groups&apos; and the everyone level.</p>
+            {!shared && !access.isError && <p className="text-sm text-zinc-500">Loading…</p>}
+            {shared && (shared.grants.length || shared.group_grants.length ? (
+                <ul aria-label="Shared with" className="divide-y divide-zinc-800">
+                    {shared.group_grants.map(grantee => row(
+                        `group:${grantee.group_id}`,
+                        <><span className="mr-1 text-[10px] uppercase text-zinc-500 border border-zinc-700 rounded px-1">Group</span> {grantee.name}</>,
+                        `group ${grantee.name}`, grantee.level, { group: grantee.name }, { group_id: grantee.group_id },
+                    ))}
+                    {shared.grants.map(grantee => row(
+                        `user:${grantee.user_id}`,
+                        <>
+                            {grantee.username}
+                            {grantee.email && <> <span className="text-zinc-500">({grantee.email})</span></>}
+                            {grantee.role === 'guest' && <> <span className="ml-1 text-xs text-zinc-500">guest: View at most</span></>}
+                            {grantee.role === 'admin' && <> <span className="ml-1 text-xs text-zinc-500">administrator: Manage everywhere</span></>}
+                        </>,
+                        grantee.username, grantee.level, { user_id: grantee.user_id }, { user_id: grantee.user_id },
+                        user?.role !== 'admin' && grantee.user_id === user?.id && grantee.level === 'manage',
+                    ))}
+                </ul>
+            ) : <p className="text-sm text-zinc-500">Not shared with any user or group.</p>)}
+            <div className="flex items-center gap-2 pt-1">
+                <select aria-label="User or group to share with" value={target} disabled={busy || !candidates.data} onChange={event => setTarget(event.target.value)}
+                    className="flex-1 min-w-0 bg-zinc-800 border border-zinc-700 rounded px-2 py-1 text-sm text-zinc-200 disabled:opacity-50">
+                    <option value="">Add a user or group…</option>
+                    {groups.length > 0 && <optgroup label="Groups">
+                        {groups.map(group => <option key={group.id} value={`group:${group.name}`}>{group.name}</option>)}
+                    </optgroup>}
+                    {users.length > 0 && <optgroup label="Users">
+                        {users.map(user => <option key={user.id} value={`user:${user.id}`}>{user.username}</option>)}
+                    </optgroup>}
+                </select>
+                {levelSelect('Level for the new share', newLevel, setNewLevel)}
+                <button type="button" onClick={share} disabled={busy || !target}
+                    className="px-3 py-1 text-sm bg-zinc-800 hover:bg-zinc-700 text-white rounded border border-zinc-700 disabled:opacity-50">
+                    Share
+                </button>
+            </div>
+            {loadError && <p role="alert" className="text-xs text-red-400">{loadError.message}</p>}
+        </div>
+    );
+}
+
 interface Props {
     dataset: Dataset;
     onClose: () => void;
-    readOnly?: boolean;
     onViewSamples?: (token: string, total: number, label: string) => void;
 }
 
@@ -624,15 +758,17 @@ function FieldTypeRow({ datasetId, field, readOnly, onSaved }: {
             <div className="flex items-center gap-3">
                 <span className="flex-1 text-sm font-mono text-zinc-200 truncate" title={field.name}>{field.name}</span>
                 <select aria-label={`Declared type for ${field.name}`} value={fieldType} disabled={disabled}
+                    title={readOnly ? needsLevel('edit') : undefined}
                     onChange={event => { setType(event.target.value as DeclaredFieldType); setError(null); }}
                     className="bg-zinc-800 border border-zinc-700 rounded px-2 py-1 text-sm text-zinc-200 disabled:opacity-50">
                     {DECLARED_TYPES.map(type => <option key={type} value={type}>{type}</option>)}
                 </select>
-                {!readOnly && <button aria-label={`Save type for ${field.name}`} onClick={save}
+                <button aria-label={`Save type for ${field.name}`} onClick={save}
                     disabled={disabled || fieldType === field.declared_type}
+                    title={readOnly ? needsLevel('edit') : undefined}
                     className="px-3 py-1 text-sm bg-cyan-700 hover:bg-cyan-600 rounded text-white disabled:opacity-40">
                     {saving ? 'Saving…' : 'Save'}
-                </button>}
+                </button>
             </div>
             {field.is_promoted && <p className="text-xs text-zinc-500">Remove this field&apos;s index in the Indexes tab before changing its type.</p>}
             {error && <p role="alert" className="text-xs text-red-400">{error}</p>}
@@ -642,15 +778,33 @@ function FieldTypeRow({ datasetId, field, readOnly, onSaved }: {
 
 type SettingsTab = 'general' | 'fields' | 'indexes' | 'versions' | 'segmentation';
 
-export function DatasetSettingsModal({ dataset, onClose, readOnly = false, onViewSamples }: Props) {
+export function DatasetSettingsModal({ dataset, onClose, onViewSamples }: Props) {
     const queryClient = useQueryClient();
     const { user } = useUser();
+    // The caller's level in the dataset: display settings, fields and indexes take edit; its name and who has access,
+    // manage. A control the level doesn't allow is disabled and says why.
+    const level = dataset.access_level;
+    const readOnly = !can(level, 'edit');
+    const editRefusal = refusal(level, 'edit');
+    const manageRefusal = refusal(level, 'manage');
     const [activeTab, setActiveTab] = useState<SettingsTab>('general');
     const [name, setName] = useState(dataset.name);
     const [description, setDescription] = useState(dataset.description || '');
     const [isGlobal, setIsGlobal] = useState(dataset.is_global);
+    // The stored level, which a dataset never made global holds at view: switching Visibility to everyone shows it.
+    const [everyoneLevel, setEveryoneLevel] = useState(dataset.everyone_level ?? 'view');
+    // The last share change's error, shown at the end of the Access section, whichever view of it the user's level
+    // gives, until the next change (a share or Save Changes) or the dialog closes.
+    const [shareError, setShareError] = useState<string | null>(null);
     const [mediaFields, setMediaFields] = useState<string[]>(dataset.media_fields || ['filepath']);
     const [selectedField, setSelectedField] = useState('');
+    // The fields a grid and the sample view open on for everyone, saved with Save Changes. The server refuses one that
+    // isn't among the media fields saved with it, so a default whose field is removed above (or one stored outside
+    // them) becomes the first media field, which its select shows before the save.
+    const [gridField, setGridField] = useState(dataset.grid_media_field);
+    const [modalField, setModalField] = useState(dataset.modal_media_field);
+    const gridDefault = mediaFields.includes(gridField) ? gridField : mediaFields[0];
+    const modalDefault = mediaFields.includes(modalField) ? modalField : mediaFields[0];
     const [segmentationConfig, setSegmentationConfig] = useState<SegmentationConfig>(
         dataset.segmentation_config || {}
     );
@@ -718,8 +872,10 @@ export function DatasetSettingsModal({ dataset, onClose, readOnly = false, onVie
         mutationFn: (data: Partial<Dataset>) => updateDataset(dataset.id, data),
         onSuccess: (updated) => {
             // Reopening the dialog before the refetch lands must show the saved values, or the next
-            // Save writes the old ones back. PATCH returns no sidebar_expand_all, so keep the cached one.
-            queryClient.setQueryData<Dataset>(['dataset', dataset.id], old => old && { ...updated, sidebar_expand_all: old.sidebar_expand_all });
+            // Save writes the old ones back. PATCH returns no sidebar_expand_all or access_level, so keep the cached ones.
+            queryClient.setQueryData<Dataset>(['dataset', dataset.id], old => old && {
+                ...updated, sidebar_expand_all: old.sidebar_expand_all, access_level: old.access_level,
+            });
             queryClient.invalidateQueries({ queryKey: ['dataset', dataset.id] });
             onClose();
         }
@@ -737,11 +893,14 @@ export function DatasetSettingsModal({ dataset, onClose, readOnly = false, onVie
     };
 
     const handleSave = () => {
+        setShareError(null);
         updateMutation.mutate({
-            name,
+            // The name and who sees the dataset take manage: sent only by a manager, so an editor's save isn't refused.
+            ...(manageRefusal ? {} : { name, is_global: isGlobal, everyone_level: everyoneLevel }),
             description,
-            is_global: isGlobal,
             media_fields: mediaFields,
+            grid_media_field: gridDefault,
+            modal_media_field: modalDefault,
             segmentation_config: segmentationConfig
         });
     };
@@ -832,86 +991,158 @@ export function DatasetSettingsModal({ dataset, onClose, readOnly = false, onVie
                         {activeTab === 'general' && (
                             <div className="space-y-4">
                                 <div>
-                                    <label className="block text-sm font-medium text-zinc-400 mb-1">Name</label>
+                                    <label htmlFor="dataset-name" className="block text-sm font-medium text-zinc-400 mb-1">Name</label>
                                     <input
+                                        id="dataset-name"
                                         type="text"
                                         value={name}
                                         onChange={e => setName(e.target.value)}
-                                        disabled={readOnly}
-                                        className={`w-full bg-zinc-800 border border-zinc-700 rounded px-3 py-2 text-white focus:outline-none focus:border-zinc-500 ${readOnly ? 'opacity-60 cursor-not-allowed' : ''}`}
+                                        disabled={!!manageRefusal}
+                                        title={manageRefusal}
+                                        className={`w-full bg-zinc-800 border border-zinc-700 rounded px-3 py-2 text-white focus:outline-none focus:border-zinc-500 ${manageRefusal ? 'opacity-60 cursor-not-allowed' : ''}`}
                                     />
                                 </div>
 
                                 <div>
-                                    <label className="block text-sm font-medium text-zinc-400 mb-1">Description</label>
+                                    <label htmlFor="dataset-description" className="block text-sm font-medium text-zinc-400 mb-1">Description</label>
                                     <textarea
+                                        id="dataset-description"
                                         value={description}
                                         onChange={e => setDescription(e.target.value)}
                                         disabled={readOnly}
+                                        title={editRefusal}
                                         className={`w-full bg-zinc-800 border border-zinc-700 rounded px-3 py-2 text-white focus:outline-none focus:border-zinc-500 h-24 ${readOnly ? 'opacity-60 cursor-not-allowed' : ''}`}
                                     />
                                 </div>
 
                                 <div>
-                                    <label htmlFor="dataset-visibility" className="block text-sm font-medium text-zinc-400 mb-1">Visibility</label>
-                                    <select
-                                        id="dataset-visibility"
-                                        value={isGlobal ? 'everyone' : 'private'}
-                                        onChange={e => setIsGlobal(e.target.value === 'everyone')}
-                                        disabled={readOnly}
-                                        className={`w-full bg-zinc-800 border border-zinc-700 rounded px-3 py-2 text-white focus:outline-none focus:border-zinc-500 ${readOnly ? 'opacity-60 cursor-not-allowed' : ''}`}
-                                    >
-                                        <option value="private">Private</option>
-                                        <option value="everyone">Everyone signed in</option>
-                                    </select>
-                                    <p className="mt-1 text-xs text-zinc-500">
-                                        {isGlobal
-                                            ? 'Every signed-in user can see this dataset, demo guests included.'
-                                            : 'Only admins, its owner and users granted access can see this dataset.'}
-                                    </p>
-                                </div>
-
-                                <div>
                                     <label className="block text-sm font-medium text-zinc-400 mb-1">Media Fields</label>
-                                    {!readOnly && (
-                                        <div className="flex gap-2 mb-2">
-                                            <select
-                                                value={selectedField}
-                                                onChange={e => setSelectedField(e.target.value)}
-                                                className="flex-1 bg-zinc-800 border border-zinc-700 rounded px-3 py-2 text-white focus:outline-none focus:border-zinc-500"
-                                            >
-                                                <option value="">Select a field...</option>
-                                                {availableFields.map(field => (
-                                                    <option key={field.name} value={field.name}>
-                                                        {field.name}
-                                                    </option>
-                                                ))}
-                                            </select>
-                                            <button
-                                                onClick={handleAddField}
-                                                disabled={!selectedField}
-                                                className="px-4 py-2 bg-zinc-800 hover:bg-zinc-700 text-white rounded border border-zinc-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-                                            >
-                                                Add
-                                            </button>
-                                        </div>
-                                    )}
+                                    <div className="flex gap-2 mb-2">
+                                        <select
+                                            aria-label="Media field to add"
+                                            value={selectedField}
+                                            onChange={e => setSelectedField(e.target.value)}
+                                            disabled={readOnly}
+                                            title={editRefusal}
+                                            className="flex-1 bg-zinc-800 border border-zinc-700 rounded px-3 py-2 text-white focus:outline-none focus:border-zinc-500 disabled:opacity-60"
+                                        >
+                                            <option value="">Select a field...</option>
+                                            {availableFields.map(field => (
+                                                <option key={field.name} value={field.name}>
+                                                    {field.name}
+                                                </option>
+                                            ))}
+                                        </select>
+                                        <button
+                                            onClick={handleAddField}
+                                            disabled={readOnly || !selectedField}
+                                            title={editRefusal}
+                                            className="px-4 py-2 bg-zinc-800 hover:bg-zinc-700 text-white rounded border border-zinc-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                                        >
+                                            Add
+                                        </button>
+                                    </div>
                                     <div className="flex flex-wrap gap-2">
                                         {mediaFields.map(field => (
                                             <div key={field} className="flex items-center gap-2 bg-zinc-800 rounded px-2 py-1 text-sm text-zinc-300 border border-zinc-700">
                                                 <span>{field}</span>
-                                                {!readOnly && (
-                                                    <button
-                                                        onClick={() => handleRemoveField(field)}
-                                                        className="text-zinc-500 hover:text-red-400"
-                                                    >
-                                                        ×
-                                                    </button>
-                                                )}
+                                                <button
+                                                    onClick={() => handleRemoveField(field)}
+                                                    disabled={readOnly}
+                                                    title={editRefusal}
+                                                    className="text-zinc-500 hover:text-red-400 disabled:opacity-50 disabled:hover:text-zinc-500 disabled:cursor-not-allowed"
+                                                >
+                                                    ×
+                                                </button>
                                             </div>
                                         ))}
                                     </div>
                                 </div>
+
+                                <div>
+                                    <div className="flex flex-wrap gap-3">
+                                        <div className="flex-1 min-w-[12rem]">
+                                            <label htmlFor="dataset-grid-media-field" className="block text-sm font-medium text-zinc-400 mb-1">Grid opens on</label>
+                                            <select
+                                                id="dataset-grid-media-field"
+                                                value={gridDefault ?? ''}
+                                                onChange={e => setGridField(e.target.value)}
+                                                disabled={readOnly}
+                                                title={editRefusal}
+                                                className={`w-full bg-zinc-800 border border-zinc-700 rounded px-3 py-2 text-white focus:outline-none focus:border-zinc-500 ${readOnly ? 'opacity-60 cursor-not-allowed' : ''}`}
+                                            >
+                                                {mediaFields.map(field => <option key={field} value={field}>{field}</option>)}
+                                            </select>
+                                        </div>
+                                        <div className="flex-1 min-w-[12rem]">
+                                            <label htmlFor="dataset-modal-media-field" className="block text-sm font-medium text-zinc-400 mb-1">Sample view opens on</label>
+                                            <select
+                                                id="dataset-modal-media-field"
+                                                value={modalDefault ?? ''}
+                                                onChange={e => setModalField(e.target.value)}
+                                                disabled={readOnly}
+                                                title={editRefusal}
+                                                className={`w-full bg-zinc-800 border border-zinc-700 rounded px-3 py-2 text-white focus:outline-none focus:border-zinc-500 ${readOnly ? 'opacity-60 cursor-not-allowed' : ''}`}
+                                            >
+                                                {mediaFields.map(field => <option key={field} value={field}>{field}</option>)}
+                                            </select>
+                                        </div>
+                                    </div>
+                                    <p className="text-xs text-zinc-500 mt-1">
+                                        The media field everyone sees first. Choosing another in a grid or a sample&apos;s view changes only your own view.
+                                    </p>
+                                </div>
+
+                                {/* Who has access, and at what level (backend/access.py). Visibility and the everyone level
+                                    are saved with Save Changes; shares change at once. */}
+                                <section aria-labelledby="dataset-access-heading" className="space-y-3 border-t border-zinc-800 pt-4">
+                                    <h3 id="dataset-access-heading" className="text-sm font-semibold text-zinc-200">Access</h3>
+                                    <div className="flex flex-wrap gap-3">
+                                        <div className="flex-1 min-w-[12rem]">
+                                            <label htmlFor="dataset-visibility" className="block text-sm font-medium text-zinc-400 mb-1">Visibility</label>
+                                            <select
+                                                id="dataset-visibility"
+                                                value={isGlobal ? 'everyone' : 'private'}
+                                                onChange={e => setIsGlobal(e.target.value === 'everyone')}
+                                                disabled={!!manageRefusal}
+                                                title={manageRefusal}
+                                                className={`w-full bg-zinc-800 border border-zinc-700 rounded px-3 py-2 text-white focus:outline-none focus:border-zinc-500 ${manageRefusal ? 'opacity-60 cursor-not-allowed' : ''}`}
+                                            >
+                                                <option value="private">Private</option>
+                                                <option value="everyone">Everyone signed in</option>
+                                            </select>
+                                        </div>
+                                        {isGlobal && (
+                                            <div className="min-w-[8rem]">
+                                                <label htmlFor="dataset-everyone-level" className="block text-sm font-medium text-zinc-400 mb-1">Everyone&apos;s level</label>
+                                                <select
+                                                    id="dataset-everyone-level"
+                                                    value={everyoneLevel}
+                                                    onChange={e => setEveryoneLevel(e.target.value as typeof everyoneLevel)}
+                                                    disabled={!!manageRefusal}
+                                                    title={manageRefusal}
+                                                    className={`w-full bg-zinc-800 border border-zinc-700 rounded px-3 py-2 text-white focus:outline-none focus:border-zinc-500 ${manageRefusal ? 'opacity-60 cursor-not-allowed' : ''}`}
+                                                >
+                                                    {EVERYONE_LEVELS.map(each => <option key={each} value={each}>{levelLabel(each)}</option>)}
+                                                </select>
+                                            </div>
+                                        )}
+                                    </div>
+                                    <p className="text-xs text-zinc-500">
+                                        {isGlobal
+                                            ? `Every signed-in user, demo guests included, can open this dataset at ${levelLabel(everyoneLevel)} (a guest at most View).`
+                                            : 'Only admins and the users and groups it is shared with can open this dataset.'}
+                                    </p>
+                                    {manageRefusal ? (
+                                        <div data-testid="dataset-access-own" className="text-sm text-zinc-400 space-y-1">
+                                            <p>{level ? `You have ${levelLabel(level)} access to this dataset.` : 'Your access to this dataset is loading.'}</p>
+                                            <p className="text-xs text-zinc-500">A manager of this dataset or an admin can change who has access.</p>
+                                        </div>
+                                    ) : (
+                                        <DatasetShares datasetId={dataset.id} onError={setShareError} />
+                                    )}
+                                    {shareError && <p role="alert" data-testid="dataset-access-error" className="text-xs text-red-400">{shareError}</p>}
+                                </section>
                             </div>
                         )}
 
@@ -950,8 +1181,11 @@ export function DatasetSettingsModal({ dataset, onClose, readOnly = false, onVie
                                                         <td className="px-3 py-2 text-zinc-200 font-mono text-xs">{field.name}</td>
                                                         <td className="px-3 py-2 text-zinc-400 text-xs">{field.type}</td>
                                                         <td className="px-3 py-2 text-zinc-400 text-xs text-center">
-                                                            {((field as SchemaField & { original_type?: string }).original_type === 'number' || field.type === 'number') && !readOnly ? (
+                                                            {((field as SchemaField & { original_type?: string }).original_type === 'number' || field.type === 'number') ? (
                                                                 <select
+                                                                    aria-label={`Display for ${field.name}`}
+                                                                    disabled={readOnly}
+                                                                    title={editRefusal}
                                                                     value={field.display_type || 'slider'}
                                                                     onChange={async (e) => {
                                                                         const val = e.target.value === 'slider' ? null : e.target.value;
@@ -959,26 +1193,28 @@ export function DatasetSettingsModal({ dataset, onClose, readOnly = false, onVie
                                                                         queryClient.invalidateQueries({ queryKey: ['dataset-schema', dataset.id] });
                                                                         queryClient.invalidateQueries({ queryKey: ['schema'] });
                                                                     }}
-                                                                    className="bg-zinc-800 border border-zinc-700 text-xs text-zinc-300 rounded px-1 py-0.5"
+                                                                    className="bg-zinc-800 border border-zinc-700 text-xs text-zinc-300 rounded px-1 py-0.5 disabled:opacity-60"
                                                                 >
                                                                     <option value="slider">Slider</option>
                                                                     <option value="enum">Dropdown</option>
                                                                 </select>
                                                             ) : (
                                                                 <span className="text-zinc-500">
-                                                                    {field.type === 'enum' ? 'Dropdown' : field.type === 'number' ? 'Slider' : '—'}
+                                                                    {field.type === 'enum' ? 'Dropdown' : '—'}
                                                                 </span>
                                                             )}
                                                         </td>
                                                         <td className="px-3 py-2 text-center">
                                                             {readOnly ? (
-                                                                <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs font-medium ${
+                                                                <button
+                                                                    disabled
+                                                                    className={`inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs font-medium cursor-not-allowed ${
                                                                     isPromoted
                                                                         ? 'bg-yellow-400/15 text-yellow-400 border border-yellow-400/30'
                                                                         : isRebuilding ? 'text-cyan-400' : 'text-zinc-600'
-                                                                }`} title={isRebuilding ? rebuildNote : undefined}>
+                                                                }`} title={isRebuilding ? `${rebuildNote}\n${editRefusal}` : editRefusal}>
                                                                     {isPromoted ? <><Rocket className="w-3 h-3" /> Yes</> : isRebuilding ? rebuildLabel : 'No'}
-                                                                </span>
+                                                                </button>
                                                             ) : (
                                                                 <button
                                                                     onClick={() => handleToggleIndex(field.name, isPromoted)}
@@ -1039,7 +1275,7 @@ export function DatasetSettingsModal({ dataset, onClose, readOnly = false, onVie
                         )}
 
                         {activeTab === 'versions' && (
-                            <VersionsPanel datasetId={dataset.id} mirror={dataset.mirror} role={user?.role} onViewSamples={onViewSamples} />
+                            <VersionsPanel datasetId={dataset.id} mirror={dataset.mirror} level={level} onViewSamples={onViewSamples} />
                         )}
 
                         {activeTab === 'segmentation' && (
@@ -1077,8 +1313,11 @@ export function DatasetSettingsModal({ dataset, onClose, readOnly = false, onVie
                     <div className="p-6 pt-0 flex justify-end gap-3 border-t border-zinc-800 mt-auto">
                         {readOnly && (
                             <span className="text-sm text-zinc-500 mr-auto">
-                                View only — contact an admin to make changes
+                                View only: changing these settings needs edit access to the dataset
                             </span>
+                        )}
+                        {updateMutation.error && (
+                            <span role="alert" className="text-sm text-red-400 mr-auto">{updateMutation.error.message}</span>
                         )}
                         <button
                             onClick={onClose}
@@ -1086,11 +1325,12 @@ export function DatasetSettingsModal({ dataset, onClose, readOnly = false, onVie
                         >
                             {(activeTab === 'versions' || activeTab === 'indexes' || readOnly) ? 'Close' : 'Cancel'}
                         </button>
-                        {!readOnly && (activeTab === 'general' || activeTab === 'segmentation') && (
+                        {(activeTab === 'general' || activeTab === 'segmentation') && (
                             <button
                                 onClick={handleSave}
-                                disabled={updateMutation.isPending}
-                                className="px-4 py-2 bg-white text-black rounded hover:bg-zinc-200 transition-colors disabled:opacity-50"
+                                disabled={readOnly || updateMutation.isPending}
+                                title={editRefusal}
+                                className="px-4 py-2 bg-white text-black rounded hover:bg-zinc-200 transition-colors disabled:opacity-50 whitespace-nowrap"
                             >
                                 {updateMutation.isPending ? 'Saving...' : 'Save Changes'}
                             </button>

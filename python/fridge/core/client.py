@@ -23,6 +23,16 @@ from .sample import _json_value
 DEFAULT_TIMEOUT = (10, 300)
 # Ids per delete_embeddings request; matches the server's target-staging batch.
 DELETE_EMBEDDINGS_IDS_PER_REQUEST = 50000
+# The levels of a dataset share, lowest first, each including the ones before it (docs/AUTHENTICATION.md). A global
+# dataset gives every signed-in user one of the first three.
+ACCESS_LEVELS = ("view", "tag", "edit", "manage")
+EVERYONE_LEVELS = ACCESS_LEVELS[:3]
+
+
+def _check_everyone_level(level, name="level"):
+    """ValueError unless `level` is None or a level a global dataset can give (EVERYONE_LEVELS)."""
+    if level is not None and level not in EVERYONE_LEVELS:
+        raise ValueError(f"{name} must be one of {', '.join(EVERYONE_LEVELS)}, or None, not {level!r}")
 
 
 def _decode_vectors_binary(buf: bytes) -> Dict[str, Any]:
@@ -499,8 +509,9 @@ class Client:
         media_fields=None,
         storage_config_id=None,
         is_global=False,
+        everyone_level=None,
     ):
-        """Create a dataset.
+        """Create a dataset (an administrator's).
 
         Args:
             name: Dataset name (must be unique).
@@ -508,24 +519,60 @@ class Client:
             media_fields: Optional list of media field names. Defaults to ["filepath"].
             storage_config_id: Optional storage config ID. NULL/None falls back to
                 the is_default storage config, then to env-var credentials.
-            is_global: If False (default), only the owner, admins, and explicitly-granted
-                users see the dataset. If True, every signed-in user sees it.
+            is_global: If False (default), admins and the users and groups it is shared with
+                see the dataset (its creator is given an edit share). If True, every signed-in
+                user gets view in it, its everyone level (``set_dataset_everyone_level`` raises it).
+            everyone_level: What the dataset gives every signed-in user while it is global: "view", "tag" or "edit"
+                (``is_global=True, everyone_level="edit"`` makes it global at edit in one call). Sent only when given;
+                the server's default is view. Given with is_global False, the dataset stays private and holds the
+                level for when it is made global. Global at view or tag is made in two steps: the dataset is created
+                private at that level, then made global (``PATCH {"is_global": true}``), so that a server older than
+                access levels, which would ignore the level, never makes it global for every power user to change.
+
+        Raises:
+            ValueError: an everyone_level other than "view", "tag" or "edit"; nothing is sent.
+            RuntimeError: is_global with everyone_level "view" or "tag", on a server older than access levels (its
+                answer names no everyone_level): the dataset was created private and stays, empty and private.
+            requests.HTTPError: as for any refusal; when the second step is refused, the message also says the
+                dataset exists, private at its level.
         """
+        _check_everyone_level(everyone_level, "everyone_level")
+        # Only the answer to the create tells a server from before access levels (it names no everyone_level): a
+        # dataset can't be read before it exists. So global at view or tag is created private first.
+        two_steps = bool(is_global) and everyone_level in ("view", "tag")
         payload = {
             "name": name,
             "description": description,
-            "is_global": is_global,
+            "is_global": False if two_steps else is_global,
         }
         if media_fields is not None:
             payload["media_fields"] = media_fields
         if storage_config_id is not None:
             payload["storage_config_id"] = storage_config_id
+        if everyone_level is not None:
+            payload["everyone_level"] = everyone_level
         resp = self.session.post(f"{self.base_url}/datasets", json=payload)
         _raise_for_status(resp)
-        return resp.json()
+        created = resp.json()
+        if not two_steps:
+            return created
+        if "everyone_level" not in created:
+            raise RuntimeError(
+                f"{name!r} was not made global at {everyone_level}: this server is older than access levels and would "
+                "ignore the level, letting every power user change the dataset. It was created private "
+                f"(id {created['id']}) and stays, empty and private, under that name; upgrade the server first.",
+            )
+        try:
+            return self.update_dataset(created["id"], is_global=True)
+        except requests.HTTPError as error:
+            raise requests.HTTPError(
+                f"{error} (dataset {name!r}, id {created['id']}, was created private at everyone level "
+                f"{everyone_level} and stays so; make it global with set_dataset_everyone_level)",
+                response=error.response,
+            ) from error
 
     def delete_dataset(self, dataset_id, *, wait=True, timeout=1800):
-        """Delete through a durable job; a local wait timeout does not cancel deletion."""
+        """Delete through a durable job (needs manage); a local wait timeout does not cancel deletion."""
         if not math.isfinite(timeout) or timeout <= 0:
             raise ValueError('timeout must be finite and positive')
         resp = self.session.delete(f"{self.base_url}/datasets/{dataset_id}", timeout=(10, 30))
@@ -534,7 +581,7 @@ class Client:
         return job.wait(timeout=timeout) if wait else job
 
     def resume_dataset_deletion(self, dataset_id, *, wait=True, timeout=1800):
-        """Continue the same cancelled/failed deletion and its checkpoint."""
+        """Continue the same cancelled/failed deletion and its checkpoint (needs manage)."""
         if not math.isfinite(timeout) or timeout <= 0:
             raise ValueError('timeout must be finite and positive')
         resp = self.session.post(f"{self.base_url}/datasets/{dataset_id}/deletion/resume", timeout=(10, 30))
@@ -542,27 +589,88 @@ class Client:
         job = Job(self, resp.json()['job_id'])
         return job.wait(timeout=timeout) if wait else job
 
-    # --- Per-dataset access control ---
+    # --- Per-dataset access control (docs/AUTHENTICATION.md) ---
+
+    def _require_access_levels(self, dataset_id, refused):
+        """Raise RuntimeError(`refused`), before anything changes, on a server older than access levels: it would
+        ignore a level and make the share or the global dataset it always made, which lets power users change the
+        dataset. Only a server with levels answers a dataset's ``access_level``."""
+        if "access_level" not in self.get_dataset_by_id(dataset_id):
+            raise RuntimeError(refused)
 
     def list_dataset_access(self, dataset_id):
-        """List users who have explicit access to `dataset_id`. Admin only."""
+        """Who `dataset_id` is shared with, and at what level (needs manage): ``is_global``, ``everyone_level``,
+        ``grants`` (users) and ``group_grants`` (groups). See ``Dataset.list_access``."""
         resp = self.session.get(f"{self.base_url}/datasets/{dataset_id}/access")
         _raise_for_status(resp)
         return resp.json()
 
-    def grant_dataset_access(self, dataset_id, user_id):
-        """Grant `user_id` access to `dataset_id`. Idempotent. Admin only."""
-        resp = self.session.post(
-            f"{self.base_url}/datasets/{dataset_id}/access",
-            json={"user_id": user_id},
-        )
+    def grant_dataset_access(self, dataset_id, user_id=None, *, group=None, level=None):
+        """Share `dataset_id` with a user (`user_id`) or a group (`group`, its name) at `level`: "view", "tag",
+        "edit" or "manage" (needs manage). Without `level` a new share is edit and an existing one keeps its level.
+        Returns the share: ``dataset_id``, ``user_id`` or ``group_id`` and ``group``, and ``level``."""
+        if (user_id is None) == (group is None):
+            raise ValueError("Give either user_id or group")
+        if level is not None and level not in ACCESS_LEVELS:
+            raise ValueError(f"level must be one of {', '.join(ACCESS_LEVELS)}, not {level!r}")
+        body: Dict[str, Any] = {"user_id": user_id} if group is None else {"group": group}
+        if level is not None:
+            body["level"] = level
+        # Edit is the share a server from before access levels makes anyway: only another level is checked first.
+        if level not in (None, "edit"):
+            self._require_access_levels(
+                dataset_id,
+                f"Not shared at {level}: this server is older than access levels and would ignore the level, making "
+                "a share that lets the user change the dataset. Upgrade the server first.",
+            )
+        resp = self.session.post(f"{self.base_url}/datasets/{dataset_id}/access", json=body)
         _raise_for_status(resp)
-        return resp.json()
+        answer = resp.json()
+        # The backstop: a server from before access levels ignores the level and makes the share it always made, which
+        # lets the user change the dataset (edit).
+        if level is not None and answer.get("level", "edit") != level:
+            raise RuntimeError(
+                f"The dataset was shared, but not at {level}: this server is older than access levels, and a share "
+                "there lets the user change the dataset. Revoke it if that isn't wanted, and upgrade the server.",
+            )
+        return answer
 
-    def revoke_dataset_access(self, dataset_id, user_id):
-        """Revoke `user_id`'s access to `dataset_id`. No-op if not granted. Admin only."""
-        resp = self.session.delete(f"{self.base_url}/datasets/{dataset_id}/access/{user_id}")
+    def revoke_dataset_access(self, dataset_id, user_id=None, *, group=None):
+        """Remove a user's (`user_id`) or a group's (`group`, its name) share of `dataset_id` (needs manage). No-op
+        if there is none. A group's id is looked up in the dataset's access list."""
+        if (user_id is None) == (group is None):
+            raise ValueError("Give either user_id or group")
+        if group is None:
+            resp = self.session.delete(f"{self.base_url}/datasets/{dataset_id}/access/{user_id}")
+        else:
+            shares = self.list_dataset_access(dataset_id).get("group_grants", [])
+            group_ids = [share["group_id"] for share in shares if share["name"] == group]
+            if not group_ids:
+                return None
+            resp = self.session.delete(f"{self.base_url}/datasets/{dataset_id}/access/groups/{group_ids[0]}")
         _raise_for_status(resp)
+        return None
+
+    def set_dataset_everyone_level(self, dataset_id, level):
+        """Make `dataset_id` global, giving every signed-in user `level` ("view", "tag" or "edit"), or private with
+        None (needs manage). See ``Dataset.set_everyone_level``."""
+        _check_everyone_level(level)
+        body: Dict[str, Any] = {"is_global": False} if level is None else {"is_global": True, "everyone_level": level}
+        # A server from before access levels understands is_global alone, and a global dataset there gives what edit
+        # does: only view and tag are checked first.
+        if level in ("view", "tag"):
+            self._require_access_levels(
+                dataset_id,
+                f"Not made global at {level}: this server is older than access levels and would ignore the level, "
+                "letting every power user change the dataset. Upgrade the server first.",
+            )
+        answer = self.update_dataset(dataset_id, **body)
+        if level is not None and answer.get("everyone_level", "edit") != level:
+            raise RuntimeError(
+                f"The dataset is now global, but not at {level}: this server is older than access levels, and a "
+                "global dataset there lets every power user change it. Make it private again with "
+                "set_everyone_level(None) if that isn't wanted, and upgrade the server.",
+            )
         return None
 
     def get_dataset(self, name):
@@ -1247,7 +1355,7 @@ class Client:
         wait=True,
         timeout=1800,
     ):
-        """Delete a captured target; cancellation retains already deleted chunks (admin only). Deleting an image
+        """Delete a captured target; cancellation retains already deleted chunks (needs edit). Deleting an image
         deletes its object samples (``objects_deleted`` in the result, apart from ``deleted_count``)."""
         payload = {
             'sample_ids': list(sample_ids or []),
@@ -1271,7 +1379,7 @@ class Client:
         return resp.json()
 
     def delete_unlinked_objects(self, dataset_id, kinds=('image_gone',), *, wait=True, timeout=1800):
-        """Delete the object samples with no image of these kinds (admin only; refused on a mirror), as a bulk
+        """Delete the object samples with no image of these kinds (needs edit; refused on a mirror), as a bulk
         delete job. By default only those whose image is gone. With none to delete there is no job."""
         response = self.session.post(
             f'{self.base_url}/datasets/{dataset_id}/objects/unlinked/delete',
@@ -1292,7 +1400,7 @@ class Client:
         wait=True,
         timeout=1800,
     ):
-        """Delete one embedding field's vectors for a target (admin only).
+        """Delete one embedding field's vectors for a target (needs edit).
 
         ``sample_ids`` are sent DELETE_EMBEDDINGS_IDS_PER_REQUEST at a time, each as its own server job run to
         completion before the next; the result is ``{'deleted': n}`` over all of them. With more than one
@@ -1910,7 +2018,7 @@ class Client:
         return resp.json()["views"]
 
     def delete_version(self, dataset_id, version_id) -> dict:
-        """Delete a dataset version. Takes an admin: it can't be brought back."""
+        """Delete a dataset version. Needs manage: it can't be brought back."""
         resp = self.session.delete(f"{self.base_url}/datasets/{dataset_id}/versions/{version_id}")
         _raise_for_status(resp)
         return resp.json()
@@ -1944,7 +2052,7 @@ class Client:
         exact_membership=False,
         restore_settings=False,
     ) -> dict:
-        """Revert dataset to a specific version. Takes an admin.
+        """Revert dataset to a specific version. Needs edit.
 
         restore_deleted=True also re-creates samples deleted since the version
         (from snapshot; embeddings/hashes must be backfilled — see get_missing).

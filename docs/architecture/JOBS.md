@@ -708,8 +708,8 @@ its owner, and heartbeats (`POST /api/workers/{id}/heartbeat`). The job endpoint
 functions above, so their semantics are the same as a local slot's:
 - `POST /api/workers/{id}/claim {wait_seconds ≤ 25}` long-polls `claim_job` with `placements=('compute',)`,
   the kinds the worker registered that run remotely (`REMOTE_KINDS`, with each kind's `JobPolicy`), and
-  `dataset_ids` = the datasets its owner can access (`filter_datasets_for_user`); a job on no dataset only
-  for an admin's worker. 200 is the job with a 120 s lease; 204 is none.
+  `dataset_ids` = the datasets its owner has edit in (`level_select`: a job's result is a write); a job on no
+  dataset only for an admin's worker. 200 is the job with a 120 s lease; 204 is none.
 - `POST .../jobs/{job_id}/heartbeat {lease_token, done?, total?, message?}`: `heartbeat_job`, then the
   progress through `publish_step`. It returns `cancel_requested`.
 - `.../complete {lease_token, result}`: `publish_step(finished=True)`. `.../fail {lease_token, error,
@@ -718,8 +718,8 @@ functions above, so their semantics are the same as a local slot's:
 - Each checks that the job's `worker_id` is the caller's worker. A lost lease is 409 (`lease_lost`: stop
   without reporting), and a busy queue is 503 with Retry-After. A worker that stops renewing loses the job
   when its lease expires: the next claim requeues it with a failure, as for a local slot.
-- Heartbeat, complete and the file transfers also check, as a claim does, that the worker's owner may still
-  access the job's dataset; when they can't (an admin removed their access), the answer is the same 409
+- Heartbeat, complete and the file transfers also check, as a claim does, that the worker's owner still has
+  edit in the job's dataset; when they don't (their access was removed or lowered), the answer is the same 409
   `lease_lost`, so the worker drops the job and goes on claiming, and its lease expires. Fail and release stay
   open, to give the job back.
 

@@ -10,11 +10,14 @@ from fastapi import HTTPException
 
 from backend import bulk_jobs, index_jobs, job_queue
 from backend.routers import datasets, embeddings
-from backend.tests import test_field_registry_postgres
+from backend.tests import test_access_rule_spec, test_field_registry_postgres
+from backend.tests.test_access_rule_spec import OTHER_POWER, POWER
 from backend.tests.test_bulk_jobs import claim, finish, step, submitted
 from backend.tests.test_field_registry_postgres import USER, ingest
 
 registry_database = test_field_registry_postgres.registry_database
+world = test_access_rule_spec.world
+SEALED = 'Dataset is being deleted; writes are disabled. Resume deletion to finish.'
 pytestmark = pytest.mark.skipif(not os.getenv('FRIDGE_TEST_POSTGRES_DSN'), reason='Requires disposable PostgreSQL')
 
 FIELD = 'embeddings_model_a'
@@ -179,33 +182,42 @@ def test_explicit_ids_in_other_datasets_and_unknown_fields_delete_nothing(regist
     registry_database(scenario)
 
 
-def test_route_requires_admin_and_a_writable_dataset(registry_database):
-    import httpx
-    from fastapi import FastAPI
+async def vectors(database, dataset_id, count):
+    """`count` samples of the dataset, each with a FIELD vector; their ids."""
+    ids = (await ingest([{} for _ in range(count)], dataset_id=dataset_id))['ids']
+    await database.execute(
+        'INSERT INTO embeddings(dataset_id,sample_id,field_name,vector) '
+        'SELECT s.dataset_id,s.id,$2,ARRAY[s.id,1,2]::real[]::vector FROM samples s WHERE s.id = ANY($1::int[])',
+        ids,
+        FIELD,
+    )
+    return ids
 
-    from backend.access import require_dataset_access
-    from backend.routers.auth import get_current_user
 
-    async def scenario(db):
-        await seed(db, 2)
-        app = FastAPI()
-        app.include_router(datasets.router)
-        app.dependency_overrides[require_dataset_access] = lambda: None
-        app.dependency_overrides[get_current_user] = lambda: {'id': 1, 'role': 'power_user'}
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://test') as client:
-            url = f'/datasets/1/embeddings/{FIELD}/delete'
-            assert (await client.post(url, json={'filters': {}})).status_code == 403
-            app.dependency_overrides[get_current_user] = lambda: USER
-            await db.execute("INSERT INTO datasets(id,name,is_global) VALUES(3,'being-removed',TRUE)")
-            await db.execute('UPDATE datasets SET deleting=TRUE WHERE id=3')
-            with pytest.raises(asyncpg.PostgresError, match='being deleted'):
-                await client.post(f'/datasets/3/embeddings/{FIELD}/delete', json={'filters': {}})
-            response = await client.post(url, json={'filters': {}})
-            assert response.status_code == 202
-            assert json.loads(response.content)['state'] == 'queued'
-        assert await db.fetchval('SELECT count(*) FROM embeddings WHERE field_name=$1', FIELD) == 2
+def test_route_takes_edit_and_a_writable_dataset(world):
+    """Deleting a field's vectors is edit in the dataset (it was an admin's): a tag user is refused, an edit user's is
+    accepted as a job, and a dataset being deleted refuses it whoever asks."""
 
-    registry_database(scenario)
+    async def scenario(w):
+        await w.dataset(10)
+        await vectors(w.database, 10, 2)
+        await w.share(10, POWER, 'tag')
+        url = f'/api/datasets/10/embeddings/{FIELD}/delete'
+        refused = await w.call(POWER, 'POST', url, json={'filters': {}})
+        assert (refused.status_code, refused.json()) == (403, {'detail': 'This needs edit access to the dataset'})
+        await w.database.execute('UPDATE dataset_access SET level = 3 WHERE dataset_id = 10 AND user_id = $1', POWER)
+        response = await w.call(POWER, 'POST', url, json={'filters': {}})
+        assert response.status_code == 202, response.text
+        assert json.loads(response.content)['state'] == 'queued'
+        await w.dataset(11)
+        await w.share(11, POWER, 'manage')
+        await w.database.execute('UPDATE datasets SET deleting=TRUE WHERE id=11')
+        for user_id in (POWER, 1):  # a manager, an admin
+            sealed = await w.call(user_id, 'POST', f'/api/datasets/11/embeddings/{FIELD}/delete', json={'filters': {}})
+            assert (sealed.status_code, sealed.json()) == (409, {'detail': SEALED}), sealed.text
+        assert await w.database.fetchval('SELECT count(*) FROM embeddings WHERE field_name=$1', FIELD) == 2
+
+    world(scenario)
 
 
 def test_emptied_field_with_an_ann_index_refuses_another_dimension_with_a_clear_message(registry_database):
@@ -340,18 +352,33 @@ def test_a_filter_without_values_is_refused_instead_of_deleting_the_whole_field(
     registry_database(scenario)
 
 
-def test_resuming_an_embedding_delete_requires_an_administrator(registry_database, monkeypatch):
-    from backend import access
-    from backend.routers import jobs as jobs_router
+def test_resuming_an_embedding_delete_takes_its_starter_at_edit_or_a_manager(world):
+    """Resuming a bulk job needs the level of its kind: deleting vectors is edit (resuming one was an admin's). Its
+    starter may while they hold edit and not once they don't; a manager of the dataset may."""
 
-    async def scenario(db):
-        monkeypatch.setattr(jobs_router, 'db', db)
-        monkeypatch.setattr(access, 'db', db)
-        ids = await seed(db, 2)
-        job_id = await delete_request(sample_ids=[ids[0]])
-        demoted = {'id': USER['id'], 'role': 'power_user'}  # the submitter, since demoted
-        with pytest.raises(HTTPException) as refused:
-            await jobs_router.resume_bulk_job(job_id, user=demoted)
-        assert refused.value.status_code == 403
+    async def scenario(w):
+        await w.dataset(10)
+        ids = await vectors(w.database, 10, 2)
+        await w.share(10, POWER, 'edit')
+        url = f'/api/datasets/10/embeddings/{FIELD}/delete'
+        started = await w.call(POWER, 'POST', url, json={'sample_ids': [ids[0]], 'background': True})
+        assert started.status_code == 202, started.text
+        job_id = started.json()['job_id']
+        assert (await w.call(POWER, 'POST', f'/api/jobs/{job_id}/cancel')).status_code == 200
+        await w.database.execute('UPDATE dataset_access SET level = 2 WHERE dataset_id = 10 AND user_id = $1', POWER)
+        lost = await w.call(POWER, 'POST', f'/api/jobs/{job_id}/resume')
+        assert lost.status_code == 403, lost.text
+        assert lost.json()['detail'] in (
+            'This needs edit access to the dataset',
+            'This needs manage access to the dataset',
+        )
+        assert await w.database.fetchval('SELECT state FROM jobs WHERE id = $1::uuid', job_id) == 'cancelled'
+        await w.database.execute('UPDATE dataset_access SET level = 3 WHERE dataset_id = 10 AND user_id = $1', POWER)
+        resumed = await w.call(POWER, 'POST', f'/api/jobs/{job_id}/resume')
+        assert resumed.status_code == 202, resumed.text
+        assert (await w.call(POWER, 'POST', f'/api/jobs/{job_id}/cancel')).status_code == 200
+        await w.share(10, OTHER_POWER, 'manage')
+        resumed = await w.call(OTHER_POWER, 'POST', f'/api/jobs/{job_id}/resume')
+        assert resumed.status_code == 202, resumed.text
 
-    registry_database(scenario)
+    world(scenario)

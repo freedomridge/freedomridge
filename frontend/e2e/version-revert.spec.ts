@@ -78,21 +78,38 @@ test('a delete the server refuses says why', async ({ page }) => {
     expect(messages[1]).toBe('The version was not deleted: Insufficient permissions');
 });
 
-test('what a guest cannot do with versions is disabled and says why, and browsing stays open', async ({ page }) => {
-    await page.route('**/api/auth/me', async route => {
-        const response = await route.fetch();
-        await route.fulfill({ response, json: { ...(await response.json()), role: 'guest' } });
-    });
-    await openVersions(page);
+test('what a guest cannot do with versions is disabled and says why, and browsing stays open', async ({ browser }) => {
+    // A real guest, shared at edit: a guest gets view at most, so making a version and reverting (edit) and deleting
+    // one (manage) are refused, each with the level it needs.
+    const username = `e2e_version_guest_${randomUUID().slice(0, 8)}`;
+    const password = 'E2e-Version-Guest-Pw-2026!';
+    const guest = await apiFetch(cookie, '/users', { method: 'POST', body: JSON.stringify({ username, password, role: 'guest' }) });
+    const context = await browser.newContext({ storageState: { cookies: [], origins: [] } });
+    try {
+        await apiFetch(cookie, `/datasets/${datasetId}/access`, { method: 'POST', body: JSON.stringify({ user_id: guest.id, level: 'edit' }) });
+        const page = await context.newPage();
+        expect((await page.request.post('/api/auth/login', { data: { username, password } })).ok()).toBeTruthy();
+        expect((await page.request.post('/api/auth/change-password', {
+            data: { current_password: password, new_password: `${password}-2` },
+        })).ok()).toBeTruthy();
+        expect((await (await page.request.get(`/api/datasets/${datasetId}`)).json()).access_level).toBe('view');
+        await openVersions(page);
+        await expect(page.getByTestId('grid-select-all')).toBeVisible();  // the dataset, and so the level, is read
 
-    await expect(page.getByPlaceholder('Version name (e.g., v2.0)')).toBeDisabled();
-    await expect(page.getByRole('group').filter({ hasText: 'Create Version' }))
-        .toHaveAttribute('title', 'Making a version takes a power user');
-    const remove = page.getByRole('button', { name: 'Delete', exact: true }).first();
-    await expect(remove).toBeDisabled();
-    await expect(remove).toHaveAttribute('title', /takes an admin/);
-    const revert = page.getByRole('button', { name: 'Revert to this snapshot' }).first();
-    await expect(revert).toBeDisabled();
-    await expect(revert).toHaveAttribute('title', /takes an admin/);
-    await expect(page.getByRole('link', { name: 'Browse snapshot' }).first()).toBeVisible();
+        await expect(page.getByPlaceholder('Version name (e.g., v2.0)')).toBeDisabled();
+        await expect(page.getByRole('group').filter({ hasText: 'Create Version' }))
+            .toHaveAttribute('title', 'This needs edit access to the dataset');
+        const remove = page.getByRole('button', { name: 'Delete', exact: true }).first();
+        await expect(remove).toBeDisabled();
+        await expect(remove).toHaveAttribute('title', 'This needs manage access to the dataset');
+        const revert = page.getByRole('button', { name: 'Revert to this snapshot' }).first();
+        await expect(revert).toBeDisabled();
+        await expect(revert).toHaveAttribute('title', 'This needs edit access to the dataset');
+        await expect(page.getByLabel(/Also restore the dataset's settings/)).toHaveCount(0);
+        await expect(page.getByRole('link', { name: 'Browse snapshot' }).first()).toBeVisible();
+    } finally {
+        await context.close();
+        // Their share goes with them.
+        await apiFetch(cookie, `/users/${guest.id}`, { method: 'DELETE' });
+    }
 });

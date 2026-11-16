@@ -1,7 +1,7 @@
 """Dataset Jobs panel → Schedules: recurring jobs for one dataset (backend/dataset_schedules.py).
 
-Anyone with access to the dataset can read its schedules; power users and admins create, change,
-delete and Run now map re-fits. The read-only index review (backend/index_advisor.py) is an
+Anyone with access to the dataset can read its schedules; who has edit in it creates, changes,
+deletes and runs now map re-fits. The read-only index review (backend/index_advisor.py) is an
 administrator's tool: only admins create, change, delete and run its schedule. Scheduled and Run-now
 jobs show in Running and History like any other job.
 """
@@ -14,11 +14,10 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field, StrictBool, StrictInt, model_validator
 
 from .. import dataset_schedules, index_advisor, map_refit
-from ..access import require_dataset_access
+from ..access import require_dataset_access, require_level
 from ..api_errors import CodedHTTPException
 from ..database import db
 from ..job_queue import QueueBusy
-from .auth import require_role
 
 router = APIRouter(
     prefix='/datasets/{id}/schedules',
@@ -170,7 +169,7 @@ async def list_schedules(id: int):
 
 
 @router.post('', status_code=201)
-async def create_schedule(id: int, body: ScheduleCreate, user: dict = Depends(require_role('power_user'))):
+async def create_schedule(id: int, body: ScheduleCreate, user: dict = Depends(require_level('edit'))):
     _require_admin_for(body.job_type, user)
     review = body.job_type == index_advisor.KIND
     if review:
@@ -231,7 +230,7 @@ async def update_schedule(
     id: int,
     schedule_id: int,
     body: ScheduleRule,
-    user: dict = Depends(require_role('power_user')),
+    user: dict = Depends(require_level('edit')),
 ):
     async with db.pool.acquire() as connection, connection.transaction():
         await connection.execute('SELECT require_writable_dataset($1)', id)
@@ -267,7 +266,7 @@ async def update_schedule(
 
 
 @router.delete('/{schedule_id}', status_code=204)
-async def delete_schedule(id: int, schedule_id: int, user: dict = Depends(require_role('power_user'))):
+async def delete_schedule(id: int, schedule_id: int, user: dict = Depends(require_level('edit'))):
     async with db.pool.acquire() as connection, connection.transaction():
         await connection.execute('SELECT require_writable_dataset($1)', id)
         current = await _schedule(connection, id, schedule_id, lock=True)
@@ -276,7 +275,7 @@ async def delete_schedule(id: int, schedule_id: int, user: dict = Depends(requir
 
 
 @router.post('/{schedule_id}/run', status_code=202)
-async def run_schedule(id: int, schedule_id: int, user: dict = Depends(require_role('power_user'))):
+async def run_schedule(id: int, schedule_id: int, user: dict = Depends(require_level('edit'))):
     """Queue the job now, ignoring the sample and frequency conditions (or return the one already
     queued or running for this map)."""
     async with db.pool.acquire() as connection:

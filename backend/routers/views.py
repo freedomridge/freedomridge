@@ -1,14 +1,23 @@
 import json
 import secrets
-from typing import Any, List
+from typing import Any, List, Optional
 
 import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.routing import APIRoute
 from pydantic import BaseModel
+from starlette.datastructures import State
 
 from .. import public_settings
-from ..access import check_dataset_access, missing_unless_allowed, require_dataset_access
+from ..access import (
+    caller_level,
+    check_dataset_access,
+    checks_level,
+    level_number,
+    level_refusal,
+    missing_unless_allowed,
+    require_dataset_access,
+)
 from ..api_errors import CodedHTTPException
 from ..database import db
 from ..models import View, ViewContentUpdate, ViewCreate
@@ -247,27 +256,51 @@ async def get_view(slug: str, request: Request):
     return data
 
 
+def _require_view_writer(view, user: dict, level: Optional[int], action: str) -> None:
+    """Someone else's view: a public one needs edit in its dataset (`level`, the caller's there: _view_level), a
+    private one an administrator. Its owner may always change their own."""
+    if view['user_id'] == user['id'] or user['role'] == 'admin':
+        return
+    if not view['is_public']:
+        raise HTTPException(status_code=403, detail=f"Not authorized to {action} this view")
+    if level is None or level < level_number('edit'):
+        raise level_refusal('edit')
+
+
+async def _view_level(view, user: dict, state: Any) -> Optional[int]:
+    """The caller's level in the view's dataset, for _require_view_writer: looked up only for someone else's public
+    view, the one case it decides. Not while holding a connection: it takes one of the pool's."""
+    if view['user_id'] == user['id'] or user['role'] == 'admin' or not view['is_public']:
+        return None
+    return await caller_level(view['dataset_id'], user, state)
+
+
 @router.delete("/views/{id}")
+@checks_level(
+    "edit for another user's public view",
+    while_deleting="its dataset comes from the view: the database refuses the delete while it is deleted (409)",
+)
 async def delete_view(id: int, user: dict = Depends(get_current_user)):
     return await remove_view(id, user)
 
 
 async def remove_view(id: int, user: dict, *, check_access: bool = True):
     """delete_view's work. With check_access off, for a follower's request the followers router has authorized (a
-    shared view of a dataset it follows), its account's dataset access isn't checked."""
+    shared view of a dataset it follows), its account's dataset access isn't checked: it deletes its own views only."""
     from .. import mirror_writes
 
-    # Check ownership or admin
-    view = await db.fetchrow("SELECT user_id, dataset_id FROM views WHERE id = $1", id)
+    view = await db.fetchrow("SELECT user_id, dataset_id, is_public FROM views WHERE id = $1", id)
     if not view:
         raise HTTPException(status_code=404, detail="View not found")
 
     if view['user_id'] != user['id'] and user['role'] != 'admin':
-        if check_access:
-            # Someone else's view in a dataset the caller can't open answers as a missing one: a 403 said it exists.
-            with missing_unless_allowed("View not found"):
-                await check_dataset_access(view['dataset_id'], user)
-        raise HTTPException(status_code=403, detail="Not authorized to delete this view")
+        if not check_access:
+            raise HTTPException(status_code=403, detail="Not authorized to delete this view")
+        state = State()  # one dataset lookup for both checks
+        # Someone else's view in a dataset the caller can't open answers as a missing one: a 403 said it exists.
+        with missing_unless_allowed("View not found"):
+            await check_dataset_access(view['dataset_id'], user, state=state)
+        _require_view_writer(view, user, await _view_level(view, user, state), 'delete')
     # A view a mirror copied from its primary is deleted there, when the mirror's views sync both ways.
     forwarded = await mirror_writes.forward_view_deletion(db, id)
     if forwarded is not None:
@@ -285,15 +318,34 @@ async def remove_view(id: int, user: dict, *, check_access: bool = True):
     response_model=View,
     dependencies=[Depends(require_dataset_access)],
 )
-async def update_view_content(id: int, view_id: int, update: ViewContentUpdate, user: dict = Depends(get_current_user)):
+@checks_level("edit for another user's public view")
+async def update_view_content_route(
+    id: int,
+    view_id: int,
+    update: ViewContentUpdate,
+    http_request: Request,
+    user: dict = Depends(get_current_user),
+):
+    return await update_view_content(id, view_id, update, user, http_request.state)
+
+
+async def update_view_content(id: int, view_id: int, update: ViewContentUpdate, user: dict, state: Any = None):
     """Replace a saved view's filters with new ones: the app's "Update this view", after a lasso in it was redrawn, say.
     The keys of `content` given replace the view's (`filters`, `viewStages`); the others stay. Its name, slug, sharing
-    and default-view status stay too; `updated_at` says when (the database stamps it: stamp_view_updated_at). Its owner
-    or an admin may, as for deleting or sharing it. With the `updated_at` the client read, a view whose filters changed
+    and default-view status stay too; `updated_at` says when (the database stamps it: stamp_view_updated_at). Who may
+    delete or share it may (_require_view_writer). With the `updated_at` the client read, a view whose filters changed
     since is refused (409 view_changed) rather than overwritten; without it the last writer wins. A mirror's copy of a
     view on its primary changes there. Followers take the new filters (views_log_update)."""
     if _has_temporary_selection(update.content):
         raise HTTPException(status_code=422, detail=TEMPORARY_SELECTION_DETAIL)
+    # The caller's level before the transaction below holds a connection and the view's row; who owns the view and
+    # whether it is public are read again there, under the lock.
+    seen = await db.fetchrow(
+        "SELECT user_id, dataset_id, is_public FROM views WHERE id = $1 AND dataset_id = $2",
+        view_id,
+        id,
+    )
+    level = None if seen is None else await _view_level(seen, user, state)
     async with db.pool.acquire() as connection, connection.transaction():
         view = await connection.fetchrow(
             "SELECT * FROM views WHERE id = $1 AND dataset_id = $2 FOR UPDATE",
@@ -302,8 +354,7 @@ async def update_view_content(id: int, view_id: int, update: ViewContentUpdate, 
         )
         if view is None:
             raise HTTPException(status_code=404, detail="View not found")
-        if view['user_id'] != user['id'] and user['role'] != 'admin':
-            raise HTTPException(status_code=403, detail="Not authorized to update this view")
+        _require_view_writer(view, user, level, 'update')
         if await connection.fetchval('SELECT 1 FROM mirror_views WHERE view_id = $1', view_id):
             from .. import mirror_writes  # here: it imports the routers
 
@@ -365,16 +416,28 @@ class ViewShare(BaseModel):
 
 
 @router.patch("/datasets/{id}/views/{view_id}/share", dependencies=[Depends(require_dataset_access)])
-async def share_view(id: int, view_id: int, share: ViewShare, user: dict = Depends(get_current_user)):
+@checks_level("edit for another user's public view")
+async def share_view_route(
+    id: int,
+    view_id: int,
+    share: ViewShare,
+    http_request: Request,
+    user: dict = Depends(get_current_user),
+):
+    return await share_view(id, view_id, share, user, http_request.state)
+
+
+async def share_view(id: int, view_id: int, share: ViewShare, user: dict, state: Any = None):
     if private_guest(user):
         raise HTTPException(status_code=403, detail='Guests cannot share views or make them public')
-    # Check ownership
-    view = await db.fetchrow("SELECT user_id FROM views WHERE id = $1 AND dataset_id = $2", view_id, id)
+    view = await db.fetchrow(
+        "SELECT user_id, dataset_id, is_public FROM views WHERE id = $1 AND dataset_id = $2",
+        view_id,
+        id,
+    )
     if not view:
         raise HTTPException(status_code=404, detail="View not found")
-
-    if view['user_id'] != user['id'] and user['role'] != 'admin':
-        raise HTTPException(status_code=403, detail="Not authorized to share this view")
+    _require_view_writer(view, user, await _view_level(view, user, state), 'share')
     await _require_known_users(share.shared_with_user_ids)
     # Made public on a mirror whose views sync both ways: it's made on the primary, and this private one is replaced
     # by its copy (docs/FOLLOWERS.md). Not a view bound to this instance (a concept, or a range on sample ids).
@@ -414,8 +477,8 @@ async def share_view(id: int, view_id: int, share: ViewShare, user: dict = Depen
             raise HTTPException(
                 status_code=409,
                 detail="This is the dataset's default view, which everyone who opens the dataset starts on, "
-                "so it stays public until an administrator chooses another default view or removes this one "
-                "as the default.",
+                "so it stays public until someone who may edit the dataset chooses another default view or removes "
+                "this one as the default.",
             )
         await connection.execute(
             "UPDATE views SET is_public = $1, shared_with_user_ids = $2 WHERE id = $3",

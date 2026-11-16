@@ -172,6 +172,11 @@ def test_a_follower_copies_a_dataset_and_then_follows_its_changes(monkeypatch, r
         assert (mirror['state'], mirror['origin_dataset_id'], mirror['tags']) == ('following', 1, 'both')
         local = await database.fetchrow('SELECT * FROM datasets WHERE id = $1', mirror['dataset_id'])
         assert local['name'] == 'training (from primary)'  # 'training' is taken here: it's the primary itself
+        # Whoever linked this instance to the primary owns the mirror, and has it by an edit share, as the creator of a
+        # dataset does: owner_id gives no access by itself.
+        assert local['owner_id'] == 1
+        share = 'SELECT level FROM dataset_access WHERE dataset_id = $1 AND user_id = 1'
+        assert await database.fetchval(share, mirror['dataset_id']) == 3
         samples = await copied(database, mirror)
         assert sorted(samples) == [corn, soy, child]
         assert samples[corn]['tags'] == ['reviewed'] and samples[corn]['filepath'] == 's3://images/a-0.jpg'

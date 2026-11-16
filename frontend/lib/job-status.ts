@@ -36,11 +36,11 @@ export function notRebuilt(job: { kind: string; state: string; result?: unknown;
 
 type IndexJob = { kind: string; state: string; dataset_id: number | null; field?: string | null; created_at: string };
 
-// A failed or cancelled vector index build can be started again by whoever may build one (a power user or an admin),
-// unless a later build of the same field is waiting, running or done.
-export function canRetryIndexBuild(job: IndexJob, listed: IndexJob[], role: string | undefined): boolean {
+// A failed or cancelled vector index build can be started again, unless a later build of the same field is waiting,
+// running or done. Whether the user may (edit in its dataset) is the caller's to show.
+export function canRetryIndexBuild(job: IndexJob, listed: IndexJob[]): boolean {
     if (job.kind !== 'ann_index_build' || (job.state !== 'failed' && job.state !== 'cancelled')) return false;
-    if (!job.field || job.dataset_id == null || (role !== 'admin' && role !== 'power_user')) return false;
+    if (!job.field || job.dataset_id == null) return false;
     const after = Date.parse(job.created_at);
     return !listed.some(other => other.kind === job.kind && other.dataset_id === job.dataset_id && other.field === job.field
         && Date.parse(other.created_at) > after && ['queued', 'running', 'succeeded'].includes(other.state));
