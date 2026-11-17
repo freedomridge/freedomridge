@@ -4,6 +4,7 @@ import { useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Info } from 'lucide-react';
 import { useUser } from '@/contexts/UserContext';
+import { refusal, type AccessLevel } from '@/lib/access-level';
 import {
     createSchedule,
     deleteSchedule,
@@ -247,10 +248,12 @@ function ScheduleForm({ datasetId, schedule, defaults, fields, onDone, canReview
     );
 }
 
-function ScheduleRow({ schedule, datasetId, canEdit, defaults }: {
+function ScheduleRow({ schedule, datasetId, canEdit, editRefusal, defaults }: {
     schedule: DatasetSchedule;
     datasetId: number;
     canEdit: boolean;
+    // Why its controls are disabled (the user's level); without one, a row they can't edit shows no controls.
+    editRefusal?: string;
     defaults: ScheduleRule;
 }) {
     const queryClient = useQueryClient();
@@ -271,16 +274,18 @@ function ScheduleRow({ schedule, datasetId, canEdit, defaults }: {
     const zone = schedule.timezone;
     const map = schedule.map;
     const review = schedule.job_type === 'index_review';
+    const offered = canEdit || !!editRefusal;
     return (
         <li data-testid="schedule-row" data-schedule-id={schedule.id} className="py-3 border-b border-zinc-800 last:border-0">
             <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
                 <span className={schedule.enabled ? 'text-green-400' : 'text-zinc-500'} aria-hidden="true">{schedule.enabled ? '●' : '○'}</span>
                 <span className="text-sm text-zinc-200">{review ? 'Index review · this dataset\'s indexes' : `Map re-fit · ${schedule.target}`}</span>
-                {canEdit ? (
+                {offered ? (
                     <button
                         data-testid="schedule-toggle"
-                        className={`ml-auto px-2 py-0.5 rounded border text-xs ${schedule.enabled ? 'border-green-500/40 text-green-300' : 'border-zinc-700 text-zinc-400'}`}
-                        disabled={toggle.isPending}
+                        className={`ml-auto px-2 py-0.5 rounded border text-xs disabled:opacity-60 disabled:cursor-not-allowed ${schedule.enabled ? 'border-green-500/40 text-green-300' : 'border-zinc-700 text-zinc-400'}`}
+                        disabled={toggle.isPending || !canEdit}
+                        title={editRefusal}
                         onClick={() => toggle.mutate()}
                         aria-pressed={schedule.enabled}
                     >
@@ -302,12 +307,12 @@ function ScheduleRow({ schedule, datasetId, canEdit, defaults }: {
                         : `${map.new_samples.toLocaleString()} points on the map; not re-fitted on a schedule yet`}
                 {schedule.last_check && !schedule.last_check.ran && ` · Checked ${when(schedule.last_check.at, zone)}: ${schedule.last_check.reason}`}
             </div>}
-            {canEdit && !editing && (
+            {offered && !editing && (
                 <div className="mt-1 flex flex-wrap justify-end gap-3 text-xs">
-                    <button data-testid="schedule-run-now" className="underline hover:text-white text-zinc-300" disabled={run.isPending} onClick={() => run.mutate()}>
+                    <button data-testid="schedule-run-now" className="underline hover:text-white text-zinc-300 disabled:opacity-60 disabled:cursor-not-allowed disabled:hover:text-zinc-300" disabled={run.isPending || !canEdit} title={editRefusal} onClick={() => run.mutate()}>
                         {run.isPending ? 'Starting…' : 'Run now'}
                     </button>
-                    <button data-testid="schedule-edit" className="underline hover:text-white text-zinc-300" onClick={() => setEditing(true)}>Edit</button>
+                    <button data-testid="schedule-edit" className="underline hover:text-white text-zinc-300 disabled:opacity-60 disabled:cursor-not-allowed disabled:hover:text-zinc-300" disabled={!canEdit} title={editRefusal} onClick={() => setEditing(true)}>Edit</button>
                     {confirmDelete ? (
                         <span className="flex gap-2">
                             <span className="text-zinc-300">Delete this schedule?</span>
@@ -315,7 +320,7 @@ function ScheduleRow({ schedule, datasetId, canEdit, defaults }: {
                             <button className="underline text-zinc-300" onClick={() => setConfirmDelete(false)}>Keep it</button>
                         </span>
                     ) : (
-                        <button data-testid="schedule-delete" className="underline hover:text-white text-zinc-300" onClick={() => setConfirmDelete(true)}>Delete</button>
+                        <button data-testid="schedule-delete" className="underline hover:text-white text-zinc-300 disabled:opacity-60 disabled:cursor-not-allowed disabled:hover:text-zinc-300" disabled={!canEdit} title={editRefusal} onClick={() => setConfirmDelete(true)}>Delete</button>
                     )}
                 </div>
             )}
@@ -333,10 +338,12 @@ function ScheduleRow({ schedule, datasetId, canEdit, defaults }: {
     );
 }
 
-// The Schedules tab of the dataset's Jobs panel; fetched and polled only while open.
-export function DatasetSchedules({ datasetId }: { datasetId: number }) {
+// The Schedules tab of the dataset's Jobs panel; fetched and polled only while open. Schedules take edit in the
+// dataset (`level`), and an index review's the administrator role too.
+export function DatasetSchedules({ datasetId, level = null }: { datasetId: number; level?: AccessLevel | null }) {
     const { user } = useUser();
-    const canEdit = user?.role === 'admin' || user?.role === 'power_user';
+    const editRefusal = refusal(level, 'edit');
+    const canEdit = !editRefusal;
     const isAdmin = user?.role === 'admin';
     const [adding, setAdding] = useState(false);
     const schedules = useQuery({
@@ -370,8 +377,8 @@ export function DatasetSchedules({ datasetId }: { datasetId: number }) {
         <div data-testid="dataset-schedules">
             <div className="flex items-center justify-between">
                 <p className="text-sm text-zinc-400">Recurring jobs for this dataset. Runs show under Running and History.</p>
-                {canEdit && !adding && (
-                    <button data-testid="add-schedule" className="px-2 py-1 rounded bg-zinc-800 hover:bg-zinc-700 text-xs text-zinc-200" onClick={() => setAdding(true)}>
+                {!adding && (
+                    <button data-testid="add-schedule" className="px-2 py-1 rounded bg-zinc-800 hover:bg-zinc-700 text-xs text-zinc-200 disabled:opacity-60 disabled:cursor-not-allowed disabled:hover:bg-zinc-800" disabled={!canEdit} title={editRefusal} onClick={() => setAdding(true)}>
                         + Add schedule
                     </button>
                 )}
@@ -393,8 +400,11 @@ export function DatasetSchedules({ datasetId }: { datasetId: number }) {
                             onDone={() => setAdding(false)}
                         />
                     ) : (
-                        <p className="mt-2 text-sm text-zinc-400">
-                            Every map already has a schedule. <button className="underline" onClick={() => setAdding(false)}>Close</button>
+                        <p className="mt-2 text-sm text-zinc-400" data-testid="schedule-nothing-to-add">
+                            {(fields.data ?? []).some(field => !field.includes('_patch_'))
+                                ? 'Every map already has a schedule.'
+                                : 'This dataset has no maps to re-fit.'}{' '}
+                            <button className="underline" onClick={() => setAdding(false)}>Close</button>
                         </p>
                     )
             )}
@@ -406,6 +416,7 @@ export function DatasetSchedules({ datasetId }: { datasetId: number }) {
                             schedule={schedule}
                             datasetId={datasetId}
                             canEdit={schedule.job_type === 'index_review' ? isAdmin : canEdit}
+                            editRefusal={schedule.job_type === 'index_review' ? undefined : editRefusal}
                             defaults={schedules.data.defaults}
                         />
                     ))}

@@ -5,13 +5,15 @@ from unittest.mock import Mock
 
 import pytest
 from fastapi import HTTPException
-from fastapi.routing import APIRoute
 from fridge.core.dataset import Dataset
 
 from backend.routers import versions
+from backend.tests import test_access_rule_spec
+from backend.tests.test_access_rule_spec import ADMIN, GUEST, POWER
 from backend.tests.test_field_registry_postgres import USER, ingest, registry_database
 
 __all__ = ['registry_database']
+world = test_access_rule_spec.world
 needs_postgres = pytest.mark.skipif(not os.getenv('FRIDGE_TEST_POSTGRES_DSN'), reason='Requires disposable PostgreSQL')
 
 
@@ -59,32 +61,44 @@ def test_a_revert_restores_the_settings_only_when_asked(registry_database):
     registry_database(scenario)
 
 
-def test_reverting_and_deleting_take_an_admin_and_making_a_version_does_not():
-    def role_guard(endpoint):
-        routes = [route for route in versions.router.routes if isinstance(route, APIRoute)]
-        route = next(route for route in routes if route.endpoint is endpoint)
-        guards = [
-            dependency.call
-            for dependency in route.dependant.dependencies
-            if 'require_role' in getattr(dependency.call, '__qualname__', '')
-        ]
-        assert len(guards) == 1, route.path
-        return guards[0]
+@needs_postgres
+def test_reverting_and_making_a_version_take_edit_and_deleting_one_takes_manage(world):
+    """A revert can delete the samples added since, change public views whoever owns them and restore the display
+    settings: edit, as each of those is (it was an admin's). A deleted version can't be brought back: manage. Making
+    a version: edit. A guest, at view, does none of them; an admin does all."""
 
-    power_user, admin = {'id': 2, 'role': 'power_user'}, {'id': 1, 'role': 'admin'}
-    # A revert can delete samples, change views whoever owns them, and restore settings: each an admin's to do.
-    revert = role_guard(versions.revert_to_version)
-    with pytest.raises(HTTPException) as refused:
-        revert(power_user)
-    assert refused.value.status_code == 403
-    assert revert(admin) == admin
-    # A deleted version can't be brought back.
-    delete = role_guard(versions.delete_version)
-    with pytest.raises(HTTPException) as refused:
-        delete(power_user)
-    assert refused.value.status_code == 403
-    assert delete(admin) == admin
-    assert role_guard(versions.post_version)(power_user) == power_user
+    async def scenario(w):
+        cases = [
+            # (caller, their level, make, revert, delete)
+            (POWER, 'tag', 403, 403, 403),
+            (POWER, 'edit', 200, 200, 403),
+            (POWER, 'manage', 200, 200, 200),
+            (GUEST, 'manage', 403, 403, 403),
+            (ADMIN, None, 200, 200, 200),
+        ]
+        for dataset_id, (caller, level, make, revert, delete) in enumerate(cases, start=10):
+            await w.dataset(dataset_id)
+            await ingest([{}], dataset_id=dataset_id)
+            if level is not None:
+                await w.share(dataset_id, caller, level)
+            made = await w.call(ADMIN, 'POST', f'/api/datasets/{dataset_id}/versions', json={'name': 'v1'})
+            assert made.status_code == 200, made.text
+            version = await w.database.fetchval('SELECT id FROM dataset_versions WHERE dataset_id = $1', dataset_id)
+            base = f'/api/datasets/{dataset_id}/versions'
+            calls = [
+                ('POST', base, {'json': {'name': 'v2'}}, make, 'edit'),
+                ('POST', f'{base}/{version}/revert', {}, revert, 'edit'),
+                ('DELETE', f'{base}/{version}', {}, delete, 'manage'),
+            ]
+            for method, path, kwargs, wanted, needed in calls:
+                response = await w.call(caller, method, path, **kwargs)
+                assert response.status_code == wanted, (caller, level, method, path, response.text)
+                if wanted == 403:
+                    assert response.json() == {'detail': f'This needs {needed} access to the dataset'}, response.text
+            remaining = await w.database.fetchval('SELECT count(*) FROM dataset_versions WHERE id = $1', version)
+            assert remaining == (0 if delete == 200 else 1), (caller, level)
+
+    world(scenario)
 
 
 def test_the_sdk_says_when_the_server_did_not_restore_the_settings():

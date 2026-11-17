@@ -10,10 +10,11 @@ from fastapi.testclient import TestClient
 from backend import access, job_queue
 from backend.main import app
 from backend.routers import jobs
-from backend.tests import test_field_registry_postgres, test_jobs_api
+from backend.tests import test_access_rule_spec, test_field_registry_postgres, test_jobs_api
 
 api = test_jobs_api.api
 registry_database = test_field_registry_postgres.registry_database
+world = test_access_rule_spec.world
 JOB_ID = test_jobs_api.JOB_ID
 CASES = [
     ('admin', 1, 10, True),
@@ -26,16 +27,23 @@ CASES = [
 ]
 
 
-@pytest.mark.parametrize('role,identifier,creator,allowed', CASES)
-def test_indicator_cancel_offer_matches_what_the_cancel_endpoint_accepts(api, role, identifier, creator, allowed):
-    api.identity['user'] = {'id': identifier, 'role': role}
-    row = test_jobs_api.job_row(state='running', created_by=creator, started_by='Owner')
-    api.database.fetch.return_value = [row]
-    api.database.fetchrow.return_value = row
-    offered = api.client.get('/api/datasets/1/jobs/active').json()['running'][0]['can_cancel']
-    response = api.client.post(f'/api/jobs/{JOB_ID}/cancel')
-    assert offered is allowed
-    assert response.status_code == (200 if allowed else 403)
+@pytest.mark.skipif(not os.getenv('FRIDGE_TEST_POSTGRES_DSN'), reason='Requires disposable PostgreSQL')
+def test_indicator_cancel_offer_matches_what_the_cancel_endpoint_accepts(world):
+    """For each caller (test_jobs_api.CANCEL_CASES: their level in the job's dataset, and whether they started it), the
+    active-jobs indicator offers cancel exactly when the cancel endpoint accepts it."""
+
+    async def scenario(w):
+        for dataset_id, (caller, level, starter, allowed) in enumerate(test_jobs_api.CANCEL_CASES, start=10):
+            job_id = await test_jobs_api.job_in_its_dataset(w, dataset_id, caller, level, starter)
+            page = await w.call(caller, 'GET', f'/api/datasets/{dataset_id}/jobs/active')
+            assert page.status_code == 200, page.text
+            listed = [job for part in ('running', 'resuming', 'waiting') for job in page.json()[part]]
+            offered = next(job['can_cancel'] for job in listed if job['id'] == job_id)
+            response = await w.call(caller, 'POST', f'/api/jobs/{job_id}/cancel')
+            assert offered is allowed, (caller, level, starter)
+            assert response.status_code == (200 if allowed else 403), (caller, level, starter, response.text)
+
+    world(scenario)
 
 
 def test_history_names_who_started_each_job(api):

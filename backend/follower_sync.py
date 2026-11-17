@@ -1468,6 +1468,13 @@ async def configure(pool, link, client, checkpoint: dict) -> StepResult:
                 name,
                 link['created_by'],
             )
+            # Its owner's share, as create_dataset gives one: owner_id gives no access by itself (access.py).
+            if link['created_by'] is not None:
+                await connection.execute(
+                    'INSERT INTO dataset_access (dataset_id, user_id) VALUES ($1, $2)',
+                    dataset_id,
+                    link['created_by'],
+                )
             await connection.execute(
                 """INSERT INTO mirrors (dataset_id, link_id, origin_dataset_id, tags, views, images, copy_blocks,
                                         copy_total, feed_cursor, primary_identity)

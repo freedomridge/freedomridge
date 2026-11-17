@@ -17,9 +17,12 @@ from backend import access, job_queue
 from backend.main import app
 from backend.routers import jobs
 from backend.routers.auth import get_current_user
-from backend.tests import test_field_registry_postgres
+from backend.tests import test_access_rule_spec, test_field_registry_postgres
+from backend.tests.test_access_rule_spec import ADMIN, GUEST, POWER
+from backend.tests.test_field_registry_postgres import ingest
 
 registry_database = test_field_registry_postgres.registry_database
+world = test_access_rule_spec.world
 JOB_ID = UUID('813b5d30-e738-4d1d-9ace-0acf1e6466fd')
 USER = {'id': 10, 'role': 'power_user'}
 
@@ -147,19 +150,65 @@ def test_global_jobs_are_admin_only(api, role, expected):
     api.allowed.assert_not_awaited()
 
 
-@pytest.mark.parametrize(
-    'role,creator,expected',
-    [('guest', 10, 403), ('power_user', 11, 403), ('power_user', 10, 200), ('admin', 11, 200)],
-)
-def test_cancellation_requires_admin_or_submitting_power_user(api, role, creator, expected):
-    api.identity['user']['role'] = role
-    api.database.fetchrow.return_value = job_row(created_by=creator)
-    response = api.client.post(f'/api/jobs/{JOB_ID}/cancel')
-    assert response.status_code == expected
-    if expected == 200:
-        api.cancellation.assert_awaited_once_with(api.database.pool, JOB_ID)
+# Who may cancel a job: (caller, their level in its dataset, whether they started it, cancelled). A bulk set is edit.
+CANCEL_CASES = [
+    (POWER, 'edit', True, True),  # its starter, at its level
+    (POWER, 'tag', True, False),  # its starter, below it
+    (POWER, 'edit', False, False),  # someone else's: manage
+    (POWER, 'manage', False, True),
+    (GUEST, 'manage', True, False),  # a guest is at view
+    (ADMIN, None, False, True),
+]
+
+
+async def job_in_its_dataset(w, dataset_id, caller, level, starter):
+    """A bulk set job (queued) in a new dataset, started by `caller` (else an admin), who is then left at `level`."""
+    await w.dataset(dataset_id)
+    sample = (await ingest([{}], dataset_id=dataset_id))['ids'][0]
+    body = {'sample_ids': [sample], 'metadata': {'checked': True}, 'background': True}
+    if starter and caller == GUEST:
+        job = await job_queue.enqueue_job(
+            w.database.pool,
+            'bulk_mutation',
+            dataset_id=dataset_id,
+            args={'operation': 'set'},
+            created_by=GUEST,
+        )
+        job_id = str(job['id'])
     else:
-        api.cancellation.assert_not_awaited()
+        if starter:
+            await w.share(dataset_id, caller, 'edit')
+        started = await w.call(
+            caller if starter else ADMIN,
+            'POST',
+            f'/api/datasets/{dataset_id}/samples/bulk-set',
+            json=body,
+        )
+        assert started.status_code == 202, started.text
+        job_id = started.json()['job_id']
+    await w.database.execute('DELETE FROM dataset_access WHERE dataset_id = $1', dataset_id)
+    if level is not None:
+        await w.share(dataset_id, caller, level)
+    return job_id
+
+
+@pytest.mark.skipif(not os.getenv('FRIDGE_TEST_POSTGRES_DSN'), reason='Requires disposable PostgreSQL')
+def test_cancellation_takes_manage_in_the_jobs_dataset_or_its_starter_at_its_level(world):
+    """It was an admin or the submitting power user. It is an admin, a manager of the job's dataset, or its starter
+    while they hold the level the job's kind needs; a refusal cancels nothing."""
+
+    async def scenario(w):
+        for dataset_id, (caller, level, starter, allowed) in enumerate(CANCEL_CASES, start=10):
+            job_id = await job_in_its_dataset(w, dataset_id, caller, level, starter)
+            response = await w.call(caller, 'POST', f'/api/jobs/{job_id}/cancel')
+            state = await w.database.fetchval('SELECT state FROM jobs WHERE id = $1::uuid', job_id)
+            case = (caller, level, starter, response.text)
+            if allowed:
+                assert (response.status_code, state) == (200, 'cancelled'), case
+            else:
+                assert (response.status_code, state) == (403, 'queued'), case
+
+    world(scenario)
 
 
 def test_running_cancel_response_does_not_pretend_the_worker_has_stopped(api):
@@ -244,7 +293,8 @@ def test_real_job_history_pagination_and_cancellation_preserve_queue_state(regis
         monkeypatch.setattr(jobs, 'db', database)
         monkeypatch.setattr(access, 'db', database)
         await database.execute("INSERT INTO users(id,username,role) VALUES (10,'jobs-owner','power_user')")
-        await database.execute('UPDATE datasets SET is_global=FALSE,owner_id=10 WHERE id=1')
+        await database.execute('UPDATE datasets SET is_global=FALSE WHERE id=1')
+        await database.execute('INSERT INTO dataset_access(dataset_id,user_id) VALUES (1,10)')  # shared with user 10
         for index in range(5):
             await job_queue.enqueue_job(database.pool, f'test-{index}', dataset_id=1, created_by=10)
         await database.execute("UPDATE jobs SET created_at='2026-10-17T00:00:00Z'")
@@ -270,7 +320,7 @@ def test_real_job_history_pagination_and_cancellation_preserve_queue_state(regis
         acknowledged = await job_queue.complete_job(database.pool, claimed['id'], claimed['lease_token'])
         assert acknowledged['state'] == 'cancelled'
         assert (await jobs.get_job(claimed['id'], USER)).state == 'cancelled'
-        await database.execute('UPDATE datasets SET owner_id=NULL WHERE id=1')
+        await database.execute('DELETE FROM dataset_access WHERE dataset_id=1 AND user_id=10')  # the share removed
         with pytest.raises(HTTPException) as revoked:
             await jobs.get_job(expected[0], USER)
         assert revoked.value.status_code == 404

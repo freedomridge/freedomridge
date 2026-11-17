@@ -512,11 +512,15 @@ def test_permissions_are_unchanged(concept_database):
         with pytest.raises(HTTPException) as refused:
             guard({'id': 9, 'role': 'guest'})
         assert refused.value.status_code == 403
+        # Every concept write needs edit in the dataset: test_access_enforcement_spec's matrix sends each a valid
+        # request at every level and refuses it below edit.
+        from backend.tests.test_access_enforcement_spec import ROUTES
+
+        levels = {(item.method, item.path): item.level for item in ROUTES}
         for route in concepts.router.routes:
             assert isinstance(route, APIRoute)
-            if route.methods and route.methods & {'POST', 'DELETE'}:
-                calls = [getattr(dependency.call, '__qualname__', '') for dependency in route.dependant.dependencies]
-                assert any('require_role' in call for call in calls), route.path
+            for method in (route.methods or set()) & {'POST', 'DELETE'}:
+                assert levels[(method, '/api' + route.path)] == 'edit', route.path
         job_id = await submit(
             concepts.create_concept(1, concepts.ConceptCreate(name='c', seed_ids=seeds[:1]), USER, wait=False),
         )

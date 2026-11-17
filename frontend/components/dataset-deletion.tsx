@@ -3,10 +3,11 @@
 import { useEffect } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { getJob, resumeDatasetDeletion, type Dataset, type JobRecord } from '@/lib/api';
-import { useUser } from '@/contexts/UserContext';
+import { refusal } from '@/lib/access-level';
 
-export function DeletionMessage({ job, canResume, resume, pending }: {
-    job?: JobRecord; canResume: boolean; resume: () => void; pending: boolean;
+// resumeRefusal: why Resume deletion is disabled (the user's level in the dataset); without it, it isn't offered.
+export function DeletionMessage({ job, canResume, resumeRefusal, resume, pending }: {
+    job?: JobRecord; canResume: boolean; resumeRefusal?: string; resume: () => void; pending: boolean;
 }) {
     const stopped = job?.state === 'cancelled' || job?.state === 'failed';
     if (job?.state === 'succeeded') return <p role="status">Dataset deleted.</p>;
@@ -14,7 +15,8 @@ export function DeletionMessage({ job, canResume, resume, pending }: {
         <p role="status">{stopped ? 'Deletion stopped. This dataset remains read-only.' : 'Dataset deletion in progress. Writes are disabled.'}</p>
         {job?.progress && <p>{job.progress.message} · {job.progress.done.toLocaleString()} rows removed</p>}
         {stopped && <p>Already removed data cannot be recovered.</p>}
-        {stopped && canResume && <button className="underline" onClick={resume} disabled={pending}>
+        {stopped && (canResume || resumeRefusal) && <button className="underline disabled:opacity-60 disabled:cursor-not-allowed" onClick={resume}
+            disabled={pending || !canResume} title={canResume ? undefined : resumeRefusal}>
             {pending ? 'Resuming…' : 'Resume deletion'}
         </button>}
     </>;
@@ -22,7 +24,8 @@ export function DeletionMessage({ job, canResume, resume, pending }: {
 
 export function DatasetDeletion({ dataset }: { dataset: Dataset }) {
     const queryClient = useQueryClient();
-    const { user } = useUser();
+    // Resuming a deletion takes manage in the dataset, as deleting it does.
+    const resumeRefusal = refusal(dataset.access_level, 'manage');
     const queryKey = ['dataset-deletion', dataset.deletion_job_id];
     const status = useQuery({
         queryKey,
@@ -43,7 +46,7 @@ export function DatasetDeletion({ dataset }: { dataset: Dataset }) {
         }
     }, [status.data?.state, queryClient]);
     return <div className="border border-amber-800/50 bg-amber-950/20 p-3 text-sm text-amber-200 space-y-1">
-        <DeletionMessage job={status.data} canResume={user?.role === 'admin'} resume={() => resume.mutate()} pending={resume.isPending} />
+        <DeletionMessage job={status.data} canResume={!resumeRefusal} resumeRefusal={resumeRefusal} resume={() => resume.mutate()} pending={resume.isPending} />
         {(status.error || resume.error) && <p role="alert">{(resume.error || status.error)?.message}</p>}
     </div>;
 }

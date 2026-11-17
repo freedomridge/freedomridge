@@ -14,15 +14,17 @@ interface Props {
     /** The field's saved default, which the view starts from. */
     savedRule: ClassRule;
     onChange: (view: ProbabilityView) => void;
-    /** Present when the user may save the shown rule as the field's default. */
+    /** Present when the shown rule can be saved as the field's default (not on a mirror). */
     onSave?: (rule: ClassRule) => Promise<void>;
+    /** Why saving is disabled: the user's level in the dataset doesn't allow it. */
+    saveRefusal?: string;
 }
 
 /**
  * How a class-probability field is shown in the sample view: its class map from a rule, or one class's probability.
  * Editing the rule redraws the image at once and writes nothing; "Save as default" stores it for everyone.
  */
-export function ClassRuleEditor({ fieldName, classes, maskTargets, colorConfig, view, savedRule, onChange, onSave }: Props) {
+export function ClassRuleEditor({ fieldName, classes, maskTargets, colorConfig, view, savedRule, onChange, onSave, saveRefusal }: Props) {
     const [saving, setSaving] = useState(false);
     const [error, setError] = useState<string | null>(null);
     const name = (k: number) => maskTargets?.[String(k)] ?? `class ${k}`;
@@ -158,7 +160,8 @@ export function ClassRuleEditor({ fieldName, classes, maskTargets, colorConfig, 
                         {onSave && !sameRule(rule, savedRule) && (
                             <button
                                 onClick={save}
-                                disabled={saving}
+                                disabled={saving || !!saveRefusal}
+                                title={saveRefusal}
                                 className="px-2 py-0.5 rounded bg-cyan-600 hover:bg-cyan-500 disabled:opacity-40 text-white"
                             >
                                 {saving ? 'Saving…' : 'Save as default'}

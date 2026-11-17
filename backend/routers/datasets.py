@@ -20,7 +20,7 @@ import asyncpg
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse, Response, StreamingResponse
-from pydantic import BaseModel, Field, TypeAdapter, ValidationError, field_validator
+from pydantic import BaseModel, Field, TypeAdapter, ValidationError, field_validator, model_validator
 
 from backend.datetimes import (
     UTC_TEXT_SQL,
@@ -70,14 +70,26 @@ from .. import (
     statistics,
     unlinked_objects,
 )
-from ..access import check_dataset_access, filter_datasets_for_user, require_dataset_access
+from ..access import (
+    EveryoneLevel,
+    Level,
+    caller_level,
+    check_dataset_access,
+    checks_level,
+    filter_datasets_for_user,
+    level_name,
+    level_number,
+    level_select,
+    require_dataset_access,
+    require_level,
+)
 from ..database import db
 from ..diskspace import INGEST_ROW_BYTES, require_free_space
 from ..models import Dataset, Sample
 from ..request_limits import guest_heavy
 from ..security import private_guest, production
 from ..validation import clean_name, clean_tags
-from .auth import get_allowed_roles, get_current_user, get_optional_user, require_role
+from .auth import get_current_user, get_optional_user, require_role
 from .embeddings import _validate_field_name as is_embedding_field_name
 from .embeddings import validate_embedding_dims
 from .views import _decode_content as _decode_view_content
@@ -214,7 +226,8 @@ class DatasetCreate(BaseModel):
     description: Optional[str] = None
     media_fields: List[str] = ["filepath"]
     storage_config_id: Optional[int] = None
-    is_global: bool = False  # private: admins, the owner and granted users
+    is_global: bool = False  # private: admins and the users and groups it is shared with
+    everyone_level: EveryoneLevel = 'view'  # what it gives every signed-in user while global
 
 
 class DatasetUpdate(BaseModel):
@@ -227,6 +240,7 @@ class DatasetUpdate(BaseModel):
     storage_config_id: Optional[int] = None
     is_global: Optional[bool] = None
     default_view_id: Optional[int] = None
+    everyone_level: Optional[EveryoneLevel] = None  # what a global dataset gives every signed-in user
 
 
 # Columns selected when returning a Dataset model. Centralised so list/get/create/update
@@ -234,7 +248,7 @@ class DatasetUpdate(BaseModel):
 _DATASET_SELECT = (
     "id, name, description, media_fields, grid_media_field, modal_media_field, "
     "segmentation_config, storage_config_id, owner_id, is_global, created_at, deleting, deletion_job_id, "
-    "default_view_id, "
+    "default_view_id, everyone_level, "
     # A mirror of a dataset on another instance (docs/FOLLOWERS.md): read-only here.
     "(SELECT jsonb_build_object('state', m.state, 'primary_url', l.url, 'origin_dataset_id', m.origin_dataset_id, "
     "'tags', m.tags, 'views', m.views, 'concept_views', m.concept_views, "
@@ -281,22 +295,30 @@ async def create_dataset(dataset: DatasetCreate, user: dict = Depends(require_ro
     if dataset.storage_config_id is not None:
         await _require_storage_config_serves(dataset.storage_config_id, None)
     query = f"""
-        INSERT INTO datasets (name, description, media_fields, storage_config_id, owner_id, is_global)
-        VALUES ($1, $2, $3, $4, $5, $6)
+        INSERT INTO datasets (name, description, media_fields, storage_config_id, owner_id, is_global, everyone_level)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
         RETURNING {_DATASET_SELECT}
     """
     deadline, pause = _time.monotonic() + _PARTITION_RETRY_SECONDS, 0.05
     while True:
         try:
-            row = await db.fetchrow(
-                query,
-                dataset.name,
-                dataset.description,
-                dataset.media_fields,
-                dataset.storage_config_id,
-                user['id'],
-                dataset.is_global,
-            )
+            async with db.pool.acquire() as connection, connection.transaction():
+                row = await connection.fetchrow(
+                    query,
+                    dataset.name,
+                    dataset.description,
+                    dataset.media_fields,
+                    dataset.storage_config_id,
+                    user['id'],
+                    dataset.is_global,
+                    level_number(dataset.everyone_level),
+                )
+                # Its creator's share, granted by nobody (as 0033's): owner_id gives no access by itself (access.py).
+                await connection.execute(
+                    'INSERT INTO dataset_access (dataset_id, user_id) VALUES ($1, $2)',
+                    row['id'],
+                    user['id'],
+                )
             return _parse_dataset_row(row)
         except asyncpg.UniqueViolationError:
             raise HTTPException(status_code=400, detail="Dataset with this name already exists")
@@ -337,6 +359,10 @@ def _parse_dataset_row(row) -> dict:
     # asyncpg may return JSONB as string if codec isn't set
     if 'segmentation_config' in data and isinstance(data['segmentation_config'], str):
         data['segmentation_config'] = json.loads(data['segmentation_config'])
+    # Levels are stored as numbers and answered as names (access.LEVELS).
+    for key in ('everyone_level', 'access_level'):
+        if data.get(key) is not None:
+            data[key] = level_name(data[key])
     return data
 
 
@@ -346,12 +372,15 @@ async def list_datasets(request: Request):
 
     - Unauthenticated → none (login required for all access)
     - Admin           → all
-    - Other users     → is_global OR owner OR explicit grant in dataset_access
+    - Other users     → is_global OR a share with them or one of their groups
+
+    Each with the caller's level in it (access_level), in the same query.
     """
     user = await get_optional_user(request)
     where_sql, where_args = await filter_datasets_for_user(user)
-    query = f"SELECT {_DATASET_SELECT} FROM datasets WHERE {where_sql} ORDER BY id"
-    rows = await db.fetch(query, *where_args)
+    level_sql, level_args = level_select(user, len(where_args) + 1)
+    query = f"SELECT {_DATASET_SELECT}, {level_sql} AS access_level FROM datasets WHERE {where_sql} ORDER BY id"
+    rows = await db.fetch(query, *where_args, *level_args)
     return [_parse_dataset_row(row) for row in rows]
 
 
@@ -361,7 +390,12 @@ async def get_dataset(id: int, request: Request):
     # Raises 404 if missing, 403 if no access. Returns the row but only with
     # the access-check fields, so we still need the full SELECT below.
     await check_dataset_access(id, user)
-    row = await db.fetchrow(f"SELECT {_DATASET_SELECT} FROM datasets WHERE id = $1", id)
+    level_sql, level_args = level_select(user, 2)
+    row = await db.fetchrow(
+        f"SELECT {_DATASET_SELECT}, {level_sql} AS access_level FROM datasets WHERE id = $1",
+        id,
+        *level_args,
+    )
     if not row:
         raise HTTPException(status_code=404, detail="Dataset not found")
     return {
@@ -435,8 +469,27 @@ async def _sidebar_expands_all(id: int) -> bool:
     return rows <= _LIGHTNING_FACET_MAX_ROWS
 
 
+@checks_level(
+    'edit; manage for name, is_global and everyone_level; an administrator for storage_config_id',
+    while_deleting='the database refuses its update while the dataset is deleted (409, the same answer)',
+)
+async def _dataset_update_level(
+    id: int,
+    dataset: DatasetUpdate,  # the handler's name for its body: FastAPI shares one body only while the names match
+    http_request: Request,
+    user: dict = Depends(get_current_user),
+) -> dict:
+    """update_dataset's caller: the highest level the fields sent need. Display settings are edit; the name and who
+    sees the dataset, manage; its storage config, a server credential, stays an administrator's."""
+    manage = any(getattr(dataset, name) is not None for name in ('name', 'is_global', 'everyone_level'))
+    await check_dataset_access(id, user, 'manage' if manage else 'edit', http_request.state)
+    if 'storage_config_id' in dataset.model_fields_set and user['role'] != 'admin':
+        raise HTTPException(status_code=403, detail="Only an administrator can change a dataset's storage config")
+    return user
+
+
 @router.patch("/datasets/{id}", response_model=Dataset)
-async def update_dataset(id: int, dataset: DatasetUpdate, user: dict = Depends(require_role("admin"))):
+async def update_dataset(id: int, dataset: DatasetUpdate, user: dict = Depends(_dataset_update_level)):
     # A dataset needs a media field, and the grid/modal must show one of them: `[]` and a grid
     # field outside the list were both stored, leaving every tile blank.
     if dataset.media_fields is not None and not dataset.media_fields:
@@ -508,6 +561,11 @@ async def update_dataset(id: int, dataset: DatasetUpdate, user: dict = Depends(r
         values.append(dataset.is_global)
         idx += 1
 
+    if dataset.everyone_level is not None:
+        fields.append(f"everyone_level = ${idx}")
+        values.append(level_number(dataset.everyone_level))
+        idx += 1
+
     # Nullable like storage_config_id: null removes the default view.
     if "default_view_id" in dataset.model_fields_set:
         if dataset.default_view_id is None:
@@ -518,7 +576,7 @@ async def update_dataset(id: int, dataset: DatasetUpdate, user: dict = Depends(r
             idx += 1
 
     if not fields:
-        # No-op patch. PATCH already required admin, so a straight fetch is
+        # No-op patch. The caller's access was checked (_dataset_update_level), so a straight fetch is
         # fine — no additional access check needed.
         row = await db.fetchrow(f"SELECT {_DATASET_SELECT} FROM datasets WHERE id = $1", id)
         if not row:
@@ -557,7 +615,7 @@ async def set_class_rule(
     id: int,
     field_name: str,
     update: ClassRuleUpdate = Body(...),
-    user: dict = Depends(require_role("power_user")),
+    user: dict = Depends(require_level("edit")),
 ):
     """A class-probability field's default rule, which the app opens the field with and the grid draws. Anyone who
     may edit the dataset may set it; it changes only how the field is shown."""
@@ -588,8 +646,15 @@ async def set_class_rule(
     return {'field_name': field_name, 'rule': rule}
 
 
+@checks_level('manage', while_deleting='deleting it again answers its deletion job, and resuming is how it ends')
+async def _manager_while_deleting(id: int, http_request: Request, user: dict = Depends(get_current_user)) -> dict:
+    """delete_dataset's and resume_dataset_deletion's caller: manage in the dataset, also once it is being deleted."""
+    await check_dataset_access(id, user, 'manage', http_request.state)
+    return user
+
+
 @router.delete("/datasets/{id}", status_code=202)
-async def delete_dataset(id: int, user: dict = Depends(require_role("admin"))):
+async def delete_dataset(id: int, user: dict = Depends(_manager_while_deleting)):
     """Seal the dataset and return its durable deletion job."""
     if await db.fetchval("SELECT 1 FROM mirrors WHERE dataset_id = $1 AND state <> 'stopped'", id):
         raise HTTPException(
@@ -601,36 +666,44 @@ async def delete_dataset(id: int, user: dict = Depends(require_role("admin"))):
 
 
 @router.post("/datasets/{id}/deletion/resume", status_code=202)
-async def resume_dataset_deletion(id: int, user: dict = Depends(require_role("admin"))):
+async def resume_dataset_deletion(id: int, user: dict = Depends(_manager_while_deleting)):
     """Continue a failed or cancelled deletion with its existing checkpoint."""
     return await dataset_deletion.submit(db.pool, id, user['id'], resume=True)
 
 
 # --- Per-dataset access control endpoints ---
 #
-# Only meaningful for non-global datasets. For global datasets, every user
-# already has access regardless of grants — the dataset_access table is
-# consulted only when datasets.is_global = FALSE.
+# A dataset is shared with users and with groups, each at a level (access.LEVELS). A global dataset gives every
+# signed-in user its everyone level too; the shares give more than that, or access once it is private again.
 
 
 class GrantAccessRequest(BaseModel):
-    user_id: int
+    # One of them: a user's id, or a group's name.
+    user_id: Optional[int] = None
+    group: Optional[str] = None
+    # Omitted: a new share is edit, and an existing one keeps its level, as a grant did before levels.
+    level: Optional[Level] = None
+
+    @model_validator(mode='after')
+    def _one_target(self) -> 'GrantAccessRequest':
+        if (self.user_id is None) == (self.group is None):
+            raise ValueError('Give either user_id or group')
+        return self
 
 
 @router.get("/datasets/{id}/access")
-async def list_dataset_access(id: int, user: dict = Depends(require_role("admin"))):
-    """List users who have been granted explicit access to this dataset."""
-    # Verify dataset exists; admins skip the access check intentionally — they
-    # need to inspect access on every dataset.
-    ds = await db.fetchrow("SELECT id, is_global FROM datasets WHERE id = $1", id)
+async def list_dataset_access(id: int, user: dict = Depends(require_level("manage"))):
+    """The users and groups this dataset is shared with, each with its level, and its everyone level. A manager who
+    isn't an administrator sees the users' names, not their email addresses, as in the user picker (candidates)."""
+    ds = await db.fetchrow("SELECT id, is_global, everyone_level FROM datasets WHERE id = $1", id)
     if not ds:
         raise HTTPException(status_code=404, detail="Dataset not found")
 
     rows = await db.fetch(
         """
-        SELECT da.user_id, u.username, u.email, u.role,
+        SELECT da.user_id, u.username, CASE WHEN $2 THEN u.email END AS email, u.role,
                da.granted_by_user_id, gb.username AS granted_by_username,
-               da.created_at
+               da.created_at, da.level
         FROM dataset_access da
         JOIN users u ON da.user_id = u.id
         LEFT JOIN users gb ON da.granted_by_user_id = gb.id
@@ -638,48 +711,114 @@ async def list_dataset_access(id: int, user: dict = Depends(require_role("admin"
         ORDER BY u.username
         """,
         id,
+        user['role'] == 'admin',
     )
-    return {"is_global": ds['is_global'], "grants": [dict(r) for r in rows]}
+    groups = await db.fetch(
+        """
+        SELECT dg.group_id, g.name, dg.granted_by_user_id, gb.username AS granted_by_username, dg.created_at,
+               dg.level
+        FROM dataset_group_access dg
+        JOIN groups g ON dg.group_id = g.id
+        LEFT JOIN users gb ON dg.granted_by_user_id = gb.id
+        WHERE dg.dataset_id = $1
+        ORDER BY g.name
+        """,
+        id,
+    )
+    return {
+        "is_global": ds['is_global'],
+        "everyone_level": level_name(ds['everyone_level']),
+        "grants": [{**r, 'level': level_name(r['level'])} for r in rows],
+        "group_grants": [{**r, 'level': level_name(r['level'])} for r in groups],
+    }
 
 
 @router.post("/datasets/{id}/access", status_code=201)
 async def grant_dataset_access(
     id: int,
     body: GrantAccessRequest,
-    user: dict = Depends(require_role("admin")),
+    user: dict = Depends(require_level("manage")),
 ):
-    """Grant `body.user_id` access to dataset `id`. Idempotent."""
+    """Share dataset `id` with a user or a group at `body.level`, up to manage. Granting again sets the level given,
+    and records the caller as its granter when that changes the level; without one, an existing share is left as it
+    is."""
     ds = await db.fetchval("SELECT id FROM datasets WHERE id = $1", id)
     if not ds:
         raise HTTPException(status_code=404, detail="Dataset not found")
-    target = await db.fetchval("SELECT id FROM users WHERE id = $1", body.user_id)
-    if not target:
-        raise HTTPException(status_code=404, detail="User not found")
+    level = None if body.level is None else level_number(body.level)
+    if body.user_id is not None:
+        target = await db.fetchval("SELECT id FROM users WHERE id = $1", body.user_id)
+        if not target:
+            raise HTTPException(status_code=404, detail="User not found")
+        table, column, answer = 'dataset_access', 'user_id', {"dataset_id": id, "user_id": target}
+    else:
+        group = await db.fetchrow("SELECT id, name FROM groups WHERE name = $1", body.group)
+        if not group:
+            raise HTTPException(status_code=404, detail="Group not found")
+        target = group['id']
+        table, column, answer = (
+            'dataset_group_access',
+            'group_id',
+            {"dataset_id": id, "group_id": target, "group": group['name']},
+        )
 
     await db.execute(
-        """
-        INSERT INTO dataset_access (dataset_id, user_id, granted_by_user_id)
-        VALUES ($1, $2, $3)
-        ON CONFLICT (dataset_id, user_id) DO NOTHING
+        f"""
+        INSERT INTO {table} (dataset_id, {column}, granted_by_user_id, level)
+        VALUES ($1, $2, $3, COALESCE($4::smallint, 3))
+        ON CONFLICT (dataset_id, {column}) DO UPDATE SET level = EXCLUDED.level,
+            granted_by_user_id = EXCLUDED.granted_by_user_id  -- who set the level it has now
+        WHERE $4::smallint IS NOT NULL AND {table}.level <> EXCLUDED.level
         """,
         id,
-        body.user_id,
+        target,
         user['id'],
+        level,
     )
-    return {"dataset_id": id, "user_id": body.user_id}
+    stored = await db.fetchval(f"SELECT level FROM {table} WHERE dataset_id = $1 AND {column} = $2", id, target)
+    return {**answer, "level": level_name(stored)}
+
+
+@router.get("/datasets/{id}/access/candidates")
+async def list_access_candidates(id: int, user: dict = Depends(require_level("manage"))):
+    """Whom a manager can share the dataset with: every active person's name and every group's, no more (an
+    administrator's user list has their roles and email addresses). Not a follower's account, a machine's, nor a
+    demo guest's, a throwaway account removed after a day."""
+    users = await db.fetch(
+        """SELECT id, username FROM users
+           WHERE is_active AND is_demo_account IS NOT TRUE
+             AND NOT EXISTS (SELECT 1 FROM followers WHERE user_id = users.id)
+           ORDER BY username""",
+    )
+    groups = await db.fetch("SELECT id, name FROM groups ORDER BY name")
+    return {"users": [dict(row) for row in users], "groups": [dict(row) for row in groups]}
 
 
 @router.delete("/datasets/{id}/access/{user_id}", status_code=204)
 async def revoke_dataset_access(
     id: int,
     user_id: int,
-    user: dict = Depends(require_role("admin")),
+    user: dict = Depends(require_level("manage")),
 ):
     """Revoke explicit access. No-op if the grant didn't exist."""
     await db.execute(
         "DELETE FROM dataset_access WHERE dataset_id = $1 AND user_id = $2",
         id,
         user_id,
+    )
+
+
+@router.delete("/datasets/{id}/access/groups/{group_id}", status_code=204)
+async def revoke_dataset_group_access(
+    id: int,
+    group_id: int,
+    user: dict = Depends(require_level("manage")),
+):
+    """Revoke a group's share. No-op if there was none."""
+    await db.execute(
+        "DELETE FROM dataset_group_access WHERE dataset_id = $1 AND group_id = $2",
+        id,
+        group_id,
     )
 
 
@@ -2621,7 +2760,7 @@ async def refresh_stale_stats(user: dict = Depends(require_role("admin")), wait:
 @router.post("/datasets/{id}/refresh-stats", dependencies=[Depends(require_dataset_access)])
 async def refresh_dataset_stats(
     id: int,
-    user: dict = Depends(require_role("power_user")),
+    user: dict = Depends(require_level("edit")),
     wait: bool = True,
     force: bool = False,
     timeout: float = 1800,
@@ -2721,7 +2860,7 @@ async def add_array_column(pool, dataset_id: int, name: str) -> None:
 async def create_array_field(
     id: int,
     request: CreateArrayFieldRequest,
-    user: dict = Depends(require_role("power_user")),
+    user: dict = Depends(require_level("edit")),
 ):
     """Create a new tag-like array field on the samples table.
 
@@ -2828,14 +2967,14 @@ def _promoted_index_name(dataset_id: int, field_name: str) -> str:
 async def promote_field(
     id: int,
     field_name: str,
-    user: dict = Depends(require_role("power_user")),
+    user: dict = Depends(require_level("edit")),
     wait: bool = True,
 ):
     """
     Promote a field to be indexed for faster filtering.
     Creates a B-Tree index for the field in a runner job (backend.index_jobs) and answers within
     five seconds: the final message, or 202 {job_id, state} while the build continues.
-    Requires power_user or admin role.
+    Requires edit access to the dataset.
     """
     started = _time.monotonic()
     # Check dataset exists
@@ -2897,7 +3036,7 @@ async def promote_field(
 async def demote_field(
     id: int,
     field_name: str,
-    user: dict = Depends(require_role("power_user")),
+    user: dict = Depends(require_level("edit")),
     wait: bool = True,
 ):
     """Remove index from a promoted field.
@@ -2935,7 +3074,7 @@ async def set_field_type(
     id: int,
     field_name: str,
     request: SetFieldTypeRequest,
-    user: dict = Depends(require_role('power_user')),
+    user: dict = Depends(require_level('edit')),
 ):
     """Explicitly change a metadata declaration without rewriting stored values or indexes."""
     _validate_field_name(field_name)
@@ -2984,7 +3123,7 @@ async def set_field_display_type(
     id: int,
     field_name: str,
     request: SetDisplayTypeRequest,
-    user: dict = Depends(require_role("power_user")),
+    user: dict = Depends(require_level("edit")),
 ):
     """Override how a field is displayed in filters (e.g., show a number field as a dropdown)."""
     if not field_name.replace("_", "").replace("-", "").isalnum():
@@ -5427,7 +5566,7 @@ async def set_overlay_config(
     id: int,
     field: str,
     request: OverlayConfigRequest,
-    user: dict = Depends(require_role("power_user")),
+    user: dict = Depends(require_level("edit")),
 ):
     """Save per-field overlay display config (heatmap colormap / range / opacity), applied
     to BOTH the modal canvas renderer and the grid composite. An empty body clears the
@@ -7036,7 +7175,7 @@ def _merge_batch_field_stats(stats: Dict[str, Any], current: Optional[Any]) -> t
 
 
 @router.post("/datasets/{id}/samples", dependencies=[Depends(require_dataset_access)])
-async def add_samples(id: int, payload: Any = Body(...), user: dict = Depends(require_role("power_user"))):
+async def add_samples(id: int, payload: Any = Body(...), user: dict = Depends(require_level("edit"))):
     # A samples wrapper always means add; retain query compatibility for other payloads.
     if (
         isinstance(payload, dict)
@@ -7251,7 +7390,7 @@ async def add_samples(id: int, payload: Any = Body(...), user: dict = Depends(re
 
 
 @router.delete("/datasets/{id}/samples/{sample_id}", dependencies=[Depends(require_dataset_access)])
-async def delete_sample(id: int, sample_id: int, user: dict = Depends(require_role("admin"))):
+async def delete_sample(id: int, sample_id: int, user: dict = Depends(require_level("edit"))):
     """
     Delete a single sample
     """
@@ -7305,12 +7444,29 @@ class SampleUpdate(BaseModel):
         return _point_location(loc)
 
 
+@checks_level('tag when only tags or a mirror\'s own @local.tags change, edit otherwise')
+async def _sample_update_level(
+    id: int,
+    request: SampleUpdate,  # the handler's name for its body: FastAPI shares one body only while the names match
+    http_request: Request,
+    user: dict = Depends(get_current_user),
+) -> dict:
+    """update_sample's caller: the tag level sends `tags` alone, or `array_fields` holding only a mirror's own
+    `@local.tags` (that server's tags field). Any other field sent, a later one too, needs edit."""
+    sent = request.model_fields_set
+    tags_only = (sent == {'tags'} and request.tags is not None) or (
+        sent == {'array_fields'} and set(request.array_fields or {}) == {LOCAL_TAGS}
+    )
+    await check_dataset_access(id, user, 'tag' if tags_only else 'edit', http_request.state)
+    return user
+
+
 @router.patch("/datasets/{id}/samples/{sample_id}", dependencies=[Depends(require_dataset_access)])
 async def update_sample(
     id: int,
     sample_id: int,
     request: SampleUpdate,
-    user: dict = Depends(require_role("power_user")),
+    user: dict = Depends(_sample_update_level),
 ):
     """
     Update a single sample's tags, metadata, and/or location.
@@ -7323,7 +7479,7 @@ async def update_sample(
     - location: If provided, replaces the location
     - heading: If provided, replaces the heading
 
-    Only admin and power_user roles can update samples.
+    Tags alone need the tag level in the dataset, anything else edit (_sample_update_level).
 
     On a mirror, `@local.<name>` keys in metadata / remove_metadata_keys, and `@local.tags` in array_fields, write
     this server's own fields (docs/FOLLOWERS.md): a request with them changes nothing of the primary's.
@@ -7560,7 +7716,7 @@ PER_SAMPLE_SYNC_LIMIT = 5000
 
 
 @router.post('/datasets/{id}/samples/bulk-delete', dependencies=[Depends(require_dataset_access)])
-async def bulk_delete_samples(id: int, request: BulkTargetRequest, user: dict = Depends(require_role('admin'))):
+async def bulk_delete_samples(id: int, request: BulkTargetRequest, user: dict = Depends(require_level('edit'))):
     if not request.sample_ids and not request.selection_token and request.filters is None:
         raise HTTPException(400, 'Provide sample_ids, selection_token, or filters ({} for all samples)')
     return await _bulk_response(id, user, 'delete', request.model_dump())
@@ -7590,13 +7746,14 @@ async def _mirror_or_deleting(id: int) -> tuple[bool, bool]:
 
 
 @router.post('/datasets/{id}/objects/unlinked', dependencies=[Depends(require_dataset_access)])
+@checks_level('view; edit links the objects first')
 async def find_unlinked_objects(id: int, user: dict = Depends(get_current_user)):
     """The object samples of this dataset with no image, by kind (unlinked_objects.py), with the filter that shows
     them. For a user who may edit the dataset, the objects whose image is there but not linked yet are linked first
     (`linked`); anyone else sees them as `linkable`. Cheap: idx_samples_unlinked_objects holds only those objects."""
     mirror, deleting = await _mirror_or_deleting(id)
     linked = 0
-    if not mirror and not deleting and user['role'] in get_allowed_roles('power_user'):
+    if not mirror and not deleting and await caller_level(id, user) >= level_number('edit'):
         linked = await _link_unlinked_objects(id)
     found = await unlinked_objects.counts(db, id)
     return {**found, 'linked': linked, 'mirror': mirror, 'filter': unlinked_objects.filter_leaf()}
@@ -7606,7 +7763,7 @@ async def find_unlinked_objects(id: int, user: dict = Depends(get_current_user))
 async def delete_unlinked_objects(
     id: int,
     request: UnlinkedObjectsDelete,
-    user: dict = Depends(require_role('admin')),
+    user: dict = Depends(require_level('edit')),
 ):
     """Delete the object samples with no image of the kinds named (by default only those whose image is gone), as a
     bulk delete of their filter: resumable units, logged for followers and statistics like any delete, each unit
@@ -7645,7 +7802,7 @@ async def bulk_delete_embeddings(
     id: int,
     field_name: str,
     request: BulkTargetRequest,
-    user: dict = Depends(require_role('admin')),
+    user: dict = Depends(require_level('edit')),
 ):
     """Delete one embedding field's vectors for a captured target, as a resumable bulk job.
 
@@ -7706,8 +7863,23 @@ async def _require_live_selection(token: Optional[str], source=None) -> None:
         )
 
 
+@checks_level('tag for tags and a mirror\'s own @local.tags, edit for any other field')
+async def _bulk_tag_level(
+    id: int,
+    request: BulkTagRequest,  # the handler's name for its body: FastAPI shares one body only while the names match
+    http_request: Request,
+    user: dict = Depends(get_current_user),
+) -> dict:
+    """bulk_tag_samples's caller: the tag level adds and removes tags only, `tags` or a mirror's own `@local.tags`.
+    Here, not in tag_samples: a follower's tag edit calls that as its account, which its subscription allows
+    (routers/followers.py)."""
+    tags = request.field_name in ('tags', LOCAL_TAGS)
+    await check_dataset_access(id, user, 'tag' if tags else 'edit', http_request.state)
+    return user
+
+
 @router.post("/datasets/{id}/samples/bulk-tag", dependencies=[Depends(require_dataset_access)])
-async def bulk_tag_samples(id: int, request: BulkTagRequest, user: dict = Depends(require_role("power_user"))):
+async def bulk_tag_samples(id: int, request: BulkTagRequest, user: dict = Depends(_bulk_tag_level)):
     """Bulk add/remove values from any array field (tags, inferred_tags, etc.)."""
     return await tag_samples(id, request, user)
 
@@ -7927,7 +8099,7 @@ def _parse_update_status(status, fallback: int) -> int:
 
 
 @router.post("/datasets/{id}/samples/bulk-set", dependencies=[Depends(require_dataset_access)])
-async def bulk_set_metadata(id: int, request: BulkSetRequest, user: dict = Depends(require_role("power_user"))):
+async def bulk_set_metadata(id: int, request: BulkSetRequest, user: dict = Depends(require_level("edit"))):
     """Bulk-merge metadata onto many samples in a single statement.
 
     Two modes after ordered row locking, touching only this dataset's rows:
@@ -8284,7 +8456,7 @@ async def rename_field(
     id: int,
     field_name: str,
     request: FieldRenameRequest,
-    user: dict = Depends(require_role("power_user")),
+    user: dict = Depends(require_level("edit")),
 ):
     """Rename a metadata key across every sample (keys bound as params; SQLi-safe).
 
@@ -8380,7 +8552,7 @@ async def clone_field(
     id: int,
     field_name: str,
     request: FieldRenameRequest,
-    user: dict = Depends(require_role("power_user")),
+    user: dict = Depends(require_level("edit")),
 ):
     """Copy a metadata key's value into a new key on every sample.
 
@@ -8455,7 +8627,7 @@ async def clone_field(
 async def clear_field(
     id: int,
     field_name: str,
-    user: dict = Depends(require_role("power_user")),
+    user: dict = Depends(require_level("edit")),
     background: bool = False,
 ):
     """Remove a metadata key from every sample in the dataset — and its registration, cached stats

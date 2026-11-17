@@ -66,18 +66,25 @@ test('a rebuild that ended without building is not shown as a finished build', (
 
 const { canRetryIndexBuild } = require('../lib/job-status.ts');
 
-test('a failed or cancelled vector index build offers a retry to a power user or admin, until a later build', () => {
+// Whether a Retry is offered depends on the job alone, whoever looks; whether it is enabled is the caller's level in
+// the dataset (edit), which the Jobs dialog decides (e2e access-levels.spec.ts).
+test('a failed or cancelled vector index build offers a retry, until a later build', () => {
     const failed = { kind: 'ann_index_build', state: 'failed', dataset_id: 3, field: 'clip', created_at: '2026-11-11T12:00:00Z' };
-    assert.equal(canRetryIndexBuild(failed, [failed], 'admin'), true);
-    assert.equal(canRetryIndexBuild({ ...failed, state: 'cancelled' }, [], 'power_user'), true);
-    assert.equal(canRetryIndexBuild(failed, [failed], 'viewer'), false);
-    assert.equal(canRetryIndexBuild(failed, [failed], undefined), false);
-    assert.equal(canRetryIndexBuild({ ...failed, state: 'succeeded' }, [], 'admin'), false);
-    assert.equal(canRetryIndexBuild({ ...failed, kind: 'field_index_build' }, [], 'admin'), false);
-    assert.equal(canRetryIndexBuild({ ...failed, field: null }, [], 'admin'), false);
+    assert.equal(canRetryIndexBuild(failed, [failed]), true);
+    assert.equal(canRetryIndexBuild({ ...failed, state: 'cancelled' }, []), true);
+    assert.equal(canRetryIndexBuild({ ...failed, state: 'succeeded' }, []), false);
+    assert.equal(canRetryIndexBuild({ ...failed, state: 'running' }, []), false);
+    assert.equal(canRetryIndexBuild({ ...failed, kind: 'field_index_build' }, []), false);
+    assert.equal(canRetryIndexBuild({ ...failed, field: null }, []), false);
+    assert.equal(canRetryIndexBuild({ ...failed, dataset_id: null }, []), false);
     // A later build of the same field that is waiting, running or done replaces it; another field's doesn't.
     const later = { ...failed, state: 'running', created_at: '2026-11-11T13:00:00Z' };
-    assert.equal(canRetryIndexBuild(failed, [later, failed], 'admin'), false);
-    assert.equal(canRetryIndexBuild(failed, [{ ...later, state: 'failed' }, failed], 'admin'), true);
-    assert.equal(canRetryIndexBuild(failed, [{ ...later, field: 'dino' }, failed], 'admin'), true);
+    assert.equal(canRetryIndexBuild(failed, [later, failed]), false);
+    assert.equal(canRetryIndexBuild(failed, [{ ...later, state: 'queued' }, failed]), false);
+    assert.equal(canRetryIndexBuild(failed, [{ ...later, state: 'succeeded' }, failed]), false);
+    assert.equal(canRetryIndexBuild(failed, [{ ...later, state: 'failed' }, failed]), true);
+    assert.equal(canRetryIndexBuild(failed, [{ ...later, field: 'dino' }, failed]), true);
+    assert.equal(canRetryIndexBuild(failed, [{ ...later, dataset_id: 4 }, failed]), true);
+    // An earlier build doesn't replace a later one.
+    assert.equal(canRetryIndexBuild(failed, [failed, { ...later, created_at: '2026-11-11T11:00:00Z' }]), true);
 });

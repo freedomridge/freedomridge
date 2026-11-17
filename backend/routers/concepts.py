@@ -25,11 +25,10 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 from .. import concept_jobs, job_wait
-from ..access import require_dataset_access
+from ..access import require_dataset_access, require_level
 from ..concept_jobs import refine_marks, spec_dict, vector_literal
 from ..database import db
 from ..encoders import encode_text, has_text_tower
-from .auth import require_role
 
 router = APIRouter(
     prefix="/datasets/{id}/concepts",
@@ -232,7 +231,7 @@ async def list_concepts(id: int):
 async def create_concept(
     id: int,
     body: ConceptCreate,
-    user: dict = Depends(require_role("power_user")),
+    user: dict = Depends(require_level("edit")),
     wait: bool = True,
 ):
     """Create a concept (seed = average seed embeddings; probe = fit; text = CLIP prompt; or
@@ -429,7 +428,7 @@ async def rescore_concept(
     id: int,
     concept_id: int,
     full: bool = True,
-    user: dict = Depends(require_role("power_user")),
+    user: dict = Depends(require_level("edit")),
     wait: bool = True,
 ):
     """Full rebuild, or pending changes for auto concepts / new embeddings for manual concepts.
@@ -457,7 +456,7 @@ async def rebuild_concept(
     id: int,
     concept_id: int,
     body: ConceptRebuild,
-    user: dict = Depends(require_role("power_user")),
+    user: dict = Depends(require_level("edit")),
     wait: bool = True,
 ):
     """Overwrite-in-place: regenerate w from new seeds/weight then full rescore (a job), or (if only
@@ -512,7 +511,7 @@ async def refine_concept(
     id: int,
     concept_id: int,
     body: ConceptRefine,
-    user: dict = Depends(require_role("power_user")),
+    user: dict = Depends(require_level("edit")),
     wait: bool = True,
 ):
     """Active-learning refine: fold boundary corrections into the concept and refit. keep_ids
@@ -570,7 +569,7 @@ async def set_auto_rescore(
     id: int,
     concept_id: int,
     body: AutoRescoreUpdate,
-    user: dict = Depends(require_role("power_user")),
+    user: dict = Depends(require_level("edit")),
 ):
     """Toggle whether the hourly maintenance job auto-scores newly-streamed samples for
     this concept. On (default) keeps a saved concept-exclude/select current as data streams
@@ -591,7 +590,7 @@ async def set_auto_rescore(
 
 
 @router.delete("/{concept_id}")
-async def delete_concept(id: int, concept_id: int, user: dict = Depends(require_role("power_user"))):
+async def delete_concept(id: int, concept_id: int, user: dict = Depends(require_level("edit"))):
     """Delete a concept; its materialized scores cascade-delete."""
     deleted = await db.fetchval(
         "DELETE FROM embedding_concepts WHERE id = $1 AND dataset_id = $2 RETURNING id",

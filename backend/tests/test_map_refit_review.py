@@ -20,9 +20,11 @@ from fridge.core import dataset as sdk_dataset
 
 from backend import backups, dataset_schedules, field_registry, job_queue, map_refit
 from backend.map_artifacts import LocalArtifactStore, model_key
-from backend.routers import datasets, embeddings, jobs
-from backend.tests import test_field_registry_postgres
+from backend.routers import datasets, embeddings
+from backend.tests import test_access_rule_spec, test_field_registry_postgres
+from backend.tests.test_access_rule_spec import GUEST, OTHER_POWER, POWER
 from backend.tests.test_dataset_schedules import add_schedule, local
+from backend.tests.test_field_registry_postgres import ingest
 from backend.tests.test_map_refit import (
     FIELD,
     USER,
@@ -36,6 +38,7 @@ from backend.tests.test_map_refit import (
 )
 
 registry_database = test_field_registry_postgres.registry_database
+world = test_access_rule_spec.world
 pytestmark = pytest.mark.skipif(not os.getenv('FRIDGE_TEST_POSTGRES_DSN'), reason='Disposable PostgreSQL required')
 
 
@@ -586,13 +589,48 @@ def test_too_little_memory_skips_before_pausing_projection_or_exporting(registry
 # --- power users stop the system re-fit of their dataset -----------------------------------------
 
 
-def test_power_users_can_cancel_map_refits_but_not_others_jobs():
-    power = {'id': 7, 'role': 'power_user'}
-    assert jobs._can_cancel({'kind': 'map_refit', 'created_by': None}, power)
-    assert jobs._can_cancel({'kind': 'map_refit', 'created_by': 3}, power)
-    assert not jobs._can_cancel({'kind': 'statistics', 'created_by': None}, power)
-    assert not jobs._can_cancel({'kind': 'bulk_mutation', 'created_by': 3}, power)
-    assert not jobs._can_cancel({'kind': 'map_refit', 'created_by': None}, {'id': 8, 'role': 'guest'})
+def test_edit_users_can_cancel_map_refits_but_not_others_jobs(world):
+    """A map re-fit comes from a dataset's schedule, which its edit users run: anyone with edit in the dataset may stop
+    one, whoever started it. Another job of someone else (or the system) needs manage; a guest stops none."""
+
+    async def scenario(w):
+        await w.dataset(10)
+        sample = (await ingest([{}], dataset_id=10))['ids'][0]
+        pool = w.database.pool
+        bulk = await w.call(
+            1,
+            'POST',
+            '/api/datasets/10/samples/bulk-set',
+            json={'sample_ids': [sample], 'metadata': {'checked': True}, 'background': True},
+        )
+        assert bulk.status_code == 202, bulk.text
+        jobs_by_name = {
+            "the schedule's re-fit": (str((await job_queue.enqueue_job(pool, 'map_refit', dataset_id=10))['id']), True),
+            "another user's re-fit": (
+                str((await job_queue.enqueue_job(pool, 'map_refit', dataset_id=10, created_by=OTHER_POWER))['id']),
+                True,
+            ),
+            'system statistics': (str((await job_queue.enqueue_job(pool, 'statistics', dataset_id=10))['id']), False),
+            "an admin's bulk job": (bulk.json()['job_id'], False),
+        }
+        await w.share(10, GUEST, 'manage')
+        await w.share(10, POWER, 'tag')
+        for name, (job_id, _) in jobs_by_name.items():
+            assert (await w.call(GUEST, 'POST', f'/api/jobs/{job_id}/cancel')).status_code == 403, name
+            refused = await w.call(POWER, 'POST', f'/api/jobs/{job_id}/cancel')
+            assert refused.status_code == 403, (name, refused.text)
+        await w.database.execute('UPDATE dataset_access SET level = 3 WHERE dataset_id = 10 AND user_id = $1', POWER)
+        for name, (job_id, refit) in jobs_by_name.items():
+            response = await w.call(POWER, 'POST', f'/api/jobs/{job_id}/cancel')
+            if refit:
+                assert response.status_code == 200, (name, response.text)
+            else:
+                assert (response.status_code, response.json()) == (
+                    403,
+                    {'detail': 'This needs manage access to the dataset'},
+                ), name
+
+    world(scenario)
 
 
 # --- an identical re-send keeps the exported row version ---------------------------------------

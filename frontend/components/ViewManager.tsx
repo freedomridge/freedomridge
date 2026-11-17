@@ -7,6 +7,7 @@ import { filterHasInSelection } from '@/lib/filter-query';
 import { copyLink, viewLink } from '@/lib/links';
 import { type SourceView, mayUpdateView, sameStages, stagesToSave } from '@/lib/source-view';
 import { ShareViewModal } from './ShareViewModal';
+import { refusal, type AccessLevel } from '@/lib/access-level';
 import { Share1Icon, TrashIcon, EyeOpenIcon, LockClosedIcon, GlobeIcon, PersonIcon, StarIcon, StarFilledIcon, Link2Icon } from '@radix-ui/react-icons';
 
 interface ViewManagerProps {
@@ -14,7 +15,7 @@ interface ViewManagerProps {
     currentFilters: ComplexFilter;
     currentViewStages?: ViewStage[];
     onLoadView: (view: View) => void;
-    // The dataset's default view, which an administrator sets here (the dataset opens on it).
+    // The dataset's default view, which anyone with edit in the dataset sets here (the dataset opens on it).
     defaultViewId?: number | null;
     onDefaultViewChanged?: () => void;
     // Set on a mirror of a dataset on a primary instance (docs/FOLLOWERS.md).
@@ -23,11 +24,13 @@ interface ViewManagerProps {
     // update it with them ("Update this view"). onViewSaved gets a view saved or updated here: the filters' source now.
     sourceView?: SourceView | null;
     onViewSaved?: (view: View) => void;
+    // The user's level in the dataset: the default view and another user's public views take edit.
+    level?: AccessLevel | null;
 }
 
 export default function ViewManager({
     datasetId, currentFilters, currentViewStages, onLoadView, defaultViewId = null, onDefaultViewChanged, mirror = null,
-    sourceView = null, onViewSaved,
+    sourceView = null, onViewSaved, level = null,
 }: ViewManagerProps) {
     const { user } = useUser();
     const { addToast } = useToast();
@@ -117,7 +120,11 @@ export default function ViewManager({
 
     // Changed since the view was opened, and whether this viewer may replace its filters with the applied ones.
     const sourceDiffers = !!sourceView && !sameStages(sourceView.stages, stages);
-    const mayUpdate = mayUpdateView(sourceView, user);
+    const editRefusal = refusal(level, 'edit');
+    const mayUpdate = mayUpdateView(sourceView, user, !editRefusal);
+    // Another user's public view takes edit: below it, Update is shown disabled and says why.
+    const updateRefusal = !mayUpdate && !!sourceView && !sourceView.fromPrimary && !!sourceView.isPublic
+        && sourceView.userId !== user?.id ? editRefusal : undefined;
 
     async function handleUpdateView() {
         if (!sourceView || !mayUpdate || !canSave) return;
@@ -245,7 +252,7 @@ export default function ViewManager({
                                         </button>
                                     </div>
                                 </div>
-                            ) : mayUpdate ? (
+                            ) : mayUpdate || updateRefusal ? (
                                 <div className="flex items-center gap-2">
                                     <p className="flex-1 min-w-0">
                                         The filters differ from the view <span className="font-medium text-white">“{sourceView.name}”</span> they came from.
@@ -253,7 +260,8 @@ export default function ViewManager({
                                     <button
                                         data-testid="view-update"
                                         onClick={handleUpdateView}
-                                        disabled={loading || !canSave}
+                                        disabled={loading || !canSave || !!updateRefusal}
+                                        title={updateRefusal}
                                         className="px-3 py-2 bg-amber-600 text-white rounded text-sm font-medium disabled:opacity-50 hover:bg-amber-500 transition-colors whitespace-nowrap"
                                     >
                                         Update this view
@@ -327,6 +335,9 @@ export default function ViewManager({
                             // A copy of a view on the primary changes there; with views both ways, it can be deleted from here.
                             const sendsUp = mirror?.views === 'both' && mirror.state === 'following';
                             const editable = !view.from_primary || sendsUp;
+                            // Another user's public view takes edit in the dataset (their private one, an admin).
+                            const othersPublic = !isMine && isPublic;
+                            const viewRefusal = othersPublic ? editRefusal : undefined;
 
                             return (
                                 <div key={view.id} className="flex items-center justify-between p-2.5 hover:bg-zinc-800 rounded-md group transition-all border border-transparent hover:border-zinc-700/50">
@@ -397,44 +408,48 @@ export default function ViewManager({
                                         >
                                             <Link2Icon className="w-3.5 h-3.5" />
                                         </button>
-                                        {user?.role === 'admin' && !mirror && (
+                                        {!mirror && (
                                             <button
                                                 data-testid="view-default-toggle"
                                                 onClick={(e) => {
                                                     e.stopPropagation();
                                                     handleSetDefault(view.id === defaultViewId ? null : view.id);
                                                 }}
-                                                disabled={view.id !== defaultViewId && !isPublic}
+                                                disabled={!!editRefusal || (view.id !== defaultViewId && !isPublic)}
                                                 className="p-1.5 text-zinc-400 hover:text-amber-300 hover:bg-amber-300/10 rounded transition-colors disabled:opacity-40 disabled:hover:text-zinc-400 disabled:hover:bg-transparent"
-                                                title={view.id === defaultViewId
+                                                title={editRefusal ?? (view.id === defaultViewId
                                                     ? 'Remove as the default view: the dataset opens with no filters'
                                                     : isPublic
                                                         ? 'Set as the default view: everyone opens the dataset on it, and Clear All goes back to it'
-                                                        : 'Make this view public first to set it as the default view: everyone who opens the dataset starts on it'}
+                                                        : 'Make this view public first to set it as the default view: everyone who opens the dataset starts on it')}
                                             >
                                                 {view.id === defaultViewId ? <StarFilledIcon className="w-3.5 h-3.5" /> : <StarIcon className="w-3.5 h-3.5" />}
                                             </button>
                                         )}
-                                        {isMine && user?.can_share_views !== false && (
+                                        {(isMine || (othersPublic && !view.from_primary)) && user?.can_share_views !== false && (
                                             <button
                                                 onClick={(e) => {
                                                     e.stopPropagation();
                                                     setSharingView(view);
                                                 }}
-                                                className="p-1.5 text-zinc-400 hover:text-cyan-400 hover:bg-cyan-400/10 rounded transition-colors"
-                                                title="Share View"
+                                                disabled={!!viewRefusal}
+                                                className="p-1.5 text-zinc-400 hover:text-cyan-400 hover:bg-cyan-400/10 rounded transition-colors disabled:opacity-40 disabled:hover:text-zinc-400 disabled:hover:bg-transparent"
+                                                aria-label="Share View"
+                                                title={viewRefusal ?? 'Share View'}
                                             >
                                                 <Share1Icon className="w-3.5 h-3.5" />
                                             </button>
                                         )}
-                                        {(isMine || user?.role === 'admin') && editable && (
+                                        {(isMine || othersPublic || user?.role === 'admin') && editable && (
                                             <button
                                                 onClick={(e) => {
                                                     e.stopPropagation();
                                                     handleDeleteView(view.id);
                                                 }}
-                                                className="p-1.5 text-zinc-400 hover:text-red-400 hover:bg-red-400/10 rounded transition-colors"
-                                                title="Delete View"
+                                                disabled={!!viewRefusal}
+                                                className="p-1.5 text-zinc-400 hover:text-red-400 hover:bg-red-400/10 rounded transition-colors disabled:opacity-40 disabled:hover:text-zinc-400 disabled:hover:bg-transparent"
+                                                aria-label="Delete View"
+                                                title={viewRefusal ?? 'Delete View'}
                                             >
                                                 <TrashIcon className="w-3.5 h-3.5" />
                                             </button>

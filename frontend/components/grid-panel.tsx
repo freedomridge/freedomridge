@@ -12,6 +12,7 @@ import { Slider } from '@/components/ui/slider';
 import { Tag, Download } from 'lucide-react';
 import * as DropdownMenu from '@radix-ui/react-dropdown-menu';
 import { SelectAllButton } from '@/components/select-all-button';
+import { mediaFieldLabel, readMediaFieldPick, rememberMediaFieldPick, shownMediaField } from '@/lib/media-field-pick';
 
 // Field types the grid's server sort orders by (_grid_order_by); anything else falls back to id.
 const SORTABLE_TYPES = new Set(['number', 'string', 'enum', 'datetime']);
@@ -56,8 +57,6 @@ interface GridPanelProps {
     filtersReady?: boolean;  // false: the filters' final shape is not known yet; hold the grid's requests
     grainMode?: 'image' | 'object';  // 'object' shows per-detection crop rows (the patch view)
     onGrainModeChange?: (mode: 'image' | 'object') => void;
-    // The View picker's choice is saved as the dataset's grid media field (the field every grid opens on).
-    onMediaFieldChange?: (field: string) => void;
     onShowObjects?: () => void;  // image grain: pivot to the objects of the selected images
     onShowImages?: () => void;  // object grain: pivot to the parent images of the selected objects
     onFindUnlabeledClick?: () => void;  // object grain: find unlabeled patch look-alikes of the selected object
@@ -87,7 +86,8 @@ interface GridPanelProps {
     onFindSimilarClick?: () => void;
     hashFields?: string[];
     onShowDuplicates?: (mode: string) => void;
-    canTag?: boolean;
+    canTag?: boolean;  // offers Tag (not on a stopped mirror)
+    tagRefusal?: string;  // why Tag is disabled: the user's level doesn't allow it
     gridSamplesRef?: React.MutableRefObject<Sample[]>;
     gridMoreRef?: React.MutableRefObject<GridMore | null>;
     selectedPatches?: Map<number, Array<{ row: number; col: number; scale: string }>>;
@@ -97,14 +97,14 @@ interface GridPanelProps {
     gridPatchMode?: string | null;
     onGridPatchModeChange?: (mode: string | null) => void;
     onClearPatches?: () => void;
-    canDeleteObjects?: boolean;  // an admin, not on a mirror: offers deleting the objects whose image is gone
+    canDeleteObjects?: boolean;  // not on a mirror: offers deleting the objects whose image is gone
+    deleteObjectsRefusal?: string;  // why that is disabled: the user's level doesn't allow it
 }
 
 export function GridPanel({
     datasetId,
     dataset,
     filters,
-    onMediaFieldChange,
     filtersReady = true,
     grainMode = 'image',
     onGrainModeChange,
@@ -137,6 +137,7 @@ export function GridPanel({
     hashFields = [],
     onShowDuplicates,
     canTag = false,
+    tagRefusal,
     gridSamplesRef,
     gridMoreRef,
     selectedPatches,
@@ -147,6 +148,7 @@ export function GridPanel({
     onGridPatchModeChange,
     onClearPatches,
     canDeleteObjects = false,
+    deleteObjectsRefusal,
 }: GridPanelProps) {
     // Effective selection spanning explicit-id and Select-All (token) modes.
     const effectiveSelectionCount = selectionCount ?? selectedIds.length;
@@ -233,16 +235,16 @@ export function GridPanel({
     // A remembered sort on a field that is no longer sortable here (demoted, removed) is dropped.
     const effectiveSortBy = sortBy && (!schema?.length || sortableFields.some(f => f.name === sortBy)) ? sortBy : undefined;
     const [imageScale, setImageScale] = useState(25);
-    const [mediaField, setMediaField] = useState<string>(dataset?.grid_media_field || 'filepath');
+    // The image field: the user's pick in this grid's View select while it is one of the dataset's media fields, else
+    // the dataset's default (grid_media_field, set in Dataset Settings). A pick changes only the user's own view and
+    // sends nothing. Like the sort, each grid keeps its own for the visit, and a grid opens on the last one picked in
+    // any grid of this dataset (lib/media-field-pick.ts). Picking the default (marked in the select) forgets the pick.
+    const [mediaPick, setMediaPick] = useState<string | null>(() => readMediaFieldPick(datasetId, 'grid'));
+    const mediaField = shownMediaField(mediaPick, dataset?.media_fields, dataset?.grid_media_field);
     // null while the grid's COUNT is in flight: show that, not the previous view's number.
     const [totalCount, setTotalCount] = useState<number | null>(null);
     // The COUNT failed: no total is coming (the grid offers Retry), so it no longer says "Counting…".
     const [countFailed, setCountFailed] = useState(false);
-
-    useEffect(() => {
-        // eslint-disable-next-line react-hooks/set-state-in-effect -- deliberate prop-sync: adopt the dataset's configured grid media field when it loads/changes
-        if (dataset?.grid_media_field) setMediaField(dataset.grid_media_field);
-    }, [dataset?.grid_media_field]);
 
     const localRef = useRef<Sample[]>([]);
     const ref = gridSamplesRef || localRef;
@@ -319,9 +321,9 @@ export function GridPanel({
                                 <button
                                     data-testid="grid-unlinked-objects-delete"
                                     onClick={deleteGoneObjects}
-                                    disabled={deletingUnlinked}
+                                    disabled={deletingUnlinked || !!deleteObjectsRefusal}
                                     className="px-1.5 py-1 border-l border-amber-500/30 hover:bg-amber-500/20 hover:text-amber-100 rounded-r transition-colors disabled:opacity-50"
-                                    title="Delete the objects whose image is gone (a background job; Job history shows the result)"
+                                    title={deleteObjectsRefusal ?? 'Delete the objects whose image is gone (a background job; Job history shows the result)'}
                                 >
                                     Delete…
                                 </button>
@@ -381,8 +383,9 @@ export function GridPanel({
                         <button
                             onClick={onTagClick}
                             data-testid="grid-tag-button"
-                            className="text-xs bg-green-500/20 hover:bg-green-500/30 text-green-400 hover:text-green-300 border border-green-500/50 px-2 py-1 rounded flex items-center gap-1 transition-colors"
-                            title="Tag selected samples"
+                            disabled={!!tagRefusal}
+                            className="text-xs bg-green-500/20 hover:bg-green-500/30 text-green-400 hover:text-green-300 border border-green-500/50 px-2 py-1 rounded flex items-center gap-1 transition-colors disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:bg-green-500/20 disabled:hover:text-green-400"
+                            title={tagRefusal ?? 'Tag selected samples'}
                         >
                             <Tag className="w-3 h-3" />
                             Tag
@@ -519,12 +522,13 @@ export function GridPanel({
                         <div className="flex items-center gap-1.5">
                             <label className="text-[11px] text-zinc-500">View:</label>
                             <select
+                                aria-label="Grid view media field"
                                 value={mediaField}
-                                onChange={(e) => { setMediaField(e.target.value); onMediaFieldChange?.(e.target.value); }}
+                                onChange={(e) => setMediaPick(rememberMediaFieldPick(datasetId, 'grid', e.target.value, dataset.grid_media_field))}
                                 className="text-xs bg-zinc-800 border border-zinc-700 rounded px-2 py-1 text-white focus:outline-none focus:border-zinc-500"
                             >
                                 {dataset.media_fields.map(field => (
-                                    <option key={field} value={field}>{field}</option>
+                                    <option key={field} value={field}>{mediaFieldLabel(field, dataset.grid_media_field)}</option>
                                 ))}
                             </select>
                         </div>

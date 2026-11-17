@@ -5,7 +5,7 @@ import { toggleOverlayField } from '@/lib/labels';
 import { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import type { Feature, Polygon } from 'geojson';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { ApiError, isRescoringRefusal, getSamples, getDatasetSchema, getDataset, getEmbeddingFields, searchSimilar, searchByImage, searchObjectToPatches, updateDataset, setClassRule, sampleDuplicates, notifySamplesMutated, createSelectionToken, getView, parseFilterQuery, formatFilterQuery, FilterQueryProblem, type Dataset, type Filters, type Sample, type SchemaField, type ComplexFilter, type ViewStage } from '@/lib/api';
+import { ApiError, isRescoringRefusal, getSamples, getDatasetSchema, getDataset, getEmbeddingFields, searchSimilar, searchByImage, searchObjectToPatches, setClassRule, sampleDuplicates, notifySamplesMutated, createSelectionToken, getView, parseFilterQuery, formatFilterQuery, FilterQueryProblem, type Filters, type Sample, type SchemaField, type ComplexFilter, type ViewStage } from '@/lib/api';
 import { describeFilter, convertSimpleFiltersToComplex } from '@/lib/filter-utils';
 import { copyLink, datasetAddress, datasetLink, decodeStages, joinQueryParts, LinkError, mayBeText, type DatasetLink } from '@/lib/links';
 import { useToast } from '@/contexts/ToastContext';
@@ -47,6 +47,8 @@ import { ExportDialog } from '@/components/export-dialog';
 import { PanelType } from '@/components/panel-content';
 import { FilterProvider, useFilters, withGrain, type AddressState, type Grain } from '@/contexts/FilterContext';
 import { useUser } from '@/contexts/UserContext';
+import { can, refusal } from '@/lib/access-level';
+import { readMediaFieldPick, rememberMediaFieldPick, shownMediaField } from '@/lib/media-field-pick';
 import { useLiveAddress } from '@/lib/runtime-config';
 
 import { LoadingScreen, ProtectedRoute } from '@/components/ProtectedRoute';
@@ -340,6 +342,10 @@ function DatasetPageContent() {
         staleTime: 0,
         refetchOnWindowFocus: false,
     });
+    // The user's level in this dataset (backend/access.py): what it doesn't allow is disabled and says why.
+    const level = dataset?.access_level;
+    // Tagging takes tag: `tags`, and on a mirror its own `@local.tags` too.
+    const tagRefusal = refusal(level, 'tag');
 
     // A lasso drawn on an earlier layout of its map (the dataset's map_layouts): its chip, applied or draft, warns, and
     // a toast says so once per lasso while the page is open. The lasso keeps filtering (lib/stale-lasso.ts).
@@ -365,34 +371,23 @@ function DatasetPageContent() {
         }
     }, [viewStages, staleDraftLasso, mapLayouts, datasetId, addToast]);
 
-    const [modalMediaField, setModalMediaFieldLocal] = useState<string>('filepath');
     const [activeOverlayFields, setActiveOverlayFields] = useState<string[]>([]);
 
-    // A grid's View choice is saved as the field the dataset's grids open on next time. The cached dataset is left
-    // as it is, so the other open grids keep their own choice.
-    const saveGridMediaField = (field: string) => {
-        if (datasetId) updateDataset(datasetId, { grid_media_field: field }).catch(() => {});
-    };
+    // The fields a grid and the sample view open on for everyone (the dataset's grid_media_field and
+    // modal_media_field) are set in Dataset Settings → General, which takes edit. Choosing another in a View select
+    // changes only the user's own view, at every level: nothing is sent, and this browser remembers the choice for
+    // the dataset, the sample view's apart from the grids' (lib/media-field-pick.ts). Each grid keeps its own
+    // (components/grid-panel.tsx). The sample view shows the user's pick while it is one of the media fields, else the
+    // default. Picking the default, which each View select marks, forgets the pick: the user follows the default again,
+    // also when it changes later.
+    const [modalMediaPick, setModalMediaPick] = useState<string | null>(() => datasetId != null ? readMediaFieldPick(datasetId, 'modal') : null);
+    const modalMediaField = shownMediaField(modalMediaPick, dataset?.media_fields, dataset?.modal_media_field);
     const setModalMediaField = (field: string) => {
-        setModalMediaFieldLocal(field);
-        if (datasetId) {
-            updateDataset(datasetId, { modal_media_field: field }).catch(() => {});
-            queryClient.setQueryData(['dataset', datasetId], (old: Dataset | undefined) =>
-                old ? { ...old, modal_media_field: field } : old
-            );
-        }
+        setModalMediaPick(datasetId != null ? rememberMediaFieldPick(datasetId, 'modal', field, dataset?.modal_media_field) : field);
     };
 
     // Fast mode (default true; `lightningMode` / `lightning_mode` in code and the API)
     const [lightningMode, setLightningMode] = useState(true);
-
-    // Initialize media fields from saved dataset preferences
-    useEffect(() => {
-        if (dataset) {
-            // eslint-disable-next-line react-hooks/set-state-in-effect -- synchronize existing per-view UI state after a prop or client-mount change
-            setModalMediaFieldLocal(dataset.modal_media_field || 'filepath');
-        }
-    }, [dataset]);
 
     // The dataset opens on its default view (FilterContext applies it once it knows which it is).
     useEffect(() => {
@@ -1246,7 +1241,6 @@ function DatasetPageContent() {
                     <GridPanel
                         datasetId={datasetId!}
                         dataset={dataset}
-                        onMediaFieldChange={saveGridMediaField}
                         filters={withGrain(stagedFilters, g.grain, g.pivot, hasObjects)}
                         filtersReady={grainKnown || !stagedFilters.filters?.length}
                         grainMode={g.grain}
@@ -1320,9 +1314,10 @@ function DatasetPageContent() {
                         onShowDuplicates={handleShowDuplicates}
                         // A mirror's tags are the primary's (with tags both ways, a tag edit here is made there), and its own
                         // tags (`@local.tags`) are its own while it follows: the tag dialog offers whichever it may edit.
-                        canTag={(user?.role === 'admin' || user?.role === 'power_user')
-                            && (!dataset?.mirror || dataset.mirror.state !== 'stopped')}
-                        canDeleteObjects={user?.role === 'admin' && !dataset?.mirror}
+                        canTag={!dataset?.mirror || dataset.mirror.state !== 'stopped'}
+                        tagRefusal={tagRefusal}
+                        canDeleteObjects={!dataset?.mirror}
+                        deleteObjectsRefusal={refusal(level, 'edit')}
                         gridSamplesRef={getGridSamplesRef(panelId)}
                         gridMoreRef={getGridMoreRef(panelId)}
                         // Patches are a sub-grid of IMAGES only. An object-grain grid never shows
@@ -1346,6 +1341,7 @@ function DatasetPageContent() {
                             key={datasetId}
                             expandAll={dataset?.sidebar_expand_all ?? false}
                             datasetId={datasetId!}
+                            level={level}
                             schema={schema || []}
                             isLoading={schemaLoading}
                             filters={simpleFilters}
@@ -1372,6 +1368,7 @@ function DatasetPageContent() {
                     <div className="h-full w-full overflow-hidden bg-zinc-900">
                         <EmbeddingsPanel
                             datasetId={datasetId!}
+                            level={level}
                             schema={schema || []}
                             selectedIds={brushedIds}
                             highlightedIds={scatterHighlightIds}
@@ -1463,6 +1460,7 @@ function DatasetPageContent() {
                     <div className="h-full w-full overflow-hidden bg-zinc-900">
                         <DuplicatesPanel
                             datasetId={datasetId!}
+                            level={level}
                             hasObjects={hasObjects}
                             selectedIds={selectedIds}
                             onSelection={(ids) => {
@@ -1490,6 +1488,7 @@ function DatasetPageContent() {
                     <div className="h-full w-full overflow-hidden bg-zinc-900">
                         <ConceptsPanel
                             datasetId={datasetId!}
+                            level={level}
                             onSampleClick={(s) => openSampleView(s, null)}
                         />
                     </div>
@@ -1704,6 +1703,7 @@ function DatasetPageContent() {
                                 currentViewStages={viewStages} // New: Stages history
                                 defaultViewId={dataset?.default_view_id ?? null}
                                 mirror={dataset?.mirror ?? null}
+                                level={level}
                                 onDefaultViewChanged={() => queryClient.invalidateQueries({ queryKey: ['dataset', datasetId] })}
                                 onLoadView={(view) => {
                                     if (view.content.viewStages) {
@@ -1766,7 +1766,7 @@ function DatasetPageContent() {
                     <QueryBuilderBar
                         stages={viewStages}
                         mapLayouts={dataset?.map_layouts}
-                        canUpdateView={mayUpdateView(sourceView, user)}
+                        canUpdateView={mayUpdateView(sourceView, user, can(level, 'edit'))}
                         expiredSelections={expiredSelections}
                         onRemoveExpired={(index) => setExpiredSelections(prev => prev.filter((_, i) => i !== index))}
                         onRemoveStage={removeStage}
@@ -1852,12 +1852,13 @@ function DatasetPageContent() {
                             sample={selectedSample}
                             activeMediaField={modalMediaField}
                             availableMediaFields={dataset?.media_fields || ['filepath']}
+                            defaultMediaField={dataset?.modal_media_field}
                             activeOverlayFields={activeOverlayFields}
                             overlayConfigs={overlayConfigs}
                             segmentationConfig={dataset?.segmentation_config}
                             // A mirror's settings, its default rules included, are its primary's: trying one is fine, saving isn't.
-                            onSaveClassRule={datasetId != null && (user?.role === 'admin' || user?.role === 'power_user')
-                                && !dataset?.mirror
+                            classRuleRefusal={refusal(level, 'edit')}
+                            onSaveClassRule={datasetId != null && !dataset?.mirror
                                 ? async (fieldName, rule) => {
                                     await setClassRule(datasetId, fieldName, rule);
                                     await queryClient.invalidateQueries({ queryKey: ['dataset', datasetId] });
@@ -1895,6 +1896,7 @@ function DatasetPageContent() {
                                 setSimilaritySearchSample(seed);
                             } : undefined}
                             onTag={() => setTagSampleId(selectedSample.id)}
+                            tagRefusal={tagRefusal}
                             // The row opened (an object shows as its parent image): a link to it opens the same view.
                             onCopyLink={() => copyDatasetLink(modalSourcePanelId != null && modalSourceId != null ? modalSourceId : selectedSample.id)}
                             onCloseOverlay={() => setTagSampleId(null)}
@@ -1928,7 +1930,7 @@ function DatasetPageContent() {
             }
 
             {datasetId != null && (
-                <DatasetJobHistoryDialog datasetId={datasetId} open={isJobHistoryOpen} onOpenChange={setIsJobHistoryOpen} />
+                <DatasetJobHistoryDialog datasetId={datasetId} level={level} open={isJobHistoryOpen} onOpenChange={setIsJobHistoryOpen} />
             )}
 
             {
@@ -1936,7 +1938,6 @@ function DatasetPageContent() {
                     <DatasetSettingsModal
                         dataset={dataset}
                         onClose={() => setIsSettingsOpen(false)}
-                        readOnly={user?.role !== 'admin'}
                         onViewSamples={(token, total, label) => {
                             // Apply the version-diff selection as a server-side stage
                             // (in_selection token) — no id list materialized client-side.

@@ -690,7 +690,7 @@ class DatasetView:
         return result['updated_count'] if wait else result
 
     def delete_samples(self, *, wait=True, timeout=1800):
-        """Delete this view's samples (admin only). Deleting an image deletes its object samples: the result's
+        """Delete this view's samples (needs edit). Deleting an image deletes its object samples: the result's
         ``objects_deleted`` counts those the view didn't include."""
         return self._dataset.client.bulk_delete_samples(
             self._dataset.id,
@@ -700,7 +700,7 @@ class DatasetView:
         )
 
     def delete_embeddings(self, field, *, wait=True, timeout=1800):
-        """Delete embedding field ``field``'s vectors for the samples of this view (admin only).
+        """Delete embedding field ``field``'s vectors for the samples of this view (needs edit).
 
         A view without a filter selects every sample, so it is refused: deleting a whole field is
         ``Dataset.delete_embedding_field``, never an accident."""

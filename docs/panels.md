@@ -208,9 +208,9 @@ async def my_endpoint(dataset_id: int, request: MyRequest):
 ```
 
 `require_dataset_access` reads the dataset ID from the `{dataset_id}` (or `{id}`) path
-parameter. An endpoint that changes data also needs a role check, as the real routers
-do: add `user: dict = Depends(require_role("power_user"))` (from `.auth`) to its
-parameters. For a `POST` that only reads, like this one, also add its function name
+parameter. An endpoint that changes data also needs the level it takes in the dataset, as
+the real routers do: add `user: dict = Depends(require_level("edit"))` (from `.access`) to
+its parameters; `backend/tests/test_route_levels.py` fails a write route without one. For a `POST` that only reads, like this one, also add its function name
 (`my_endpoint`) to `_READ_ONLY_DATASET_POSTS` in `backend/access.py`; otherwise it
 returns 409 while the dataset is being deleted.
 

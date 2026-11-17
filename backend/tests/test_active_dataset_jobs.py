@@ -81,7 +81,8 @@ def test_real_active_jobs_include_old_running_work_all_waiting_pages_and_submitt
         monkeypatch.setattr(jobs, 'db', database)
         monkeypatch.setattr(access, 'db', database)
         await database.execute("INSERT INTO users(id,username,role) VALUES (10,'Alex','power_user')")
-        await database.execute('UPDATE datasets SET owner_id=10,is_global=FALSE WHERE id=1')
+        await database.execute('UPDATE datasets SET is_global=FALSE WHERE id=1')
+        await database.execute('INSERT INTO dataset_access(dataset_id,user_id) VALUES (1,10)')  # shared with Alex
         running = await job_queue.enqueue_job(
             database.pool,
             'umap_fit',

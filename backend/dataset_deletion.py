@@ -41,6 +41,7 @@ DATASET_TABLES = (
     ('embedding_layouts', ('dataset_id', 'field_name')),
     ('views', ('id',)),
     ('dataset_access', ('dataset_id', 'user_id')),
+    ('dataset_group_access', ('dataset_id', 'group_id')),
     ('dataset_stats_state', ('dataset_id',)),
     # A followed dataset's change log, which a follower that has been away leaves large. The keys follow each
     # table's index on the dataset. The datasets trigger's own delete then finds nothing left.

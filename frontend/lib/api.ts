@@ -1,6 +1,7 @@
 import type { PatchScaleInfo } from './patch-scales';
 import type { ClassRule } from './class-rules';
 import type { DefaultView } from './default-view';
+import type { AccessLevel } from './access-level';
 
 // Segmentation visualization configuration
 export interface FieldColorConfig {
@@ -31,9 +32,13 @@ export interface Dataset {
     grid_media_field: string;
     modal_media_field: string;
     segmentation_config?: SegmentationConfig;
-    // True: every signed-in user sees the dataset. False (the default for new datasets): admins, its
-    // owner and users granted access.
+    // True: every signed-in user sees the dataset. False (the default for new datasets): admins and the
+    // users and groups it is shared with.
     is_global: boolean;
+    // What a global dataset gives every signed-in user. Not read while it is private.
+    everyone_level?: 'view' | 'tag' | 'edit';
+    // GET /datasets and GET /datasets/{id} only: the caller's level in the dataset (backend/access.py).
+    access_level?: AccessLevel | null;
     created_at: string;
     // GET /datasets/{id} only: the filter sidebar opens with every field expanded and computed (the
     // dataset's rows are few enough to filter every field at once).
@@ -111,6 +116,7 @@ export interface JobRecord {
     field?: string | null; // an index build's field
     cancel_requested: boolean;
     waiting_for?: string | null; // a queued job not started yet: what it waits for
+    can_control?: boolean; // the job lists only: whether the caller may stop, resume or discard it
     result?: unknown; // only sent to admins and the job's submitter
     error?: unknown; // only sent to admins and the job's submitter
 }
@@ -730,6 +736,23 @@ export class ApiError extends Error {
         if (status === 401 && typeof window !== 'undefined') {
             window.dispatchEvent(new Event('fridge:unauthorized'));
         }
+        noticeLevelRefusal(status, message);
+    }
+}
+
+// A refusal for want of a level in a dataset (backend/access.py): someone lowered the user's level while the page was
+// open. providers.tsx then reads the datasets again, so access_level and every control that follows it catch up.
+export const LEVEL_REFUSED_EVENT = 'fridge:level-refused';
+
+/** Whether `message` is the server's refusal for want of a level: "This needs <level> access to the dataset". */
+export function isLevelRefusal(message: unknown): boolean {
+    return typeof message === 'string' && /^This needs (view|tag|edit|manage) access to the dataset$/.test(message);
+}
+
+/** Announces a level refusal (a 403 with that detail). ApiError does it; a raw fetch passes its status and detail. */
+export function noticeLevelRefusal(status: number, detail: unknown): void {
+    if (status === 403 && isLevelRefusal(detail) && typeof window !== 'undefined') {
+        window.dispatchEvent(new Event(LEVEL_REFUSED_EVENT));
     }
 }
 
@@ -882,6 +905,107 @@ export async function resumeDatasetDeletion(id: number): Promise<{ job_id: strin
     });
     await ensureOk(res, 'Failed to resume deletion');
     return res.json();
+}
+
+// --- Who has access to a dataset (Dataset Settings → Access; manage) ---
+export interface DatasetUserGrant {
+    user_id: number;
+    username: string;
+    email: string | null;  // null for a manager who isn't an administrator
+    role: string;  // a guest's level is at most view, whatever its share
+    level: AccessLevel;
+}
+
+export interface DatasetGroupGrant {
+    group_id: number;
+    name: string;
+    level: AccessLevel;
+}
+
+export interface DatasetAccess {
+    is_global: boolean;
+    everyone_level: 'view' | 'tag' | 'edit';
+    grants: DatasetUserGrant[];
+    group_grants: DatasetGroupGrant[];
+}
+
+export async function getDatasetAccess(id: number): Promise<DatasetAccess> {
+    const res = await fetch(`${API_BASE}/datasets/${id}/access`, { credentials: 'include' });
+    await ensureOk(res, 'Could not read who has access');
+    return res.json();
+}
+
+// Whom a manager can share the dataset with: every active user's name and every group's.
+export async function getAccessCandidates(id: number): Promise<{ users: { id: number; username: string }[]; groups: { id: number; name: string }[] }> {
+    const res = await fetch(`${API_BASE}/datasets/${id}/access/candidates`, { credentials: 'include' });
+    await ensureOk(res, 'Could not list users and groups');
+    return res.json();
+}
+
+// Shares the dataset with a user (by id) or a group (by name) at `level`; sharing again changes the level.
+export async function grantDatasetAccess(id: number, target: { user_id: number } | { group: string }, level: AccessLevel): Promise<void> {
+    const res = await fetch(`${API_BASE}/datasets/${id}/access`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({ ...target, level }),
+    });
+    await ensureOk(res, 'Could not share the dataset');
+}
+
+export async function revokeDatasetAccess(id: number, target: { user_id: number } | { group_id: number }): Promise<void> {
+    const path = 'user_id' in target ? `${target.user_id}` : `groups/${target.group_id}`;
+    const res = await fetch(`${API_BASE}/datasets/${id}/access/${path}`, { method: 'DELETE', credentials: 'include' });
+    await ensureOk(res, 'Could not remove the share');
+}
+
+// --- Groups (User Management; administrators) ---
+export interface Group {
+    id: number;
+    name: string;
+    members: { id: number; username: string }[];
+    // The datasets it is shared with, by name, with its level in each (changed in each dataset's Access section); a
+    // dataset being deleted is listed until its deletion finishes.
+    datasets: { id: number; name: string; level: AccessLevel; deleting: boolean }[];
+}
+
+export async function getGroups(): Promise<Group[]> {
+    const res = await fetch(`${API_BASE}/groups`, { credentials: 'include' });
+    await ensureOk(res, 'Could not list groups');
+    return res.json();
+}
+
+export async function createGroup(name: string): Promise<void> {
+    const res = await fetch(`${API_BASE}/groups`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({ name }),
+    });
+    await ensureOk(res, 'Could not create the group');
+}
+
+export async function renameGroup(id: number, name: string): Promise<void> {
+    const res = await fetch(`${API_BASE}/groups/${id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({ name }),
+    });
+    await ensureOk(res, 'Could not rename the group');
+}
+
+export async function deleteGroup(id: number): Promise<void> {
+    const res = await fetch(`${API_BASE}/groups/${id}`, { method: 'DELETE', credentials: 'include' });
+    await ensureOk(res, 'Could not delete the group');
+}
+
+export async function setGroupMember(id: number, userId: number, member: boolean): Promise<void> {
+    const res = await fetch(`${API_BASE}/groups/${id}/members/${userId}`, {
+        method: member ? 'PUT' : 'DELETE',
+        credentials: 'include',
+    });
+    await ensureOk(res, member ? 'Could not add the member' : 'Could not remove the member');
 }
 
 export async function getJob(jobId: string): Promise<JobRecord> {
