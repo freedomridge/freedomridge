@@ -3,6 +3,7 @@
 import { useState, useEffect, useMemo, useCallback, useRef, type ReactNode } from 'react';
 import { type Sample, type SegmentationConfig } from '@/lib/api';
 import { getSampleMediaUrl } from '@/lib/media-utils';
+import { mediaFieldLabel } from '@/lib/media-field-pick';
 import { parseAnnotations, isOverlayActive, toggleOverlayField } from '@/lib/labels';
 import * as Dialog from '@radix-ui/react-dialog';
 import { EyeOpenIcon, EyeNoneIcon } from '@radix-ui/react-icons';
@@ -16,6 +17,7 @@ interface Props {
     sample: Sample;
     activeMediaField?: string;
     availableMediaFields?: string[];
+    defaultMediaField?: string;  // the dataset's default, marked in the View select
     activeOverlayFields?: string[];
     overlayConfigs?: Record<string, { colormap?: string; range?: [number, number]; opacity?: number } | null>;
     segmentationConfig?: SegmentationConfig;
@@ -36,6 +38,7 @@ interface Props {
     // Find Similar from the sample on screen (the modal had no actions).
     onFindSimilar?: () => void;
     onTag?: () => void;  // tag THIS sample (the one shown) without leaving the view
+    tagRefusal?: string;  // why Tag is disabled: the user's level in the dataset doesn't allow it
     onCopyLink?: () => void;  // a link that opens this sample on the applied filters
     // A dialog layered over this view (the tag dialog). Rendered INSIDE the Radix content so it is
     // inside its focus trap and click-outside boundary; while it is open, Escape closes it (not the
@@ -44,13 +47,14 @@ interface Props {
     onCloseOverlay?: () => void;
     /** Emphasize this box over the image — e.g. the object whose parent is shown. */
     highlightCuboidField?: string | null;
-    /** Present when the user may save a class-probability field's shown rule as its default. */
+    /** Present when a class-probability field's shown rule can be saved as its default (not on a mirror). */
     onSaveClassRule?: (fieldName: string, rule: ClassRule) => Promise<void>;
+    classRuleRefusal?: string;  // why saving it is disabled: the user's level in the dataset doesn't allow it
     highlightCuboidId?: string | null;
     highlightBox?: [number, number, number, number] | null;
 }
 
-export function SampleModal({ sample, activeMediaField = 'filepath', availableMediaFields = ['filepath'], activeOverlayFields: initialOverlayFields = [], overlayConfigs, segmentationConfig, onMediaFieldChange, onClose, availablePatchScales = [], patchScaleLabels, patchFieldName = 'clip', onPatchSearch, patchScale: externalPatchScale, onPatchScaleChange, onNext, onPrevious, hasNext = false, hasPrevious = false, isSelected = false, onToggleSelection, onFindSimilar, onTag, onCopyLink, overlay, onCloseOverlay, highlightBox, highlightCuboidId, highlightCuboidField, onSaveClassRule }: Props) {
+export function SampleModal({ sample, activeMediaField = 'filepath', availableMediaFields = ['filepath'], defaultMediaField, activeOverlayFields: initialOverlayFields = [], overlayConfigs, segmentationConfig, onMediaFieldChange, onClose, availablePatchScales = [], patchScaleLabels, patchFieldName = 'clip', onPatchSearch, patchScale: externalPatchScale, onPatchScaleChange, onNext, onPrevious, hasNext = false, hasPrevious = false, isSelected = false, onToggleSelection, onFindSimilar, onTag, tagRefusal, onCopyLink, overlay, onCloseOverlay, highlightBox, highlightCuboidId, highlightCuboidField, onSaveClassRule, classRuleRefusal }: Props) {
     // How each class-probability field is shown while the modal is open: edited rules redraw at once, write nothing,
     // and stay while stepping through samples.
     const [probabilityViews, setProbabilityViews] = useState<Record<string, ProbabilityView>>({});
@@ -377,7 +381,9 @@ export function SampleModal({ sample, activeMediaField = 'filepath', availableMe
                             {onTag && (
                                 <button
                                     onClick={onTag}
-                                    className="text-xs text-zinc-400 hover:text-white border border-zinc-700 rounded px-2 py-1"
+                                    disabled={!!tagRefusal}
+                                    title={tagRefusal}
+                                    className="text-xs text-zinc-400 hover:text-white border border-zinc-700 rounded px-2 py-1 disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:text-zinc-400"
                                     data-testid="modal-tag"
                                 >
                                     Tag
@@ -398,13 +404,14 @@ export function SampleModal({ sample, activeMediaField = 'filepath', availableMe
                                 <div className="flex items-center gap-2">
                                     <label className="text-xs text-zinc-500">View:</label>
                                     <select
+                                        aria-label="Sample view media field"
                                         value={activeMediaField}
                                         onChange={(e) => onMediaFieldChange(e.target.value)}
                                         className="text-xs bg-zinc-800 border border-zinc-700 rounded px-2 py-1 text-white focus:outline-none focus:border-zinc-500"
                                     >
                                         {availableMediaFields.map(field => (
                                             <option key={field} value={field}>
-                                                {field}
+                                                {defaultMediaField ? mediaFieldLabel(field, defaultMediaField) : field}
                                             </option>
                                         ))}
                                     </select>
@@ -636,6 +643,7 @@ export function SampleModal({ sample, activeMediaField = 'filepath', availableMe
                                     probabilityViews={probabilityViews}
                                     onProbabilityView={(field, view) => setProbabilityViews(views => ({ ...views, [field]: view }))}
                                     onSaveClassRule={onSaveClassRule}
+                                    classRuleRefusal={classRuleRefusal}
                                 />
                             </dl>
                         </div>
@@ -660,6 +668,7 @@ function PropertyViewer({
     probabilityViews = {},
     onProbabilityView,
     onSaveClassRule,
+    classRuleRefusal,
 }: {
     data: unknown;
     prefix?: string;
@@ -673,6 +682,7 @@ function PropertyViewer({
     probabilityViews?: Record<string, ProbabilityView>;
     onProbabilityView?: (field: string, view: ProbabilityView) => void;
     onSaveClassRule?: (fieldName: string, rule: ClassRule) => Promise<void>;
+    classRuleRefusal?: string;
 }) {
     if (!data || typeof data !== 'object') return null;
 
@@ -734,6 +744,7 @@ function PropertyViewer({
                         savedRule={savedRule}
                         onChange={view => onProbabilityView(field, view)}
                         onSave={onSaveClassRule ? rule => onSaveClassRule(field, rule) : undefined}
+                        saveRefusal={classRuleRefusal}
                     />
                 )}
             </div>
@@ -967,6 +978,7 @@ function PropertyViewer({
                                     probabilityViews={probabilityViews}
                                     onProbabilityView={onProbabilityView}
                                     onSaveClassRule={onSaveClassRule}
+                                    classRuleRefusal={classRuleRefusal}
                                 />
                             </div>
                         </div>

@@ -11,10 +11,12 @@ from fastapi import HTTPException
 
 from backend import job_queue, job_service
 from backend.routers import datasets
-from backend.tests import test_field_registry_postgres
+from backend.tests import test_access_rule_spec, test_field_registry_postgres
+from backend.tests.test_access_rule_spec import GUEST, POWER
 from backend.tests.test_field_registry_postgres import USER, ingest
 
 registry_database = test_field_registry_postgres.registry_database
+world = test_access_rule_spec.world
 pytestmark = pytest.mark.skipif(not os.getenv('FRIDGE_TEST_POSTGRES_DSN'), reason='Requires disposable PostgreSQL')
 
 
@@ -338,28 +340,29 @@ def test_lost_lease_cannot_publish(registry_database):
     registry_database(scenario)
 
 
-def test_bulk_delete_http_admin_policy(registry_database):
-    import httpx
-    from fastapi import FastAPI
+def test_bulk_delete_http_takes_edit_in_the_dataset(world):
+    """Bulk delete is edit (it was an admin's): a tag user and a guest are refused, an edit user's is accepted as a job
+    (queued: nothing runs it here), and nothing is deleted by the request itself."""
 
-    from backend.access import require_dataset_access
-    from backend.routers.auth import get_current_user
+    async def scenario(w):
+        await w.dataset(10)
+        await ingest([{}], dataset_id=10)
+        await w.share(10, POWER, 'tag')
+        await w.share(10, GUEST, 'manage')
+        path = '/api/datasets/10/samples/bulk-delete'
+        jobs = "SELECT count(*) FROM jobs WHERE kind = 'bulk_mutation' AND dataset_id = 10"
+        for user_id in (POWER, GUEST):
+            response = await w.call(user_id, 'POST', path, json={'filters': {}})
+            assert response.status_code == 403, response.text
+            assert response.json() == {'detail': 'This needs edit access to the dataset'}
+        assert await w.database.fetchval(jobs) == 0
+        await w.database.execute('UPDATE dataset_access SET level = 3 WHERE dataset_id = 10 AND user_id = $1', POWER)
+        response = await w.call(POWER, 'POST', path, json={'filters': {}})
+        assert response.status_code == 202, response.text
+        assert await w.database.fetchval(jobs) == 1
+        assert await w.database.fetchval('SELECT count(*) FROM samples WHERE dataset_id = 10') == 1
 
-    async def scenario(database):
-        await ingest([{}])
-        app = FastAPI()
-        app.include_router(datasets.router)
-        app.dependency_overrides[require_dataset_access] = lambda: None
-        app.dependency_overrides[get_current_user] = lambda: {'id': 1, 'role': 'power_user'}
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://test') as client:
-            response = await client.post('/datasets/1/samples/bulk-delete', json={'filters': {}})
-            assert response.status_code == 403
-            app.dependency_overrides[get_current_user] = lambda: USER
-            response = await client.post('/datasets/1/samples/bulk-delete', json={'filters': {}})
-            assert response.status_code == 202
-        assert await database.fetchval('SELECT count(*) FROM samples') == 1
-
-    registry_database(scenario)
+    world(scenario)
 
 
 def test_admission_drains_low_id_writers_and_prunes_empty_field(registry_database):

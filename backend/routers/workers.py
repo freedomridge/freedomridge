@@ -16,7 +16,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from .. import job_queue, map_refit
-from ..access import filter_datasets_for_user
+from ..access import level_number, level_select
 from ..database import db
 from ..job_queue import JobPolicy
 from ..map_artifacts import LocalArtifactStore
@@ -179,19 +179,27 @@ async def _worker_job(worker_id: str, job_id: uuid.UUID, user: dict) -> Dict[str
     return dict(job)
 
 
+def _editable(user: dict, param: int) -> tuple[str, list]:
+    """SQL true for a `datasets` row the worker's owner may edit, as (sql, args) naming their id as ${param}. A job's
+    result is a write to its dataset (a map re-fit becomes its map): view isn't enough."""
+    level_sql, level_args = level_select(user, param)
+    return f"{level_sql} >= {level_number('edit')}", level_args
+
+
 async def _owner_may_access(dataset_id: Optional[int], user: dict) -> None:
-    """409 (ACCESS_LOST) unless the worker's owner may still access the job's dataset, as a claim requires. A lease
+    """409 (ACCESS_LOST) unless the worker's owner may still edit the job's dataset, as a claim requires. A lease
     stands for the job, not for access the owner has lost since the claim: when an admin removes their access to a
-    private dataset, the worker can't download more of its data, upload a result for it or keep the lease. Giving
-    the job back (fail, release) stays open; otherwise the lease expires and the job goes back to the queue."""
+    private dataset, or lowers it below edit, the worker can't download more of its data, upload a result for it or
+    keep the lease. Giving the job back (fail, release) stays open; otherwise the lease expires and the job goes back
+    to the queue."""
     if dataset_id is None:
         allowed = user['role'] == 'admin'  # as for a claim: a job on no dataset is for an admin's worker
     else:
-        where, args = await filter_datasets_for_user(user)
+        editable, args = _editable(user, 2)
         allowed = await db.fetchval(
-            f'SELECT EXISTS (SELECT 1 FROM datasets WHERE id = ${len(args) + 1} AND {where})',
-            *args,
+            f'SELECT EXISTS (SELECT 1 FROM datasets WHERE id = $1 AND {editable})',
             dataset_id,
+            *args,
         )
     if not allowed:
         raise HTTPException(status_code=409, detail=ACCESS_LOST)
@@ -220,7 +228,7 @@ async def _done_with(worker_id: str, job_id: uuid.UUID) -> None:
 async def claim(worker_id: str, request: ClaimRequest, user: dict = Depends(get_worker_user)):
     """The next compute job this worker can take, waiting up to `wait_seconds` for one (long polling); 204 when
     none came. Only kinds the worker registered for that run remotely now (REMOTE_KINDS), and only jobs on
-    datasets its owner can access (jobs on no dataset only for an admin's worker). The job comes with a lease
+    datasets its owner may edit (jobs on no dataset only for an admin's worker). The job comes with a lease
     of LEASE_SECONDS: renew it with the job heartbeat every JOB_HEARTBEAT_SECONDS."""
     worker = await _own_worker(worker_id, user)
     # A waiting worker claims again every CLAIM_WAIT_SECONDS at most: each claim keeps it online.
@@ -229,8 +237,8 @@ async def claim(worker_id: str, request: ClaimRequest, user: dict = Depends(get_
     admin = user['role'] == 'admin'
     dataset_ids = None
     if not admin:
-        where, args = await filter_datasets_for_user(user)
-        dataset_ids = [row['id'] for row in await db.fetch(f'SELECT id FROM datasets WHERE {where}', *args)]
+        editable, args = _editable(user, 1)
+        dataset_ids = [row['id'] for row in await db.fetch(f'SELECT id FROM datasets WHERE {editable}', *args)]
     deadline = time.monotonic() + request.wait_seconds
     while True:
         job = None

@@ -17,7 +17,7 @@ Once a minute, the job runner:
 2. **Starts one machine** when a compute job has waited at least the wait time, no connected worker is free to take
    it, no started machine is still connecting, and the limits allow it. The job says "Starting a compute worker".
    A free worker counts only for the jobs it can take: an admin's worker takes any, a power user's only jobs on
-   datasets that user can access.
+   datasets that user has edit in.
 
 A machine is a spot instance of the configured type, launched on-demand only when AWS has no spot capacity for it.
 It boots AWS's current Amazon Linux 2023 (read from AWS's public SSM parameter, so there is no image to maintain),

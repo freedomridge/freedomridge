@@ -33,8 +33,14 @@ class Dataset(BaseModel):
     modal_media_field: str = "filepath"
     segmentation_config: Optional[Dict[str, Any]] = None
     storage_config_id: Optional[int] = None  # NULL → fall back to default storage config / env vars
-    owner_id: Optional[int] = None  # User who created the dataset (always has access)
+    owner_id: Optional[int] = None  # User who created the dataset (given an edit share then; no access by itself)
     is_global: bool = False  # If True, every signed-in user can access (no per-user grants needed)
+    # What a global dataset gives every signed-in user: view, tag or edit (view until a manager raises it). Not read
+    # while it is private.
+    everyone_level: str = 'view'
+    # GET /datasets and GET /datasets/{id} only (None elsewhere): the caller's level in the dataset, view, tag, edit or
+    # manage (backend/access.py).
+    access_level: Optional[str] = None
     created_at: datetime
     # GET /datasets/{id} only (None elsewhere): the filter sidebar opens with every field expanded and
     # computed, because the dataset's rows are few enough to filter every field at once.

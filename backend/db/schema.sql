@@ -39,25 +39,60 @@ CREATE TABLE IF NOT EXISTS datasets (
     stats_full_requests BIGINT NOT NULL DEFAULT 0,       -- bumped by each write that asks for a full recompute
     storage_config_id INTEGER,  -- FK to storage_configs(id) added below; defined here without FK
                                 -- because storage_configs is declared later in this file
-    owner_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
-    is_global BOOLEAN DEFAULT FALSE,  -- private: admins, the owner and granted users
+    owner_id INTEGER REFERENCES users(id) ON DELETE SET NULL,  -- who created it; gives no access by itself (0033)
+    is_global BOOLEAN DEFAULT FALSE,  -- private: admins and the users and groups it is shared with
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     default_view_id INTEGER,  -- the saved view the app opens on; FK to views(id) added below, after views
-    followed BOOLEAN NOT NULL DEFAULT FALSE  -- a follower instance follows it: it logs its changes
+    followed BOOLEAN NOT NULL DEFAULT FALSE,  -- a follower instance follows it: it logs its changes
+    -- (0033) The level a global dataset gives every signed-in user: 1 view, 2 tag, 3 edit. Read only while is_global;
+    -- view until a manager raises it (0033 gave the datasets already global edit).
+    everyone_level SMALLINT NOT NULL DEFAULT 1
+        CONSTRAINT datasets_everyone_level_check CHECK (everyone_level BETWEEN 1 AND 3)
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_datasets_active_name ON datasets(name) WHERE NOT deleting;
 
--- Per-user dataset access grants (only consulted when datasets.is_global = FALSE).
+-- A dataset's shares with single users, each at a level (0033): 1 view, 2 tag, 3 edit, 4 manage, each including the
+-- ones before it (backend/access.py). A user's level is the highest of their own share, their groups' shares and, for
+-- a global dataset, its everyone_level.
 CREATE TABLE IF NOT EXISTS dataset_access (
     dataset_id INTEGER NOT NULL REFERENCES datasets(id) ON DELETE CASCADE,
     user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     granted_by_user_id INTEGER REFERENCES users(id),
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    level SMALLINT NOT NULL DEFAULT 3 CONSTRAINT dataset_access_level_check CHECK (level BETWEEN 1 AND 4),
     PRIMARY KEY (dataset_id, user_id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_dataset_access_user ON dataset_access(user_id);
+
+-- (0033) Groups of users, made by admins; a user can be in several.
+CREATE TABLE IF NOT EXISTS groups (
+    id SERIAL PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE,
+    created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS group_members (
+    group_id INTEGER NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    PRIMARY KEY (group_id, user_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_group_members_user ON group_members(user_id);
+
+-- (0033) A dataset's shares with groups, at the same levels as dataset_access.
+CREATE TABLE IF NOT EXISTS dataset_group_access (
+    dataset_id INTEGER NOT NULL REFERENCES datasets(id) ON DELETE CASCADE,
+    group_id INTEGER NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+    level SMALLINT NOT NULL CONSTRAINT dataset_group_access_level_check CHECK (level BETWEEN 1 AND 4),
+    granted_by_user_id INTEGER REFERENCES users(id),
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (dataset_id, group_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_dataset_group_access_group ON dataset_group_access(group_id);
 
 -- Samples table (images)
 CREATE TABLE IF NOT EXISTS samples (
@@ -2375,6 +2410,7 @@ BEGIN
         ('duplicate_members', 'dataset'),
         ('duplicate_pending', 'dataset'),
         ('dataset_access', 'dataset'),
+        ('dataset_group_access', 'dataset'),
         ('samples', 'dataset'),
         ('dataset_fields', 'dataset'),
         ('embedding_viz_rank', 'dataset'),
@@ -3403,5 +3439,6 @@ INSERT INTO schema_migrations (filename) VALUES
     ('0029_object_parent_column.sql'),
     ('0030_object_parent_key.sql'),
     ('0031_metadata_instant.sql'),
-    ('0032_datetime_index_rebuilds.sql')
+    ('0032_datetime_index_rebuilds.sql'),
+    ('0033_access_levels.sql')
 ON CONFLICT (filename) DO NOTHING;

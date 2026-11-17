@@ -4,7 +4,9 @@ import { adminLogin, apiFetch, createFixtureDataset } from './api';
 
 // "Update this view" (Saved Views): the filters opened from a saved view (Saved Views, the default view, a ?view=
 // link) can replace that view's, once they differ from it, by its owner or an admin, after a confirm naming it. Its
-// name, link and sharing stay. Anyone else, or a mirror's copy of the primary's view, is offered only Save as new.
+// name, link and sharing stay. Another user's public view takes edit in the dataset (access levels): below it the
+// button is shown disabled and says why, as every control a level doesn't allow does. Another user's private view, or
+// a mirror's copy of the primary's view, is offered only Save as new, at any level.
 test.use({ storageState: AUTH_STATE });
 
 const AT_LEAST_2 = { field: 'idx', operator: '>=', value: 2 };
@@ -14,7 +16,8 @@ let datasetId = 0;
 
 test.beforeAll(async () => {
     cookie = await adminLogin();
-    // Its own copy of the fixture, open to every user (the second test signs in as another one).
+    // Its own copy of the fixture, open to every user at view, where a dataset made global starts (the second test
+    // signs in as another user, and sets the everyone level it needs).
     datasetId = await createFixtureDataset(cookie, `e2e-update-view-${Date.now()}`, true);
 });
 test.afterAll(async () => {
@@ -85,9 +88,17 @@ test('Update this view replaces a saved view\'s filters after a confirm naming i
     await expectTotal(page, 10);
 });
 
-test('a view shared by someone else offers only Save as new; the new view is the viewer\'s to update', async ({ browser }) => {
-    test.setTimeout(90_000);
+test('another user\'s public view can\'t be updated below edit, and says why; their private one is offered only Save as new', async ({ browser }) => {
+    test.setTimeout(120_000);
     const view = await makeView(`e2e-not-mine-${Date.now()}`);
+    // Every user's level in this global dataset is its everyone level: tag here, below the edit that another user's
+    // public view needs.
+    const everyone = async (level: string) => apiFetch(cookie, `/datasets/${datasetId}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ everyone_level: level }),
+    });
+    const before = (await apiFetch(cookie, `/datasets/${datasetId}`)).everyone_level;
+    await everyone('tag');
     const username = `e2e_update_view_${Date.now()}`;
     const password = 'E2e-Update-View-Pw-2026!';
     const user = await apiFetch(cookie, '/users', { method: 'POST', body: JSON.stringify({ username, password, role: 'power_user' }) });
@@ -104,12 +115,14 @@ test('a view shared by someone else offers only Save as new; the new view is the
         await removeLastChip(page);
         await expectTotal(page, 10);
         await page.getByRole('button', { name: 'Saved Views' }).click();
-        await expect(page.getByTestId('view-source-read-only')).toContainText(`“${view.name}”`);
-        await expect(page.getByTestId('view-source-read-only')).toContainText("isn't yours to change");
-        await expect(page.getByTestId('view-update')).toHaveCount(0);
+        await expect(page.getByTestId('view-source')).toContainText(`“${view.name}”`);
+        await expect(page.getByTestId('view-update')).toBeDisabled();
+        await expect(page.getByTestId('view-update')).toHaveAttribute('title', 'This needs edit access to the dataset');
+        await expect(page.getByTestId('view-source-read-only')).toHaveCount(0);
         // Nor does the server take it.
         const refused = await page.request.patch(`/api/datasets/${datasetId}/views/${view.id}/content`, { data: { content: { filters: {} } } });
         expect(refused.status()).toBe(403);
+        expect(await refused.json()).toEqual({ detail: 'This needs edit access to the dataset' });
 
         // Saved as new, the filters are that view's, which is theirs.
         const mine = `e2e-mine-${Date.now()}`;
@@ -124,8 +137,49 @@ test('a view shared by someone else offers only Save as new; the new view is the
         await expect(page.getByTestId('view-source')).toContainText(`“${mine}”`);
         await expect(page.getByTestId('view-update')).toBeVisible();
         expect((await apiFetch(cookie, `/views/${view.slug}`)).content.viewStages).toHaveLength(2);  // theirs unchanged
+
+        // At edit, the button is enabled and the server takes another user's public view.
+        await everyone('edit');
+        await page.goto(`/datasets/${datasetId}?view=${view.slug}`);
+        await expectTotal(page, 6);
+        await removeLastChip(page);
+        await expectTotal(page, 10);
+        await page.getByRole('button', { name: 'Saved Views' }).click();
+        await expect(page.getByTestId('view-update')).toBeEnabled();
+        await page.getByRole('button', { name: 'Close Views' }).click();
+        const taken = await page.request.patch(`/api/datasets/${datasetId}/views/${view.id}/content`, { data: { content: { filters: {} } } });
+        expect(taken.status()).toBe(200);
+
+        // Their private view, shared with this user, is still only theirs: no level changes it, so the app says it
+        // isn't theirs to change and offers Save as new.
+        const hidden = await apiFetch(cookie, `/datasets/${datasetId}/views`, {
+            method: 'POST',
+            body: JSON.stringify({
+                name: `e2e-private-${Date.now()}`,
+                is_public: false,
+                shared_with_user_ids: [user.id],
+                content: {
+                    filters: { logic: 'AND', filters: [AT_LEAST_2, UNDER_8] },
+                    viewStages: [
+                        { type: 'filter', description: 'idx ≥ 2', filter: AT_LEAST_2 },
+                        { type: 'filter', description: 'idx < 8', filter: UNDER_8 },
+                    ],
+                },
+            }),
+        });
+        const still = await page.request.patch(`/api/datasets/${datasetId}/views/${hidden.id}/content`, { data: { content: { filters: {} } } });
+        expect(still.status()).toBe(403);
+        await page.goto(`/datasets/${datasetId}?view=${hidden.slug}`);
+        await expectTotal(page, 6);
+        await removeLastChip(page);
+        await expectTotal(page, 10);
+        await page.getByRole('button', { name: 'Saved Views' }).click();
+        await expect(page.getByTestId('view-source-read-only')).toContainText(`“${hidden.name}”`);
+        await expect(page.getByTestId('view-source-read-only')).toContainText("isn't yours to change");
+        await expect(page.getByTestId('view-update')).toHaveCount(0);
     } finally {
         await ctx.close();
+        await everyone(before);  // as it was
         await apiFetch(cookie, `/users/${user.id}`, { method: 'DELETE' });
     }
 });

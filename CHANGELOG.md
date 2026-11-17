@@ -4,6 +4,94 @@ Freedom Ridge has one version for the server, the web app and the Python SDK (th
 file), following [Semantic Versioning](https://semver.org). A release lists **upgrade notes** when
 it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
 
+## 2.13.0 (2026-11-16)
+
+2.13.0 lets one server serve several teams: user groups, and a level for each share of a dataset (view, tag, edit
+or manage), checked on every write to it. Nobody loses access in the upgrade, but power users gain six actions
+that were admin-only, and a dataset made global from now on starts at view; read the upgrade notes. A dataset's
+default image field is now set in Dataset Settings, not by whoever last picked one. One migration, which touches
+no samples.
+
+### Upgrade notes
+
+- One database migration, `0033_access_levels.sql`, applied with `scripts/apply_migrations.sh` (step 4 of
+  [Upgrading](docs/UPGRADING.md)). It adds groups, a level on every share of a dataset and the everyone level of a
+  global dataset, and takes a moment: it touches only users, datasets and their shares, never samples.
+- **Nobody loses access.** Existing shares and dataset owners become edit shares, and datasets already global when
+  you upgrade get the everyone level edit, so nothing changes for them.
+- **A dataset made global after the upgrade starts at view**, including one created global from the SDK or the API
+  (`Dataset(name, is_global=True)`, `POST /api/datasets` with `"is_global": true`), which before this release let
+  every power user edit it. Pass `everyone_level="edit"` to keep it editable by every power user:
+  `Dataset(name, is_global=True, everyone_level="edit")` or `client.create_dataset(..., everyone_level="edit")`
+  (`"everyone_level": "edit"` with the API); for a dataset that exists, `set_everyone_level("edit")` or Everyone's
+  level in Dataset Settings.
+- **Power users gain six actions that were admin-only**, wherever they have edit, which after the upgrade is every
+  dataset shared with them and every dataset that was already global: delete a sample, bulk delete, delete
+  embeddings, delete unlinked objects, revert to a version, and change the dataset's display settings (description,
+  media fields, colours, the default view). **Deleting samples that no version holds can't be undone except from a
+  backup. Nor can a revert's deletion of the samples added since the version**: its undo snapshot brings back their
+  fields and tags, not their embeddings, map positions, hashes or concept scores. An admin who doesn't want every
+  power user to have these lowers a global dataset's everyone level, and its existing shares, to tag or view (in
+  Dataset Settings, or with `Dataset.set_everyone_level` and `Dataset.grant_access` from the SDK).
+- **A dataset's `owner_id` no longer gives access by itself.** The migration gives each owner an edit share, and
+  creating a dataset gives its creator one; removing that share removes their access, as for anyone else.
+- Shares, groups and everyone levels belong to each instance: they aren't synced to followers, and a follower's
+  mirrors keep their own.
+
+### Added
+
+- **User groups and access levels per dataset** ([Authentication](docs/AUTHENTICATION.md#access-levels)). A dataset
+  is shared with users and with groups, each at a level: **view** (browse, filter, search, export, compare versions,
+  save and share views), **tag** (add and remove sample tags: the `tags` field only, and a mirror's own `@local.tags`),
+  **edit** (add, change and delete samples, fields, embeddings and concepts; versions and revert; display settings;
+  anyone's public views) or **manage** (who has access and at what level, visibility and the everyone level, the
+  name, deleting versions and the dataset). A user's level is the highest of their own share, their groups' shares
+  and a global dataset's everyone level (view, tag or edit); a guest has view at most, and an administrator manage
+  everywhere. Every write to a dataset checks the caller's level there, so the SDK and API tokens follow it too, and a
+  refusal answers 403 `This needs <level> access to the dataset`. Administrators create groups and choose their
+  members under Settings → User Management; a manager shares the dataset in the Access section of Dataset Settings.
+  `GET /api/datasets` and `GET /api/datasets/{id}` answer the caller's `access_level`. Levels don't separate the
+  files samples point at: local files under `FRIDGE_DATA_ROOT`, and a bucket several teams share under different
+  prefixes, can be reached from any of their datasets; a bucket per team, with a storage configuration limited to the
+  team's datasets, is separated ([Authentication](docs/AUTHENTICATION.md#files-are-not-separated-between-teams)).
+- **The SDK shares datasets with groups and at a level** ([Python SDK](docs/SDK.md#sharing-a-dataset)):
+  `Dataset.grant_access(user_id=None, *, group=None, level=None)`, `revoke_access(user_id=None, *, group=None)`,
+  `list_access()` with `everyone_level` and `group_grants`, `set_everyone_level(level)` and the `access_level`
+  property, with the same calls on the client. `grant_access(user_id)` without a level still makes an edit share and
+  leaves an existing share's level alone, so existing scripts work unchanged. `Dataset(...)` and
+  `client.create_dataset(...)` take `everyone_level`, and `to_patches` and `sync_between_instances` give the dataset
+  they make the source's everyone level.
+- **The Groups section shows where each group has access** (Settings → User Management): each group lists the datasets
+  it is shared with and its level in each, as links, with a dataset being deleted marked. Levels are still changed in
+  the dataset's own Access section. **Several members are added at once**: Add members opens a list of the active
+  people who aren't in the group, filtered as you type, and one press adds everyone ticked.
+- **The dataset's default image field is a setting** (Dataset Settings → General, under Media Fields): "Grid opens on"
+  and "Sample view opens on", saved with the other display settings and needing edit. Both View selects mark the
+  default.
+
+### Changed
+
+- **Sharing a dataset is a manager's, no longer only an administrator's**: the access list, granting (up to manage)
+  and revoking, visibility and the everyone level, the name, deleting a version, deleting the dataset and resuming
+  its deletion need manage in the dataset. Creating a dataset, its storage configuration, patch-vector imports and
+  index reviews stay an administrator's.
+- **Stopping, resuming or discarding a job** takes manage in its dataset, or being the user who started it while they
+  still have the level it needs; anyone with edit stops a map re-fit. A patch-vector import and a mirror's sync stay
+  an administrator's. Changing, sharing or deleting another user's public view takes edit in its dataset.
+- **A compute worker claims a dataset's jobs, and keeps them, only while its owner has edit there**, no longer view: a
+  job's result is a write to the dataset. A worker whose owner drops below edit loses the job at its next heartbeat,
+  upload or completion, as when the owner's access is removed.
+- **Choosing an image field in a grid or in the sample view no longer changes the dataset's default**, for anyone,
+  administrators included: it changed it on every pick an administrator made. The choice is your own, and the
+  browser remembers it for that dataset, as it remembers the grid's sort; choosing the default again goes back to
+  following the default.
+
+### Fixed
+
+- **The dataset page opens when the browser refuses storage** (site data blocked, some private windows): it showed
+  "Something went wrong", from the embeddings panel and the panel layout reading storage unguarded. Nothing is
+  remembered there, and everything else works.
+
 ## 2.12.1 (2026-11-13)
 
 2.12.1 adds a setting for deployments that would rather keep filter text out of the address bar:

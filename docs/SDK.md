@@ -148,7 +148,20 @@ dataset = Dataset(
 
 `Dataset(name)` is load-or-create: it returns the existing dataset if one with
 that name exists, otherwise creates it. The `description`/`media_fields`
-arguments are only applied when creating.
+arguments are only applied when creating, as are `is_global` and `everyone_level`:
+a new dataset is private unless `is_global=True`, and a global one gives every
+signed-in user `everyone_level`, view unless given
+([Sharing a dataset](#sharing-a-dataset)):
+
+```python
+Dataset("street_scenes", is_global=True)                         # everyone can view it
+Dataset("street_scenes", is_global=True, everyone_level="edit")  # every power user can edit it
+```
+
+`everyone_level` given without `is_global=True` is kept for when the dataset is
+made global. Opening an existing dataset changes neither (a `UserWarning` says so
+when `is_global=True` or an `everyone_level` differs from the dataset's): use
+`set_everyone_level` on it.
 
 #### Loading an Existing Dataset
 
@@ -208,7 +221,7 @@ dataset.add_samples(samples)
 Load the target with `Dataset.from_id(dataset_id)` or an explicit lookup of an
 existing dataset. `Dataset(name)` creates it if absent, so a typo can redirect
 ingest into a new dataset. Creating a dataset needs an `admin` token; adding samples
-to an existing one needs `power_user` or `admin`.
+to an existing one needs edit in it ([Sharing a dataset](#sharing-a-dataset)).
 
 Use `dataset.add_samples(batch, on_duplicate="skip")` on the **first attempt and
 every retry**. Keep each sample's `filepath` stable (for S3, use the same
@@ -495,7 +508,7 @@ per field name, for every dataset.
 ##### Deleting a dataset
 
 ```python
-dataset.delete()   # admin only; waits for the server deletion job
+dataset.delete()   # needs manage; waits for the server deletion job
 ```
 
 Deletion runs as a durable server job (the API answers 202). `delete()` waits for
@@ -754,6 +767,9 @@ sample.quality_score = 9.5
 sample.save()
 ```
 
+`save()` always sends the sample's metadata, so it needs edit in the dataset. With tag only, change
+tags with `tag_samples` and `untag_samples` (below), which need tag.
+
 ### Bulk Tagging
 
 ```python
@@ -778,6 +794,71 @@ dataset.set_values(view.ids(), "reviewed", True)
 # Set a DIFFERENT value per sample (e.g. scores)
 dataset.set_values_per_sample("priority", {12: 0.9, 15: 0.3, 21: 0.7})
 ```
+
+## Sharing a dataset
+
+A dataset is shared with users and with groups, each at a level: `"view"`, `"tag"`, `"edit"` or
+`"manage"`, each including the ones before it ([Access levels](AUTHENTICATION.md#access-levels)). These
+calls need manage in the dataset. A refusal raises `requests.HTTPError` with the server's reason, such as
+`This needs manage access to the dataset`.
+
+```python
+ds = Dataset.from_id(12)
+
+ds.grant_access(group="team-2", level="view")   # a group, by name: browse and export, no changes
+ds.grant_access(17, level="tag")                # a collaborator (user id 17): tags, nothing more
+ds.grant_access(17)                             # no level: a new share is edit, an existing one keeps its level
+
+ds.list_access()
+# {"is_global": False, "everyone_level": "view",
+#  "grants": [{"user_id": 17, "username": "ada", "level": "tag", ...}],
+#  "group_grants": [{"group_id": 3, "name": "team-2", "level": "view", ...}]}
+
+ds.revoke_access(17)
+ds.revoke_access(group="team-2")                # a group with no share here: nothing to do
+
+ds.set_everyone_level("view")                   # global: every signed-in user can view it
+ds.set_everyone_level(None)                     # private again; the shares stay
+
+ds.access_level                                 # your own level here, such as "manage"
+```
+
+- `grant_access(user_id=None, *, group=None, level=None)` takes exactly one of `user_id` and `group`
+  (a group's name). Without `level`, a new share is edit and an existing share keeps its level, so
+  `grant_access(user_id)` does what it did before levels. Granting again with a level sets that level,
+  a lower one too. It returns the share: `dataset_id`, `user_id` (or `group_id` and `group`) and `level`.
+- `list_access()` returns `is_global`, `everyone_level` (what the dataset gives every signed-in user
+  while it is global), `grants` and `group_grants`. A user's share has `user_id`, `username`, `email`
+  (in an administrator's answer only, otherwise `None`), `role`, `level`, `granted_by_user_id`,
+  `granted_by_username` and `created_at`; a group's share has `group_id`, `name`, `level`,
+  `granted_by_user_id`, `granted_by_username` and `created_at`.
+- `revoke_access(user_id=None, *, group=None)` removes only that share: the user can still reach the
+  dataset through a group's share or the everyone level.
+- `set_everyone_level(level)`: `"view"`, `"tag"` or `"edit"` makes the dataset global at that level, and
+  `None` makes it private. `Dataset(name, is_global=True)` creates a dataset that is global at view, and
+  `Dataset(name, is_global=True, everyone_level="edit")` one that every power user can edit, as a global
+  dataset was before levels (`client.create_dataset(..., everyone_level=...)` too). An everyone level
+  other than view, tag or edit raises `ValueError` before anything is sent.
+  `client.update_dataset(id, is_global=...)` still works, and keeps the dataset's everyone level: view
+  unless a manager set another.
+- `access_level` asks the server each time, so it counts a share changed since the dataset was loaded.
+  An administrator has manage everywhere, a guest view at most.
+- A wrong combination (both or neither of `user_id` and `group`) or an unknown level raises `ValueError`
+  before anything is sent.
+- Administrators create groups and choose their members in the app (Settings → User Management); the
+  SDK doesn't manage users or groups.
+- The client has the same calls: `client.grant_dataset_access(dataset_id, user_id=None, *, group=None,
+  level=None)`, `client.revoke_dataset_access(dataset_id, user_id=None, *, group=None)`,
+  `client.list_dataset_access(dataset_id)` and `client.set_dataset_everyone_level(dataset_id, level)`.
+- A server older than access levels would ignore a level. A grant at view, tag or manage, and
+  `set_everyone_level("view")` or `("tag")`, first read the dataset (`GET /api/datasets/{id}`): only a
+  server with levels answers its `access_level`, and on another one the call raises `RuntimeError`
+  before anything changes. A grant without a level or at edit, and `set_everyone_level("edit")` or
+  `(None)`, send no extra request: an older server does the same with them. A dataset can't be read
+  before it exists, so creating one global at view or tag takes two requests: it is created private at
+  that level, then made global (`PATCH {"is_global": true}`) once the answer shows a server with levels
+  (it names `everyone_level`). On an older server the call raises `RuntimeError` instead, and the new
+  dataset stays, empty and private: it is never global there. Every other create is one request.
 
 ---
 
@@ -958,7 +1039,7 @@ drawn:
   `"#rrggbb"` colour to get a legend.
 
 Class names and colours are dataset settings, stored in `segmentation_config`
-(admin; the SDK call below is `PATCH /api/datasets/{id}`):
+(edit; the SDK call below is `PATCH /api/datasets/{id}`):
 
 ```python
 sample = Sample("/data/images/img_001.jpg")
@@ -1404,7 +1485,7 @@ Redraw the lasso in the app (and save the view again), or remove it. To make the
 ### Deleting a field's vectors
 
 `delete_embeddings(field, sample_ids, *, wait=True, timeout=1800)` removes one embedding field's
-vectors and nothing else (admin only). Use it to recompute a model's vectors for chosen samples: delete
+vectors and nothing else (needs edit). Use it to recompute a model's vectors for chosen samples: delete
 them, list the cleared samples with `missing()`, upload new vectors.
 
 ```python
@@ -1748,11 +1829,11 @@ atomically saving an undo snapshot first. By default it preserves current sample
 and leaves the dataset's settings as they are. It never restores embeddings or image-hash
 values. Use checkout or the snapshot browser for the exact historical dataset view.
 
-Reverting takes an `admin` (HTTP 403 otherwise): it can delete the samples added since a
-version, rewrite or remove public saved views whoever made them, and restore the dataset's
-settings, each of which takes an admin on its own. Deleting a version takes an `admin` too: it
-can't be brought back. Everyone with access to the dataset, guests included, can list, browse
-and compare its versions, and making one takes a `power_user`.
+Reverting needs edit in the dataset (HTTP 403 `This needs edit access to the dataset`
+otherwise): it can delete the samples added since a version, rewrite or remove public saved
+views whoever made them, and restore the dataset's settings, each of which needs edit on its
+own. Deleting a version needs manage: it can't be brought back. Everyone with access to the
+dataset, guests included, can list, browse and compare its versions, and making one needs edit.
 
 A recorded view comes back under its name with its filters: a public view of that name is
 given them, and one deleted since is made again, with the link it had when that is still free.
@@ -1786,7 +1867,7 @@ the dataset is that version again. Before it runs, it asks with the numbers coun
 moment: how many samples and public saved views it deletes and restores, and whether one of the
 deleted views is the one the dataset opens on. Two checkboxes above the list change what it
 does: one keeps what was added since (the button then reads **Restore sample data**), the
-other also restores the settings. For anyone but an admin the button is disabled and says why.
+other also restores the settings. For anyone without edit in the dataset the button is disabled and says why.
 
 `exact_membership=True` also restores deleted samples and removes later additions, samples
 and public saved views alike; it is an explicit destructive operation. An image added since the version goes with its
@@ -2129,7 +2210,8 @@ print(f"Found {result['total']} samples in San Francisco")
 class Dataset:
     # Creation and loading
     def __init__(name: str, description: str = None, media_fields: list[str] = None,
-                 storage_config_id: int = None, is_global: bool = False)  # load-or-create by name; new datasets are private
+                 storage_config_id: int = None, is_global: bool = False,
+                 everyone_level: str = None)  # load-or-create by name; new datasets are private
     @classmethod
     def from_id(dataset_id: int) -> Dataset  # load existing by id (no create)
 
@@ -2139,6 +2221,7 @@ class Dataset:
     description: str | None
     media_fields: list[str] | None
     created_at: str | None   # ISO-8601
+    access_level: str | None  # your level here: "view", "tag", "edit" or "manage" (asks the server)
 
     # Sample operations
     def add_samples(samples: list[Sample], on_duplicate="error", *, replace_tags=False) -> dict  # {"ids": [...]}
@@ -2148,7 +2231,7 @@ class Dataset:
     def get_or_create(filepath: str, **kwargs) -> tuple[Sample, bool]
     def __getitem__(filepath: str) -> Sample            # dataset["/path/img.jpg"]
     # No __len__: use dataset.all().count()
-    def delete(*, wait=True, timeout=1800) -> dict | Job          # admin only; a server job
+    def delete(*, wait=True, timeout=1800) -> dict | Job          # needs manage; a server job
     def resume_deletion(*, wait=True, timeout=1800) -> dict | Job
 
     # Querying (returns DatasetView)
@@ -2163,18 +2246,18 @@ class Dataset:
     def tag_samples(sample_ids: list[int], tags: list[str], *, wait=True, timeout=1800) -> dict | Job
     def untag_samples(sample_ids: list[int], tags: list[str], *, wait=True, timeout=1800) -> dict | Job
     def set_values(sample_ids: list[int], field: str, value: Any, *, wait=True, timeout=1800) -> int | Job
-    # admin only. Deleting an image deletes its object samples: the result's deleted_count counts the samples
+    # needs edit. Deleting an image deletes its object samples: the result's deleted_count counts the samples
     # targeted, objects_deleted the objects that went with their images. A bulk delete deletes an image's objects
     # even when its filter or excluded_ids left them out, and counts them in objects_deleted.
     def delete_samples(sample_ids, *, wait=True, timeout=1800) -> dict | Job
     # Objects with no image (docs/OBJECT_PATCH_VIEW.md): counts by kind, a view of them, and deleting the kinds named
-    # (admin; by default only those whose image is gone; refused on a mirror)
+    # (edit; by default only those whose image is gone; refused on a mirror)
     def unlinked_objects() -> dict      # {'total', 'kinds': {...}, 'linkable', 'linked', 'mirror', 'filter'}
     def unlinked_objects_view(kinds: list[str] | None = None) -> DatasetView
     def delete_unlinked_objects(kinds=('image_gone',), *, wait=True, timeout=1800) -> dict | Job
     # One embedding field's vectors only; see "Deleting a field's vectors". sample_ids: a list or a view
-    def delete_embeddings(field, sample_ids, *, wait=True, timeout=1800) -> dict | Job   # admin only
-    def delete_embedding_field(field, *, wait=True, timeout=1800) -> dict | Job   # every sample; admin only
+    def delete_embeddings(field, sample_ids, *, wait=True, timeout=1800) -> dict | Job   # needs edit
+    def delete_embedding_field(field, *, wait=True, timeout=1800) -> dict | Job   # every sample; needs edit
     # Requests of at most 5,000 patches, each waited in turn; wait=False returns one Job per batch
     # (a single Job for one batch). Completed batches stay applied if a later one fails.
     def set_values_per_sample(field: str, values_by_id: dict[int, Any], batch_size=5000, *, wait=True,
@@ -2251,6 +2334,12 @@ class Dataset:
     def version(version_name: str = None, version_id: int = None) -> VersionView  # queryable, read-only
     def revert(version_name: str = None, version_id: int = None, restore_deleted: bool = False,
                exact_membership: bool = False, restore_settings: bool = False) -> dict
+
+    # Access (needs manage); see "Sharing a dataset"
+    def grant_access(user_id: int = None, *, group: str = None, level: str = None) -> dict
+    def revoke_access(user_id: int = None, *, group: str = None) -> None
+    def list_access() -> dict   # {"is_global", "everyone_level", "grants", "group_grants"}
+    def set_everyone_level(level: str | None) -> None   # "view" | "tag" | "edit": global; None: private
 ```
 
 ### DatasetView Class

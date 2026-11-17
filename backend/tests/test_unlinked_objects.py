@@ -8,7 +8,7 @@ import os
 import pytest
 from fastapi import HTTPException
 
-from backend import index_advisor, unlinked_objects
+from backend import access, index_advisor, unlinked_objects
 from backend.routers import datasets, versions
 from backend.tests import test_bulk_jobs
 from backend.tests import test_field_registry_postgres as registry_helpers
@@ -16,7 +16,7 @@ from backend.tests.test_object_parent_column import add, column, ids
 
 registry_database = registry_helpers.registry_database
 USER = registry_helpers.USER
-VIEWER = {**USER, 'role': 'viewer'}
+VIEWER = {'id': 30, 'role': 'power_user', 'username': 'viewer'}  # at view in dataset 1 (the finder test sets it)
 pytestmark = pytest.mark.skipif(
     not os.getenv('FRIDGE_TEST_POSTGRES_DSN'),
     reason='Requires an isolated PostgreSQL/PostGIS test database',
@@ -64,10 +64,13 @@ async def matching(database, node) -> list:
     return sorted(sample['id'] for sample in response['items'])
 
 
-def test_the_finder_counts_each_kind_links_what_it_can_and_its_filter_shows_them(registry_database):
+def test_the_finder_counts_each_kind_links_what_it_can_and_its_filter_shows_them(registry_database, monkeypatch):
     async def scenario(database):
         found = await every_kind(database)
-        # Someone who can't edit the dataset sees the object waiting for its link, apart.
+        # Someone who can't edit the dataset (at view: its everyone level) sees the object waiting for its link, apart.
+        monkeypatch.setattr(access, 'db', database)
+        await database.execute("INSERT INTO users (id, username, role) VALUES (30, 'viewer', 'power_user')")
+        await database.execute('UPDATE datasets SET everyone_level = 1 WHERE id = 1')
         report = await datasets.find_unlinked_objects(1, VIEWER)
         assert (report['kinds'], report['total'], report['linkable'], report['linked']) == (EVERY_KIND, 9, 1, 0)
         assert await column(database, found['linkable']) == [None]

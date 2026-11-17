@@ -17,7 +17,7 @@ import secrets
 import shlex
 from datetime import datetime, timedelta, timezone
 
-from .access import filter_datasets_for_user
+from .access import level_number, level_select
 from .crypto import decrypt_secret, hash_token
 from .version import VERSION
 
@@ -320,7 +320,7 @@ async def waiting_jobs(pool, settings) -> list:
 async def free_workers(pool, waiting: list) -> int:
     """Online compute workers without a job that could claim one of the `waiting` jobs, by the claim route's rules
     (routers/workers.py): an active admin's worker takes any job, a power user's only a job on a dataset its owner
-    can access. A power user's own worker mustn't hold back a machine for a job it can never take."""
+    may edit. A power user's own worker mustn't hold back a machine for a job it can never take."""
     workers = await pool.fetch(
         """SELECT w.user_id, u.role FROM workers w JOIN users u ON u.id = w.user_id
            WHERE w.placement = 'compute' AND w.current_job_id IS NULL
@@ -337,11 +337,12 @@ async def free_workers(pool, waiting: list) -> int:
             continue
         if not dataset_ids:  # a job on no dataset is for an admin's worker only
             continue
-        where, args = await filter_datasets_for_user({'id': worker['user_id'], 'role': worker['role']})
+        level_sql, args = level_select({'id': worker['user_id'], 'role': worker['role']}, 2)
+        editable = f"{level_sql} >= {level_number('edit')}"
         if await pool.fetchval(
-            f'SELECT EXISTS (SELECT 1 FROM datasets WHERE id = ANY(${len(args) + 1}::int[]) AND {where})',
-            *args,
+            f'SELECT EXISTS (SELECT 1 FROM datasets WHERE id = ANY($1::int[]) AND {editable})',
             dataset_ids,
+            *args,
         ):
             free += 1
     return free

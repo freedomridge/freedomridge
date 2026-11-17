@@ -5,8 +5,8 @@ import * as Dialog from '@radix-ui/react-dialog';
 import { Cross2Icon } from '@radix-ui/react-icons';
 import { keepPreviousData, useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { buildAnnIndex, discardBulkJob, getDatasetJobHistory, getGlobalJobs, resumeBulkJob, type JobRecord, type JobRecordPage } from '@/lib/api';
-import { useUser } from '@/contexts/UserContext';
 import { canRetryIndexBuild, notRebuilt, waitingNote } from '@/lib/job-status';
+import { refusal, type AccessLevel } from '@/lib/access-level';
 import { jobName } from '@/components/dataset-jobs';
 import { DatasetSchedules } from '@/components/dataset-schedules';
 
@@ -59,8 +59,7 @@ export function BulkJobOutcome({ job, canResume, resume, discard, pending }: {
     </p>;
 }
 
-function JobHistoryItem({ job, listed }: { job: JobRecord; listed: JobRecord[] }) {
-    const { user } = useUser();
+function JobHistoryItem({ job, listed, level }: { job: JobRecord; listed: JobRecord[]; level?: AccessLevel | null }) {
     const queryClient = useQueryClient();
     const resume = useMutation({
         mutationFn: () => resumeBulkJob(job.id),
@@ -75,7 +74,8 @@ function JobHistoryItem({ job, listed }: { job: JobRecord; listed: JobRecord[] }
             queryClient.invalidateQueries({ queryKey: ['dataset-job-history', job.dataset_id] });
         },
     });
-    const canResume = user?.role === 'admin' || (user?.role === 'power_user' && user?.id === job.created_by);
+    // The server says who may (can_control, routers/jobs.py): hidden otherwise, as Cancel is in the running list.
+    const canResume = job.can_control === true;
     const retry = useMutation({
         mutationFn: () => buildAnnIndex(job.dataset_id as number, job.field as string),
         onSuccess: () => {
@@ -84,7 +84,8 @@ function JobHistoryItem({ job, listed }: { job: JobRecord; listed: JobRecord[] }
             queryClient.invalidateQueries({ queryKey: ['global-jobs'] });
         },
     });
-    const canRetry = canRetryIndexBuild(job, listed, user?.role);
+    const canRetry = canRetryIndexBuild(job, listed);
+    const retryRefusal = refusal(level, 'edit');  // building a vector index takes edit in its dataset
     const unbuilt = notRebuilt(job);
     const state = job.state === 'running' && job.cancel_requested
         ? { label: 'Cancelling', tone: STATE.cancelled.tone }
@@ -120,7 +121,7 @@ function JobHistoryItem({ job, listed }: { job: JobRecord; listed: JobRecord[] }
             )}
             {canRetry && (
                 <p className="mt-1 text-xs text-zinc-400">
-                    <button className="underline hover:text-white" disabled={retry.isPending} onClick={() => retry.mutate()} data-testid="job-retry-index">
+                    <button className="underline hover:text-white disabled:opacity-60 disabled:cursor-not-allowed disabled:hover:text-zinc-400" disabled={retry.isPending || !!retryRefusal} title={retryRefusal} onClick={() => retry.mutate()} data-testid="job-retry-index">
                         {retry.isPending ? 'Starting…' : 'Retry'}
                     </button>{' '}building this index
                 </p>
@@ -134,11 +135,12 @@ function JobHistoryItem({ job, listed }: { job: JobRecord; listed: JobRecord[] }
     );
 }
 
-export function JobHistoryList({ queryKey, fetchPage, emptyText, poll = false }: {
+export function JobHistoryList({ queryKey, fetchPage, emptyText, poll = false, level = null }: {
     queryKey: readonly unknown[];
     fetchPage: (cursor?: string) => Promise<JobRecordPage>;
     emptyText: string;
     poll?: boolean;
+    level?: AccessLevel | null;  // the user's level in the jobs' dataset
 }) {
     const [cursors, setCursors] = useState<string[]>([]);
     const cursor = cursors.at(-1);
@@ -164,7 +166,7 @@ export function JobHistoryList({ queryKey, fetchPage, emptyText, poll = false }:
     return (
         <div data-testid="job-history">
             {page.data.items.length ? (
-                <ul>{page.data.items.map(job => <JobHistoryItem key={job.id} job={job} listed={page.data.items} />)}</ul>
+                <ul>{page.data.items.map(job => <JobHistoryItem key={job.id} job={job} listed={page.data.items} level={level} />)}</ul>
             ) : (
                 <p className="text-sm text-zinc-500">{cursor ? 'No older jobs.' : emptyText}</p>
             )}
@@ -187,8 +189,9 @@ export function JobHistoryList({ queryKey, fetchPage, emptyText, poll = false }:
 }
 
 // Dialog content unmounts while closed, so history and schedules are only fetched and polled while open.
-export function DatasetJobHistoryDialog({ datasetId, open, onOpenChange }: {
+export function DatasetJobHistoryDialog({ datasetId, level = null, open, onOpenChange }: {
     datasetId: number;
+    level?: AccessLevel | null;  // the user's level in the dataset
     open: boolean;
     onOpenChange: (open: boolean) => void;
 }) {
@@ -229,8 +232,9 @@ export function DatasetJobHistoryDialog({ datasetId, open, onOpenChange }: {
                                 fetchPage={cursor => getDatasetJobHistory(datasetId, cursor)}
                                 emptyText="No jobs have run on this dataset yet."
                                 poll
+                                level={level}
                             />
-                        ) : <DatasetSchedules datasetId={datasetId} />}
+                        ) : <DatasetSchedules datasetId={datasetId} level={level} />}
                     </div>
                 </Dialog.Content>
             </Dialog.Portal>

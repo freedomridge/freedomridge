@@ -22,7 +22,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 from .. import job_queue, job_wait
-from ..access import require_dataset_access
+from ..access import require_dataset_access, require_level
 from ..database import db
 from ..field_registry import (
     REQUEST_FULL_REFRESH,
@@ -32,7 +32,6 @@ from ..field_registry import (
     register_fields,
 )
 from ..index_jobs import submit_ann_index, valid_hnsw_index
-from .auth import require_role
 
 router = APIRouter(
     prefix="/datasets/{id}/quality",
@@ -92,7 +91,7 @@ class AnnIndexRequest(BaseModel):
 async def build_ann_index(
     id: int,
     request: AnnIndexRequest,
-    user: dict = Depends(require_role("power_user")),
+    user: dict = Depends(require_level("edit")),
     wait: bool = True,
 ):
     """Build the per-field HNSW index server-side, as a runner job (backend.index_jobs).
@@ -132,7 +131,7 @@ class UniquenessRequest(BaseModel):
 
 
 @router.post("/uniqueness/compute")
-async def uniqueness_compute(id: int, request: UniquenessRequest, user: dict = Depends(require_role("power_user"))):
+async def uniqueness_compute(id: int, request: UniquenessRequest, user: dict = Depends(require_level("edit"))):
     """Write the RAW mean-k-NN cosine distance for one keyset chunk of samples.
 
     Loop with after_id = last_id until processed < chunk, then /range + /normalize.
@@ -227,7 +226,7 @@ class RepresentativenessComputeRequest(BaseModel):
 async def representativeness_compute(
     id: int,
     request: RepresentativenessComputeRequest,
-    user: dict = Depends(require_role("power_user")),
+    user: dict = Depends(require_level("edit")),
 ):
     """Write RAW cosine similarity to the centroid for one keyset chunk. No ANN
     index needed (plain scan), so no guard. Loop, then /range + /normalize."""
@@ -303,7 +302,7 @@ class NormalizeRequest(BaseModel):
 
 
 @router.post("/normalize")
-async def normalize(id: int, request: NormalizeRequest, user: dict = Depends(require_role("power_user"))):
+async def normalize(id: int, request: NormalizeRequest, user: dict = Depends(require_level("edit"))):
     """Rewrite metadata_field in place to (raw - lo)/span for one keyset chunk."""
     chunk = max(1, min(200000, int(request.chunk)))
     span = request.span if request.span and request.span > 0 else None
@@ -362,7 +361,7 @@ class DuplicatesComputeRequest(BaseModel):
 async def duplicates_compute(
     id: int,
     request: DuplicatesComputeRequest,
-    user: dict = Depends(require_role("power_user")),
+    user: dict = Depends(require_level("edit")),
 ):
     """Stream candidate near-duplicate pairs (HNSW top-k within `thresh`) for one
     keyset chunk into quality_dup_pairs[token]. Loop, then /duplicates/finalize."""
@@ -421,7 +420,7 @@ class DuplicatesFinalizeRequest(BaseModel):
 async def duplicates_finalize(
     id: int,
     request: DuplicatesFinalizeRequest,
-    user: dict = Depends(require_role("power_user")),
+    user: dict = Depends(require_level("edit")),
 ):
     """Union-find the staged pairs into groups and write the group id back to
     samples.metadata[group_field]. Returns {total_groups, total_duplicate_samples}."""

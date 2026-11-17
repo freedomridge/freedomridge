@@ -5,6 +5,7 @@ import { useQuery, useInfiniteQuery, useQueryClient } from '@tanstack/react-quer
 import { getHashStats, findDuplicates, getSamples, getDuplicateCount, refreshDuplicates, notifySamplesMutated, type Sample, type ComplexFilter, type ViewStage } from '@/lib/api';
 import { getSampleMediaUrl } from '@/lib/media-utils';
 import { useFilters, withGrain } from '@/contexts/FilterContext';
+import { refusal, type AccessLevel } from '@/lib/access-level';
 
 interface Props {
     datasetId: number;
@@ -13,11 +14,12 @@ interface Props {
      onToggleSelection?: (id: number) => void;
     selectedIds?: number[];
     hasObjects?: boolean;
+    level?: AccessLevel | null;  // the user's level in the dataset: rebuilding a collapse set takes edit
 }
 
 const PAGE_SIZE = 20;
 
-export function DuplicatesPanel({ datasetId, onSelection, onSampleClick, onToggleSelection, selectedIds = [], hasObjects = false }: Props) {
+export function DuplicatesPanel({ datasetId, onSelection, onSampleClick, onToggleSelection, selectedIds = [], hasObjects = false, level = null }: Props) {
     const [hashField, setHashField] = useState('');
     const queryClient = useQueryClient();
     const [rebuilding, setRebuilding] = useState(false);
@@ -215,8 +217,8 @@ export function DuplicatesPanel({ datasetId, onSelection, onSampleClick, onToggl
                         {collapseConfig && (
                             <button
                                 data-testid="dup-collapse-rebuild"
-                                disabled={rebuilding}
-                                title="Rebuild this collapse set; background jobs maintain it as hashes change"
+                                disabled={rebuilding || !!refusal(level, 'edit')}
+                                title={refusal(level, 'edit') ?? 'Rebuild this collapse set; background jobs maintain it as hashes change'}
                                 className="text-zinc-400 hover:text-white border border-zinc-700 rounded px-2 py-0.5 disabled:opacity-50"
                                 onClick={async () => {
                                     setRebuilding(true);

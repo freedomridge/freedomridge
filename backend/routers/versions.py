@@ -13,14 +13,13 @@ import asyncpg
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import AwareDatetime, BaseModel
 
-from ..access import require_dataset_access
+from ..access import require_dataset_access, require_level
 from ..database import db
 from ..diskspace import estimate_snapshot_bytes, require_free_space
 from ..field_registry import LOCAL_PREFIX, REQUEST_FULL_REFRESH, _value_names, lock_field_lifecycle
 from ..label_fields import DISCOVERY_TYPES, LEGACY_LABEL_FIELDS, DatasetArrayColumns, label_context
 from ..request_limits import guest_heavy
 from ..validation import clean_name
-from .auth import require_role
 from .datasets import (
     AggregationSpec,
     _derived_field,
@@ -699,7 +698,7 @@ _CREATE_RETRY_DELAYS = (0.1, 0.2)
 
 
 @router.post("")
-async def post_version(id: int, request: CreateVersionRequest, user: dict = Depends(require_role("power_user"))):
+async def post_version(id: int, request: CreateVersionRequest, user: dict = Depends(require_level("edit"))):
     """Create a version, made by the requesting user unless the request says who made it."""
     return await create_version(id, request, user.get('username'))
 
@@ -1216,8 +1215,8 @@ async def query_version_samples(id: int, version_id: int, request: VersionSample
     return {"items": items}
 
 
-# An admin: a deleted version can't be brought back, and it is the record of what the dataset was.
-@router.delete("/{version_id}", dependencies=[Depends(require_role("admin"))])
+# Manage: a deleted version can't be brought back, and it is the record of what the dataset was.
+@router.delete("/{version_id}", dependencies=[Depends(require_level("manage"))])
 async def delete_version(id: int, version_id: int):
     """Delete a version and its snapshot data."""
     row = await db.fetchrow(
@@ -1536,10 +1535,10 @@ async def revert_to_version(
     id: int,
     version_id: int,
     restore_deleted: bool = False,
-    # An admin: a revert can do what only an admin may do one at a time. It deletes the samples added since
-    # (exact_membership), rewrites or removes public views whoever owns them, and can change the dataset's
-    # settings (restore_settings).
-    user: dict = Depends(require_role("admin")),
+    # Edit: a revert does what edit allows one at a time. It deletes the samples added since (exact_membership),
+    # rewrites or removes public views whoever owns them, and can change the dataset's display settings
+    # (restore_settings).
+    user: dict = Depends(require_level("edit")),
     exact_membership: bool = False,
     restore_settings: bool = False,
 ):

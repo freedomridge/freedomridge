@@ -1,6 +1,6 @@
 """A signed-in user who can't open a dataset could tell which sample, view and job ids exist in it: a missing id
-answered 404 and one in that dataset 403 (check_dataset_access). Both answer the same 404 now, and a user who can open
-the dataset gets what they got before."""
+answered 404 and one in that dataset 403 (check_dataset_access). Both answer the same 404 now. A user who can open the
+dataset sees the row, so what they may do with it is answered as before, by their level: here view."""
 
 import asyncio
 import os
@@ -27,24 +27,21 @@ CALLER = {'id': 20, 'role': 'power_user'}
 # (method, path, module whose db finds the row, the row) for every endpoint that finds a row by its own id.
 ENDPOINTS = {
     'sample media': ('GET', '/api/samples/7/media', main, {'dataset_id': 2, 'path': None}),
-    'view deletion': ('DELETE', '/api/views/7', views, {'user_id': OWNER, 'dataset_id': 2}),
+    'view deletion': ('DELETE', '/api/views/7', views, {'user_id': OWNER, 'dataset_id': 2, 'is_public': False}),
     'job': ('GET', f'/api/jobs/{JOB_ID}', jobs, job_row(dataset_id=2, created_by=OWNER)),
     'job cancel': ('POST', f'/api/jobs/{JOB_ID}/cancel', jobs, job_row(dataset_id=2, created_by=OWNER)),
     'job resume': ('POST', f'/api/jobs/{JOB_ID}/resume', jobs, job_row(dataset_id=2, created_by=OWNER)),
     'job discard': ('POST', f'/api/jobs/{JOB_ID}/discard', jobs, job_row(dataset_id=2, created_by=OWNER)),
 }
-# What the caller gets once they may open the dataset: as before this change.
+# What the caller gets once they may open the dataset (at view): another user's private view is its owner's, and
+# another user's job needs manage.
 WITH_ACCESS = {
     'sample media': (404, "Sample 7 has no value for field 'filepath'"),
     'view deletion': (403, 'Not authorized to delete this view'),
     'job': (200, None),
-    'job cancel': (
-        403,
-        'Only an administrator or the submitting power user can cancel a job '
-        '(power users can also cancel map re-fits in their datasets)',
-    ),
-    'job resume': (403, 'Only an administrator or the submitting power user can resume a job'),
-    'job discard': (403, 'Only an administrator or the submitting power user can discard a job'),
+    'job cancel': (403, 'This needs manage access to the dataset'),
+    'job resume': (403, 'This needs manage access to the dataset'),
+    'job discard': (403, 'This needs manage access to the dataset'),
 }
 
 
@@ -101,7 +98,7 @@ def test_a_user_who_can_open_the_dataset_is_unaffected(ask, endpoint):
 
 def test_a_follower_deleting_a_view_it_did_not_make_still_hears_why(monkeypatch):
     """The followers router authorizes a follower's request by the dataset it follows, not its account's access."""
-    monkeypatch.setattr(views, 'db', Rows({'user_id': OWNER, 'dataset_id': 2}))
+    monkeypatch.setattr(views, 'db', Rows({'user_id': OWNER, 'dataset_id': 2, 'is_public': False}))
     checked = AsyncMock(side_effect=AssertionError('a follower is not asked for dataset access'))
     monkeypatch.setattr(views, 'check_dataset_access', checked)
     with pytest.raises(HTTPException) as refused:

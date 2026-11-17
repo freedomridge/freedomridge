@@ -1,6 +1,7 @@
 // The saved view the applied filters came from: opened from Saved Views, as the dataset's default view, or from a
 // `?view=` link. While the stages differ from the view's as it was opened (a stale lasso redrawn, a filter added), its
-// owner or an admin can replace the view's filters with them ("Update this view"); anyone can still save a new one.
+// owner, an admin, or (a public view) anyone with edit in the dataset can replace the view's filters with them ("Update
+// this view"); anyone can still save a new one.
 import type { ViewStage } from './api';
 
 export interface SourceView {
@@ -69,7 +70,13 @@ export function stagesToSave(stages: ViewStage[]): ViewStage[] {
     return stages.map(saved);
 }
 
-/** Who may replace a view's filters: its owner or an admin, as for deleting or sharing it; never a mirror's copy. */
-export function mayUpdateView(source: SourceView | null, user: { id: number; role: string } | null | undefined): boolean {
-    return !!source && !!user && !source.fromPrimary && (source.userId === user.id || user.role === 'admin');
+/** Who may replace a view's filters, as for deleting or sharing it: its owner, an admin, or for a public view whoever has
+ * edit in its dataset (`datasetEdit`); never a mirror's copy. */
+export function mayUpdateView(
+    source: SourceView | null,
+    user: { id: number; role: string } | null | undefined,
+    datasetEdit = false,
+): boolean {
+    return !!source && !!user && !source.fromPrimary
+        && (source.userId === user.id || user.role === 'admin' || (!!source.isPublic && datasetEdit));
 }

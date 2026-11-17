@@ -8,11 +8,15 @@ Usage (requires FRIDGE_TEST_URL pointing to a disposable backend):
 """
 
 import sys
+import tempfile
 import traceback
+
+import requests
 
 from fridge import ClassProbabilities, Dataset, DatasetView, Sample, connect, geo_within, threshold_rule
 from fridge._test_safety import require_test_url
-from fridge.core.client import get_client
+from fridge.core import client as client_module
+from fridge.core.client import Client, get_client
 
 PASS = 0
 FAIL = 0
@@ -2114,6 +2118,8 @@ def run_tests():
 
     _()
 
+    _run_access_tests(client)
+
     # --- CLEANUP ---
     print("\n--- Cleanup ---")
     client.delete_dataset(ds._id)
@@ -2128,6 +2134,612 @@ def run_tests():
             print(f"  {name}: {err}")
     print("=" * 60)
     return FAIL == 0
+
+
+# =========================================================================
+# ACCESS LEVELS
+# A dataset is shared with users and groups at a level, view < tag < edit < manage; a global dataset gives every
+# signed-in user its everyone level; Dataset.access_level is the caller's own level. These run on their own private
+# dataset, with power users and a group the admin makes over HTTP (the SDK has no user or group management), and
+# check what the server stores over HTTP too, so a check doesn't lean on the SDK method it tests.
+# =========================================================================
+ACCESS_DATASET = 'sdk-test-access'
+# Datasets made global by the SDK without a level, to see where they start (view); deleted with the rest.
+ACCESS_OPEN_DATASETS = ('sdk-test-access-open', 'sdk-test-access-opened')
+# Datasets made with an everyone level, and patch datasets with their sources; deleted with the rest.
+ACCESS_LEVEL_DATASETS = {
+    'edit': 'sdk-test-access-at-edit',
+    'held': 'sdk-test-access-held-at-tag',
+    'made': 'sdk-test-access-made-at-tag',
+    'refused': 'sdk-test-access-refused-level',
+    **{f'source-{kind}': f'sdk-test-access-patch-source-{kind}' for kind in ('edit', 'view', 'private')},
+    **{f'patches-{kind}': f'sdk-test-access-patches-{kind}' for kind in ('edit', 'view', 'private')},
+}
+ACCESS_GROUP = 'sdk-acc-team'
+ACCESS_USERS = {'alice': 'sdk_acc_alice', 'bob': 'sdk_acc_bob', 'carol': 'sdk_acc_carol', 'dave': 'sdk_acc_dave'}
+ACCESS_PASSWORD = 'sdk-access-pass-1'
+LEVELS = ('view', 'tag', 'edit', 'manage')
+MANAGE_REFUSAL = 'This needs manage access to the dataset'
+
+
+def _raises(error, call, *args, **kwargs):
+    """The `error` call(*args, **kwargs) raised. Raising nothing fails; any other exception propagates as it is."""
+    try:
+        call(*args, **kwargs)
+    except error as raised:
+        return raised
+    raise AssertionError(f"expected {error.__name__} from {getattr(call, '__name__', call)}{args}{kwargs}")
+
+
+def _http_error(call, *args, **kwargs):
+    """The status and message of the SDK's error (requests.HTTPError) that call(*args, **kwargs) raised."""
+    raised = _raises(requests.HTTPError, call, *args, **kwargs)
+    assert raised.response is not None, raised
+    return raised.response.status_code, str(raised)
+
+
+def _dataset_as(user_client, dataset_id):
+    """Dataset `dataset_id` as `user_client` opens it: a new object each time, so what it says is read now."""
+    saved = client_module._client
+    client_module._client = user_client
+    try:
+        return Dataset.from_id(dataset_id)
+    finally:
+        client_module._client = saved
+
+
+def _run_access_tests(client):
+    print("\n--- Access levels ---")
+    base = client.base_url
+    admin = client.session
+    ctx: dict = {}
+
+    def ok(response):
+        assert response.ok, f"{response.request.method} {response.url}: {response.status_code} {response.text[:300]}"
+        return response
+
+    def remove_leftovers():
+        # The dataset first: its shares go with it, and a user who granted one can't be deleted while it stands.
+        for d in client.get_datasets():
+            if d['name'] in (ACCESS_DATASET, *ACCESS_OPEN_DATASETS, *ACCESS_LEVEL_DATASETS.values()):
+                client.delete_dataset(d['id'])
+        for u in ok(admin.get(f"{base}/users")).json():
+            if u['username'] in ACCESS_USERS.values():
+                ok(admin.delete(f"{base}/users/{u['id']}"))
+        for g in ok(admin.get(f"{base}/groups")).json():
+            if g['name'] == ACCESS_GROUP:
+                ok(admin.delete(f"{base}/groups/{g['id']}"))
+
+    @test("access setup (HTTP): a private dataset, four signed-in power users, a group with one of them")
+    def _():
+        remove_leftovers()
+        ds = Dataset(ACCESS_DATASET)
+        samples = [
+            Sample(filepath=f's3://test/access_{i}.jpg', tags=['seed'], metadata={'note': 'orig'}) for i in range(3)
+        ]
+        ids = ds.add_samples(samples)['ids']
+        users = {}
+        for short, name in ACCESS_USERS.items():
+            created = ok(
+                admin.post(f"{base}/users", json={'username': name, 'password': ACCESS_PASSWORD, 'role': 'power_user'}),
+            )
+            user_client = Client(base)
+            user_client.login(name, ACCESS_PASSWORD)
+            # A new user changes their password before anything else; the same one is allowed.
+            ok(
+                user_client.session.post(
+                    f"{base}/auth/change-password",
+                    json={'current_password': ACCESS_PASSWORD, 'new_password': ACCESS_PASSWORD},
+                ),
+            )
+            users[short] = (created.json()['id'], user_client)
+        group_id = ok(admin.post(f"{base}/groups", json={'name': ACCESS_GROUP})).json()['id']
+        ok(admin.put(f"{base}/groups/{group_id}/members/{users['bob'][0]}"))
+        ctx.update(ds=ds, ids=ids, users=users, group_id=group_id, admin_id=client.whoami()['id'])
+        for _uid, user_client in users.values():  # private and shared with none of them
+            status, text = _http_error(_dataset_as, user_client, ds.id)
+            assert status == 403, text
+
+    _()
+    if 'ds' not in ctx:
+        print("  SKIP  the other access tests: their setup failed")
+        return
+
+    ds, ids, group_id, admin_id = ctx['ds'], ctx['ids'], ctx['group_id'], ctx['admin_id']
+    users = ctx['users']
+    alice, alice_client = users['alice']
+    bob, bob_client = users['bob']
+    carol, carol_client = users['carol']
+    dave, dave_client = users['dave']
+    first = 's3://test/access_0.jpg'
+
+    # What the server holds, read and set over HTTP as the admin.
+    def shares():
+        return ok(admin.get(f"{base}/datasets/{ds.id}/access")).json()
+
+    def user_level(user_id):
+        return next((g['level'] for g in shares()['grants'] if g['user_id'] == user_id), None)
+
+    def group_level():
+        return next((g['level'] for g in shares()['group_grants'] if g['group_id'] == group_id), None)
+
+    def dataset_row():
+        return ok(admin.get(f"{base}/datasets/{ds.id}")).json()
+
+    def share(user_id, level):
+        ok(admin.post(f"{base}/datasets/{ds.id}/access", json={'user_id': user_id, 'level': level}))
+
+    def unshare(user_id):
+        ok(admin.delete(f"{base}/datasets/{ds.id}/access/{user_id}"))
+
+    def share_group(level):
+        ok(admin.post(f"{base}/datasets/{ds.id}/access", json={'group': ACCESS_GROUP, 'level': level}))
+
+    def unshare_group():
+        ok(admin.delete(f"{base}/datasets/{ds.id}/access/groups/{group_id}"))
+
+    def make_private():
+        ok(admin.patch(f"{base}/datasets/{ds.id}", json={'is_global': False}))
+
+    def level_of(user_client):
+        """The caller's level as the SDK says it, on a dataset object opened now."""
+        return _dataset_as(user_client, ds.id).access_level
+
+    try:
+
+        @test("access_level: an admin's own level is manage, on the dataset object it created and on one loaded")
+        def _():
+            assert ds.access_level == 'manage', ds.access_level
+            assert level_of(client) == 'manage'
+
+        _()
+
+        @test("list_access on a new private dataset: not global, its everyone level, the creator's edit share")
+        def _():
+            answer = ds.list_access()
+            assert {'is_global', 'everyone_level', 'grants', 'group_grants'} <= set(answer), answer
+            assert answer['is_global'] is False, answer
+            assert answer['everyone_level'] == 'view', answer  # what it would give everyone, were it made global
+            assert [(g['user_id'], g['username'], g['level']) for g in answer['grants']] == [
+                (admin_id, 'admin', 'edit'),
+            ], answer
+            assert answer['group_grants'] == [], answer
+
+        _()
+
+        @test("grant_access(user_id), positional, no level (an old script's call): a new share is edit")
+        def _():
+            unshare(alice)
+            assert isinstance(ds.grant_access(alice), dict)
+            assert user_level(alice) == 'edit', shares()
+
+        _()
+
+        @test("grant_access(user_id) a second time changes nothing: one share, still edit")
+        def _():
+            share(alice, 'edit')
+            ds.grant_access(alice)
+            assert [g['level'] for g in shares()['grants'] if g['user_id'] == alice] == ['edit'], shares()
+
+        _()
+
+        @test("grant_access(user_id, level=...) sets each level, raising it and lowering it")
+        def _():
+            for level in ('view', 'tag', 'edit', 'manage', 'edit', 'tag', 'view'):
+                assert isinstance(ds.grant_access(alice, level=level), dict)
+                assert user_level(alice) == level, (level, shares())
+
+        _()
+
+        @test("grant_access(user_id) with no level leaves a share lowered to view at view (old scripts)")
+        def _():
+            share(alice, 'view')
+            ds.grant_access(alice)
+            assert user_level(alice) == 'view', shares()
+            ds.grant_access(user_id=alice)
+            assert user_level(alice) == 'view', shares()
+
+        _()
+
+        @test("access_level: a non-admin's own level is the level of their share, at each level")
+        def _():
+            make_private()
+            for level in LEVELS:
+                share(alice, level)
+                assert level_of(alice_client) == level, level
+
+        _()
+
+        @test("granted view: the user reads the dataset, and is refused tagging and editing")
+        def _():
+            make_private()
+            ds.grant_access(alice, level='view')
+            mine = _dataset_as(alice_client, ds.id)
+            assert mine.count() == 3
+            assert mine[first].metadata['note'] == 'orig'
+            status, text = _http_error(mine.tag_samples, [ids[0]], ['acc-view'])
+            assert status == 403 and 'This needs tag access to the dataset' in text, text
+            status, text = _http_error(mine.set_values, [ids[0]], 'note', 'changed')
+            assert status == 403 and 'This needs edit access to the dataset' in text, text
+            sample = ds[first]
+            assert 'acc-view' not in sample.tags and sample.metadata['note'] == 'orig', (sample.tags, sample.metadata)
+
+        _()
+
+        @test("granted tag: the user adds and removes `tags`, and is refused changing other metadata")
+        def _():
+            make_private()
+            ds.grant_access(alice, level='tag')
+            mine = _dataset_as(alice_client, ds.id)
+            mine.tag_samples([ids[0]], ['acc-tag'])  # across a selection
+            assert 'acc-tag' in ds[first].tags
+            mine.untag_samples([ids[0]], ['acc-tag'])
+            assert 'acc-tag' not in ds[first].tags
+            mine.client.update_sample(ds.id, ids[0], tags=['seed', 'acc-one'])  # one sample, tags only
+            assert sorted(ds[first].tags) == ['acc-one', 'seed']
+            status, text = _http_error(mine.set_values, [ids[0]], 'note', 'changed')
+            assert status == 403 and 'This needs edit access to the dataset' in text, text
+            status, text = _http_error(mine.client.update_sample, ds.id, ids[0], metadata={'note': 'changed'})
+            assert status == 403 and 'This needs edit access to the dataset' in text, text
+            assert ds[first].metadata['note'] == 'orig'
+            ds.client.update_sample(ds.id, ids[0], tags=['seed'])
+
+        _()
+
+        @test("granted edit: the user changes metadata")
+        def _():
+            make_private()
+            ds.grant_access(alice, level='edit')
+            mine = _dataset_as(alice_client, ds.id)
+            mine.set_values([ids[0]], 'note', 'edited')
+            assert ds[first].metadata['note'] == 'edited'
+            ds.set_values([ids[0]], 'note', 'orig')
+
+        _()
+
+        @test("an edit-level user is refused every sharing call with the server's text, and nothing changes")
+        def _():
+            make_private()
+            share(alice, 'edit')
+            share_group('view')
+            before, row = shares(), dataset_row()
+            mine = _dataset_as(alice_client, ds.id)
+            calls = [
+                (mine.list_access, (), {}),
+                (mine.grant_access, (dave,), {}),
+                (mine.grant_access, (dave,), {'level': 'view'}),
+                (mine.grant_access, (), {'group': ACCESS_GROUP, 'level': 'manage'}),
+                (mine.revoke_access, (admin_id,), {}),
+                (mine.revoke_access, (), {'group': ACCESS_GROUP}),
+                (mine.set_everyone_level, ('view',), {}),
+                (mine.set_everyone_level, (None,), {}),
+            ]
+            for call, args, kwargs in calls:
+                status, text = _http_error(call, *args, **kwargs)
+                assert status == 403 and MANAGE_REFUSAL in text, (call.__name__, args, kwargs, text)
+            assert shares() == before, shares()
+            after = dataset_row()
+            assert (after['is_global'], after['everyone_level']) == (row['is_global'], row['everyone_level'])
+
+        _()
+
+        @test("grant_access to a user who doesn't exist raises the SDK's error with the server's 404")
+        def _():
+            before = shares()
+            for kwargs in ({}, {'level': 'view'}):
+                status, text = _http_error(ds.grant_access, 999999999, **kwargs)
+                assert status == 404 and 'User not found' in text, (kwargs, text)
+            assert shares() == before, shares()
+
+        _()
+
+        @test("grant_access(group=name), no level: a new group share is edit, and its member gets edit")
+        def _():
+            make_private()
+            unshare_group()
+            assert isinstance(ds.grant_access(group=ACCESS_GROUP), dict)
+            listed = [g for g in shares()['group_grants'] if g['group_id'] == group_id]
+            assert [(g['name'], g['level']) for g in listed] == [(ACCESS_GROUP, 'edit')], shares()
+            assert level_of(bob_client) == 'edit'
+
+        _()
+
+        @test("grant_access(group=name, level=...) changes the group's level; with no level it keeps it")
+        def _():
+            make_private()
+            share_group('edit')
+            ds.grant_access(group=ACCESS_GROUP, level='view')
+            assert group_level() == 'view' and level_of(bob_client) == 'view', shares()
+            ds.grant_access(group=ACCESS_GROUP)
+            assert group_level() == 'view', shares()
+            ds.grant_access(group=ACCESS_GROUP, level='manage')
+            assert group_level() == 'manage' and level_of(bob_client) == 'manage', shares()
+            ds.grant_access(group=ACCESS_GROUP, level='tag')
+            assert group_level() == 'tag' and level_of(bob_client) == 'tag', shares()
+
+        _()
+
+        @test("grant_access to a group that doesn't exist raises the SDK's error with the server's 404")
+        def _():
+            before = shares()
+            for kwargs in ({}, {'level': 'view'}):
+                status, text = _http_error(ds.grant_access, group='sdk-acc-no-such-group', **kwargs)
+                assert status == 404 and 'Group not found' in text, (kwargs, text)
+            assert shares() == before, shares()
+
+        _()
+
+        @test("revoke_access(group=name) removes the group's share, and its member can't open the dataset")
+        def _():
+            make_private()
+            share_group('view')
+            assert level_of(bob_client) == 'view'
+            assert ds.revoke_access(group=ACCESS_GROUP) is None
+            assert group_level() is None, shares()
+            status, text = _http_error(_dataset_as, bob_client, ds.id)
+            assert status == 403, text
+            assert ACCESS_DATASET not in [d['name'] for d in bob_client.get_datasets()]
+
+        _()
+
+        @test("revoke_access(group=name) of a group the dataset isn't shared with is a no-op")
+        def _():
+            unshare_group()
+            before = shares()
+            assert ds.revoke_access(group=ACCESS_GROUP) is None
+            assert shares() == before, shares()
+
+        _()
+
+        @test("revoke_access(user_id) removes the share; again, or of a user never shared with, is a no-op")
+        def _():
+            make_private()
+            share(alice, 'view')
+            assert ds.revoke_access(alice) is None
+            assert user_level(alice) is None, shares()
+            status, text = _http_error(_dataset_as, alice_client, ds.id)
+            assert status == 403, text
+            before = shares()
+            assert ds.revoke_access(user_id=alice) is None
+            assert ds.revoke_access(dave) is None
+            assert shares() == before, shares()
+
+        _()
+
+        @test("list_access after user and group shares lists each, with its level and name")
+        def _():
+            make_private()
+            unshare(dave)
+            share(alice, 'tag')
+            share(carol, 'manage')
+            share_group('view')
+            answer = ds.list_access()
+            assert {'is_global', 'everyone_level', 'grants', 'group_grants'} <= set(answer), answer
+            assert answer['is_global'] is False, answer
+            got = sorted((g['user_id'], g['username'], g['level']) for g in answer['grants'])
+            assert got == sorted(
+                [
+                    (admin_id, 'admin', 'edit'),
+                    (alice, ACCESS_USERS['alice'], 'tag'),
+                    (carol, ACCESS_USERS['carol'], 'manage'),
+                ],
+            ), answer
+            assert [(g['group_id'], g['name'], g['level']) for g in answer['group_grants']] == [
+                (group_id, ACCESS_GROUP, 'view'),
+            ], answer
+
+        _()
+
+        @test("a manager who isn't an administrator can call every sharing method")
+        def _():
+            make_private()
+            share(carol, 'manage')
+            unshare(dave)
+            unshare_group()
+            mine = _dataset_as(carol_client, ds.id)
+            assert mine.access_level == 'manage'
+            assert carol in [g['user_id'] for g in mine.list_access()['grants']]
+            assert isinstance(mine.grant_access(dave, level='view'), dict)
+            assert user_level(dave) == 'view', shares()
+            mine.grant_access(dave)
+            assert user_level(dave) == 'view', shares()
+            mine.grant_access(group=ACCESS_GROUP, level='tag')
+            assert group_level() == 'tag', shares()
+            assert mine.revoke_access(group=ACCESS_GROUP) is None
+            assert group_level() is None, shares()
+            assert mine.revoke_access(dave) is None
+            assert user_level(dave) is None, shares()
+            assert mine.set_everyone_level('view') is None
+            row = dataset_row()
+            assert (row['is_global'], row['everyone_level']) == (True, 'view'), row
+            assert mine.set_everyone_level(None) is None
+            assert dataset_row()['is_global'] is False
+
+        _()
+
+        @test("set_everyone_level(view | tag | edit) makes the dataset global at it; a user with no share gets it")
+        def _():
+            make_private()
+            unshare(dave)
+            unshare_group()
+            share(alice, 'view')
+            for level in ('view', 'tag', 'edit'):
+                assert ds.set_everyone_level(level) is None
+                answer = ds.list_access()
+                assert (answer['is_global'], answer['everyone_level']) == (True, level), answer
+                assert level_of(dave_client) == level, level
+            assert level_of(alice_client) == 'edit'  # the higher of her view share and the everyone level
+            ds.set_everyone_level('view')
+            assert level_of(alice_client) == 'view'
+            share(alice, 'manage')
+            assert level_of(alice_client) == 'manage'  # a share above the everyone level still counts
+
+        _()
+
+        @test("Dataset(name, is_global=True) makes a dataset global at view: a user with no share views it")
+        def _():
+            opened = Dataset(ACCESS_OPEN_DATASETS[0], is_global=True)
+            row = ok(admin.get(f"{base}/datasets/{opened.id}")).json()
+            assert (row['is_global'], row['everyone_level']) == (True, 'view'), row
+            assert _dataset_as(dave_client, opened.id).access_level == 'view'
+
+        _()
+
+        @test("update_dataset(id, is_global=True) on a private dataset makes it global at view")
+        def _():
+            created = client.create_dataset(ACCESS_OPEN_DATASETS[1])
+            assert (created['is_global'], created['everyone_level']) == (False, 'view'), created
+            answer = client.update_dataset(created['id'], is_global=True)
+            assert (answer['is_global'], answer['everyone_level']) == (True, 'view'), answer
+            assert _dataset_as(dave_client, created['id']).access_level == 'view'
+
+        _()
+
+        @test("Dataset(name, is_global=True, everyone_level='edit') makes a dataset every power user can edit")
+        def _():
+            made = Dataset(ACCESS_LEVEL_DATASETS['edit'], is_global=True, everyone_level='edit')
+            row = ok(admin.get(f"{base}/datasets/{made.id}")).json()
+            assert (row['is_global'], row['everyone_level']) == (True, 'edit'), row
+            theirs = _dataset_as(dave_client, made.id)  # dave has no share in it
+            assert theirs.access_level == 'edit'
+            theirs.add_samples([Sample(filepath='s3://test/access_at_edit_0.jpg', metadata={'by': 'dave'})])
+            assert ok(admin.get(f"{base}/datasets/{made.id}/samples", params={'limit': 5})).json()['total'] == 1
+
+        _()
+
+        @test("Dataset(name, everyone_level='tag') without is_global: private, holding tag for when it is made global")
+        def _():
+            held = Dataset(ACCESS_LEVEL_DATASETS['held'], everyone_level='tag')
+            row = ok(admin.get(f"{base}/datasets/{held.id}")).json()
+            assert (row['is_global'], row['everyone_level']) == (False, 'tag'), row
+            status, text = _http_error(_dataset_as, dave_client, held.id)
+            assert status == 403, text
+            ok(admin.patch(f"{base}/datasets/{held.id}", json={'is_global': True}))
+            assert _dataset_as(dave_client, held.id).access_level == 'tag'
+
+        _()
+
+        @test("client.create_dataset(name, is_global=True, everyone_level='tag') creates it global at tag")
+        def _():
+            created = client.create_dataset(ACCESS_LEVEL_DATASETS['made'], is_global=True, everyone_level='tag')
+            assert (created['is_global'], created['everyone_level']) == (True, 'tag'), created
+            assert _dataset_as(dave_client, created['id']).access_level == 'tag'
+
+        _()
+
+        @test("an everyone level other than view, tag or edit raises ValueError and creates nothing")
+        def _():
+            name = ACCESS_LEVEL_DATASETS['refused']
+            for level in ('manage', 'owner', 'Edit', ''):
+                _raises(ValueError, client.create_dataset, name, is_global=True, everyone_level=level)
+                _raises(ValueError, Dataset, name, is_global=True, everyone_level=level)
+            assert name not in [d['name'] for d in client.get_datasets()]
+
+        _()
+
+        @test("to_patches gives the patch dataset its source's is_global and everyone level")
+        def _():
+            for kind, made, wanted in (
+                ('edit', {'is_global': True, 'everyone_level': 'edit'}, (True, 'edit')),
+                ('view', {'is_global': True, 'everyone_level': 'view'}, (True, 'view')),
+                ('private', {}, (False, None)),
+            ):
+                body = {'name': ACCESS_LEVEL_DATASETS[f'source-{kind}'], **made}
+                source = Dataset.from_id(ok(admin.post(f"{base}/datasets", json=body)).json()['id'])
+                with tempfile.TemporaryDirectory() as patches_dir:
+                    patches = source.to_patches('detections', ACCESS_LEVEL_DATASETS[f'patches-{kind}'], patches_dir)
+                row = ok(admin.get(f"{base}/datasets/{patches.id}")).json()
+                if wanted[0]:
+                    assert (row['is_global'], row['everyone_level']) == wanted, (kind, row)
+                else:
+                    assert row['is_global'] is False, (kind, row)  # a private source's patches are private
+
+        _()
+
+        @test("made global at edit, then private, then global again with update_dataset: still at edit")
+        def _():
+            make_private()
+            unshare(dave)
+            unshare_group()
+            assert ds.set_everyone_level('edit') is None
+            assert level_of(dave_client) == 'edit'
+            client.update_dataset(ds.id, is_global=False)
+            status, text = _http_error(_dataset_as, dave_client, ds.id)
+            assert status == 403, text
+            answer = client.update_dataset(ds.id, is_global=True)
+            assert (answer['is_global'], answer['everyone_level']) == (True, 'edit'), answer
+            assert level_of(dave_client) == 'edit'
+            make_private()
+
+        _()
+
+        @test("set_everyone_level(None) makes the dataset private: a user with no share loses it, shares stay")
+        def _():
+            ok(admin.patch(f"{base}/datasets/{ds.id}", json={'is_global': True, 'everyone_level': 'tag'}))
+            unshare(dave)
+            unshare_group()
+            share(alice, 'view')
+            assert ok(dave_client.session.get(f"{base}/datasets/{ds.id}")).json()['access_level'] == 'tag'
+            assert ds.set_everyone_level(None) is None
+            assert ds.list_access()['is_global'] is False
+            assert dataset_row()['is_global'] is False
+            status, text = _http_error(_dataset_as, dave_client, ds.id)
+            assert status == 403, text
+            assert user_level(alice) == 'view' and level_of(alice_client) == 'view', shares()
+
+        _()
+
+        @test("grant_access with both targets, neither, or another level raises ValueError, and changes nothing")
+        def _():
+            share(alice, 'view')
+            share_group('view')
+            before = shares()
+            calls: list[tuple[tuple, dict]] = [
+                ((), {}),
+                ((), {'level': 'view'}),
+                ((None,), {'group': None}),
+                ((alice,), {'group': ACCESS_GROUP}),
+                ((alice,), {'group': ACCESS_GROUP, 'level': 'edit'}),
+                ((alice,), {'level': 'owner'}),
+                ((alice,), {'level': 'admin'}),
+                ((alice,), {'level': ''}),
+                ((), {'group': ACCESS_GROUP, 'level': 'write'}),
+            ]
+            for args, kwargs in calls:
+                _raises(ValueError, ds.grant_access, *args, **kwargs)
+            assert shares() == before, shares()
+
+        _()
+
+        @test("revoke_access with both targets or neither raises ValueError, and changes nothing")
+        def _():
+            share(alice, 'view')
+            share_group('view')
+            before = shares()
+            for args, kwargs in (((), {}), ((None,), {'group': None}), ((alice,), {'group': ACCESS_GROUP})):
+                _raises(ValueError, ds.revoke_access, *args, **kwargs)
+            assert shares() == before, shares()
+
+        _()
+
+        @test("set_everyone_level('manage') or another level raises ValueError, and changes nothing")
+        def _():
+            make_private()
+            before, row = shares(), dataset_row()
+            for level in ('manage', 'admin', 'private', ''):
+                _raises(ValueError, ds.set_everyone_level, level)
+            after = dataset_row()
+            assert (after['is_global'], after['everyone_level']) == (row['is_global'], row['everyone_level'])
+            assert shares() == before, shares()
+
+        _()
+
+    finally:
+        try:
+            remove_leftovers()
+            print(f"Deleted {ACCESS_DATASET}, its users and its group")
+        except Exception as error:  # a cleanup failure must not hide the results above
+            print(f"Access cleanup failed: {error}")
 
 
 if __name__ == "__main__":

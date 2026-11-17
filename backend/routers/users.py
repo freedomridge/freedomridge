@@ -5,6 +5,7 @@ import asyncpg
 from fastapi import APIRouter, Body, Depends, HTTPException
 from pydantic import BaseModel
 
+from ..access import level_name
 from ..auth_policy import validate_new_password
 from ..database import db
 from ..passwords import hash_password
@@ -50,10 +51,19 @@ def require_admin(user: dict = Depends(get_current_user)):
 
 
 @router.get("/users", response_model=List[UserListResponse])
-async def list_users(admin: dict = Depends(require_admin)):
-    query = """
+async def list_users(admin: dict = Depends(require_admin), people: bool = False):
+    """Every account; with `people`, only those a group or a dataset share is for: active, and not a follower's
+    account nor a demo guest's, as /datasets/{id}/access/candidates lists them (the group member picker)."""
+    where = (
+        "WHERE is_active AND is_demo_account IS NOT TRUE "
+        "AND NOT EXISTS (SELECT 1 FROM followers WHERE user_id = users.id)"
+        if people
+        else ""
+    )
+    query = f"""
         SELECT id, username, email, role, is_active, last_login, created_at
         FROM users
+        {where}
         ORDER BY id
     """
     rows = await db.fetch(query)
@@ -239,3 +249,112 @@ async def reset_password(
                 revoked = await revoke_api_tokens(conn, id)
 
     return {"message": "Password reset successfully", "revoked_tokens": revoked}
+
+
+# --- Groups (backend/access.py): datasets are shared with them, and each member gets the group's level ---
+
+
+class GroupMember(BaseModel):
+    id: int
+    username: str
+
+
+class GroupDataset(BaseModel):
+    id: int
+    name: str
+    level: str
+    deleting: bool
+
+
+class GroupResponse(BaseModel):
+    id: int
+    name: str
+    created_by: Optional[int]
+    created_at: datetime
+    members: List[GroupMember]
+    datasets: List[GroupDataset]
+
+
+class GroupName(BaseModel):
+    name: str
+
+
+@router.get("/groups", response_model=List[GroupResponse])
+async def list_groups(admin: dict = Depends(require_admin)):
+    """Each group with its members and the datasets it is shared with, at the group's level in each. A dataset being
+    deleted is listed, as GET /datasets lists it for an administrator, and says so (`deleting`)."""
+    rows = await db.fetch(
+        """
+        SELECT g.id, g.name, g.created_by, g.created_at,
+               COALESCE(jsonb_agg(jsonb_build_object('id', u.id, 'username', u.username) ORDER BY u.username)
+                        FILTER (WHERE u.id IS NOT NULL), '[]') AS members,
+               COALESCE((SELECT jsonb_agg(jsonb_build_object('id', d.id, 'name', d.name, 'level', a.level,
+                                                             'deleting', d.deleting)
+                                          ORDER BY d.name, d.id)
+                         FROM dataset_group_access a JOIN datasets d ON d.id = a.dataset_id
+                         WHERE a.group_id = g.id), '[]') AS datasets
+        FROM groups g
+        LEFT JOIN group_members m ON m.group_id = g.id
+        LEFT JOIN users u ON u.id = m.user_id
+        GROUP BY g.id
+        ORDER BY g.name
+        """,
+    )
+    return [
+        {**row, 'datasets': [{**share, 'level': level_name(share['level'])} for share in row['datasets']]}
+        for row in rows
+    ]
+
+
+@router.post("/groups", status_code=201)
+async def create_group(body: GroupName, admin: dict = Depends(require_admin)):
+    # Unique as written, as usernames are.
+    name = clean_name(body.name, "Group name")
+    try:
+        group_id = await db.fetchval(
+            "INSERT INTO groups (name, created_by) VALUES ($1, $2) RETURNING id",
+            name,
+            admin['id'],
+        )
+    except asyncpg.UniqueViolationError:
+        raise HTTPException(status_code=400, detail="A group with this name already exists")
+    return {"id": group_id, "name": name}
+
+
+@router.patch("/groups/{id}")
+async def rename_group(id: int, body: GroupName, admin: dict = Depends(require_admin)):
+    name = clean_name(body.name, "Group name")
+    try:
+        renamed = await db.execute("UPDATE groups SET name = $2 WHERE id = $1", id, name)
+    except asyncpg.UniqueViolationError:
+        raise HTTPException(status_code=400, detail="A group with this name already exists")
+    if renamed == "UPDATE 0":
+        raise HTTPException(status_code=404, detail="Group not found")
+    return {"id": id, "name": name}
+
+
+@router.delete("/groups/{id}", status_code=204)
+async def delete_group(id: int, admin: dict = Depends(require_admin)):
+    """Its members and its shares go with it."""
+    if await db.execute("DELETE FROM groups WHERE id = $1", id) == "DELETE 0":
+        raise HTTPException(status_code=404, detail="Group not found")
+
+
+@router.put("/groups/{id}/members/{user_id}", status_code=204)
+async def add_group_member(id: int, user_id: int, admin: dict = Depends(require_admin)):
+    """Idempotent."""
+    try:
+        await db.execute(
+            "INSERT INTO group_members (group_id, user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+            id,
+            user_id,
+        )
+    except asyncpg.ForeignKeyViolationError as error:
+        missing = "Group" if error.constraint_name == "group_members_group_id_fkey" else "User"
+        raise HTTPException(status_code=404, detail=f"{missing} not found")
+
+
+@router.delete("/groups/{id}/members/{user_id}", status_code=204)
+async def remove_group_member(id: int, user_id: int, admin: dict = Depends(require_admin)):
+    """No-op if they weren't a member."""
+    await db.execute("DELETE FROM group_members WHERE group_id = $1 AND user_id = $2", id, user_id)

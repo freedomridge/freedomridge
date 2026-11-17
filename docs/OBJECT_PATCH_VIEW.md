@@ -61,7 +61,7 @@ request, deleted. Each object with no image is of one kind:
 - The filter is `{"field": "parent_id", "operator": "unlinked_object", "value": [kinds]}` (all kinds when empty).
   It has no form in the query text or the filter builder: its chip in the app is read-only. It asks about live
   data, so a version's query refuses it (400), as it does the cross-grain operators.
-- `POST /datasets/{id}/objects/unlinked/delete` (admin) with `{"kinds": [...]}`, by default only `image_gone`,
+- `POST /datasets/{id}/objects/unlinked/delete` (edit) with `{"kinds": [...]}`, by default only `image_gone`,
   links first, then deletes them as a bulk delete of that filter: resumable units, logged for followers and
   statistics like any delete, each unit deleting only what still matches (an object whose image arrived meanwhile
   stays). The answer names the kinds and the `expected` count; the job's result has `deleted_count`. Never automatic.

@@ -40,8 +40,11 @@ dataset_id = response.json()["id"]
 `media_fields` lists the fields that hold displayable media: `filepath` plus any
 metadata keys (here `thumbnail`) that hold another path for the same sample. The
 grid and modal can switch between them.
+The field each opens on for everyone (`grid_media_field`, `modal_media_field`) is set in Dataset Settings →
+General, **Grid opens on** and **Sample view opens on**, or with `PATCH /datasets/{id}`. Switching in a grid or a
+sample's view changes only your own view, which your browser remembers for the dataset.
 
-## Add samples (power_user or admin)
+## Add samples (edit)
 
 Send up to about 1,000 samples per request, wrapped with an `on_duplicate` mode:
 
@@ -131,7 +134,7 @@ The [SDK label classes](SDK.md#structured-labels) build these dicts for you, and
 [mask colours and class names](SDK.md#mask-overlays-and-annotation-colours)
 are set per dataset with `segmentation_config`.
 
-## Update samples (power_user or admin)
+## Update samples (edit; tag for tags alone)
 
 Update one sample in place; it keeps its id, embeddings and hashes:
 
@@ -153,7 +156,7 @@ For many samples, `POST /api/datasets/{id}/samples/bulk-set` merges the same
 or a different patch per sample (`{"updates": [{"sample_id": 1, "metadata": {...}}, ...]}`).
 Re-sending samples with `"on_duplicate": "update"` also works.
 
-## Tag samples (power_user or admin)
+## Tag samples (tag)
 
 ```python
 requests.post(
@@ -163,7 +166,8 @@ requests.post(
 ).raise_for_status()
 ```
 
-Add `"field_name": "<array field>"` to tag a field other than `tags`.
+Add `"field_name": "<array field>"` to tag a field other than `tags`; that needs edit, except a mirror's own
+`@local.tags` on a follower, which is tag as `tags` is.
 
 ## List samples
 
@@ -198,7 +202,7 @@ on the client, sized to the machine's RAM, and uploads coordinates for every
 sample. The server-side `POST /api/datasets/{id}/embeddings/reduce` endpoint fits
 in the API process and refuses fields with more than 200,000 vectors (HTTP 413).
 
-## Default view (admin)
+## Default view (edit)
 
 A dataset's default view is a public saved view that the web app opens the dataset on, for example
 one that hides black images or road photos with concept filters. Its filters show in the filter bar
@@ -210,7 +214,7 @@ image once the image is scored.
 Only the app applies it. The API and the SDK return every sample, and a script loads the view
 like any other saved view when it wants those filters.
 
-An administrator sets it in **Saved Views** with the ★ next to a public view, or over REST:
+Someone with edit in the dataset sets it in **Saved Views** with the ★ next to a public view, or over REST:
 
 ```python
 requests.patch(
@@ -228,8 +232,9 @@ without a default view.
 
 The web app remembers which saved view the applied filters came from: one chosen in **Saved Views**,
 the default view, a view's link, or one just saved. Once the filters differ from it (a stale lasso
-redrawn, a filter added or removed), **Saved Views** says so, and the view's owner or an admin gets
-**Update this view**: after a confirm naming the view, its filters are replaced with the applied
+redrawn, a filter added or removed), **Saved Views** says so, and the view's owner, an admin, or (for a
+public view) anyone with edit in the dataset gets **Update this view**: after a confirm naming the view,
+its filters are replaced with the applied
 ones. Its name, link and sharing stay, and a default view stays the default; everyone who opens it
 then gets the new filters. A temporary selection is left out, as when saving a view. Anyone else
 is offered only saving the filters as a new view, which is then theirs to update. On a mirror, a
@@ -345,7 +350,7 @@ It changes only the page's address, not the server's requests:
 - The dataset page sends filter values, regions and search text in request bodies, which the bundled nginx
   and backend don't log.
 
-## Delete samples (admin)
+## Delete samples (edit)
 
 `DELETE /api/datasets/{id}/samples/{sample_id}` deletes one sample; `POST /api/datasets/{id}/samples/bulk-delete`
 deletes `sample_ids`, a `selection_token` or `filters` (less `excluded_ids`) as a server job (202; follow it with
@@ -358,7 +363,7 @@ Object samples left with no image (their image never came, or was deleted on a r
 objects) are found with `POST /api/datasets/{id}/objects/unlinked` and deleted, a kind at a time, with
 `POST /api/datasets/{id}/objects/unlinked/delete` ([Object view](OBJECT_PATCH_VIEW.md)).
 
-## Delete a dataset (admin)
+## Delete a dataset (manage)
 
 ```python
 job = requests.delete(f"{API_URL}/datasets/{dataset_id}", headers=headers)
@@ -370,22 +375,24 @@ Jobs panel. The SDK's `Dataset.delete()` waits for it.
 
 ## Endpoint summary
 
-| Endpoint | Method | Role | Description |
+Who may call each one: the admin role, or a [level in the dataset](AUTHENTICATION.md#access-levels).
+
+| Endpoint | Method | Who | Description |
 |----------|--------|------|-------------|
-| `/datasets` | POST | admin | Create a dataset |
-| `/datasets/{id}` | GET | any logged-in user with access | Dataset details |
-| `/datasets/{id}` | PATCH | admin | Update name, description, media fields, `segmentation_config`, `default_view_id` |
-| `/datasets/{id}` | DELETE | admin | Delete (202, server job) |
-| `/datasets/{id}/samples` | POST | power_user | Add samples |
-| `/datasets/{id}/samples` | GET | any logged-in user with access | List samples (`{"items", "total"}`) |
-| `/datasets/{id}/samples/{sample_id}` | PATCH | power_user | Update one sample |
-| `/datasets/{id}/samples/{sample_id}` | DELETE | admin | Delete one sample (an image's objects with it) |
-| `/datasets/{id}/samples/bulk-delete` | POST | admin | Delete many samples (an image's objects with it) |
-| `/datasets/{id}/objects/unlinked` | POST | any logged-in user with access | The objects with no image, by kind |
-| `/datasets/{id}/objects/unlinked/delete` | POST | admin | Delete the objects with no image of the kinds named |
-| `/datasets/{id}/samples/bulk-set` | POST | power_user | Merge metadata into many samples |
-| `/datasets/{id}/samples/bulk-tag` | POST | power_user | Add or remove tags |
-| `/datasets/{id}/embeddings` | POST | power_user | Upload vectors |
+| `/datasets` | POST | admin | Create a dataset; `"is_global": true` makes it global at `everyone_level` (view unless given) |
+| `/datasets/{id}` | GET | view | Dataset details, with your `access_level` |
+| `/datasets/{id}` | PATCH | edit; manage for `name`, `is_global` and `everyone_level`; admin for `storage_config_id` | Update name, description, media fields, `segmentation_config`, `default_view_id`, visibility |
+| `/datasets/{id}` | DELETE | manage | Delete (202, server job) |
+| `/datasets/{id}/samples` | POST | edit | Add samples |
+| `/datasets/{id}/samples` | GET | view | List samples (`{"items", "total"}`) |
+| `/datasets/{id}/samples/{sample_id}` | PATCH | edit; tag when only `tags` is sent (or a mirror's `@local.tags`) | Update one sample |
+| `/datasets/{id}/samples/{sample_id}` | DELETE | edit | Delete one sample (an image's objects with it) |
+| `/datasets/{id}/samples/bulk-delete` | POST | edit | Delete many samples (an image's objects with it) |
+| `/datasets/{id}/objects/unlinked` | POST | view (with edit, it links what it can first) | The objects with no image, by kind |
+| `/datasets/{id}/objects/unlinked/delete` | POST | edit | Delete the objects with no image of the kinds named |
+| `/datasets/{id}/samples/bulk-set` | POST | edit | Merge metadata into many samples |
+| `/datasets/{id}/samples/bulk-tag` | POST | tag for `tags` (and a mirror's `@local.tags`), edit for another field | Add or remove tags |
+| `/datasets/{id}/embeddings` | POST | edit | Upload vectors |
 
 ## Troubleshooting
 

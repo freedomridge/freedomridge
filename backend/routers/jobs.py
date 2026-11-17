@@ -5,14 +5,24 @@ import binascii
 import json
 import re
 from datetime import datetime, timezone
-from typing import Any, Literal
+from typing import Any, Literal, Optional
 from uuid import UUID
 
 import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
+from starlette.datastructures import State
 
-from ..access import check_dataset_access, missing_unless_allowed
+from ..access import (
+    MANAGE,
+    Level,
+    LevelRefused,
+    check_dataset_access,
+    checks_level,
+    level_number,
+    level_refusal,
+    missing_unless_allowed,
+)
 from ..database import db
 from ..index_actions import public_message
 from ..job_queue import JOB_TABLE, CancelRefused, QueueBusy, cancel_job
@@ -33,10 +43,17 @@ _WAITING_FOR = {  # by the resource's name before any ':' (a follower's sync has
     'map_fit': 'for another map re-fit to finish (one at a time)',
     'follower_sync': "for this primary's running sync to finish (one at a time per primary)",
 }
+# A bulk edit of tags alone (`tags`, or a mirror's own `@local.tags`), which the tag level may start (and so stop,
+# resume or discard: _kind_level).
+_TAGS_ONLY = (
+    "(jobs.kind = 'bulk_mutation' AND jobs.args->>'operation' = 'tag' "
+    "AND jobs.args->>'field_name' IN ('tags', '@local.tags'))"
+)
 _PUBLIC_COLUMNS = (
     'id, kind, dataset_id, placement, lane, resources, state, progress_done, progress_total, message, '
     'result, error, created_by, created_at, updated_at, started_at, finished_at, '
     'heartbeat_at, attempt, failures, max_failures, available_at, cancel_requested, '
+    f'{_TAGS_ONLY} AS tags_only, '
     # An index build's field, so the jobs list can name it and build it again; no other job's arguments.
     "CASE WHEN kind IN ('ann_index_build', 'field_index_build') "
     "THEN COALESCE(args->>'field', args->>'field_name') END AS field, "
@@ -48,6 +65,14 @@ _ACTIVE_COLUMNS = (
     'id, kind, placement, lane, state, progress_done, progress_total, message, available_at, created_at, '
     'created_by, started_at'
 )
+# The level in its dataset a job's kind needs, so its starter may stop, resume or discard it while they still have
+# that level; any other kind, edit. None: an administrator's (a patch import reads a bucket with the server's
+# credentials; a mirror's sync belongs to its link).
+_KIND_LEVELS: dict[str, Optional[str]] = {
+    'dataset_deletion': 'manage',
+    'patch_vector_import': None,
+    'follower_sync': None,
+}
 
 
 class JobProgress(BaseModel):
@@ -82,6 +107,9 @@ class JobStatus(BaseModel):
     started_by: str
     # What a queued job that hasn't started waits for, when it isn't its turn yet: "for ..." (waiting_for).
     waiting_for: str | None = None
+    # The job lists only: whether the caller may stop, resume or discard it (_can_cancel), as the active list's
+    # can_cancel says for a running one.
+    can_control: bool | None = None
 
 
 class JobPage(BaseModel):
@@ -122,12 +150,57 @@ class ActiveJobPage(BaseModel):
     next_cursor: str | None
 
 
-def _can_cancel(job, user: dict) -> bool:
+def _kind_level(job) -> Optional[str]:
+    return 'tag' if job.get('tags_only') else _KIND_LEVELS.get(job['kind'], 'edit')
+
+
+def _yours(job, user: dict) -> bool:
+    # Map re-fits are system jobs from a dataset's schedules, which who has edit there manages: they can stop
+    # tonight's fit like they can Run now.
+    return job['created_by'] == user['id'] or job['kind'] == 'map_refit'
+
+
+def _can_cancel(job, user: dict, level: Optional[int]) -> bool:
+    """Whether `user`, whose level in the job's dataset is `level`, may stop, resume or discard the job: an
+    administrator; for a kind that isn't an administrator's alone, a manager of its dataset, or its starter while
+    they have the level its kind needs."""
     if user['role'] == 'admin':
         return True
-    # Map re-fits are system jobs from a dataset's schedules, which its power users manage (the caller
-    # has already checked dataset access); they can stop tonight's fit like they can Run now.
-    return user['role'] == 'power_user' and (job['created_by'] == user['id'] or job['kind'] == 'map_refit')
+    needed = _kind_level(job)
+    if needed is None or level is None:
+        return False
+    return level >= MANAGE or (level >= level_number(needed) and _yours(job, user))
+
+
+async def _level_in(dataset_id: int, user: dict, state: Any) -> Optional[int]:
+    """The caller's level in the dataset: the highest check_dataset_access grants them, from the one lookup it keeps
+    on `state`. None: the dataset is gone (a deleted dataset's jobs stay readable to who started them)."""
+    if user['role'] == 'admin':
+        return MANAGE
+    levels: tuple[Level, ...] = ('manage', 'edit', 'tag')
+    for level in levels:
+        try:
+            await check_dataset_access(dataset_id, user, level, state)
+            return level_number(level)
+        except LevelRefused:
+            continue
+        except HTTPException as error:
+            if error.status_code != 404:
+                raise
+            return None
+    return level_number('view')
+
+
+async def _controlled_job(job_id: UUID, user: dict):
+    """The job, if `user` may stop, resume or discard it (_can_cancel); 403 naming the level they lack."""
+    job = await _authorized_job(job_id, user)
+    level = None if job['dataset_id'] is None else await _level_in(job['dataset_id'], user, State())
+    if not _can_cancel(job, user, level):
+        needed = _kind_level(job)
+        if needed is None:
+            raise HTTPException(status_code=403, detail='Only an administrator can stop, resume or discard this job')
+        raise level_refusal(needed if _yours(job, user) else 'manage')
+    return job
 
 
 def waiting_for(job, user: dict) -> str | None:
@@ -153,8 +226,9 @@ def _message(job, user: dict) -> str | None:
     return job['message'] if user['role'] == 'admin' else public_message(job['kind'], job['message'])
 
 
-def job_status(job, user: dict) -> JobStatus:
-    """An explicit public allowlist keeps internal arguments, checkpoints and lease credentials private."""
+def job_status(job, user: dict, can_control: Optional[bool] = None) -> JobStatus:
+    """An explicit public allowlist keeps internal arguments, checkpoints and lease credentials private. Only the job
+    lists give `can_control`; without it the field stays unset, so the answer leaves it out."""
     outcome = job_outcome(job, user)
     if private_guest(user):
         outcome['error'] = None
@@ -182,6 +256,7 @@ def job_status(job, user: dict) -> JobStatus:
         started_by='' if private_guest(user) else job['started_by'],
         waiting_for=waiting_for(job, user),
         **outcome,
+        **({} if can_control is None else {'can_control': can_control}),
     )
 
 
@@ -237,7 +312,9 @@ async def list_dataset_jobs(
     user: dict = Depends(get_current_user),
     include_system_statistics: bool = False,
 ):
-    await check_dataset_access(dataset_id, user)
+    state = State()  # one dataset lookup for both
+    await check_dataset_access(dataset_id, user, state=state)
+    level = await _level_in(dataset_id, user, state)  # who may stop, resume or discard which job (_can_cancel)
     scope = 'dataset_id = $1'
     if not include_system_statistics:
         scope += (
@@ -245,7 +322,15 @@ async def list_dataset_jobs(
             " AND dedupe_owner='system' AND state='succeeded'"
             " AND NOT barrier @> '{\"full\":true}')"
         )
-    return await _job_page(scope, [dataset_id], limit=limit, cursor=cursor, user=user, also=_DATASET_REFERENCE)
+    return await _job_page(
+        scope,
+        [dataset_id],
+        limit=limit,
+        cursor=cursor,
+        user=user,
+        also=_DATASET_REFERENCE,
+        level=level,
+    )
 
 
 @router.get('/admin/jobs', response_model=JobPage, response_model_exclude_unset=True)
@@ -268,9 +353,14 @@ async def _job_page(
     cursor: str | None,
     user: dict,
     also: str | None = None,
+    level: Optional[int] = None,
 ) -> JobPage:
     """Newest first. `scope` is a fixed predicate whose parameters come first; `also` adds the jobs of a
-    second predicate (same parameters), each part read through its own index, merged by the same keyset."""
+    second predicate (same parameters), each part read through its own index, merged by the same keyset.
+
+    `level` is the caller's in the one dataset whose jobs are listed, for each job's can_control: a list holds one
+    dataset's jobs and jobs of no dataset (an index review naming it; every job of the global list), which the
+    level doesn't reach (_controlled_job). A list spanning datasets would need one level per dataset."""
     created_at, job_id = _decode_cursor(cursor) if cursor is not None else (None, None)
     after = len(scope_args)
     keyset = (
@@ -285,7 +375,10 @@ async def _job_page(
         )
     rows = await db.fetch(query, *scope_args, created_at, job_id, limit + 1)
     return JobPage(
-        items=[job_status(row, user) for row in rows[:limit]],
+        items=[
+            job_status(row, user, can_control=_can_cancel(row, user, None if row['dataset_id'] is None else level))
+            for row in rows[:limit]
+        ],
         next_cursor=_cursor(rows[limit - 1]) if len(rows) > limit else None,
     )
 
@@ -318,7 +411,9 @@ async def list_active_dataset_jobs(
     cursor: str | None = Query(None, max_length=512),
     user: dict = Depends(get_current_user),
 ):
-    await check_dataset_access(dataset_id, user)
+    state = State()  # one dataset lookup for both
+    await check_dataset_access(dataset_id, user, state=state)
+    level = await _level_in(dataset_id, user, state)  # who may stop which job (_can_cancel)
     available_at, created_at, identifier = _decode_active_cursor(cursor)
     columns = ', '.join(f'jobs.{column}' for column in _ACTIVE_COLUMNS.split(', '))
     rows = await db.fetch(
@@ -335,6 +430,7 @@ async def list_active_dataset_jobs(
                        OR $2::timestamptz IS NULL OR (available_at,created_at,id)>($2,$3,$4::uuid))))
             )
             SELECT {columns}, controls.cancel_requested, jobs.dataset_id IS NOT NULL AS dataset_lane,
+                {_TAGS_ONLY} AS tags_only,
                 (jobs.state = 'running' AND jobs.checkpoint ? 'uncancellable') AS uncancellable,
                 (jobs.state='running' AND jobs.lease_expires_at<=clock_timestamp()) AS stalled,
                 (jobs.state='queued' AND jobs.available_at>clock_timestamp()) AS retry_delayed,
@@ -364,7 +460,7 @@ async def list_active_dataset_jobs(
             started_by='' if private_guest(user) else row['started_by'],
             progress=JobProgress(done=row['progress_done'], total=row['progress_total'], message=_message(row, user)),
             cancel_requested=row['cancel_requested'],
-            can_cancel=_can_cancel(row, user) and not row.get('uncancellable'),
+            can_cancel=_can_cancel(row, user, level) and not row.get('uncancellable'),
             stalled=row['stalled'],
             retry_delayed=row['retry_delayed'],
             dataset_lane=row['dataset_lane'],
@@ -379,15 +475,17 @@ async def list_active_dataset_jobs(
     )
 
 
+_CONTROL = (
+    "manage in its dataset; its starter: the level its kind needs; a map re-fit: edit; "
+    "a patch import or a mirror's sync: an administrator"
+)
+_CONTROL_WHILE_DELETING = "its dataset comes from the job; the queue runs none of a deleting dataset's jobs"
+
+
 @router.post('/jobs/{job_id}/cancel', response_model=JobStatus, response_model_exclude_unset=True)
+@checks_level(_CONTROL, while_deleting=_CONTROL_WHILE_DELETING)
 async def request_job_cancellation(job_id: UUID, user: dict = Depends(get_current_user)):
-    job = await _authorized_job(job_id, user)
-    if not _can_cancel(job, user):
-        raise HTTPException(
-            status_code=403,
-            detail='Only an administrator or the submitting power user can cancel a job '
-            '(power users can also cancel map re-fits in their datasets)',
-        )
+    job = await _controlled_job(job_id, user)
     try:
         cancelled = await cancel_job(db.pool, job_id)
     except CancelRefused as error:
@@ -401,12 +499,11 @@ async def request_job_cancellation(job_id: UUID, user: dict = Depends(get_curren
 
 
 @router.post('/jobs/{job_id}/resume', status_code=202)
+@checks_level(_CONTROL, while_deleting=_CONTROL_WHILE_DELETING)
 async def resume_bulk_job(job_id: UUID, user: dict = Depends(get_current_user)):
     from .. import bulk_jobs, concept_jobs
 
-    job = await _authorized_job(job_id, user)
-    if not _can_cancel(job, user):
-        raise HTTPException(403, 'Only an administrator or the submitting power user can resume a job')
+    job = await _controlled_job(job_id, user)
     if job['kind'] == concept_jobs.EXPLICIT_KIND:
         # Continues the same checkpoint while the job still owns its concept.
         try:
@@ -415,9 +512,6 @@ async def resume_bulk_job(job_id: UUID, user: dict = Depends(get_current_user)):
             raise HTTPException(409, 'Job state is busy; retry resume') from error
     if job['kind'] != bulk_jobs.KIND:
         raise HTTPException(400, 'This job does not support bulk resume')
-    operation = await db.fetchval("SELECT args->>'operation' FROM jobs WHERE id=$1", job_id)
-    if operation in ('delete', 'delete_embeddings') and user['role'] != 'admin':
-        raise HTTPException(403, 'Only an administrator can resume a deletion')
     try:
         return await bulk_jobs.resume(db.pool, job_id)
     except QueueBusy as error:
@@ -432,13 +526,12 @@ async def resume_bulk_job(job_id: UUID, user: dict = Depends(get_current_user)):
 
 
 @router.post('/jobs/{job_id}/discard')
+@checks_level(_CONTROL, while_deleting=_CONTROL_WHILE_DELETING)
 async def discard_bulk_job(job_id: UUID, user: dict = Depends(get_current_user)):
     """Give up a stopped bulk job: completed chunks stay, the rest never runs and no longer blocks revert."""
     from .. import bulk_jobs
 
-    job = await _authorized_job(job_id, user)
-    if not _can_cancel(job, user):
-        raise HTTPException(403, 'Only an administrator or the submitting power user can discard a job')
+    job = await _controlled_job(job_id, user)
     if job['kind'] != bulk_jobs.KIND:
         raise HTTPException(400, 'Only bulk jobs can be discarded')
     try:

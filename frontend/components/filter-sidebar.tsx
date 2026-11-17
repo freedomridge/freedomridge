@@ -13,7 +13,7 @@ import * as Slider from '@radix-ui/react-slider';
 import { useState, useEffect, useId, useMemo, useRef, type ReactNode } from 'react';
 import { type QueryFunctionContext, useQueries } from '@tanstack/react-query';
 import { useToast } from '@/contexts/ToastContext';
-import { useUser } from '@/contexts/UserContext';
+import { refusal, type AccessLevel } from '@/lib/access-level';
 
 // Range slider that COMMITS the filter only on release (onValueCommit) while the
 // thumb + label track the drag locally. Previously the sliders fired onChange on
@@ -92,6 +92,8 @@ interface Props {
     // Every section starts expanded: the dataset is small enough to filter every field at once (the
     // server's sidebar_expand_all). Read when the sidebar mounts.
     expandAll?: boolean;
+    // The user's level in the dataset: promoting a field (building its index) takes edit.
+    level?: AccessLevel | null;
 }
 
 // A field whose statistics are still pending shows only its header: there is nothing to expand.
@@ -178,13 +180,13 @@ export function FilterSidebar({
     appliedFilters,
     valuesUpdating = false,
     expandAll: expandAllOnOpen = false,
+    level = null,
 }: Props) {
     // The fields the sidebar lists: parent_id isn't one (`sidebar: false`); nothing here asks for it.
     const schema = useMemo(() => fullSchema.filter(field => field.sidebar !== false), [fullSchema]);
     const hasActiveFilters = Object.keys(filters).length > 0;
     const [promotingField, setPromotingField] = useState<string | null>(null);
     const { addToast } = useToast();
-    const { user } = useUser();
 
     // Every field is a collapsible section. On a dataset
     // small enough to filter every field at once every section starts expanded; on a larger one they
@@ -312,8 +314,8 @@ export function FilterSidebar({
     // So visual consistency is achieved without forcing state change.
 
 
-    // Check if user can promote fields (power_user or admin)
-    const canPromote = user?.role === 'admin' || user?.role === 'power_user';
+    // Promoting a field (building its index) takes edit in the dataset: below it the button is disabled and says why.
+    const promoteRefusal = refusal(level, 'edit');
 
     const handlePromote = async (field: string) => {
         if (promotingField) return;
@@ -422,9 +424,6 @@ export function FilterSidebar({
             );
         }
 
-        // Only show promote button if user has permission
-        if (!canPromote) return null;
-
         // Annotation label fields cannot be indexed (nested in JSONB arrays)
         if (isDerivedLabelField(field.name, schema)) return null;
 
@@ -440,9 +439,10 @@ export function FilterSidebar({
         return (
             <button
                 onClick={() => handlePromote(field.name)}
-                disabled={isPromoting}
-                className={`p-1 rounded hover:bg-zinc-800 transition-colors ${isPromoting ? 'text-zinc-500' : 'text-zinc-500 hover:text-yellow-400'}`}
-                title="Promote Field (Create Index)"
+                disabled={isPromoting || !!promoteRefusal}
+                className={`p-1 rounded hover:bg-zinc-800 transition-colors disabled:cursor-not-allowed disabled:hover:bg-transparent ${isPromoting || promoteRefusal ? 'text-zinc-500' : 'text-zinc-500 hover:text-yellow-400'}`}
+                aria-label="Promote Field (Create Index)"
+                title={promoteRefusal ?? 'Promote Field (Create Index)'}
             >
                 {isPromoting ? <span className="animate-spin">⟳</span> : <Rocket className="w-4 h-4" />}
             </button>

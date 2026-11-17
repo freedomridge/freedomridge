@@ -12,11 +12,10 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from .. import job_wait
-from ..access import require_dataset_access
+from ..access import require_dataset_access, require_level
 from ..database import db
 from ..diskspace import INGEST_ROW_BYTES, require_free_space
 from ..request_limits import guest_heavy
-from .auth import require_role
 
 router = APIRouter(
     prefix="/datasets/{id}/hashes",
@@ -402,8 +401,8 @@ def hash_upsert_sql(hex_len: int) -> str:
 
 
 @router.post("/upload")
-async def upload_hashes(id: int, hashes: List[HashUpload], user: dict = Depends(require_role("power_user"))):
-    """Upload pre-computed hashes for samples (power_user+, scoped to this dataset)."""
+async def upload_hashes(id: int, hashes: List[HashUpload], user: dict = Depends(require_level("edit"))):
+    """Upload pre-computed hashes for samples (edit access, scoped to this dataset)."""
     if not hashes:
         return {"message": "No hashes provided", "written": 0, "skipped": 0}
 
@@ -435,7 +434,7 @@ async def upload_hashes(id: int, hashes: List[HashUpload], user: dict = Depends(
 async def refresh_duplicates(
     id: int,
     config: str,
-    user: dict = Depends(require_role("power_user")),
+    user: dict = Depends(require_level("edit")),
     wait: bool = True,
 ):
     """(Re)build the hidden-duplicate set powering the "collapse duplicates" toggle, for one
