@@ -31,7 +31,7 @@
 #
 # The steps follow ci.yml. When ci.yml changes, update them to match and set CI_YML_SHA256 to its
 # `sha256sum`; a run stops while the two disagree.
-CI_YML_SHA256=a6b8dc7a5447f25e5c7f56aec8ef861ca650cfb1ce44218385db368cdff280d3
+CI_YML_SHA256=4ff15f1d8beef4a249ec54c643cd2ce9eedc798178869007baa2c8917b64ed0d
 set -u
 
 JOBS=${2:-lint,example-tests,backend-tests,db-recovery,frontend,quality,e2e}
