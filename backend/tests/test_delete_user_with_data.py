@@ -12,12 +12,16 @@ from backend.routers import users as users_router
 
 
 class _DB:
-    """Its own pool and connection; records statements and whether the transaction rolled back."""
+    """Its own pool and connection; records statements and whether the transaction rolled back. A database where the
+    user has no share in a dataset being deleted: every read finds nothing."""
 
     def __init__(self, raise_fk):
         self.raise_fk = raise_fk
         self.executed: list = []
         self.rolled_back = False
+
+    async def fetch(self, query, *args):
+        return []
 
     async def execute(self, query, *args):
         self.executed.append(query)

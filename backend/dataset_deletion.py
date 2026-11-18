@@ -40,6 +40,7 @@ DATASET_TABLES = (
     ('embedding_viz_meta', ('dataset_id', 'field_name')),
     ('embedding_layouts', ('dataset_id', 'field_name')),
     ('views', ('id',)),
+    # Skipped (SHARE_TABLES), but kept in their places: a deletion's checkpoint counts its place in this list.
     ('dataset_access', ('dataset_id', 'user_id')),
     ('dataset_group_access', ('dataset_id', 'group_id')),
     ('dataset_stats_state', ('dataset_id',)),
@@ -52,6 +53,9 @@ DATASET_TABLES = (
     # A follower's copy held after its primary was restored: its matches with the primary (mirror_restores).
     ('mirror_restore_map', ('dataset_id', 'sample_id')),
 )
+# A dataset's shares stay until its row goes, the deletion's last step, which takes them with it (their foreign keys
+# cascade): until then whoever started a deletion that stopped can still open the dataset and resume it.
+SHARE_TABLES = ('dataset_access', 'dataset_group_access')
 CONCEPT_TABLES = (
     ('embedding_concept_scores', ('concept_id', 'sample_id')),
     ('concept_score_pending', ('concept_id', 'block_id', 'transaction_id')),
@@ -344,9 +348,10 @@ def handler(pool):
             if index == len(DATASET_TABLES):
                 return StepResult(checkpoint={**checkpoint, 'phase': 'samples'})
             table, keys = DATASET_TABLES[index]
-            rows, size = await _batch(pool, table, keys, 't.dataset_id=$1', [dataset_id], batch_size, checkpoint)
-            if rows:
-                return _delete_step(job, checkpoint, table, keys, rows, size)
+            if table not in SHARE_TABLES:
+                rows, size = await _batch(pool, table, keys, 't.dataset_id=$1', [dataset_id], batch_size, checkpoint)
+                if rows:
+                    return _delete_step(job, checkpoint, table, keys, rows, size)
             return StepResult(checkpoint={**checkpoint, 'table': index + 1})
 
         if phase == 'samples':

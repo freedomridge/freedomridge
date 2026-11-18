@@ -4,6 +4,27 @@ Freedom Ridge has one version for the server, the web app and the Python SDK (th
 file), following [Semantic Versioning](https://semver.org). A release lists **upgrade notes** when
 it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
 
+## 2.13.1 (2026-11-17)
+
+2.13.1 keeps a dataset's shares until its deletion finishes, so the manager who started a deletion can still follow,
+cancel and resume it, and updates Next.js to 16.4.6 for two cache advisories. No migrations: the standard upgrade
+steps.
+
+### Fixed
+
+- **Next.js 16.4.6**, for GHSA-mfr8-8qww-v76h and GHSA-vc7v-qv4w-wrv8 (moderate: information leaking across root
+  params through `'use cache'` and `unstable_cache`, neither of which Freedom Ridge uses). `next build` now refuses
+  16.4.3, so building 2.13.0's frontend from source fails; 2.13.1's builds again. Release images aren't affected.
+- **A dataset keeps its shares until its deletion finishes.** Deleting a dataset removed its shares with users and
+  groups among its first tables, long before its samples. On a large dataset, the manager who started the deletion
+  then lost the dataset while it was still being deleted: it left their list, and they could no longer open it,
+  follow or cancel its deletion, or resume it once it had stopped (cancelled or failed); only an administrator
+  could. The Groups section stopped listing it for its groups too. The shares now go with the dataset row itself,
+  the deletion's last step. Until then a user or group with a share in the dataset can't be deleted: the answer
+  (409) names the dataset, by name and id, and says to resume or finish its deletion first. A deletion under way
+  when you upgrade finishes as before; one that had already removed the shares still needs an administrator if it
+  stops.
+
 ## 2.13.0 (2026-11-16)
 
 2.13.0 lets one server serve several teams: user groups, and a level for each share of a dataset (view, tag, edit

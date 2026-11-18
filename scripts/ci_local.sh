@@ -13,12 +13,14 @@
 #                    with its environments and node_modules takes about 3 GB; delete it once you have
 #                    read the logs.
 #   CI_LOCAL_PORT    two digits NN: the run's database, API and frontend listen on loopback ports 554NN,
-#                    80NN and 30NN (default 93). Give runs at the same time different values.
+#                    80NN and 30NN, and backend-tests' shards 2-4 their databases on 562NN-564NN (default 93).
+#                    Give runs at the same time different values.
 #   NODE_BIN         a directory to put first on PATH, for the Node major version that ci.yml sets up.
 #   MAPBOX_ENV_FILE  an .env file with NEXT_PUBLIC_MAPBOX_TOKEN, so the map e2e test runs instead of
 #                    skipping itself. The token goes only into this run's frontend build. Its URL
 #                    restrictions must allow localhost; an e2e run checks a map tile first.
-#   BACKEND_TESTS    pytest arguments to run instead of the whole backend suite (skips the SDK suites).
+#   BACKEND_TESTS    pytest arguments to run instead of the whole backend suite (skips the SDK suites). Without
+#                    it, the suite runs as ci.yml's four shards, side by side, each with its own database.
 #   E2E_SPECS        Playwright spec files (a :line is fine) to run instead of the whole e2e suite: the ordinary ones
 #                    named, then the *.fits.spec.ts ones named (playwright.config.ts), without the rest of the suite.
 #
@@ -31,14 +33,16 @@
 #
 # The steps follow ci.yml. When ci.yml changes, update them to match and set CI_YML_SHA256 to its
 # `sha256sum`; a run stops while the two disagree.
-CI_YML_SHA256=4ff15f1d8beef4a249ec54c643cd2ce9eedc798178869007baa2c8917b64ed0d
+CI_YML_SHA256=ede3c8937d0cdd16ffd50a24111d43a06c562f4f819d9586c5fc4a8f061bd6a4
 set -u
 
 JOBS=${2:-lint,example-tests,backend-tests,db-recovery,frontend,quality,e2e}
 P=${CI_LOCAL_PORT:-93}
 [[ $P =~ ^[0-9][0-9]$ ]] || { echo "CI_LOCAL_PORT must be two digits" >&2; exit 2; }
 DBPORT=554$P APIPORT=80$P FEPORT=30$P
-for port in "$DBPORT" "$APIPORT" "$FEPORT"; do
+# Backend-test shards 2-4 get their own databases on 562NN-564NN (shard 1 uses the run's database).
+SHARDS="1 2 3 4" SHARD_PORTS="562$P 563$P 564$P"
+for port in "$DBPORT" "$APIPORT" "$FEPORT" $SHARD_PORTS; do
   if (exec 3<> "/dev/tcp/127.0.0.1/$port") 2> /dev/null; then
     echo "Port $port is in use; choose another CI_LOCAL_PORT" >&2
     exit 2
@@ -126,18 +130,19 @@ stop_group() { # stop_group <process group leader>
 cleanup() {
   stop_group "$BACKEND"
   stop_group "$FRONTEND"
-  docker rm -fv "$DB" > /dev/null 2>&1
+  docker rm -fv "$DB" "$DB-s2" "$DB-s3" "$DB-s4" > /dev/null 2>&1
 }
 trap cleanup EXIT
 trap 'exit 1' INT TERM HUP
 
-start_db() { # a fresh database from schema.sql, as each ci.yml job starts one
-  docker rm -fv "$DB" > /dev/null 2>&1
-  docker run -d --name "$DB" --tmpfs /var/lib/postgresql/data:rw,size=12g \
+start_db() { # start_db [container] [port]: a fresh database from schema.sql, as each ci.yml job starts one
+  local name=${1:-$DB} port=${2:-$DBPORT}
+  docker rm -fv "$name" > /dev/null 2>&1
+  docker run -d --name "$name" --tmpfs /var/lib/postgresql/data:rw,size=12g \
     -e POSTGRES_USER=freedomridge -e POSTGRES_PASSWORD=password -e POSTGRES_DB=freedomridge \
-    -p "127.0.0.1:$DBPORT:5432" "$IMAGE" > /dev/null &&
-    timeout 90 bash -c "until docker exec -e PGPASSWORD=password $DB psql -h 127.0.0.1 -U freedomridge -d freedomridge -c 'SELECT 1' >/dev/null 2>&1; do sleep 1; done" &&
-    docker exec -i "$DB" psql -U freedomridge -d freedomridge -v ON_ERROR_STOP=1 -q < backend/db/schema.sql
+    -p "127.0.0.1:$port:5432" "$IMAGE" > /dev/null &&
+    timeout 90 bash -c "until docker exec -e PGPASSWORD=password $name psql -h 127.0.0.1 -U freedomridge -d freedomridge -c 'SELECT 1' >/dev/null 2>&1; do sleep 1; done" &&
+    docker exec -i "$name" psql -U freedomridge -d freedomridge -v ON_ERROR_STOP=1 -q < backend/db/schema.sql
 }
 start_backend() { # start_backend <log name> <environment bin directory> [VAR=value ...]
   local name=$1 bin=$2
@@ -192,25 +197,47 @@ if want example-tests; then
   result example-tests $? "$(tail -1 "$L/example-tests.log")"
 fi
 
-if want backend-tests; then
+if want backend-tests && [ -n "${BACKEND_TESTS:-}" ]; then
   start_db > "$L/backend-tests-db.log" 2>&1
   result "backend-tests database" $?
   # shellcheck disable=SC2086 # BACKEND_TESTS holds several arguments
   FRIDGE_TEST_POSTGRES_DSN=$DATABASE_URL FRIDGE_TEST_POSTGRES_CONTAINER=$DB \
     "$LEAN/python" -m pytest -q -p no:cacheprovider ${BACKEND_TESTS:-} > "$L/backend-tests.log" 2>&1
   result "backend-tests pytest" $? "$(tail -1 "$L/backend-tests.log")"
-  if [ -z "${BACKEND_TESTS:-}" ]; then
-    start_backend sdk "$LEAN"
-    result "backend-tests backend start" $?
-    docker exec "$DB" psql -U freedomridge -d freedomridge -qc \
-      "UPDATE users SET must_change_password = false WHERE username = 'admin';"
-    for suite in test_sdk test_integrity test_map_contract test_objects test_synth_integration; do
-      FRIDGE_TEST_URL=http://127.0.0.1:$APIPORT/api "$LEAN/python" -m "fridge.$suite" > "$L/sdk-$suite.log" 2>&1
-      result "backend-tests $suite" $? "$(grep -E 'passed|failed' "$L/sdk-$suite.log" | tail -1)"
-    done
-    stop_group "$BACKEND"
-    BACKEND=
-  fi
+elif want backend-tests; then
+  # ci.yml's four shards, side by side: each its own database and data folder. Shard 1 uses the run's
+  # database, and the SDK suites run on it afterwards, as in ci.yml.
+  pids=()
+  for k in $SHARDS; do
+    name=$DB port=$DBPORT data=$W/data
+    [ "$k" = 1 ] || { name=$DB-s$k port=56$k$P data=$W/data-s$k; }
+    mkdir -p "$data"
+    (
+      start_db "$name" "$port" > "$L/backend-tests-db-s$k.log" 2>&1 || { echo "shard $k: its database didn't start"; exit 2; }
+      dsn=postgres://freedomridge:password@127.0.0.1:$port/freedomridge
+      FRIDGE_TEST_SHARD=$k/4 FRIDGE_TEST_POSTGRES_DSN=$dsn FRIDGE_TEST_POSTGRES_CONTAINER=$name \
+        FRIDGE_DB_CONTAINER=$name DATABASE_URL=$dsn FRIDGE_DATA_ROOT=$data \
+        "$LEAN/python" -m pytest -q -p no:cacheprovider
+    ) > "$L/backend-tests-s$k.log" 2>&1 &
+    pids+=($!)
+  done
+  i=0
+  for k in $SHARDS; do
+    wait "${pids[$i]}"
+    result "backend-tests pytest shard $k/4" $? "$(tail -1 "$L/backend-tests-s$k.log")"
+    i=$((i + 1))
+  done
+  docker rm -fv "$DB-s2" "$DB-s3" "$DB-s4" > /dev/null 2>&1
+  start_backend sdk "$LEAN"
+  result "backend-tests backend start" $?
+  docker exec "$DB" psql -U freedomridge -d freedomridge -qc \
+    "UPDATE users SET must_change_password = false WHERE username = 'admin';"
+  for suite in test_sdk test_integrity test_map_contract test_objects test_synth_integration; do
+    FRIDGE_TEST_URL=http://127.0.0.1:$APIPORT/api "$LEAN/python" -m "fridge.$suite" > "$L/sdk-$suite.log" 2>&1
+    result "backend-tests $suite" $? "$(grep -E 'passed|failed' "$L/sdk-$suite.log" | tail -1)"
+  done
+  stop_group "$BACKEND"
+  BACKEND=
 fi
 
 if want db-recovery; then

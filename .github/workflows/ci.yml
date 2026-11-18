@@ -85,7 +85,13 @@ jobs:
   backend-tests:
     if: ${{ !github.event.repository.private || github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 30
+    # Four shards side by side, each with its own database: whole test files, balanced by
+    # backend/tests/shard_timings.json (scripts/backend_test_shards.py). Shard 1 also runs the SDK suites.
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
     steps:
       - uses: actions/checkout@v7
         with:
@@ -116,14 +122,16 @@ jobs:
       - name: Install backend + SDK
         # The lean server (no torch/transformers), as before, plus the test tools.
         run: uv sync --frozen --no-default-groups --group dev
-      - name: Backend unit and PostgreSQL contract tests
+      - name: Backend unit and PostgreSQL contract tests (shard ${{ matrix.shard }} of 4)
         env:
           FRIDGE_TEST_POSTGRES_DSN: postgres://freedomridge:password@127.0.0.1:55494/freedomridge
           FRIDGE_TEST_POSTGRES_CONTAINER: ci-db
           FRIDGE_DB_CONTAINER: ci-db
           FRIDGE_DB_USER: freedomridge
+          FRIDGE_TEST_SHARD: ${{ matrix.shard }}/4
         run: python -m pytest -q
       - name: Start backend
+        if: matrix.shard == 1
         env:
           DATABASE_URL: postgres://freedomridge:password@127.0.0.1:55494/freedomridge
           SESSION_COOKIE_SECURE: 'false'   # cookie must flow over plain HTTP in CI
@@ -132,6 +140,7 @@ jobs:
           nohup python -m backend.launch -- python -m uvicorn backend.main:app --host 127.0.0.1 --port 8001 > backend.log 2>&1 &
           timeout 60 bash -c 'until curl -sf http://127.0.0.1:8001/api/datasets >/dev/null; do sleep 1; done'
       - name: Clear admin must_change_password for the SDK suites
+        if: matrix.shard == 1
         # The SDK integration suites log in as the seeded admin and call the API directly;
         # the server-side must_change_password gate 403s every non-exempt route until the
         # password is changed. Clear the flag so the suites run as a normal post-first-login
@@ -139,6 +148,7 @@ jobs:
         # get_current_user reads the flag per-request from the DB, so this takes effect live.
         run: docker exec ci-db psql -U freedomridge -d freedomridge -c "UPDATE users SET must_change_password = false WHERE username = 'admin';"
       - name: Integration suites (self-creating + self-cleaning datasets)
+        if: matrix.shard == 1
         env:
           FRIDGE_TEST_URL: http://127.0.0.1:8001/api
         run: |
@@ -148,7 +158,7 @@ jobs:
           python -m fridge.test_objects
           python -m fridge.test_synth_integration
       - name: Backend log
-        if: failure()
+        if: failure() && matrix.shard == 1
         run: tail -150 backend.log || true
 
   frontend:

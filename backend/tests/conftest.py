@@ -8,6 +8,7 @@ from urllib.parse import unquote, urlsplit
 import asyncpg
 import pytest
 
+from scripts.backend_test_shards import load_timings, parse_shard, split
 from scripts.db_test_safety import UnsafeTestDatabase, endpoint, require_container, require_test_url
 
 IDENTITY_SQL = 'SELECT system_identifier FROM pg_control_system()'
@@ -90,6 +91,38 @@ def pytest_sessionstart(session):
     except Exception:
         # Connection errors can contain connection strings; do not expose credentials.
         pytest.exit('Unsafe test database target: could not verify PostgreSQL server identity', returncode=2)
+
+
+_shard = None
+
+
+def pytest_configure(config):
+    # Read the shard once and take it out of the environment: a nested pytest run that a test starts must not
+    # inherit it and deselect its own tests.
+    global _shard
+    _shard = os.getenv('FRIDGE_TEST_SHARD')
+    _patch.delenv('FRIDGE_TEST_SHARD', raising=False)
+
+
+def pytest_collection_modifyitems(config, items):
+    """FRIDGE_TEST_SHARD=K/N keeps only shard K's test files (scripts/backend_test_shards.py)."""
+    spec = _shard
+    if not spec:
+        return
+    try:
+        index, count = parse_shard(spec)
+    except ValueError as error:
+        pytest.exit(str(error), returncode=pytest.ExitCode.USAGE_ERROR)
+
+    def file_of(item):
+        return item.path.relative_to(config.rootpath).as_posix()
+
+    shard = set(split([file_of(item) for item in items], count, load_timings())[index - 1])
+    kept = [item for item in items if file_of(item) in shard]
+    dropped = [item for item in items if file_of(item) not in shard]
+    if dropped:
+        config.hook.pytest_deselected(items=dropped)
+    items[:] = kept
 
 
 def pytest_unconfigure(config):

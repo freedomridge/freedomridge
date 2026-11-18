@@ -223,6 +223,8 @@ the DDL; a crash after a successful drop simply finds the next index on retry. T
 idempotent external effect, like backup file work, does not require a new runner primitive.
 The final fenced transaction removes the dataset row (only empty child relations and
 the two lane rows remain) and publishes success. Shared/global indexes remain intact.
+The dataset's shares with users and groups go with the row, through their foreign keys, and
+not before: whoever started a deletion that stops can still open the dataset and resume it.
 
 Cancel stops at a unit boundary and leaves a **partially deleted, read-only dataset**.
 It does not restore removed data. `POST /api/datasets/{id}/deletion/resume` returns 202

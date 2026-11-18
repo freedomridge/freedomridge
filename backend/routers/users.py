@@ -165,6 +165,31 @@ async def update_user(id: int, update: UserUpdate, admin: dict = Depends(require
     return {"message": "User updated successfully", "revoked_tokens": revoked}
 
 
+async def _refuse_shares_in_deletions(
+    connection: Any,
+    who: Literal["user", "group"],
+    target: int,
+    after: str = "",
+) -> None:
+    """409 naming the datasets being deleted that the user or group has a share in. A dataset keeps its shares until
+    its deletion finishes (dataset_deletion.SHARE_TABLES), so deleting the user or group, which removes them, would be
+    refused by the database's deletion guard anyway; asked first, the answer says which datasets."""
+    table = "dataset_access" if who == "user" else "dataset_group_access"
+    rows = await connection.fetch(
+        f"SELECT d.id, d.name FROM {table} a JOIN datasets d ON d.id = a.dataset_id "
+        f"WHERE a.{who}_id = $1 AND d.deleting ORDER BY d.name, d.id",
+        target,
+    )
+    if not rows:
+        return
+    named = ", ".join(f"'{row['name']}' (id {row['id']})" for row in rows)
+    if len(rows) == 1:
+        detail = f"This {who} has a share in a dataset being deleted, {named}. Resume or finish that dataset's deletion"
+    else:
+        detail = f"This {who} has a share in datasets being deleted: {named}. Resume or finish their deletions"
+    raise HTTPException(status_code=409, detail=f"{detail} before deleting the {who}.{after}")
+
+
 @router.delete("/users/{id}")
 async def delete_user(id: int, admin: dict = Depends(require_admin)):
     if id == admin['id']:
@@ -174,6 +199,14 @@ async def delete_user(id: int, admin: dict = Depends(require_admin)):
         assert db.pool is not None  # connected at startup (lifespan)
         async with db.pool.acquire() as conn:
             async with conn.transaction():
+                # The database's deletion guard stays the backstop, and still answers for the user's other ties to a
+                # dataset being deleted (below).
+                await _refuse_shares_in_deletions(
+                    conn,
+                    "user",
+                    id,
+                    " You can deactivate the account in the meantime.",
+                )
                 # Their PRIVATE views would be orphaned (views.user_id ON DELETE SET NULL): listed for
                 # nobody, deletable by nobody. Public views stay (an admin can delete them);
                 # the id leaves every share list. All undone if the user can't be deleted (409 below).
@@ -335,7 +368,9 @@ async def rename_group(id: int, body: GroupName, admin: dict = Depends(require_a
 
 @router.delete("/groups/{id}", status_code=204)
 async def delete_group(id: int, admin: dict = Depends(require_admin)):
-    """Its members and its shares go with it."""
+    """Its members and its shares go with it. Not while a dataset it has a share in is being deleted (409); the
+    database's deletion guard is the backstop."""
+    await _refuse_shares_in_deletions(db, "group", id)
     if await db.execute("DELETE FROM groups WHERE id = $1", id) == "DELETE 0":
         raise HTTPException(status_code=404, detail="Group not found")
 
