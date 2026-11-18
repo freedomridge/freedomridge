@@ -111,6 +111,12 @@ The harness checks that the DSN and container name the same disposable server be
 anything. For a focused run, pass the relevant `backend/tests/test_*.py` files. Some database
 tests fail rather than skip when the test settings are missing.
 
+CI splits the suite into four shards that run side by side, each against its own database:
+`FRIDGE_TEST_SHARD=K/4` runs shard K, a set of whole test files balanced by
+`backend/tests/shard_timings.json`. `scripts/ci_local.sh` runs the four the same way. After adding
+slow tests, refresh the timings from a full run (`python -m pytest -q --junitxml=<file>`, then
+`python -m scripts.backend_test_shards <file>`); stale timings only unbalance the shards.
+
 Then run the SDK integration suites against a backend on that database. They create and delete
 their own datasets.
 
