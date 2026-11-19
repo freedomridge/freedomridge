@@ -4,6 +4,17 @@ Freedom Ridge has one version for the server, the web app and the Python SDK (th
 file), following [Semantic Versioning](https://semver.org). A release lists **upgrade notes** when
 it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
 
+## 2.13.2 (2026-11-18)
+
+2.13.2 updates the production nginx to 1.31.9 for the nginx advisories of 18 November 2026. No migrations: the
+standard upgrade steps (`pull` fetches the new nginx image and `up` recreates the nginx container).
+
+### Fixed
+
+- **nginx 1.31.9** in `docker-compose.prod.yml` (was 1.31.8), for CVE-2026-123007 and CVE-2026-123633 (HTTP/2,
+  which the production config turns on), CVE-2026-118899 (reading a request body over TLS 1.3) and the other
+  advisories nginx fixed in 1.31.9 and 1.30.7. The development and try-it setups don't run nginx.
+
 ## 2.13.1 (2026-11-17)
 
 2.13.1 keeps a dataset's shares until its deletion finishes, so the manager who started a deletion can still follow,
