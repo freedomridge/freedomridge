@@ -279,6 +279,11 @@ on; the others touch no sample.
   now in double quotes, and a number is written bare: a spreadsheet that reads the file with `;` takes a line with no
   `;` for one cell, with the comma as its decimal mark, so a number followed by an unquoted text could read as one
   formula ([DATASET_MANAGEMENT.md](docs/DATASET_MANAGEMENT.md#export-samples-as-csv)).
+- **"Select all" in the Export dialog also ticks a field the dialog lists after the click.** It ticked only the fields
+  listed at that moment, so a field the page's field list brought later (the list was still loading, or a bulk edit
+  added the field while the dialog was open) stayed unticked, the count didn't show it, and the file lacked its column.
+  After "Select all" every listed field is ticked, a later one when it appears, until a field is unticked or Reset is
+  pressed; from then on the ticks are the ones you set, as before. The file is otherwise as it was.
 - **A place excluded from a filter card's Builder tab is kept out on a dataset with objects**, as one excluded from
   the Query tab is. The Builder tab saves `location not within "US-KS"` as the one rule of a group: the same filter
   and the same "Not in Kansas" chip, which the page and the assistant now link to the objects as they link the bare

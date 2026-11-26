@@ -105,12 +105,21 @@ export function ExportDialog({ datasetId, schema, dataset, appliedCount, hasObje
         return { fields: regular, promoted };
     }, [schema]);
 
-    // Field selection state
-    const [selectedFields, setSelectedFields] = useState<Set<string>>(() => new Set(['filepath']));
+    // Field selection state. After "Select all" the selection is every listed field, also one the page's field list
+    // brings later (it may still be filling in), until a field is unticked or Reset is pressed.
+    const [pickedFields, setPickedFields] = useState<Set<string>>(() => new Set(['filepath']));
+    const [allPicked, setAllPicked] = useState(false);
+    const selectedFields = useMemo(
+        () => (allPicked ? new Set<string>([...SYSTEM_FIELDS, ...metadataFields.fields]) : pickedFields),
+        [allPicked, metadataFields, pickedFields],
+    );
 
     const toggleField = (field: string) => {
-        setSelectedFields(prev => {
-            const next = new Set(prev);
+        // Unticking after "Select all" keeps the other listed fields ticked; later fields are no longer added.
+        const start = allPicked ? selectedFields : null;
+        setAllPicked(false);
+        setPickedFields(prev => {
+            const next = new Set(start ?? prev);
             if (next.has(field)) next.delete(field);
             else next.add(field);
             return next;
@@ -118,12 +127,12 @@ export function ExportDialog({ datasetId, schema, dataset, appliedCount, hasObje
     };
 
     const selectAllFields = () => {
-        const all = new Set<string>([...SYSTEM_FIELDS, ...metadataFields.fields]);
-        setSelectedFields(all);
+        setAllPicked(true);
     };
 
     const resetFields = () => {
-        setSelectedFields(new Set(['filepath']));
+        setAllPicked(false);
+        setPickedFields(new Set(['filepath']));
     };
 
     // Export is always IMAGE grain. Objects are an opt-in per-grid grain; every other consumer of
