@@ -183,6 +183,24 @@ for sample in page["items"]:   # page["total"] is the dataset size
 
 Increase `offset` by `limit` until it reaches `total`.
 
+## Export samples as CSV
+
+In the web app, the grid's **Export** button opens the Export dialog, which writes a CSV of the whole dataset, the
+applied filters, the current view or the selected samples, with the fields you tick: a header row of field names, then
+one row a sample. The browser builds it from `POST /api/datasets/{id}/samples/query` (`fields`, `slim: true`, a page
+at a time by `after_id`). A list is written as its values joined with `;`, an object as JSON, a missing value as an
+empty cell. Every text cell, the header's too, is in double quotes, and a number is written bare: a spreadsheet that
+reads the file with `;` takes a line with no `;` for one cell, with the comma as its decimal mark, so a number followed
+by an unquoted text could read as one formula.
+
+A text that would start a formula when a spreadsheet opens the file (`=`, `+`, `-`, `@` or a look-alike such as `＝`,
+after any leading spaces or double quotes, or a tab or a carriage return first) is written with an apostrophe in front,
+which a spreadsheet shows as text: at the start of a cell, and also after a `;`, a tab or a line break inside one,
+where a spreadsheet that reads the file with `;` (Excel in much of Europe) or tabs begins a new cell. A program reading
+the file sees those apostrophes, and ordinary text is touched too: `range 3; -5 to 5` becomes `range 3;' -5 to 5`. A
+text made only of numbers (`-5`, `-5;3`) gets none; one with anything else gets one before each number that has a sign
+too (`a;-5` becomes `a;'-5`). The assistant's value list download keeps the same rule ([ASSISTANT.md](ASSISTANT.md)).
+
 ## Describe a field (edit)
 
 A field's description and unit say what it means, in the app (Dataset Settings → Fields, and on the field's name in

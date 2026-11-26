@@ -156,6 +156,18 @@ each field. Six migrations, none of which touches a sample.
 
 ### Fixed
 
+- **A CSV from the Export dialog can't run a formula in a spreadsheet.** A cell that starts with `=`, `+`, `-`, `@`,
+  a tab or a carriage return (a metadata value such as `=HYPERLINK(...)`, put there by whoever supplied the data) was
+  written as it was, and a spreadsheet opening the file ran it as a formula. A text that would start a formula, the
+  header's too, is now written with an apostrophe in front, which a spreadsheet shows as text, as the assistant's value
+  list download does: at the start of a cell (after any leading spaces or double quotes, and for look-alike signs such
+  as `＝` too), and also after each `;`, tab or line break inside one, where a spreadsheet that reads the file with `;`
+  (Excel in much of Europe) or tabs begins a new cell. A program reading the file sees those apostrophes, and ordinary
+  text is touched too: `range 3; -5 to 5` becomes `range 3;' -5 to 5`, a list `["a", "=b"]` becomes `a;'=b`, and
+  `a;-5` becomes `a;'-5`; a text made only of numbers (`-5`, `-5;3`) gets none. Every text cell, the header's too, is
+  now in double quotes, and a number is written bare: a spreadsheet that reads the file with `;` takes a line with no
+  `;` for one cell, with the comma as its decimal mark, so a number followed by an unquoted text could read as one
+  formula ([DATASET_MANAGEMENT.md](docs/DATASET_MANAGEMENT.md#export-samples-as-csv)).
 - **Text that reads as a number but is too large for one is text.** A value such as the hex id `0347677e05719710`
   matched the aggregate route's number pattern and overflowed when cast, so `count_values` (which orders ties by
   number) and every number operation failed with a 500 on a field holding one. It is now counted and listed as the

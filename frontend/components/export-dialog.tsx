@@ -9,6 +9,7 @@ import { useState, useMemo, useCallback, useRef, useEffect } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { useFilters, withGrain } from '@/contexts/FilterContext';
 import { getSamples, type ComplexFilter, type SchemaField, type Dataset } from '@/lib/api';
+import { escapeCsvField } from '@/lib/csv';
 import { isLocalField, localValue, type LocalFieldsHolder } from '@/lib/local-fields';
 
 const SYSTEM_FIELDS = ['filepath', 'id', 'media_type', 'tags', 'created_at', 'last_modified_at'] as const;
@@ -32,22 +33,6 @@ interface ExportDialogProps {
     /** False when the grid it was opened from doesn't show the selection (one of the other grain). */
     offerSelection?: boolean;
     onClose: () => void;
-}
-
-function escapeCsvField(value: unknown): string {
-    if (value === null || value === undefined) return '';
-    if (Array.isArray(value)) {
-        const joined = value.map(v => (v === null || v === undefined) ? '' : String(v)).join(';');
-        if (joined.includes(',') || joined.includes('"') || joined.includes('\n') || joined.includes('\r')) {
-            return `"${joined.replace(/"/g, '""')}"`;
-        }
-        return joined;
-    }
-    const str = typeof value === 'object' ? JSON.stringify(value) : String(value);
-    if (str.includes(',') || str.includes('"') || str.includes('\n') || str.includes('\r')) {
-        return `"${str.replace(/"/g, '""')}"`;
-    }
-    return str;
 }
 
 // Slim sample row from /samples/query: id + requested top-level fields, with

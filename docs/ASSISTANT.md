@@ -537,11 +537,17 @@ the assistant; a request made for a tool is refused on every `/api/assistant/` r
 - `GET /api/assistant/views/{handle}`: `{"dataset_id", "stages", "created_at", "expires_at"}`, the stages as the app's
   filter bar keeps them (`{type, description, filter}`), with their real values. Another person's handle is a 404
   saying it belongs to someone else's conversation; an unknown or expired one a 404 saying views are kept 30 days.
-- `GET /api/assistant/lists/{handle}/csv`: a CSV with a header row `value,count` and one row per distinct value,
+- `GET /api/assistant/lists/{handle}/csv`: a CSV with a header row `"value","count"` and one row per distinct value,
   however many. Anyone else, and an unknown or expired handle: 404. A kept list's download is the list as it was when
-  the tool answered; a list too long to keep is counted again when the download is opened. A text value that starts
-  with `=`, `+`, `-`, `@`, a tab or a carriage return is written with a leading apostrophe, so a spreadsheet can't run
-  it as a formula; numbers are written as they are.
+  the tool answered; a list too long to keep is counted again when the download is opened. A text that would start a
+  formula (`=`, `+`, `-`, `@` or a look-alike such as `＝`, after any leading spaces or double quotes, or a tab or a
+  carriage return first) is written with an apostrophe in front, so a spreadsheet can't run it: at the start of a
+  cell, and also after a `;`, a tab or a line break inside one, where a spreadsheet that reads the file with `;` (Excel
+  in much of Europe) or tabs begins a new cell. A program reading the file sees those apostrophes, and ordinary text is
+  touched too: `range 3; -5 to 5` becomes `range 3;' -5 to 5`. A text that is only a number (`-5`) gets none. Every
+  text cell is in double quotes, and a number or a count is written bare: a spreadsheet that reads the file with `;`
+  takes a line with no `;` for one cell, with the comma as its decimal mark, so a number next to an unquoted text could
+  read as one formula.
 
 ### Finding
 
