@@ -45,8 +45,10 @@ from .routers import auth
 from .version import VERSION
 
 PATH = '/mcp'
-# How long a 2026-07-28 client may reuse the tool list before asking again, and only for the caller that asked: the
-# list is fixed for a release, so a few minutes of reuse costs nothing, and an upgrade reaches clients soon after.
+# How long a 2026-07-28 client may reuse the tool list before asking again, and only for the caller that asked. The
+# list is the caller's (assistant.tools_for: the administration tools join it for an administrator while they are
+# switched on), so a change of the switch, of a role or of a release reaches a client's list within these minutes. A
+# call is decided at once, whatever the list a client kept.
 TOOL_LIST_CACHE_MS = 5 * 60 * 1000
 # Where the signed-in user travels from the token check to the tool handlers, on the request's ASGI scope.
 _USER = 'fridge.mcp_user'
@@ -195,7 +197,9 @@ async def _list_tools(
     ctx: ServerRequestContext[Any, Any],
     params: types.PaginatedRequestParams | None,
 ) -> types.ListToolsResult:
-    read_only = types.ToolAnnotations(read_only_hint=True)
+    assert ctx.request is not None  # the HTTP transports always attach the request
+    user = ctx.request.scope[_USER]
+    read_only = types.ToolAnnotations(read_only_hint=True)  # every tool, the administration tools too, only reads
     return types.ListToolsResult(
         tools=[
             types.Tool(
@@ -204,13 +208,14 @@ async def _list_tools(
                 input_schema=tool.input_schema,
                 annotations=read_only,
             )
-            for tool in assistant.tools()
+            for tool in await assistant.tools_for(user_id=user['id'], door='mcp')
         ],
     )
 
 
 async def _call_tool(ctx: ServerRequestContext[Any, Any], params: types.CallToolRequestParams) -> types.CallToolResult:
-    if params.name not in {tool.name for tool in assistant.tools()}:
+    # An administration tool is never unknown: for someone who may not call it, call_tool answers not_allowed.
+    if params.name not in {tool.name for tool in (*assistant.tools(), *assistant.admin_tools())}:
         raise MCPError(code=types.INVALID_PARAMS, message=f'Unknown tool: {params.name}')
     assert ctx.request is not None  # the HTTP transports always attach the request
     user = ctx.request.scope[_USER]

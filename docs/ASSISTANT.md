@@ -25,6 +25,8 @@ a second.
   ([Keeping a field's values back](#keeping-a-fields-values-back)); and samples' fields, which it doesn't read unless
   an administrator allows it.
 - **What it never does:** write, delete or share anything. Every tool only reads.
+- **Administration tools** let an administrator's AI client read the server's status, background jobs, backups and
+  index advice, behind a switch of their own, off as shipped ([Administration tools](#administration-tools)).
 
 ## Getting started
 
@@ -152,6 +154,7 @@ refused with "The MCP server is switched off on this server". **Settings → Ass
 - **The assistant may read samples' fields**: off as shipped, when `get_samples` gives only samples' ids and links.
   On, the model reads each sample's fields (their values, private fields left out) and its file path, which can show
   where files are kept, such as a bucket's and its folders' names.
+- **Administration tools**: off as shipped ([Administration tools](#administration-tools)).
 
 The settings belong to this server: nothing of them is synced to followers or from a primary.
 
@@ -189,7 +192,8 @@ them (a key left out doesn't change):
   "groups": [{"id": 3, "name": "agronomy"}],
   "users": [{"id": 12, "username": "sam", "allowed": false}],
   "new_datasets_closed": false,
-  "sample_fields": false
+  "sample_fields": false,
+  "admin_tools": false
 }
 ```
 
@@ -380,7 +384,8 @@ costs the most: its exact distinct count groups 4 million different values. On t
 Every tool reads. A tool answers `{"ok": true, "result": ...}` or `{"ok": false, "error": {"code", "message",
 "retryable"}}`. The codes:
 
-- `not_allowed`: the MCP server is switched off, or this person or account may not use it now;
+- `not_allowed`: the MCP server is switched off, or this person or account may not use it now (for an
+  administration tool, also: its switch is off, or the person is not an administrator);
 - `refused`: the API's own refusal, in its words (no access, a closed dataset, a level too low, a private field
   questioned);
 - `not_found`: a dataset, field, handle or saved view that doesn't exist (a handle or a saved view this person can't
@@ -411,6 +416,9 @@ and comes with the true total and the offset that gets the rest.
 | `search_similar` | a view's images most like some words or samples, as a working view | `POST /api/search`, `samples/query` |
 | `list_saved_views` | the saved views the person can see | `GET .../views` |
 | `open_saved_view` | a saved view as a working view, with its own link | `GET /api/views/{slug}`, `samples/query` |
+
+For an administrator, four more tools read the server's status, background jobs, backups and index advice while the
+administration tools are switched on: [Administration tools](#administration-tools).
 
 ### `list_datasets`
 
@@ -626,6 +634,213 @@ same `not_found`; a view of a dataset closed to the assistant is `refused`. Open
 Both make views within a view's limits: a search adds one stage to the view searched, and a saved view brings its own,
 so a search of a view of 50 stages, or a saved view of more than 50, is `invalid` and makes no view.
 
+## Administration tools
+
+Four more tools help an administrator run the server: `system_status`, `backup_status`, `list_jobs` and
+`index_advice`. They read what Settings → System status and a dataset's page show, and they only read: each answer has a
+`link` to the page where the administrator acts (removes an index, backs up now, stops a job). Calling one twice
+changes nothing.
+
+### Who may use them
+
+**Settings → Assistant → Administration tools** is their switch, off as shipped and on a server upgraded to this
+release (`admin_tools` on `GET` and `PATCH /api/admin/assistant`). A person may call one when, at that moment, they may
+use the MCP server ([Who may use it](#who-may-use-it)), they are an administrator, and the switch is on. All three are
+read again on every call and on every request a tool makes: an administrator made a power user, or the switch turned
+off, is refused at the next request. Refused, a call answers `not_allowed` with "The administration tools are switched
+off on this server" or "This tool is for administrators"; the MCP server's own refusals come first, in their words.
+
+The MCP server lists them after the thirteen to a person who may call them now, and to nobody else. A client may keep
+the list it was given for five minutes, so a change of the switch or of a role reaches its list within five minutes; a
+call is decided at once. Called by name, they are never an unknown tool: someone who may not call one gets
+`not_allowed`. Each is marked read-only.
+
+### What goes to the AI client
+
+What these tools read goes to the AI client the administrator connects, and from there to its AI service: the ids and
+names of datasets and the names and sizes of their indexes, also for datasets closed to the assistant (an administrator
+runs the whole server), never their samples, their fields' values or their jobs' messages; usernames (who started a
+job, who removed an index); error messages (a failed job's, a failed backup's); and the backup folder and its files'
+names.
+
+Never: a token, a password or its hash, a storage key or secret, a connection string, a signed URL, the assistant's
+sealing key, an email address, an IP address, a worker's host name, a commit or tree hash, or a file-system path other
+than the backup folder. Each answer is built from named facts: a tool copies only the facts listed below, so something
+a route adds later never reaches a client by itself. A free text (an error, a progress message, a reason) is cut to 500
+characters, and an email or IP address, a web or connection address, a path outside the backup folder, a hash (12
+hexadecimal characters or more, with a digit and a letter) or a secret in it is written `[email address]`,
+`[IP address]`, `[address]`, `[path]`, `[hash]` or `[secret]`. That is a second line of defence for text the server
+did not write: it can't recognise a host name inside a sentence.
+
+The administrators' pages know nothing of a dataset closed to the assistant or of a field's values kept from it, and
+their free text can quote data: a failed index build's database error quotes the value it could not read. So:
+
+- **A job's messages** (its error, its progress message) are given only when every dataset the job is about is open
+  to the assistant and has no field whose values are kept from it, or when it is about no dataset and its kind is
+  known to be: a backup, a region load, the selection cleanup, the server's own index review, the removal of an index
+  that belongs to no dataset. A kind is known to be about none only when the job reads no sample's values, or its
+  messages are written by the app from counts and names alone. Restoring an index is not: it builds the index again
+  from its stored definition, reading every row the index covers, and a hand-made expression index can fail quoting a
+  sample's value from any dataset. A job is about the dataset it belongs to, the one it names in what it was asked to
+  do (a dataset's index review belongs to none and names its dataset), and every dataset it writes: a follower's sync
+  names only its link and writes that link's mirrors on this server. Otherwise `error` and the
+  progress `message` are null and, when there was one to keep back, `error_withheld` says why: "This job's messages
+  are kept back: its dataset is closed to the assistant", "This job's messages are kept back: its dataset has fields
+  whose values are kept from the assistant", "This job's messages are kept back: its dataset no longer exists" (also
+  for a sync whose link no longer exists or has no mirror left: a mirror's row goes with its dataset, so none left can
+  mean deleted since), or "This job's messages are kept back: this kind of job is not yet known to be about no
+  dataset" (a restore, and any other kind that belongs to no dataset, a kind added later included). `error_withheld` is
+  null whenever nothing is kept back. The person reads the messages on the job's linked page. Known and left open:
+  when some of a link's mirrors are left and one was deleted, a past sync's words are judged by the ones left.
+- **An index's SQL definition** is judged by the constants it holds, whatever kind the advisor calls it: the advisor
+  guesses a kind from the index's name, and a person can name an index like the app's
+  (`idx_samples_site_gin … WHERE metadata->>'site' = 'Farm 12'`). A constant is a quoted text or a number: PostgreSQL
+  prints strings, dates, intervals, arrays and jsonb quoted and numbers bare (`… = 4417`, `> 9000.5`,
+  `= ANY (ARRAY[12, 31, 407])`), so a partial index for one plot, farm or year holds a field's value either way. A
+  definition is given whole when every quoted text in it is one the server writes itself (a field's name:
+  `metadata ->> 'field'`, `metadata -> 'field'`, `metadata ? 'field'`, with or without the `::text` PostgreSQL prints
+  after it; a vector index's `field_name = '…'`; a storage parameter inside `WITH (…)`) and every number is the
+  server's own (`dataset_id = N`, a storage parameter, a type's modifier such as `numeric(10,2)`; digits inside a name
+  such as `embeddings_d7` are not numbers). It is also given whole when it is one of the indexes `schema.sql` ships:
+  the same name on the same table, holding no quoted text and no number `schema.sql`'s own statement for it doesn't
+  (those are the app's constants; an index made under a shipped index's name with a value of its own in it is not one
+  of them). Otherwise, or when it is longer than 2,000 characters, `definition` is null and `definition_withheld` is
+  true, and the words about that index (an overlap's `reason`, a `needed` reason) write each such quoted text `'…'`
+  and each such number `…`. Everything the app builds stays whole: a field's index is its expression and
+  `WHERE dataset_id = N`, a vector index quotes its field, a list column's index holds no constant.
+
+Every answer is at most 20 KB; each list comes a page at a time with its true total.
+
+### `system_status`
+
+No arguments. The server's health, from `GET /api/admin/status`:
+
+```json
+{"checked_at": "2026-11-19T09:00:00+00:00", "server": {"version": "2.13.2", "restart_needed": false},
+ "database": {"reachable": true, "size_bytes": 140000000000, "pending_migrations": [], "unknown_migrations": [],
+              "stale_functions": []},
+ "database_disk": {"total_bytes": 172000000000, "free_bytes": 50000000000, "level": "ok",
+                   "low_below_bytes": 5368709120, "ingest_paused_below_bytes": 1073741824},
+ "cache_disks": [{"folders": ["S3 image cache", "Crop cache"], "total_bytes": 172000000000,
+                  "free_bytes": 50000000000, "level": "ok"}],
+ "workers": {"server": {"online": 3, "last_seen": "2026-11-19T08:59:58+00:00"},
+             "compute": {"online": 0, "last_seen": null}},
+ "backups": {"level": "ok", "latest_at": "2026-11-19T02:00:05+00:00", "next_run_at": "2026-11-20T02:00:00+00:00"},
+ "link": "https://fr.example.org/settings/status"}
+```
+
+`database_disk.level` is `ok`, `low` (below `low_below_bytes`: the app warns), `paused` (below
+`ingest_paused_below_bytes`: new samples are refused until space is freed) or `unknown`; a cache disk is `ok` or `low`
+and names its folders by their labels, never their paths. "Pending" means `pending_migrations` (migrations the code has
+and the database hasn't run), `unknown_migrations` (ones the database ran that the code doesn't know), `stale_functions`
+and `restart_needed` (the code on disk is newer than the code running), never a newer release: nothing checks for one.
+A database that doesn't answer is `{"reachable": false, "error": "..."}`, and workers that can't be counted
+`{"available": false, "error": "..."}`. `backups` is the short form; `backup_status` has the rest.
+
+### `backup_status`
+
+No arguments. The backups, from `GET /api/admin/status`, `GET /api/admin/backups/schedule` and the backup jobs:
+
+```json
+{"level": "failed", "folder": "/mnt/data/backups",
+ "latest": {"file": "freedomridge_20261019T055351Z.sql.gz", "created_at": "2026-10-19T05:53:51+00:00",
+            "size_bytes": 20040000000, "dump_seconds": 1019, "verify_seconds": 205, "tables": 30},
+ "last_failure": {"failed_at": "2026-10-20T02:00:00+00:00", "error": "BackupError: free space 3 GB, need 40 GB"},
+ "kept": {"count": 2, "total_bytes": 40080000000, "oldest_created_at": "2026-10-18T02:00:04+00:00"},
+ "unverified_dumps": 0, "disk": {"total_bytes": 8000000000000, "free_bytes": 2000000000000},
+ "schedule": {"interval_hours": 24, "start_hour": 2, "keep": 7, "next_run_at": "2026-10-21T02:00:00+00:00"},
+ "running": null,
+ "recent_runs": [{"job": "5b1c2e9a-...", "state": "failed", "started_at": "2026-10-20T02:00:01+00:00",
+                  "finished_at": "2026-10-20T02:00:03+00:00", "file": null, "size_bytes": null,
+                  "error": "RuntimeError: BackupError: free space 3 GB, need 40 GB"}],
+ "link": "https://fr.example.org/settings/status"}
+```
+
+`level` is `ok`, `overdue` (the newest verified backup is older than the schedule allows), `failed` (a backup failed
+after the newest verified one), `none`, `unreadable` (the folder can't be read: `folder` and `error` say which and why)
+or `not_configured`: no backup folder is set, the other facts are null or empty, and `note` says "This server takes no
+backups through the app (no backup folder is set). A deployment may back up another way; see the backup docs." (the
+production Compose stack reads this way while its sidecar backs up elsewhere: [Backups](BACKUP_AND_MIGRATION.md)).
+`latest` is the newest backup that was verified when it was made. `running` is `{"job", "state", "started_at"}` for a
+backup queued or running now, else null. `recent_runs` are the last ten backup jobs, newest first, each run that
+succeeded with its own backup's `file` and `size_bytes`.
+
+### `list_jobs`
+
+Background jobs across the whole server. Arguments: `state` (`needs_attention`, the default: failed, queued and
+running; or one of `failed`, `running`, `queued`, `succeeded`, `cancelled`), `kind`, `dataset` (a dataset's id: its
+jobs and those that name it), `since_hours` (1 to 8760, default 168), `limit` (1 to 50, default 20), `offset`.
+
+```json
+{"jobs": [{"id": "0b7e...", "kind": "field_index_build", "state": "failed",
+           "dataset": {"id": 7, "name": "main"}, "field": "serial_number", "started_by": "sam",
+           "created_at": "2026-11-18T09:14:03+00:00", "started_at": "2026-11-18T09:14:04+00:00",
+           "finished_at": "2026-11-18T09:15:10+00:00", "progress": {"done": 0, "total": null, "message": null},
+           "failures": 2, "max_failures": 2, "error": "QueryCanceledError: canceling statement due to statement timeout",
+           "error_withheld": null, "link": "https://fr.example.org/datasets/7"}],
+ "total": 3, "offset": 0, "next_offset": null,
+ "counts": {"failed": 3, "running": 1, "queued": 0, "succeeded": 2114, "cancelled": 0},
+ "kinds": ["backup", "field_index_build", "index_review", "selection_cleanup"],
+ "since": "2026-11-12T09:20:00+00:00", "link": "https://fr.example.org/settings/status"}
+```
+
+Newest first. The window bounds the jobs that have ended (failed, succeeded, cancelled), by when they were created in
+the last `since_hours`; a job still queued or running is listed and counted however old it is, for one waiting weeks
+for a worker is what needs attention. `total` counts the jobs that match; `counts` is by state for the same `kind`,
+`dataset` and window, whatever `state` asks; `kinds` are the kinds in the window, whatever the other filters, so a
+model can ask for one. `progress` is `{"done", "total", "message"}`, its `message` null when the job has
+none or it is kept back. `started_by` is a username, or "System". An unknown `dataset` is `not_found`; an unknown
+`kind` gives an empty list. A job's result is never given.
+
+It stands on `GET /api/admin/jobs/all` (administrators only): `state` (repeatable; every state without it), `kind`,
+`dataset_id` (the jobs about that dataset), `since` (the jobs that have ended, created at or after it), `limit` (1 to
+100, default 50) and `offset`, answering `{"jobs", "total", "counts", "kinds",
+"offset", "next_offset"}`, each job with `id`, `kind`, `state`, `dataset_id` (the dataset it is about), `dataset_name`,
+`field`, `started_by`, `created_at`, `started_at`, `finished_at`, `progress`, `failures`, `max_failures`,
+`cancel_requested` and `error`: no result, and nothing of what a job was asked beyond the dataset it is about, but for
+a `backup` job's `backup`, its own `{"file", "size_bytes", "tables"}`, null until it has succeeded. It reads
+the jobs table through two indexes of its own (migration `0041_jobs_across_datasets.sql`) and never reads samples: on a
+million jobs it answers a week's window in a few milliseconds and a year's in about a tenth of a second.
+
+### `index_advice`
+
+What the index advisor found at its last review. Arguments: `dataset` (one dataset's indexes; left out, the server's
+own), `section` (one list, a page at a time: `overlapping`, `possibly_unused`, `suggested`, `needed`, `too_new`,
+`removed`), `limit` (1 to 50, default 20), `offset` (with `section`).
+
+```json
+{"scope": "system", "dataset": null, "reviewed_at": "2026-11-18T03:00:04+00:00", "enough_history": true,
+ "window_days": 7, "idle_days_required": 14, "review_running": false, "last_failure": null,
+ "totals": {"overlapping": 10, "possibly_unused": 2, "suggested": 0, "needed": 41, "too_new": 3, "removed": 1,
+            "redundant_bytes": 5400000000},
+ "overlapping": [{"redundant": {"name": "idx_a", "table": "samples", "kind": "other", "method": "btree",
+                                "dataset": null, "field": null, "size_bytes": 540000000, "scans": 12,
+                                "last_scan": "2026-11-01T10:00:00+00:00", "valid": true, "needed": [],
+                                "definition": "CREATE INDEX idx_a ON public.samples USING btree (a)",
+                                "definition_withheld": false},
+                  "kept": {"name": "idx_b", "...": "..."}, "rule": "prefix",
+                  "reason": "Its columns (a) lead idx_b (a, b), which serves the same searches (reading a larger index)"}],
+ "possibly_unused": [{"name": "idx_c", "...": "...", "idle_days": 31.5, "invalid": false}],
+ "schedule": {"enabled": true, "frequency": "weekly", "weekday": 0, "time": "03:00", "timezone": "UTC",
+              "next_run_at": "2026-11-23T03:00:00+00:00", "last_run_at": "2026-11-16T03:00:00+00:00"},
+ "pending_actions": [], "offset": 0, "next_offset": null, "link": "https://fr.example.org/settings/status"}
+```
+
+Without `section`, the first `limit` entries of `overlapping` and `possibly_unused` (and `suggested`, for a dataset),
+fewer when they would make the answer too large (`note` says so); with `section`, that list alone, and `next_offset`
+is for it. `totals` counts every list; `redundant_bytes` is the size of the redundant indexes of `overlapping` and of
+`possibly_unused`, each index once. An overlap is one of three rules: `duplicate` (the same columns, operators, order
+and predicate), `operators` (the same columns, with an operator class whose operators the other's include) or `prefix`
+(a B-tree whose columns lead the other's). `possibly_unused` waits for `enough_history`: the advisor calls an index
+unused only once it has watched for `idle_days_required` days, and `note` says when it hasn't. `needed` lists why each
+index must stay; `suggested` (a dataset's) is `{"field", "type", "reason", "excess_seconds", "build_seconds",
+"pays_back", "usages"}`; `removed` is `{"index_name", "table", "field", "size_bytes", "reason", "removed_by",
+"removed_at", "state"}`. An index's `dataset` is `{"id", "name"}` when it belongs to one, a closed dataset included.
+With no review yet, `reviewed_at` is null, the lists are empty and `note` says an administrator starts one on the
+page. `last_failure` is `{"finished_at", "error", "error_withheld"}`: a dataset's review keeps its error back as a
+job's (a failed review of a closed dataset's indexes has `error` null and the sentence). The tool removes nothing: the
+person removes or restores an index on the linked page.
+
 ## The call log
 
 Every tool call made through the assistant leaves one row: who, through which door (`mcp`), which tool, which dataset
@@ -651,13 +866,16 @@ Administrators read it under Settings → Assistant, **Recent calls**, and at
 
 ## How a tool reads (for developers)
 
-`backend/assistant` holds the tools (`catalog.py`, `working.py`, `finding.py`), the rule (`rule.py`) and the way a tool
-reads (`inner.py`, `api.py`). The door (`backend/mcp_door.py`) calls four functions:
+`backend/assistant` holds the tools (`catalog.py`, `working.py`, `finding.py`, and the administration tools in
+`admin.py`), the rule (`rule.py`) and the way a tool reads (`inner.py`, `api.py`). The door (`backend/mcp_door.py`)
+calls these:
 
 ```python
 from backend import assistant
 
 assistant.tools()                                    # the tools, in their fixed order
+assistant.admin_tools()                              # the administration tools, in their order
+await assistant.tools_for(user_id=7, door='mcp')     # what that person could call through that door now
 assistant.instructions()                             # the text a model is given before the tools
 await assistant.door_refusal(user_id=7, door='mcp')  # None, or the sentence that says why not
 await assistant.call_tool(user_id=7, door='mcp', name='list_datasets', arguments={})
@@ -672,14 +890,22 @@ await assistant.call_tool(user_id=7, door='mcp', name='list_datasets', arguments
   is marked as the assistant's.
 - **One place for the closed rule.** For a marked user, `check_dataset_access` refuses a closed dataset after the
   access check, and `filter_datasets_for_user` leaves it out (`backend/access.py`), so routes that find their dataset
-  through a view, a job or a body follow without anything more.
+  through a view, a job or a body follow without anything more. An administration tool's user is marked too, and
+  neither applies to it: it reaches only the routes its tool lists, which name closed datasets like any other, and
+  what could carry a closed dataset's samples is kept out of their answers ([Administration
+  tools](#what-goes-to-the-ai-client)).
 - **Two fences.** Each tool lists the (method, route) pairs it may call. A request for any other is refused before it
-  is sent, and `get_current_user` refuses a request served by a route the tool doesn't list, and every
-  administrators' route (`/api/admin/...`), whoever the user is: those answer across datasets and know nothing of a
-  closed dataset. A job of no dataset reads as one that doesn't exist. Either refusal can only come from a tool's own
-  fault, so `call_tool` raises `ToolFailed` for it. `backend/tests/test_assistant_core.py` checks that every route a
-  read tool lists is a GET or one of the POSTs the route guard counts as reads, is no administrators' route, and
-  identifies its caller.
+  is sent, and `get_current_user` refuses a request served by a route the tool doesn't list, and, for the thirteen,
+  every administrators' route by its path, whoever the user is: `/api/admin/...`, and the administrators-only reads
+  elsewhere (`/api/users`, `/api/groups`, `/api/followers`, `/api/primaries`, `/api/storage/configs`,
+  `/api/compute-launcher`, `/api/workers`, a dataset's `/index-advisor`). Those answer across datasets and know nothing
+  of a closed dataset. A job of no dataset reads to them as one that doesn't exist. Either refusal can only come from a
+  tool's own fault, so `call_tool` raises `ToolFailed` for it. Only an administration tool may call an administrators'
+  route: one its tool lists (`private.SPANNING_ROUTES` holds every route such a tool may list, and it may list no
+  other), while its user may use the door, is an administrator and the administration tools are switched on, all read
+  afresh for each request; the routes keep their own administrator check. `backend/tests/test_assistant_core.py`
+  checks that every route a read tool lists is a GET or one of the POSTs the route guard counts as reads, is no
+  administrators' route, and identifies its caller.
 - **Private values in one place.** Every route a tool reads is sealed by `inner.py`, not by each tool
   (`private.py`, `guard.py`):
   - **Out:** every answer reaches a tool with each value of a private field replaced by a sealed token: AES-SIV
@@ -696,7 +922,10 @@ await assistant.call_tool(user_id=7, door='mcp', name='list_datasets', arguments
   - **Text:** filter text the server writes for a tool shows a private field's values as
     `(3 values kept from the assistant)`. A saved view's stage words that name one are written again the same way.
   - **Deny by default:** a tool may list a route only once its answer's shape is declared covered
-    (`private.COVERED_ROUTES`), with a test that plants values and reads that route's answer. A route that names no
+    (`private.COVERED_ROUTES`), with a test that plants values and reads that route's answer. An administration
+    tool may list only the routes of `private.SPANNING_ROUTES`, which span datasets: it copies only the facts it names
+    from their answers, and `private.keep_back` first takes out a job's messages by its dataset and a hand-made index's
+    definition that holds a quoted value. A route that names no
     dataset in its path declares where the dataset its answer is sealed for comes from (`private.DATASET_FROM`): none
     (the regions), its body (the search), or the one it resolved itself (a saved view by its slug, whose route keeps
     the dataset it checks on the request, and answers a private view its caller may not see as missing before it

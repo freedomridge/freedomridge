@@ -351,6 +351,178 @@ async def list_global_jobs(
     return await _job_page('dataset_id IS NULL', [], limit=limit, cursor=cursor, user=user)
 
 
+JobState = Literal['queued', 'running', 'succeeded', 'failed', 'cancelled']
+_STATES: tuple[JobState, ...] = ('queued', 'running', 'succeeded', 'failed', 'cancelled')
+_ACTIVE = ('queued', 'running')  # not ended: listed and counted whatever the window
+# The dataset a job is about: the one it belongs to, or the one its arguments name (a dataset's index review, a vector
+# index's removal belong to none and name theirs).
+_ABOUT = (
+    "COALESCE(jobs.dataset_id, CASE WHEN jobs.args->>'dataset_id' ~ '^[0-9]{1,9}$' "
+    "THEN (jobs.args->>'dataset_id')::int END)"
+)
+
+
+def _all_job(row) -> dict[str, Any]:
+    return {
+        'id': str(row['id']),
+        'kind': row['kind'],
+        'state': row['state'],
+        'dataset_id': row['about'],
+        'dataset_name': row['dataset_name'],
+        'field': row['field'],
+        'started_by': row['started_by'],
+        'created_at': row['created_at'].isoformat(),
+        'started_at': row['started_at'].isoformat() if row['started_at'] else None,
+        'finished_at': row['finished_at'].isoformat() if row['finished_at'] else None,
+        'progress': {'done': row['progress_done'], 'total': row['progress_total'], 'message': row['message']},
+        'failures': row['failures'],
+        'max_failures': row['max_failures'],
+        'cancel_requested': row['cancel_requested'],
+        'error': row['error'],
+        # A backup's own result, all it holds (null until it has succeeded); no other kind's result is given.
+        **({'backup': row['backup']} if row['kind'] == 'backup' else {}),
+    }
+
+
+class _Args:
+    """The parameters of one statement by name, each placeholder made when the text first uses it."""
+
+    def __init__(self, values: dict[str, Any]):
+        self.values = values
+        self.order: list[str] = []
+
+    def __getitem__(self, name: str) -> str:
+        if name not in self.order:
+            self.order.append(name)
+        return f'${self.order.index(name) + 1}'
+
+    def used(self) -> list[Any]:
+        return [self.values[name] for name in self.order]
+
+
+def _parts(args: _Args, columns: str, states: Any, *, kind: bool = False, tail: str = '') -> str:
+    """The jobs of `states` in the window as a UNION ALL of fixed predicates, one per state and per way a job is about
+    the dataset, so each is a range of one index (idx_jobs_state_created): a queued or running job whatever its age,
+    one that has ended when it was created at or after `since`; the jobs a dataset holds, and those of no dataset that
+    name it (idx_jobs_named_dataset)."""
+    branches = ['']
+    if args.values['dataset'] is not None:
+        named = args['dataset']
+        branches = [
+            f'jobs.dataset_id = {named}',
+            f"jobs.dataset_id IS NULL AND jobs.args ? 'dataset_id' AND jobs.args->>'dataset_id' = {named}::text",
+        ]
+    found = []
+    for state in states:
+        for branch in branches:
+            where = [f"jobs.state = '{state}'", branch]
+            if args.values['since'] is not None and state not in _ACTIVE:
+                where.append(f"jobs.created_at >= {args['since']}")
+            if kind:
+                where.append(f"jobs.kind = {args['kind']}")
+            found.append(f"(SELECT {columns} FROM jobs WHERE {' AND '.join(part for part in where if part)}{tail})")
+    return ' UNION ALL '.join(found)
+
+
+@router.get('/admin/jobs/all')
+async def list_all_jobs(
+    state: Optional[list[JobState]] = Query(None),
+    kind: Optional[str] = Query(None, min_length=1, max_length=200),
+    dataset_id: Optional[int] = Query(None, ge=1, le=2**31 - 1),
+    since: Optional[datetime] = None,
+    limit: int = Query(50, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    user: dict = Depends(get_current_user),
+):
+    """Jobs across the whole server, newest first, for an administrator: those in `state` (repeatable; every state
+    without it), of one `kind`, about one dataset (`dataset_id`: the jobs it holds, and those of no dataset that name
+    it, such as its index reviews), in the window: every queued or running job however old, and the jobs that have
+    ended created at or after `since`. `total` counts what matches; `counts` is by state for the same kind, dataset and
+    window, whatever `state` asks; `kinds` are the kinds of the jobs in the window, whatever the other filters. A job's
+    result, and what it was asked beyond the dataset it is about, are never given, but for a backup's own `backup`:
+    `{file, size_bytes, tables}` once it has succeeded."""
+    if user['role'] != 'admin':
+        raise HTTPException(status_code=403, detail='Only administrators can access global jobs')
+    if since is not None and since.tzinfo is None:
+        since = since.replace(tzinfo=timezone.utc)
+    wanted = list(dict.fromkeys(state)) if state else list(_STATES)
+    values = {'dataset': dataset_id, 'since': since, 'kind': kind, 'limit': limit, 'offset': offset}
+    async with db.pool.acquire() as connection, connection.transaction(isolation='repeatable_read', readonly=True):
+        if dataset_id is not None and not await connection.fetchval(
+            'SELECT EXISTS (SELECT 1 FROM datasets WHERE id = $1)',
+            dataset_id,
+        ):
+            raise HTTPException(status_code=404, detail='Dataset not found')
+        # The window's jobs of every state by kind: the counts, and the kinds a model can ask for (of every dataset).
+        args = _Args(values)
+        tally = await connection.fetch(
+            f"""SELECT kind, state, count(*) AS jobs FROM ({_parts(args, 'jobs.kind, jobs.state', _STATES)}) found
+                GROUP BY kind, state""",
+            *args.used(),
+        )
+        kinds = {row['kind'] for row in tally}
+        if dataset_id is not None:
+            args = _Args({**values, 'dataset': None})
+            found = _parts(args, 'jobs.kind', _STATES)
+            kinds = {
+                row['kind']
+                for row in await connection.fetch(f'SELECT DISTINCT kind FROM ({found}) found', *args.used())
+            }
+        counts = {name: 0 for name in _STATES}
+        for row in tally:
+            if kind is None or row['kind'] == kind:
+                counts[row['state']] += row['jobs']
+        total = sum(counts[name] for name in wanted)
+        rows = []
+        if offset < total:
+            args = _Args({**values, 'enough': offset + limit})
+            # Each part is a range of idx_jobs_state_created (or of a dataset's indexes), read newest first and no
+            # further than the page needs.
+            found = _parts(
+                args,
+                'jobs.id, jobs.created_at',
+                wanted,
+                kind=kind is not None,
+                tail=f' ORDER BY jobs.created_at DESC, jobs.id DESC LIMIT {args["enough"]}',
+            )
+            rows = await connection.fetch(
+                f"""WITH page AS (
+                        SELECT id, created_at FROM ({found}) found
+                        ORDER BY created_at DESC, id DESC LIMIT {args['limit']} OFFSET {args['offset']}
+                    )
+                    SELECT jobs.id, jobs.kind, jobs.state, {_ABOUT} AS about, d.name AS dataset_name,
+                           CASE WHEN jobs.kind IN ('ann_index_build', 'field_index_build')
+                                THEN COALESCE(jobs.args->>'field', jobs.args->>'field_name') END AS field,
+                           COALESCE(u.username, CASE WHEN jobs.dedupe_owner = 'system' THEN 'System'
+                                                     ELSE 'Deleted user' END) AS started_by,
+                           jobs.created_at, jobs.started_at, jobs.finished_at, jobs.progress_done,
+                           jobs.progress_total, jobs.message, jobs.failures, jobs.max_failures,
+                           COALESCE(controls.cancel_requested, FALSE) AS cancel_requested, jobs.error,
+                           CASE WHEN jobs.kind = 'backup' AND jobs.state = 'succeeded'
+                                     AND jsonb_typeof(jobs.result) = 'object'
+                                THEN jsonb_build_object('file', jobs.result->'file', 'size_bytes',
+                                                        jobs.result->'size_bytes', 'tables', jobs.result->'tables')
+                           END AS backup
+                    FROM page JOIN jobs ON jobs.id = page.id
+                    -- Every job gets its row (the jobs_initialize_controls trigger); a LEFT JOIN all the same, so a job
+                    -- missing one is never dropped from a page its total counts.
+                    LEFT JOIN job_controls controls ON controls.job_id = jobs.id
+                    LEFT JOIN users u ON u.id = jobs.created_by
+                    LEFT JOIN datasets d ON d.id = {_ABOUT}
+                    ORDER BY page.created_at DESC, page.id DESC""",
+                *args.used(),
+            )
+    following = offset + len(rows)
+    return {
+        'jobs': [_all_job(row) for row in rows],
+        'total': total,
+        'counts': counts,
+        'kinds': sorted(kinds),
+        'offset': offset,
+        'next_offset': following if rows and following < total else None,
+    }
+
+
 async def _job_page(
     scope: str,
     scope_args: list,

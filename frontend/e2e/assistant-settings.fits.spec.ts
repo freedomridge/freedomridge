@@ -24,6 +24,7 @@ type Settings = {
     groups: Array<{ id: number; name: string }>;
     users: Array<{ id: number; username: string; allowed: boolean }>;
     new_datasets_closed: boolean;
+    admin_tools: boolean;
 };
 
 const S = stamp();
@@ -48,6 +49,11 @@ const NEEDS_EDIT = 'This needs edit access to the dataset';
 const VIEW_ONLY = 'View only: changing these settings needs edit access to the dataset';
 const KEEP = 'Keep this field\'s values from the assistant';
 const FIELDS_INTRO = 'A field whose values are kept from the assistant still shows them here; the assistant learns what the field means and how many samples have it, never a value.';
+// The administration tools' switch (m2-contract-admin-read-tools 1.4), under its own heading. Read here: the heading
+// labels its section (a region, as the page's other sections are), and the switch is the section's one switch or
+// checkbox, whatever its own name.
+const ADMIN_TOOLS_NOTE = 'Lets an administrator\'s AI client read this server\'s status, background jobs, backups and index advice. What it reads goes to that client: the names of datasets and of their indexes, with the indexes\' sizes (also for datasets closed to the assistant, never their samples), usernames, error messages and backup locations. Never passwords, tokens or storage keys.';
+const ADMIN_TOOLS_MCP_OFF = 'While the MCP server is off, nobody can use them.';
 
 test.beforeAll(async () => {
     cookie = await adminLogin();
@@ -59,7 +65,7 @@ test.afterAll(async () => {
     await allSteps([
         () => apiFetch(cookie, '/admin/assistant', {
             method: 'PATCH',
-            body: JSON.stringify({ mcp_enabled: found.mcp_enabled, roles: found.roles, new_datasets_closed: found.new_datasets_closed }),
+            body: JSON.stringify({ mcp_enabled: found.mcp_enabled, roles: found.roles, new_datasets_closed: found.new_datasets_closed, admin_tools: found.admin_tools }),
         }),
         ...datasetIds.map(id => () => deleteDatasetAndWait(cookie, id, 120_000)),
         ...groupIds.map(id => () => deleteGroup(cookie, id)),
@@ -117,6 +123,8 @@ const rolesGroup = (page: Page) => page.getByRole('group', { name: 'Roles', exac
 const roleBox = (page: Page, name: 'Administrators' | 'Power users') => rolesGroup(page).getByRole('checkbox', { name, exact: true });
 const groupsBox = (page: Page) => page.getByRole('group', { name: 'Groups whose members may use it', exact: true });
 const newClosedBox = (page: Page) => page.getByRole('region', { name: 'Datasets', exact: true }).getByRole('checkbox', { name: 'New datasets start closed to the assistant', exact: true });
+const adminToolsRegion = (page: Page) => page.getByRole('region', { name: 'Administration tools', exact: true });
+const adminToolsSwitch = (page: Page) => adminToolsRegion(page).getByRole('switch').or(adminToolsRegion(page).getByRole('checkbox'));
 const peopleTable = (page: Page) => page.getByRole('table', { name: 'People and the assistant', exact: true });
 const answerOf = (page: Page, username: string) => page.getByRole('combobox', { name: `Assistant for ${username}`, exact: true });
 const rowOf = (page: Page, username: string) => peopleTable(page).getByRole('row').filter({ has: page.getByText(username, { exact: true }) });
@@ -562,6 +570,45 @@ test('New datasets start closed: off as shipped; ticked, a dataset created after
     const later = await apiFetch(cookie, '/datasets', { method: 'POST', body: JSON.stringify({ name: `${PREFIX}later` }) });
     datasetIds.push(later.id);
     expect(later.assistant_closed, 'made after it was unticked').toBe(false);
+});
+
+test('Administration tools: a switch of their own under that heading, off on a fresh server, with its note, and a sentence more while the MCP server is off; a click sends only admin_tools and survives a reload', async ({ page }) => {
+    expect(found.admin_tools, 'off on a fresh server').toBe(false);
+    const sent = writesTo(page, '/api/admin/assistant');
+    try {
+        await patchSettings({ mcp_enabled: false });
+        await openAssistant(page);
+        await expect(page.getByRole('heading', { name: 'Administration tools', exact: true })).toBeVisible();
+        const region = adminToolsRegion(page);
+        await expect(adminToolsSwitch(page)).toHaveCount(1);
+        await expect(adminToolsSwitch(page)).not.toBeChecked();
+        await expect(region).toContainText(ADMIN_TOOLS_NOTE);
+        await expect(region).toContainText(ADMIN_TOOLS_MCP_OFF);
+
+        // The MCP server on: the note stays, the sentence goes, without a reload.
+        await mcpSwitch(page).click();
+        await expect(mcpSwitch(page)).toHaveAttribute('aria-checked', 'true');
+        await expect(region).toContainText(ADMIN_TOOLS_NOTE);
+        await expect(region).not.toContainText(ADMIN_TOOLS_MCP_OFF);
+
+        // On: only that key is sent; it survives a reload.
+        const before = sent.length;
+        await adminToolsSwitch(page).click();
+        await expect(adminToolsSwitch(page)).toBeChecked();
+        expect(sent.slice(before)).toEqual([['PATCH', '/api/admin/assistant', { admin_tools: true }]]);
+        await page.reload();
+        await expect(adminToolsSwitch(page)).toBeChecked();
+        expect((await settings()).admin_tools).toBe(true);
+        expect((await settings()).mcp_enabled).toBe(true);
+
+        // Off again: only that key.
+        await adminToolsSwitch(page).click();
+        await expect(adminToolsSwitch(page)).not.toBeChecked();
+        expect(sent.at(-1)).toEqual(['PATCH', '/api/admin/assistant', { admin_tools: false }]);
+        expect((await settings()).admin_tools).toBe(false);
+    } finally {
+        await patchSettings({ mcp_enabled: false, admin_tools: false });
+    }
 });
 
 test('a refused change shows the server\'s words at the top and the next change clears them; a settings read that fails shows its message instead of the sections (answers faked)', async ({ page }) => {

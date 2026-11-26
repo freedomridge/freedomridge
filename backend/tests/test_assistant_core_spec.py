@@ -92,6 +92,7 @@ SHIPPED = {
     'users': [],
     'new_datasets_closed': False,
     'sample_fields': False,  # the working-views contract's one more key
+    'admin_tools': False,  # m2-contract-admin-read-tools 1.1
 }
 # The POST routes that only read (docs, the access spec's view-level reads): any other POST writes.
 READ_POSTS = {

@@ -15,7 +15,7 @@ from .. import public_settings
 from ..api_errors import CodedHTTPException
 from ..assistant import rule as assistant_rule
 from ..assistant.api import NOT_ALLOWED_CODE, ROUTE_REFUSED_CODE
-from ..assistant.identity import ASSISTANT_KEY, Identity, scope_identity
+from ..assistant.identity import ADMIN_TOOL_KEY, ASSISTANT_KEY, Identity, administrators_route, scope_identity
 from ..auth_cleanup import DEMO_ACCOUNT_LOCK, cleanup_accounts
 from ..auth_policy import validate_new_password
 from ..crypto import hash_token
@@ -257,20 +257,31 @@ async def _assistant_user(identity: Identity, request: Request) -> dict:
     """The user of an assistant's request made in process (backend/assistant/inner.py), read afresh: refused (403,
     code assistant_not_allowed) unless the account is active, owes no password change and may use the assistant
     through the request's door now; refused too (code assistant_route_refused) when the route serving the request isn't
-    one the calling tool lists, or is an administrators' route (/api/admin/...), whoever the user is: those answer
-    across datasets and know nothing of a dataset closed to the assistant. The user answered carries the door
-    (ASSISTANT_KEY), which the access rule reads (backend/access.py)."""
+    one the calling tool lists, or is an administrators' route (/api/admin/..., and the administrators-only reads
+    elsewhere: identity.administrators_route), whoever the user is: those answer across datasets and know nothing of a
+    dataset closed to the assistant. The user answered carries the door (ASSISTANT_KEY), which the access rule reads
+    (backend/access.py).
+
+    An administration tool's request (Identity.admin, backend/assistant/admin.py) may reach the administrators' routes
+    its tool lists, and only while its user is an administrator and the administration tools are switched on, read
+    afresh here with the rule (assistant_not_allowed otherwise). Its user also carries ADMIN_TOOL_KEY."""
     verdict = await assistant_rule.verdict(identity.user_id, identity.door, db)
     if verdict.refusal is not None or verdict.user is None:
         raise CodedHTTPException(403, verdict.refusal or assistant_rule.ACCOUNT_INACTIVE, NOT_ALLOWED_CODE)
     route = request.scope.get('route')
-    if request.url.path.startswith('/api/admin/') or request.url.path == '/api/admin':
+    if identity.admin:
+        refusal = assistant_rule.admin_refusal(verdict)
+        if refusal is not None:
+            raise CodedHTTPException(403, refusal, NOT_ALLOWED_CODE)
+    elif administrators_route(request.url.path):
         raise CodedHTTPException(403, "The assistant may not call the administrators' routes", ROUTE_REFUSED_CODE)
     if request.url.path.startswith('/api/assistant/'):  # the people's own: a view's link, a list's download
         raise CodedHTTPException(403, "The assistant may not call the people's assistant routes", ROUTE_REFUSED_CODE)
     if (request.method, getattr(route, 'endpoint', None)) not in identity.routes:
         raise CodedHTTPException(403, 'This route is not one the assistant\'s tool may call', ROUTE_REFUSED_CODE)
     user = {**verdict.user, ASSISTANT_KEY: identity.door}
+    if identity.admin:
+        user[ADMIN_TOOL_KEY] = True
     await set_request_user(user)
     return user
 

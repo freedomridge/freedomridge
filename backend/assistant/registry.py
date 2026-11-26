@@ -1,8 +1,12 @@
-"""The assistant's tools in their fixed order, and the text a model is given before them."""
+"""The assistant's tools in their fixed order, the administration tools, and the text a model is given before them."""
 
+# ADMIN_TOOLS: for an administrator, while the administration tools are switched on (rule.admin_refusal), after TOOLS.
+from .admin import ADMIN_TOOLS
 from .catalog import DESCRIBE_DATASET, LIST_DATASETS, Tool
 from .finding import FINDING_TOOLS
 from .working import WORKING_TOOLS
+
+__all__ = ['ADMIN_TOOLS', 'INSTRUCTIONS', 'TOOLS']
 
 TOOLS: tuple[Tool, ...] = (LIST_DATASETS, DESCRIBE_DATASET, *WORKING_TOOLS, *FINDING_TOOLS)
 

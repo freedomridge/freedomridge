@@ -30,6 +30,8 @@ assistant)" for such a request (filter_query.format_filter with `kept`).
 
 import base64
 import json
+import re
+import uuid
 from dataclasses import dataclass
 from typing import Any, Collection, Iterable, Optional
 
@@ -123,6 +125,336 @@ DATASET_FROM: dict[tuple[str, str], str] = {
 # dropped, never sealed: a token is made only from what a dataset holds, so a request can't have its own guess turned
 # into a token that opens. An error answer is treated the same way, for it may echo the request.
 ECHO_ROUTES = frozenset({('POST', '/api/datasets/{id}/filter_query/parse')})
+
+# The routes an administration tool may list (backend/assistant/admin.py), and no other: inner.request refuses it every
+# route not here (and every other tool a route not in COVERED_ROUTES), and get_current_user refuses the administrators'
+# routes among them to every other tool by path. They answer across datasets and know neither rule above (an
+# administration tool's request reads closed datasets too: backend/access.py), and their free text can quote data (a
+# failed index build's database error quotes the value it could not read). So the tool copies into its answer only the
+# facts it names, and before it reads an answer, inner.request takes out with `keep_back` whatever could hold a private
+# field's value or anything of a closed dataset's samples:
+# - a job's words (its error, its progress message) unless the job is about datasets that are all open to the assistant
+#   and have no private field, or is of a kind known to be about no dataset (`withheld` says why, when there was
+#   something to take out). A job is about the dataset it belongs to, the one its arguments name, and, for a follower's
+#   sync, every mirror of its link, which it writes;
+# - an index's definition when it holds a constant (a quoted text or a number) other than one the server writes (a
+#   field's name, a vector index's field, a storage parameter, a field index's dataset, a type's modifier), whatever
+#   kind the advisor guessed from its name, unless it is one of the indexes schema.sql ships holding only constants
+#   schema.sql's statement holds; or when it is longer than DEFINITION_LIMIT (`definition` null, `definition_withheld`
+#   true). The words about such an index (an overlap's reason, why it is needed) write each such constant '…' or ….
+JOBS_ALL = '/api/admin/jobs/all'
+SYSTEM_INDEX_ADVICE = '/api/admin/index-advisor'
+DATASET_INDEX_ADVICE = '/api/datasets/{id}/index-advisor'
+SPANNING_ROUTES: dict[tuple[str, str], str] = {
+    ('GET', '/api/datasets'): 'every dataset, closed ones too: an administration tool copies only ids and names',
+    ('GET', '/api/admin/status'): 'the server: disks, database, workers, backups; of no dataset',
+    ('GET', '/api/admin/backups/schedule'): 'the backup schedule; of no dataset',
+    ('GET', JOBS_ALL): "jobs of every dataset: a job's words kept back by the dataset it is about",
+    (
+        'GET',
+        SYSTEM_INDEX_ADVICE,
+    ): "the server's indexes: a definition holding a value (a quoted text or a number) kept back",
+    ('GET', DATASET_INDEX_ADVICE): (
+        "one dataset's indexes: a definition holding a value kept back, its review's failure by the dataset"
+    ),
+}
+# Why a job's words were kept back (`withheld`): its dataset is closed to the assistant, has fields marked
+# values_private, or no longer exists (what it held can't be known); or it belongs to no dataset and its kind is not one
+# known to be about none.
+CLOSED, PRIVATE_FIELDS, GONE, UNKNOWN_KIND = 'closed', 'private_fields', 'gone', 'unknown_kind'
+# The kinds of job known to be about no dataset when they belong to none (job_service's handlers). A kind belongs here
+# only when the job reads no sample's values, or its messages are written by the app from counts and names alone:
+# - backup: pg_dump, verified by counting the dump's rows; pg_dump's errors don't quote rows;
+# - region_load: reads a boundary file into the region tables;
+# - selection_cleanup: deletes expired selections;
+# - index_review (the server's own; a dataset's names it in its arguments): reads the catalogs only;
+# - index_drop of an index of no dataset (a vector index's names its dataset): DROP INDEX evaluates no row, and its
+#   messages name blocking sessions by pid, application, state and age.
+# Not index_restore: it builds an index again from its stored definition, reading every row it covers, and a hand-made
+# expression index fails quoting a sample's value from any dataset. Any other kind that belongs to no dataset, a kind
+# added later included, is kept back until it is named here.
+ABOUT_NO_DATASET = frozenset({'backup', 'region_load', 'selection_cleanup', 'index_review', 'index_drop'})
+# A follower's sync names only its link, and writes that link's mirror datasets.
+FOLLOWER_SYNC = 'follower_sync'
+# The longest definition given: one index never fills an answer.
+DEFINITION_LIMIT = 2000
+# The constants of SQL as PostgreSQL prints a definition: a quoted text ('...' with '' inside, which E'', U&'', B''
+# and X'' constants end in too; a dollar-quoted $$...$$, $tag$...$tag$), or a number, printed bare (4417, 9000.5,
+# ARRAY[12, 31, 407]). Strings, dates, intervals, arrays and jsonb are quoted, so these two are every constant, but for
+# the words true, false and null. A "quoted identifier" is a name, not a constant, and is skipped (a collation such as
+# "C.UTF-8"). A number is found only where it stands alone: digits inside a name (idx_samples_meta_7_crop,
+# embeddings_d7, int4_ops, metadata_instant_v1) and a $1 are not numbers; a minus sign before one leaves it a number.
+_TOKENS = re.compile(r"""'(?:[^']|'')*'|"(?:[^"]|"")*"|\$([A-Za-z_][A-Za-z0-9_]*)?\$.*?\$\1\$""", re.S)
+_NUMBER = re.compile(r'(?<![\w.$])\d+(?:\.\d+)?(?:[eE][+-]?\d+)?(?![\w.])')
+# What stands before a quoted text the server writes itself, each time in the form PostgreSQL prints it (::text after a
+# literal): a field's name (metadata ->> 'name', metadata -> 'name', metadata ? 'name'; not local_metadata, not
+# E'...'), a vector index's field (WHERE (field_name = 'name'::text)), or a storage parameter's value inside WITH (...)
+# (WITH (m='16', ef_construction='64')).
+_SERVER_WRITTEN_BEFORE = (
+    re.compile(r'(?<![\w."$])metadata\s*(?:->>|->|\?)\s*$'),
+    re.compile(r'(?<![\w."$])field_name\s*=\s*$'),
+    re.compile(r"\bWITH \((?:\w+=(?:'(?:[^']|'')*'|[\w.+-]+), )*\w+=$"),
+)
+# What stands before a number the server writes itself: a field index's WHERE (dataset_id = N), a storage parameter
+# inside WITH (...), a type's modifier after :: (numeric(10,2), vector(4), public.vector(4)). Of the type names
+# PostgreSQL prints with a modifier, only these have words between the name's first word and the parenthesis:
+# character varying(255), bit varying(8), and an interval's fields (interval second(3), interval day to second(3));
+# timestamp(3) without time zone and time(3) with time zone print the modifier straight after the first word, and
+# double precision takes none. Any other word there (::boolean AND f(4417)) is not a type's.
+_SERVER_NUMBER_BEFORE = (
+    re.compile(r'(?<![\w."$])dataset_id\s*=\s*$'),
+    _SERVER_WRITTEN_BEFORE[2],
+    re.compile(
+        r'::[A-Za-z_][\w."]*(?: (?:varying|year|month|day|hour|minute|second|to))*\(\s*(?:\d+\s*,\s*)*$',
+    ),
+)
+KEPT_TEXT, KEPT_NUMBER = "'…'", '…'
+
+
+def _held(quoted: str) -> str:
+    """What a quoted text holds (a JSON object or list written one way: PostgreSQL prints '{"a": 1}' for '{"a":1}')."""
+    value = quoted[1:-1].replace("''", "'") if quoted.startswith("'") else re.sub(r'^\$\w*\$|\$\w*\$$', '', quoted)
+    try:
+        parsed = json.loads(value)
+    except ValueError:
+        return value
+    return json.dumps(parsed, sort_keys=True) if isinstance(parsed, (dict, list)) else value
+
+
+def _stray(gap: str) -> Optional[int]:
+    return min((at for at in (gap.find("'"), gap.find('"'), gap.find('$$')) if at >= 0), default=None)
+
+
+def _constants(text: str) -> tuple[list[tuple[int, int, str, bool]], Optional[int]]:
+    """The constants of SQL `text`, each (start, end, what it holds, whether the server writes it there); and where a
+    quote that never closes starts (None when every quote closes)."""
+    found: list[tuple[int, int, str, bool]] = []
+    end = 0
+
+    def numbers(stop: int) -> None:
+        for number in _NUMBER.finditer(text, end, stop):
+            own = any(before.search(text[: number.start()]) for before in _SERVER_NUMBER_BEFORE)
+            found.append((number.start(), number.end(), number.group(0), own))
+
+    for token in _TOKENS.finditer(text):
+        stray = _stray(text[end : token.start()])
+        if stray is not None:
+            numbers(end + stray)
+            return found, end + stray
+        numbers(token.start())
+        if not token.group(0).startswith('"'):
+            own = any(before.search(text[: token.start()]) for before in _SERVER_WRITTEN_BEFORE)
+            found.append((token.start(), token.end(), _held(token.group(0)), own))
+        end = token.end()
+    stray = _stray(text[end:])
+    numbers(len(text) if stray is None else end + stray)
+    return found, None if stray is None else end + stray
+
+
+def definition_kept(definition: str) -> bool:
+    """Whether an index's SQL definition holds a constant (a quoted text or a number) other than one the server writes
+    itself (a field's name, a vector index's field, a storage parameter, a field index's dataset, a type's modifier),
+    or a quote that never closes, so it is kept from an administration tool."""
+    found, stray = _constants(definition)
+    return stray is not None or any(not own for *_, own in found)
+
+
+def quoted_kept(text: str) -> str:
+    """`text` (words that quote SQL) with each constant other than one the server writes itself written '…' (a quoted
+    text) or … (a number), and a quote that never closes written '…' to the end."""
+    found, stray = _constants(text)
+    if stray is not None:
+        text = text[:stray] + KEPT_TEXT
+    for start, end, _, own in reversed(found):
+        if not own:
+            text = text[:start] + (KEPT_TEXT if text[start] in "'$" else KEPT_NUMBER) + text[end:]
+    return text
+
+
+def _shipped(entry: dict[str, Any], shipped: dict[str, tuple[str, set[str]]]) -> bool:
+    """Whether an index is one schema.sql ships: its name on the same table, holding no constant of its own (beyond
+    those the server writes) that its statement in schema.sql doesn't hold."""
+    name = entry.get('name')
+    known = shipped.get(name) if isinstance(name, str) else None
+    if known is None or known[0] != entry.get('table'):
+        return False
+    found, stray = _constants(entry['definition'])
+    return stray is None and {value for _, _, value, own in found if not own} <= known[1]
+
+
+def _definition_withheld(entry: dict[str, Any], shipped: dict[str, tuple[str, set[str]]]) -> bool:
+    """Whether an index entry's definition is kept back: longer than DEFINITION_LIMIT; else, unless it is one of the
+    indexes schema.sql ships (_shipped: their quoted texts are the app's own constants), when it quotes a text the
+    server doesn't write itself. The advisor's kind is a guess from the name: never trusted."""
+    definition = entry['definition']
+    if len(definition) > DEFINITION_LIMIT:
+        return True
+    return not _shipped(entry, shipped) and definition_kept(definition)
+
+
+def _index_words_kept(node: Any, shipped: dict[str, tuple[str, set[str]]]) -> Any:
+    """An index advice answer with each index's definition kept back as _definition_withheld says, and the words about
+    such an index (an overlap's reason, why it is needed) with each quoted text written '…'. `shipped`: schema.sql's
+    indexes, name -> (table, what its statement quotes)."""
+    if isinstance(node, list):
+        return [_index_words_kept(item, shipped) for item in node]
+    if not isinstance(node, dict):
+        return node
+    out = {key: _index_words_kept(value, shipped) for key, value in node.items()}
+    withheld = False
+    if isinstance(node.get('definition'), str):
+        withheld = _definition_withheld(node, shipped)
+        out['definition'] = None if withheld else node['definition']
+        out['definition_withheld'] = withheld
+    # Only an index entry's own words (why it is needed) and an overlap's reason, which names both indexes' columns,
+    # quote an index: never a list of entries that has the same name (a system review's `needed`). A side without a
+    # marked definition counts as kept back.
+    if 'redundant' in node and 'kept' in node:
+        quoting = any(_dict_of(out.get(side)).get('definition_withheld') is not False for side in ('redundant', 'kept'))
+    else:
+        quoting = withheld
+    if quoting and isinstance(out.get('reason'), str):
+        out['reason'] = quoted_kept(out['reason'])
+    if quoting and isinstance(out.get('needed'), list):
+        out['needed'] = [quoted_kept(item) if isinstance(item, str) else item for item in out['needed']]
+    return out
+
+
+def _dict_of(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def _job_reason(job: dict[str, Any], reasons: dict[int, str], syncs: dict[str, Optional[str]]) -> Optional[str]:
+    """Why a job's words are kept back, or None: by the dataset it is about (it belongs to it, or its arguments name
+    it); for a follower's sync, by its link's mirrors (`syncs`, GONE when unknown); for any other job of no dataset,
+    by its kind (ABOUT_NO_DATASET, else UNKNOWN_KIND)."""
+    about = job.get('dataset_id')
+    if type(about) is int:  # a dataset's id (never True or False)
+        return reasons.get(about)
+    if job.get('kind') == FOLLOWER_SYNC:
+        return syncs.get(str(job.get('id')), GONE)
+    return None if job.get('kind') in ABOUT_NO_DATASET else UNKNOWN_KIND
+
+
+def _worst(found: Iterable[Optional[str]]) -> Optional[str]:
+    """The reason that says most, of a job about several datasets: closed, then private fields, then gone."""
+    present = set(found)
+    return next((reason for reason in (CLOSED, PRIVATE_FIELDS, GONE) if reason in present), None)
+
+
+def _job_kept(job: Any, reason: Optional[str]) -> Any:
+    """A job with its words taken out when `reason` keeps them back; `withheld` says why, when there were any."""
+    if not isinstance(job, dict):
+        return job
+    progress = job.get('progress')
+    message = progress.get('message') if isinstance(progress, dict) else None
+    if reason is None:
+        return {**job, 'withheld': None}
+    return {
+        **job,
+        'error': None,
+        'progress': {**progress, 'message': None} if isinstance(progress, dict) else progress,
+        'withheld': reason if job.get('error') is not None or message is not None else None,
+    }
+
+
+async def sync_mirrors(job_ids: Collection[str], source: Any = None) -> dict[str, Optional[list[int]]]:
+    """For each follower's sync job, the mirror datasets of its link on this server, which it writes (mirrors.link_id);
+    None when its link no longer exists, or the job doesn't name one."""
+    known = [uuid.UUID(job_id) for job_id in job_ids if _is_uuid(job_id)]
+    if not known:
+        return {}
+    rows = await (source if source is not None else database.db).fetch(
+        """SELECT j.id::text AS job, l.id IS NOT NULL AS linked,
+                  array_remove(array_agg(m.dataset_id ORDER BY m.dataset_id), NULL) AS mirrors
+           FROM jobs j
+           LEFT JOIN primary_links l ON l.id::text = j.args->>'link_id'
+           LEFT JOIN mirrors m ON m.link_id = l.id
+           WHERE j.id = ANY($1::uuid[])
+           GROUP BY j.id, l.id""",
+        known,
+    )
+    return {row['job']: list(row['mirrors']) if row['linked'] else None for row in rows}
+
+
+def _is_uuid(value: Any) -> bool:
+    try:
+        uuid.UUID(value)
+    except (TypeError, ValueError, AttributeError):
+        return False
+    return True
+
+
+async def kept_datasets(dataset_ids: Collection[int], source: Any = None) -> dict[int, str]:
+    """For each of these datasets whose jobs' words an administration tool may not read, why (CLOSED, PRIVATE_FIELDS
+    or GONE); a dataset open to the assistant with no private field is left out."""
+    if not dataset_ids:
+        return {}
+    rows = await (source if source is not None else database.db).fetch(
+        'SELECT d.id, d.assistant_closed, EXISTS (SELECT 1 FROM dataset_fields f WHERE f.dataset_id = d.id '
+        'AND f.values_private) AS private FROM datasets d WHERE d.id = ANY($1::int[])',
+        sorted(dataset_ids),
+    )
+    found = {row['id']: row for row in rows}
+    reasons = {}
+    for dataset_id in dataset_ids:
+        row = found.get(dataset_id)
+        if row is None:
+            reasons[dataset_id] = GONE
+        elif row['assistant_closed']:
+            reasons[dataset_id] = CLOSED
+        elif row['private']:
+            reasons[dataset_id] = PRIVATE_FIELDS
+    return reasons
+
+
+async def keep_back(method: str, template: str, path_params: dict[str, Any], answer: Any) -> Any:
+    """A SPANNING_ROUTES answer with what could hold a private value or a closed dataset's samples taken out (see
+    SPANNING_ROUTES). inner.request applies it to every such answer, before the administration tool reads it."""
+    if (method, template) not in SPANNING_ROUTES or not isinstance(answer, dict):
+        return answer
+    if template == JOBS_ALL and isinstance(answer.get('jobs'), list):
+        jobs = [job for job in answer['jobs'] if isinstance(job, dict)]
+        syncing = [
+            job['id']
+            for job in jobs
+            if job.get('kind') == FOLLOWER_SYNC and job.get('dataset_id') is None and isinstance(job.get('id'), str)
+        ]
+        mirrors = await sync_mirrors(syncing)
+        named = {job['dataset_id'] for job in jobs if type(job.get('dataset_id')) is int}
+        named |= {dataset_id for found in mirrors.values() for dataset_id in found or ()}
+        reasons = await kept_datasets(named)
+        # No mirror left reads as gone: a mirror's row goes with its dataset, so a past sync may quote a deleted one's.
+        syncs = {
+            job_id: GONE if not found else _worst(reasons.get(dataset_id) for dataset_id in found)
+            for job_id, found in mirrors.items()
+        }
+        return {
+            **answer,
+            'jobs': [
+                _job_kept(job, _job_reason(job, reasons, syncs) if isinstance(job, dict) else None)
+                for job in answer['jobs']
+            ],
+        }
+    if template in (SYSTEM_INDEX_ADVICE, DATASET_INDEX_ADVICE):
+        from ..index_advisor import core_index_statements, core_indexes
+
+        statements = core_index_statements()
+        shipped = {
+            name: (table, {value for _, _, value, _ in _constants(statements.get(name, ''))[0]})
+            for name, table in core_indexes().items()
+        }
+        answer = _index_words_kept(answer, shipped)
+        dataset_id = request_dataset(path_params, None)
+        failure = answer.get('last_failure')
+        # The system's review is about no dataset; a dataset's review is about that dataset.
+        if dataset_id is not None and isinstance(failure, dict):
+            reason = (await kept_datasets({dataset_id})).get(dataset_id)
+            if reason is not None:
+                had = failure.get('message') is not None
+                answer['last_failure'] = {**failure, 'message': None, 'withheld': reason if had else None}
+        return answer
+    return answer
 
 
 @dataclass(frozen=True)

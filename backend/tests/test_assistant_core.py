@@ -125,6 +125,7 @@ def test_a_fresh_server_has_the_mcp_door_off_and_administrators_let_in(world):
             'users': [],
             'new_datasets_closed': False,
             'sample_fields': False,
+            'admin_tools': False,
         }
         for user_id in ROLES:
             assert await assistant.door_refusal(user_id=user_id, door='mcp') == rule.MCP_OFF

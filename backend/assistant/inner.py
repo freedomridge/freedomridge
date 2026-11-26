@@ -17,6 +17,10 @@ the API's filter compiler refuses any way of questioning a private field but by 
 there. Every answer reaches the tool with each value of its dataset's private fields sealed, here. An error answer of a
 request that opened a token says only that, for its words could hold the opened values.
 
+An administration tool (Identity.admin, backend/assistant/admin.py) may call only the routes of private.SPANNING_ROUTES,
+which answer across datasets; every other tool only covered ones. An administration tool reads each answer after
+private.keep_back has taken out what could hold a private field's value or a closed dataset's samples.
+
 Nothing here holds a pooled database connection while a request runs: the request takes its own, as any other does.
 """
 
@@ -116,7 +120,10 @@ async def request(
     listed = frozenset(listed)
     if (method, template) not in listed:
         raise RouteNotListed(f'{method} {template} is not one of the routes this tool lists')
-    if (method, template) not in private.COVERED_ROUTES:
+    if identity.admin:
+        if (method, template) not in private.SPANNING_ROUTES:
+            raise RouteNotListed(f'{method} {template} is not a route an administration tool may read')
+    elif (method, template) not in private.COVERED_ROUTES:
         raise RouteNotListed(f"{method} {template} doesn't declare that its answer's shape is sealed")
     handlers = frozenset((each_method, route_handler(each_method, each)) for each_method, each in listed)
     path = _path(template, path_params or {})
@@ -143,7 +150,7 @@ async def request(
         'headers': headers,
         'client': None,
         'server': None,
-        SCOPE_KEY: Identity(identity.user_id, identity.door, handlers, identity.seal_key),
+        SCOPE_KEY: Identity(identity.user_id, identity.door, handlers, identity.seal_key, identity.admin),
         # request.state: check_dataset_access keeps the dataset it resolved here, read back below.
         'state': {},
     }
@@ -213,4 +220,6 @@ async def request(
     about = private.answer_field(dict(path_params or {}), dict(query or {}), body)
     echo = (method, template) in private.ECHO_ROUTES or not 200 <= status < 300
     answer = private.seal_answer(answer, kept, seal, about, echo=echo)
+    if identity.admin and 200 <= status < 300:
+        answer = await private.keep_back(method, template, dict(path_params or {}), answer)
     return Answer(status, answer, answer_headers, guarded.unreadable)

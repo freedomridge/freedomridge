@@ -1,8 +1,10 @@
 """call_tool: one tool call for one user through one door (docs/ASSISTANT.md).
 
 Each call reads the account and the assistant rule afresh (rule.verdict), checks the arguments against the tool's
-schema, and runs the tool as the user. It answers {'ok': True, 'result': ...} or {'ok': False, 'error': ...}, plain
-JSON values, and raises only for a server fault (api.ToolFailed, or an error of the server's own).
+schema, and runs the tool as the user. An administration tool (admin.py) also needs the administrator role and its
+switch (rule.admin_refusal), and runs with Identity.admin, which each of its requests checks again. It answers
+{'ok': True, 'result': ...} or {'ok': False, 'error': ...}, plain JSON values, and raises only for a server fault
+(api.ToolFailed, or an error of the server's own).
 """
 
 import json
@@ -13,7 +15,7 @@ from . import rule
 from .api import Api, ToolError
 from .catalog import Tool
 from .identity import Identity
-from .registry import TOOLS
+from .registry import ADMIN_TOOLS, TOOLS
 
 _JSON_TYPES = {
     'integer': 'a whole number',
@@ -44,6 +46,8 @@ def _type_ok(value: Any, kind: str) -> bool:
 def _check_value(where: str, spec: Mapping[str, Any], value: Any) -> Any:
     if not _type_ok(value, spec.get('type', '')):
         raise ToolError('invalid', f"{where}: must be {_JSON_TYPES.get(spec.get('type', ''), spec.get('type'))}")
+    if 'enum' in spec and value not in spec['enum']:
+        raise ToolError('invalid', f"{where}: one of {', '.join(str(each) for each in spec['enum'])} (got {value!r})")
     if 'minimum' in spec and value < spec['minimum']:
         raise ToolError('invalid', f"{where}: must be at least {spec['minimum']} (got {value})")
     if 'maximum' in spec and value > spec['maximum']:
@@ -95,7 +99,7 @@ def check_arguments(schema: Mapping[str, Any], arguments: Any) -> dict[str, Any]
 
 
 def find_tool(name: str) -> Optional[Tool]:
-    return next((tool for tool in TOOLS if tool.name == name), None)
+    return next((tool for tool in (*TOOLS, *ADMIN_TOOLS) if tool.name == name), None)
 
 
 def _failure(error: ToolError) -> dict[str, Any]:
@@ -110,9 +114,14 @@ async def call_tool(*, user_id: int, door: str, name: str, arguments: Optional[M
     tool = find_tool(name)
     if tool is None:
         return _failure(ToolError('unknown_tool', f"There is no tool named {name!r}"))
+    admin = any(tool is each for each in ADMIN_TOOLS)
+    refusal = rule.admin_refusal(verdict) if admin else None
+    if refusal is not None:  # an administration tool is never unknown: it is refused, saying why
+        return _failure(ToolError('not_allowed', refusal))
     try:
         checked = check_arguments(tool.input_schema, arguments)
-        result = await tool.run(Api(Identity(user_id, door, seal_key=verdict.seal_key), tool.routes), checked)
+        identity = Identity(user_id, door, seal_key=verdict.seal_key, admin=admin)
+        result = await tool.run(Api(identity, tool.routes), checked)
     except ToolError as error:
         return _failure(error)
     # Plain JSON values only: what json.dumps writes as it is (a tool builds its result from the API's JSON).

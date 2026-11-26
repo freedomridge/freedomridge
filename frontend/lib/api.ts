@@ -1027,8 +1027,9 @@ export async function deleteGroup(id: number): Promise<void> {
     await ensureOk(res, 'Could not delete the group');
 }
 
-// Settings → Assistant (administrators): whether the MCP server is on, who may use the assistant, and whether new
-// datasets start closed to it (docs/ASSISTANT.md). Every change answers the whole settings.
+// Settings → Assistant (administrators): whether the MCP server is on, who may use the assistant, whether new
+// datasets start closed to it, and the administration tools' switch (docs/ASSISTANT.md). Every change answers the
+// whole settings.
 export interface AssistantSettings {
     mcp_enabled: boolean;
     roles: { admin: boolean; power_user: boolean; guest: boolean };
@@ -1039,6 +1040,8 @@ export interface AssistantSettings {
     new_datasets_closed: boolean;
     // Whether a tool may read samples' own fields and file paths (get_samples' `fields`).
     sample_fields: boolean;
+    // Whether an administrator's AI client may use the administration tools (status, jobs, backups, index advice).
+    admin_tools: boolean;
 }
 
 export async function getAssistantSettings(): Promise<AssistantSettings> {
@@ -1048,7 +1051,7 @@ export async function getAssistantSettings(): Promise<AssistantSettings> {
 }
 
 export async function updateAssistantSettings(
-    changes: Partial<Pick<AssistantSettings, 'mcp_enabled' | 'new_datasets_closed' | 'sample_fields'>> & { roles?: Partial<AssistantSettings['roles']> },
+    changes: Partial<Pick<AssistantSettings, 'mcp_enabled' | 'new_datasets_closed' | 'sample_fields' | 'admin_tools'>> & { roles?: Partial<AssistantSettings['roles']> },
 ): Promise<AssistantSettings> {
     const res = await fetch(`${API_BASE}/admin/assistant`, {
         method: 'PATCH',

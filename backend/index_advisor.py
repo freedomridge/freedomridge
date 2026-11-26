@@ -62,7 +62,7 @@ _FIELD_EXPRESSION = re.compile(r"metadata ->> '((?:[^']|'')*)'")
 _CREATE_INDEX = re.compile(
     r'\bCREATE\s+(?:UNIQUE\s+)?INDEX\s+(?:CONCURRENTLY\s+)?(?:IF\s+NOT\s+EXISTS\s+)?([A-Za-z_][A-Za-z0-9_]*)'
     r'\s+ON\s+(?:ONLY\s+)?(?:public\.)?([A-Za-z_][A-Za-z0-9_]*)'
-    r'|\bDROP\s+INDEX\s+(?:CONCURRENTLY\s+)?(?:IF\s+EXISTS\s+)?([A-Za-z_][A-Za-z0-9_]*)',
+    r'|\bDROP\s+INDEX\s+(?:CONCURRENTLY\s+)?(?:IF\s+EXISTS\s+)?(?:public\.)?([A-Za-z_][A-Za-z0-9_]*)',
     re.I,
 )
 
@@ -97,6 +97,21 @@ def core_indexes() -> Dict[str, str]:
         else:
             indexes.pop(name, None)
     return indexes
+
+
+@lru_cache(maxsize=1)
+def core_index_statements() -> Dict[str, str]:
+    """name -> the CREATE INDEX statement schema.sql leaves for it, up to its semicolon: what the app's own index
+    quotes (the assistant's administration tools compare a live definition's quoted texts with it)."""
+    text = re.sub(r'--[^\n]*', '', (DB_DIR / 'schema.sql').read_text())
+    statements: Dict[str, str] = {}
+    for match in _CREATE_INDEX.finditer(text):
+        if match.group(1):
+            end = text.find(';', match.end())
+            statements[match.group(1)] = text[match.start() : end if end >= 0 else len(text)]
+        else:
+            statements.pop(match.group(3), None)
+    return statements
 
 
 # ---------------------------------------------------------------------------------------------------

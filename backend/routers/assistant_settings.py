@@ -1,6 +1,7 @@
 """Settings → Assistant, for administrators (docs/ASSISTANT.md): whether the MCP server is on, who may use the
-assistant (each role, the groups that let their members in, and each user's own answer), and whether new datasets
-start closed to it. This server's own: nothing here is synced to followers.
+assistant (each role, the groups that let their members in, and each user's own answer), whether new datasets
+start closed to it, and whether administrators may use the administration tools. This server's own: nothing here is
+synced to followers.
 
 Every route answers the whole settings, as GET does. The rule that reads them is backend/assistant/rule.py."""
 
@@ -33,6 +34,7 @@ class SettingsUpdate(BaseModel):
     roles: Optional[RolesUpdate] = None
     new_datasets_closed: Optional[bool] = None
     sample_fields: Optional[bool] = None  # the assistant may read samples' own fields and file paths
+    admin_tools: Optional[bool] = None  # an administrator's AI client may read status, jobs, backups and indexes
 
 
 class UserAnswer(BaseModel):
@@ -57,6 +59,7 @@ async def settings_answer() -> dict[str, Any]:
         'users': [dict(row) for row in users],
         'new_datasets_closed': settings['new_datasets_closed'],
         'sample_fields': settings['sample_fields'],
+        'admin_tools': settings['admin_tools'],
     }
 
 
@@ -74,6 +77,8 @@ async def update_assistant_settings(update: SettingsUpdate, admin: dict = Depend
         columns['new_datasets_closed'] = update.new_datasets_closed
     if update.sample_fields is not None:
         columns['sample_fields'] = update.sample_fields
+    if update.admin_tools is not None:
+        columns['admin_tools'] = update.admin_tools
     if update.roles is not None:
         for role in rule.ROLES:
             value = getattr(update.roles, role)

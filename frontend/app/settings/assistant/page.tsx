@@ -14,8 +14,8 @@ import {
 } from '@/lib/api';
 
 // Settings → Assistant, for administrators (docs/ASSISTANT.md): whether the MCP server is on, who may use the
-// assistant, and whether new datasets start closed to it. Each change is sent at once; the server answers the whole
-// settings, which replace what the page shows.
+// assistant, whether new datasets start closed to it, and the administration tools' switch. Each change is sent at
+// once; the server answers the whole settings, which replace what the page shows.
 
 interface Person {
     id: number;
@@ -225,6 +225,22 @@ function AssistantSettingsPanel() {
                     Off, it gives a sample as its id and a link that opens it. On, it may also read the fields it asks for and the
                     file path, except fields whose values are kept from it.
                 </p>
+            </section>
+
+            <section aria-labelledby="assistant-admin-heading" className="space-y-2">
+                <h2 id="assistant-admin-heading" className="text-xl font-semibold text-white">Administration tools</h2>
+                <div className="flex items-center gap-3">
+                    <Switch label="Administration tools" checked={current.admin_tools} disabled={busy} describedBy="assistant-admin-note"
+                        onChange={next => act(() => change.mutate({ admin_tools: next }))} />
+                    <span className="text-sm text-zinc-200">{current.admin_tools ? 'On' : 'Off'}</span>
+                </div>
+                <p id="assistant-admin-note" className="text-sm text-zinc-400">
+                    Lets an administrator&apos;s AI client read this server&apos;s status, background jobs, backups and index advice. What it
+                    reads goes to that client: the names of datasets and of their indexes, with the indexes&apos; sizes (also for datasets
+                    closed to the assistant, never their samples), usernames, error messages and backup locations. Never passwords, tokens
+                    or storage keys.
+                </p>
+                {!current.mcp_enabled && <p className="text-sm text-zinc-400">While the MCP server is off, nobody can use them.</p>}
             </section>
 
             <AssistantCalls />

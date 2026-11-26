@@ -12,6 +12,9 @@ handle its caller passes (`source`: the authentication passes its own) or the ap
 the call. Only `GET /api/auth/me`, a hint for the app, first asks `mcp_switched_on`, which reads the switch at most
 once every few seconds per process: while the MCP server is off, that page load costs no query. Asked with
 `?fresh=1`, it skips that memory and asks the rule.
+
+The administration tools (admin.py) need more: the administrator role, and their own switch (admin_tools), off as
+shipped. `admin_refusal` answers that from the same reading, before each call of one and for each request it makes.
 """
 
 import time
@@ -30,6 +33,9 @@ CHAT_OFF = 'The assistant is switched off on this server'
 ACCOUNT_INACTIVE = 'Account is inactive'
 PASSWORD_CHANGE_REQUIRED = 'Password change required before using the API — call /api/auth/change-password.'
 NOT_LET_IN = 'Your account may not use the assistant on this server'
+# An administration tool, for someone who may use the door: its switch off, or someone who isn't an administrator.
+ADMIN_TOOLS_OFF = 'The administration tools are switched off on this server'
+ADMINS_ONLY = 'This tool is for administrators'
 
 # As shipped, and for a server whose settings row is missing: the door off, administrators let in.
 DEFAULTS: dict[str, bool] = {
@@ -39,11 +45,12 @@ DEFAULTS: dict[str, bool] = {
     'guest_allowed': False,
     'new_datasets_closed': False,
     'sample_fields': False,
+    'admin_tools': False,
 }
 ROLES = ('admin', 'power_user', 'guest')
 
 _VERDICT = """
-    SELECT s.mcp_enabled, s.admin_allowed, s.power_user_allowed, s.guest_allowed, s.seal_key,
+    SELECT s.mcp_enabled, s.admin_allowed, s.power_user_allowed, s.guest_allowed, s.seal_key, s.admin_tools,
            u.id, u.username, u.email, u.role, u.must_change_password, u.is_active, u.is_demo_account,
            (SELECT own.allowed FROM assistant_users own WHERE own.user_id = u.id) AS own_answer,
            EXISTS (SELECT 1 FROM assistant_groups listed JOIN group_members m ON m.group_id = listed.group_id
@@ -64,6 +71,7 @@ class Verdict:
     user: Optional[dict[str, Any]]
     refusal: Optional[str]
     seal_key: Optional[bytes] = field(default=None, repr=False)  # the server's key for private values (private.py)
+    admin_tools: bool = False  # whether the administration tools are switched on
 
 
 def _setting(row: Any, key: str) -> bool:
@@ -106,7 +114,18 @@ async def verdict(user_id: int, door: str, source: Any = None) -> Verdict:
     known = isinstance(user_id, int) and not isinstance(user_id, bool) and 0 < user_id < 2**31
     row = await _database(source).fetchrow(_VERDICT, user_id if known else None)
     user = None if row['id'] is None else {key: row[key] for key in USER_KEYS}
-    return Verdict(user, decide(row, door), bytes(row['seal_key']) if row['seal_key'] else None)
+    seal_key = bytes(row['seal_key']) if row['seal_key'] else None
+    return Verdict(user, decide(row, door), seal_key, _setting(row, 'admin_tools'))
+
+
+def admin_refusal(verdict: Verdict) -> Optional[str]:
+    """Why the user of `verdict` may not call an administration tool now (None: they may): the door's own refusal
+    first, then the administration tools' switch, then the role."""
+    if verdict.refusal is not None or verdict.user is None:
+        return verdict.refusal or ACCOUNT_INACTIVE
+    if not verdict.admin_tools:
+        return ADMIN_TOOLS_OFF
+    return None if verdict.user['role'] == 'admin' else ADMINS_ONLY
 
 
 async def door_refusal(*, user_id: int, door: str, source: Any = None) -> Optional[str]:
@@ -147,8 +166,8 @@ def forget_switch() -> None:
 async def read_settings(source: Any = None) -> dict[str, bool]:
     """The settings row (the shipped defaults where it is missing)."""
     row = await _database(source).fetchrow(
-        'SELECT mcp_enabled, admin_allowed, power_user_allowed, guest_allowed, new_datasets_closed, sample_fields '
-        'FROM assistant_settings WHERE singleton',
+        'SELECT mcp_enabled, admin_allowed, power_user_allowed, guest_allowed, new_datasets_closed, sample_fields, '
+        'admin_tools FROM assistant_settings WHERE singleton',
     )
     return dict(DEFAULTS) if row is None else {key: bool(row[key]) for key in DEFAULTS}
 

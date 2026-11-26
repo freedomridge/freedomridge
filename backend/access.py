@@ -30,7 +30,10 @@ The assistant (docs/ASSISTANT.md): a request a tool makes in process carries its
 (identity.assistant_door). For such a request, and only for it, a dataset closed to the assistant (assistant_closed)
 is refused by check_dataset_access, after the access check, with ASSISTANT_CLOSED, and left out by
 filter_datasets_for_user. An administrator's request through a tool is checked the same way: caller_level doesn't
-skip the lookup for it. The same user reads the dataset in the app and through the API as before.
+skip the lookup for it. The same user reads the dataset in the app and through the API as before. An administration
+tool's request (identity.admin_tool) is neither refused a closed dataset nor has it left out: it reaches only the
+routes its tool lists (private.SPANNING_ROUTES), which name closed datasets as they name every other, and the tool
+keeps their answers to named facts with nothing of a closed dataset's samples (backend/assistant/private.py).
 """
 
 from contextlib import contextmanager
@@ -38,7 +41,7 @@ from typing import Any, Callable, Iterator, Literal, Optional, TypeVar
 
 from fastapi import Depends, HTTPException, Request
 
-from .assistant.identity import assistant_door
+from .assistant.identity import admin_tool, assistant_door
 from .database import db
 
 # The levels of a share, lowest first: each includes the ones before it. Stored as their numbers (1 to 4), so SQL
@@ -202,7 +205,7 @@ async def check_dataset_access(
         if await _level(dataset, user, state) < needed:
             raise level_refusal(level)
     # After the access check: a user who can't open the dataset learns nothing about it from a tool.
-    if dataset.get('assistant_closed') and assistant_door(user):
+    if dataset.get('assistant_closed') and assistant_door(user) and not admin_tool(user):
         raise AssistantClosed()
     return dataset
 
@@ -329,8 +332,8 @@ async def filter_datasets_for_user(user: Optional[dict]) -> tuple[str, list]:
     if user is None:
         # Login required for all access — anonymous callers see no datasets.
         return ("FALSE", [])
-    # Through the assistant, a dataset closed to it is left out.
-    closed = " AND NOT assistant_closed" if assistant_door(user) else ""
+    # Through the assistant, a dataset closed to it is left out (not for an administration tool: identity.admin_tool).
+    closed = " AND NOT assistant_closed" if assistant_door(user) and not admin_tool(user) else ""
     if user.get('role') == 'admin':
         return ("NOT assistant_closed" if closed else "TRUE", [])
     return (

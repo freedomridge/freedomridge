@@ -113,7 +113,9 @@ CREATE TABLE IF NOT EXISTS assistant_settings (
     seal_key BYTEA NOT NULL DEFAULT sha512((gen_random_uuid()::text || gen_random_uuid()::text || gen_random_uuid()::text
                                     || gen_random_uuid()::text)::bytea),
     -- (0038) Whether the assistant may read samples' own fields and file paths.
-    sample_fields BOOLEAN NOT NULL DEFAULT FALSE
+    sample_fields BOOLEAN NOT NULL DEFAULT FALSE,
+    -- (0040) Whether an administrator's AI client may use the administration tools (status, jobs, backups, indexes).
+    admin_tools BOOLEAN NOT NULL DEFAULT FALSE
 );
 INSERT INTO assistant_settings (singleton) VALUES (TRUE) ON CONFLICT DO NOTHING;
 
@@ -1976,6 +1978,11 @@ CREATE INDEX IF NOT EXISTS idx_concept_jobs_failed ON jobs ((args->>'concept_id'
     WHERE kind = 'concept_scoring' AND state = 'failed';
 CREATE INDEX IF NOT EXISTS idx_concept_jobs_resume ON jobs ((args->>'concept_id'),created_at DESC,id DESC)
     WHERE kind = 'concept_scoring';
+-- (0041) The jobs of the whole server by state, newest first (GET /api/admin/jobs/all), and the jobs of no dataset that
+-- name one in their arguments (a dataset's index reviews).
+CREATE INDEX IF NOT EXISTS idx_jobs_state_created ON jobs (state, created_at DESC, id DESC) INCLUDE (kind, dataset_id);
+CREATE INDEX IF NOT EXISTS idx_jobs_named_dataset ON jobs ((args->>'dataset_id'), created_at DESC, id DESC)
+    WHERE dataset_id IS NULL AND args ? 'dataset_id';
 
 CREATE OR REPLACE FUNCTION dispatch_concept_score_work(
     batch_size INTEGER, target_dataset INTEGER,
@@ -3720,5 +3727,7 @@ INSERT INTO schema_migrations (filename) VALUES
     ('0036_assistant.sql'),
     ('0037_mcp_tokens_and_assistant_calls.sql'),
     ('0038_assistant_working_views.sql'),
-    ('0039_region_sets_bundled.sql')
+    ('0039_region_sets_bundled.sql'),
+    ('0040_assistant_admin_tools.sql'),
+    ('0041_jobs_across_datasets.sql')
 ON CONFLICT (filename) DO NOTHING;

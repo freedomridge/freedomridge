@@ -1,5 +1,6 @@
-"""Links the assistant gives a person: to a view in the app, to a sample, to a value list's download. They start with
-the server's configured public address, never with the address a request came in on (an inner request has none).
+"""Links the assistant gives a person: to a view in the app, to a sample, to a value list's download, to the pages where
+an administrator acts (System status, a dataset's page). They start with the server's configured public address, never
+with the address a request came in on (an inner request has none).
 
 The address: FRIDGE_PUBLIC_URL when set; else the first of ALLOWED_ORIGINS when that is set (a production deploy must
 set it to the HTTPS public origin: docker-compose.prod.yml); else http://localhost:3000, the app's own address on a
@@ -48,3 +49,13 @@ def sample_link(dataset_id: int, sample_id: int) -> str:
 
 def list_download(handle: str) -> str:
     return f'{public_address()}/api/assistant/lists/{quote(handle, safe="")}/csv'
+
+
+def status_page() -> str:
+    """Settings → System status, where an administrator sees the server's health, backups, jobs and indexes."""
+    return f'{public_address()}/settings/status'
+
+
+def dataset_page(dataset_id: int) -> str:
+    """A dataset's page, whose Dataset Settings and Job history show its indexes and jobs."""
+    return f'{public_address()}/datasets/{dataset_id}'

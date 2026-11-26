@@ -84,6 +84,12 @@ class FakeAssistant:
     def tools(self):
         return self.tool_list
 
+    def admin_tools(self):
+        return ()
+
+    async def tools_for(self, *, user_id, door):
+        return self.tool_list
+
     def instructions(self):
         return 'Freedom Ridge holds image datasets; start with list_datasets.'
 

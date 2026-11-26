@@ -7,20 +7,23 @@ it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
 ## Unreleased
 
 This release adds an AI assistant: Claude Code and other MCP clients answer questions about a server's datasets
-through thirteen read-only tools at `/mcp`, reading as the person using them. It is off until an administrator
+through thirteen read-only tools at `/mcp`, reading as the person using them, and an administrator's client can read
+the server's status, background jobs, backups and index advice through four more. It is off until an administrator
 switches it on. Also new: named regions as a filter, a text form for concept filters, and a description and unit for
-each field. Six migrations, none of which touches a sample.
+each field. Eight migrations, none of which touches a sample.
 
 ### Upgrade notes
 
-- Six database migrations, `0034_regions.sql` to `0039_region_sets_bundled.sql`, and changed database functions,
+- Eight database migrations, `0034_regions.sql` to `0041_jobs_across_datasets.sql`, and changed database functions,
   applied with `scripts/apply_migrations.sh` (step 4 of [Upgrading](docs/UPGRADING.md)). They add empty tables and
-  columns and touch no rows.
+  columns and touch no rows. `0041` builds two indexes on the jobs table, about a second per million jobs, while job
+  writes wait.
 - The job runner loads the region boundaries by itself on its first start after the upgrade: its image now carries
   the boundary file (40.7 MB more). The load takes about half a minute on a desktop computer, a few minutes on a
   small server, and adds 151 MB to the database. A development checkout runs `python -m backend.regions fetch` once
   ([Upgrading](docs/UPGRADING.md#a-development-checkout)).
-- The assistant ships off, and an upgraded server keeps it off; existing datasets stay open to it once it is on.
+- The assistant ships off, and an upgraded server keeps it off; existing datasets stay open to it once it is on. Its
+  administration tools have a switch of their own, also off.
 - **What switching it on means:** the server calls no AI service and needs no key, but each person you let in can have
   their own AI client read what they can already see in their datasets and send it to that client's AI service
   (Anthropic for Claude Code). Who may use it, closing a dataset and keeping a field's values back narrow it; it never
@@ -87,6 +90,22 @@ each field. Six migrations, none of which touches a sample.
     whose second read runs out of time still answers its first read's numbers, each exact, with a `note`; `too_slow`
     says what ran out and what to do, names the fields of a filter that are not indexed, and no longer advises an index
     where one would not help ([docs/ASSISTANT.md](docs/ASSISTANT.md#what-is-quick-and-what-is-slow)).
+  - **Administration tools** ([docs/ASSISTANT.md](docs/ASSISTANT.md#administration-tools)). `system_status`,
+    `backup_status`, `list_jobs` (background jobs across every dataset, failures first) and `index_advice` (the index
+    advisor's last review: overlapping, possibly unused, suggested and needed indexes) read for an administrator what
+    Settings → System status shows, and change nothing: each answer links to the page where the administrator acts.
+    They are listed and answer only to an administrator who may use the MCP server, while **Administration tools** is
+    on in Settings → Assistant (off as shipped; `admin_tools` on `GET`/`PATCH /api/admin/assistant`), read again at
+    every request. Their answers are built from named facts: the names of datasets and of their indexes with the
+    indexes' sizes (closed datasets too), usernames, error messages and the backup folder reach the AI client; never a token, password, storage key, email or IP address,
+    host name, hash, or a path outside the backup folder. A job's messages are kept back when a dataset it is about
+    (a follower's sync: its link's mirrors) is closed to the assistant or has a private field, or when it belongs to no
+    dataset and its kind isn't one known to be about none (a restore isn't: it reads every row its index covers); an
+    index's definition when it holds a constant (a quoted text or a number) the server doesn't write itself, unless it
+    is one of schema.sql's own holding only constants schema.sql's statement for it holds. New route
+    `GET /api/admin/jobs/all` (administrators): every job of the server by state, kind, dataset and window (the window
+    bounds the jobs that have ended; a queued or running job is listed however old), with counts by state and the
+    kinds present, never a job's result but a backup's own file, size and tables.
   - **The call log.** Every tool call is logged (who, tool, dataset, when, how long, the outcome; never the arguments
     or the result) for 30 days: administrators read it under Settings → Assistant, **Recent calls**, and at
     `GET /api/admin/assistant/calls`.
@@ -108,7 +127,9 @@ each field. Six migrations, none of which touches a sample.
     `GET /api/views/{slug}` answers a private view its caller may not see as missing before anything else, as it
     always did for a person. Migrations `0036_assistant.sql` (three small tables and `datasets.assistant_closed`,
     false on every existing dataset), `0037_mcp_tokens_and_assistant_calls.sql` (the token kind and the empty log
-    table) and `0038_assistant_working_views.sql` (two tables and `assistant_settings.sample_fields`).
+    table), `0038_assistant_working_views.sql` (two tables and `assistant_settings.sample_fields`),
+    `0040_assistant_admin_tools.sql` (`assistant_settings.admin_tools`) and `0041_jobs_across_datasets.sql` (two
+    indexes of the jobs table, for `GET /api/admin/jobs/all`).
 - **Named regions, and a filter for the samples in one** ([docs/REGIONS.md](docs/REGIONS.md)). They come with the
   install: the job runner's Docker image carries Natural Earth's 1:10m states and provinces (version 5.1.1, public
   domain), checked against a pinned SHA-256 when the image is built, and the job runner loads them by itself when it
