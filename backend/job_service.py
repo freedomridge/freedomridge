@@ -8,6 +8,7 @@ import signal
 from datetime import datetime, timedelta
 
 from . import (
+    assistant_calls,
     auth_cleanup,
     backups,
     bulk_jobs,
@@ -16,6 +17,7 @@ from . import (
     dataset_deletion,
     dataset_schedules,
     duplicate_jobs,
+    field_kinds,
     follower_search,
     follower_sync,
     index_actions,
@@ -25,6 +27,7 @@ from . import (
     map_placement,
     map_refit,
     patch_import,
+    regions,
     schema_check,
     statistics,
 )
@@ -151,7 +154,8 @@ async def _cleanup_statistics_history(pool, job):
     async with pool.acquire(timeout=1) as connection:
         expired = await connection.fetch(
             """SELECT id FROM jobs
-               WHERE kind IN ('statistics','concept_scoring','duplicate_maintenance','map_place','follower_sync')
+               WHERE kind IN ('statistics','concept_scoring','duplicate_maintenance','map_place','follower_sync',
+                              'field_kinds')
                  AND dedupe_owner='system' AND state='succeeded'
                  AND NOT barrier @> '{"full":true}' AND finished_at<$1
                ORDER BY finished_at,id LIMIT $2""",
@@ -172,7 +176,8 @@ async def _cleanup_statistics_history(pool, job):
     async def publish(connection):
         await connection.execute(
             """DELETE FROM jobs WHERE id=ANY($1::uuid[])
-               AND kind IN ('statistics','concept_scoring','duplicate_maintenance','map_place','follower_sync')
+               AND kind IN ('statistics','concept_scoring','duplicate_maintenance','map_place','follower_sync',
+                            'field_kinds')
                  AND dedupe_owner='system' AND state='succeeded'
                AND NOT barrier @> '{"full":true}' AND finished_at<$2""",
             [row['id'] for row in expired],
@@ -240,6 +245,9 @@ async def run_service(dsn=DATABASE_URL):
     async def handle_duplicates(job):
         return await duplicate_jobs.handler(pool)(job)
 
+    async def handle_field_kinds(job):
+        return await field_kinds.handler(pool)(job)
+
     async def handle_explicit_concepts(job):
         return await concept_jobs.explicit_handler(pool)(job)
 
@@ -259,6 +267,9 @@ async def run_service(dsn=DATABASE_URL):
     async def handle_patch_import(job):
         return await patch_import.handler(pool)(job)
 
+    async def handle_region_load(job):
+        return await regions.handler(pool)(job)
+
     async def handle_follower_sync(job):
         return await follower_sync.handler(pool)(job)
 
@@ -277,11 +288,23 @@ async def run_service(dsn=DATABASE_URL):
         nonlocal dispatch_after
         dispatch_after = await concept_jobs.dispatch_changes(pool, after_dataset=dispatch_after)
 
+    bundled_loads_queued = False
+
+    async def queue_bundled_loads():
+        # Once each time the runner starts (tried again until it succeeds): the boundary sets whose pinned file came
+        # with the install and that this database has never loaded (docs/REGIONS.md). Restore recovery leaves region
+        # loads alone, so this doesn't wait for it.
+        nonlocal bundled_loads_queued
+        if not bundled_loads_queued:
+            await regions.queue_bundled_loads(pool)
+            bundled_loads_queued = True
+
     handlers = {
         SELECTION_CLEANUP: handle_cleanup,
         statistics.KIND: handle_statistics,
         concept_jobs.KIND: handle_concepts,
         duplicate_jobs.KIND: handle_duplicates,
+        field_kinds.KIND: handle_field_kinds,
         backups.KIND: backups.handler(),
         dataset_deletion.KIND: handle_deletion,
         bulk_jobs.KIND: handle_bulk,
@@ -292,6 +315,7 @@ async def run_service(dsn=DATABASE_URL):
         map_placement.KIND: handle_map_place,
         index_advisor.KIND: handle_index_review,
         patch_import.KIND: handle_patch_import,
+        regions.KIND: handle_region_load,
         follower_sync.KIND: handle_follower_sync,
         index_actions.DROP_KIND: handle_index_drop,
         index_actions.RESTORE_KIND: handle_index_restore,
@@ -306,6 +330,7 @@ async def run_service(dsn=DATABASE_URL):
                 statistics.KIND: statistics.POLICY,
                 concept_jobs.KIND: concept_jobs.POLICY,
                 duplicate_jobs.KIND: duplicate_jobs.POLICY,
+                field_kinds.KIND: field_kinds.POLICY,
                 backups.KIND: backups.POLICY,
                 dataset_deletion.KIND: dataset_deletion.POLICY,
                 bulk_jobs.KIND: bulk_jobs.POLICY,
@@ -316,6 +341,7 @@ async def run_service(dsn=DATABASE_URL):
                 map_placement.KIND: map_placement.POLICY,
                 index_advisor.KIND: index_advisor.POLICY,
                 patch_import.KIND: patch_import.POLICY,
+                regions.KIND: regions.POLICY,
                 follower_sync.KIND: follower_sync.POLICY,
                 index_actions.DROP_KIND: index_actions.POLICY,
                 index_actions.RESTORE_KIND: index_actions.POLICY,
@@ -378,12 +404,14 @@ async def run_service(dsn=DATABASE_URL):
             searches = asyncio.create_task(follower_search.serve(pool, stopping))
             schedules = [
                 (lambda: auth_cleanup.scheduled_cleanup(pool), 300, 'Demo account and session cleanup', False),
+                (lambda: assistant_calls.prune(pool), 3600, 'Assistant call log cleanup', False),
                 (lambda: schedule_cleanup(pool, interval), min(interval, 5), 'Selection cleanup', False),
                 (lambda: statistics.schedule_statistics(pool), stats_interval, 'Statistics', True),
                 (dispatch_concepts, 1, 'Concept work delivery', True),
                 (lambda: concept_jobs.schedule_concepts(pool), concept_interval, 'Concepts', True),
                 (lambda: backups.schedule_backups(pool), 60, 'Backups', False),
                 (lambda: duplicate_jobs.schedule_duplicates(pool), 5, 'Duplicates', True),
+                (lambda: field_kinds.schedule(pool), field_kinds.SCHEDULE_SECONDS, 'Field kinds', True),
                 (lambda: map_placement.schedule_placements(pool), 5, 'Map placement', True),
                 (lambda: follower_sync.schedule_sync(pool), follower_interval, 'Follower sync', True),
                 (
@@ -400,6 +428,7 @@ async def run_service(dsn=DATABASE_URL):
                 (lambda: map_refit.sweep(pool), 600, 'Map artifact cleanup', False),
                 (lambda: map_refit.heal_unranked_maps(pool), 600, 'Unranked map heal', False),
                 (lambda: map_refit.expire_unclaimed_fits(pool), 600, 'Unclaimed map fit expiry', False),
+                (queue_bundled_loads, 5, 'Region boundaries', False),
             ]
             retries = [FailureBackoff(logger, f'{name} scheduling', period) for _, period, name, _ in schedules]
             next_runs = [0.0] * len(schedules)

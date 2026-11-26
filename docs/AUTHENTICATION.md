@@ -126,6 +126,8 @@ Whatever their levels, only an administrator can:
 - run the index advisor: its reviews (a dataset's too, and review schedules), and removing or restoring an index;
 - manage users, and groups and their members;
 - manage followers, primaries, the compute launcher, backups and system status;
+- switch the assistant on and choose who may use it (Settings → Assistant, [ASSISTANT.md](ASSISTANT.md)); closing a
+  dataset to the assistant takes manage in it;
 - refresh every dataset's stale statistics at once (`POST /api/datasets/refresh-stats`);
 - stop, resume or discard a patch-vector import, a mirror's sync, or a job that belongs to no dataset.
 
@@ -218,10 +220,11 @@ Details:
 - `POST /api/users/{id}/reset-password` (`{"password": ..., "revoke_tokens": true}`) revokes the user's tokens
   unless `revoke_tokens` is `false`; without the field it revokes them. `POST /api/auth/change-password` revokes
   your own tokens only with `"revoke_tokens": true`. Both answer `revoked_tokens` with how many they revoked of
-  each scope (`full`, `follower`, `worker`), all 0 when not asked to revoke.
-- Deactivating a user revokes all of their tokens, follower and worker tokens included, in the same step;
+  each scope (`full`, `follower`, `worker`, and `mcp` when there were MCP tokens), all 0 when not asked to revoke.
+- Deactivating a user revokes all of their tokens, follower, worker and MCP tokens included, in the same step;
   reactivating the account doesn't bring them back. `PATCH /api/users/{id}` with `"is_active": false` answers
-  `revoked_tokens` with how many it revoked of each scope (`full`, `follower`, `worker`).
+  `revoked_tokens` with how many it revoked of each scope (`full`, `follower`, `worker`, and `mcp` when there were
+  any).
 - A **worker token** (on the tokens page, **Used by: a compute worker**; `"scope": "worker"`;
   `client.create_token(name, scope="worker")`) is for a compute
   worker, a machine that runs jobs for the server (`python -m fridge.worker`). Only the worker endpoints
@@ -230,6 +233,10 @@ Details:
 - A **follower token** is created with a follower on the primary (`POST /api/followers`, admins only), for
   a [follower instance](FOLLOWERS.md). It belongs to the follower's own account, `follower:<name>`, and
   only the follower endpoints accept it. Removing the follower revokes it.
+- An **MCP token** (on the tokens page, **Used by: An AI client (MCP)**, offered when you may use the assistant's
+  MCP server; `"scope": "mcp"`) is for an AI client such as Claude Code. It opens the MCP server at `/mcp` and
+  nothing else: any other route refuses it exactly as a token that doesn't exist, and `/mcp` takes no other token
+  and no session ([Assistant](ASSISTANT.md#the-mcp-token)).
 
 The SDK's `client.login(username, password)` also works, but it keeps the password in your script
 and uses a cookie session that expires when idle. Prefer a token.
@@ -325,6 +332,8 @@ the variable.
 | `/api/tokens` | GET | signed in | List your tokens (never their values) |
 | `/api/tokens/{id}` | DELETE | owner | Revoke one of your tokens |
 | `/api/users/{id}/tokens` | DELETE | admin | Revoke all of a user's tokens |
+| `/mcp` | POST | MCP token of a user who may use the assistant | The MCP server for AI clients ([Assistant](ASSISTANT.md)) |
+| `/api/admin/assistant/calls` | GET | admin | The assistant's tool calls of the last 30 days, newest first |
 | `/api/groups` | GET, POST | admin | List groups with their members; create a group |
 | `/api/groups/{id}` | PATCH, DELETE | admin | Rename a group; delete it with its shares |
 | `/api/groups/{id}/members/{user_id}` | PUT, DELETE | admin | Add a member; remove one |

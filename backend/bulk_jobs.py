@@ -6,14 +6,17 @@ from datetime import datetime
 
 from fastapi import HTTPException
 
-from . import job_queue, local_writes, stale_lassos
+from . import field_kinds, job_queue, local_writes, stale_lassos
 from .api_errors import CodedHTTPException
 from .diskspace import INGEST_ROW_BYTES, require_free_space
 from .field_registry import (
     LOCAL_PREFIX,
+    RESERVED_METADATA_KEYS,
+    forget_definitions,
     invalidate_values,
     lock_field_lifecycle,
     prune_fields,
+    refuse_column_keys,
     register_fields,
 )
 from .job_runner import StepResult
@@ -132,8 +135,12 @@ async def submit(pool, dataset_id, user_id, operation, payload):
     tokens = selection_tokens(payload.get('filters'))
     if payload.get('selection_token'):
         tokens.add(payload['selection_token'])
+    # A concept that isn't the dataset's is refused now, not when the first unit runs.
+    await datasets.require_known_concepts(payload.get('filters'), dataset_id)
     # Freeze the validated expression and catalog interpretation, not a mutable saved view ID.
     # The dataset ID scopes cross-grain subqueries exactly as the grid's own query does.
+    # A region this server doesn't have is refused now, not when the first unit runs.
+    await datasets.require_known_regions(payload.get('filters'))
     args: list = []
     predicate, _ = (
         datasets.parse_filter_node(
@@ -144,11 +151,37 @@ async def submit(pool, dataset_id, user_id, operation, payload):
             None,
             dataset_id,
             array_columns=await datasets.get_dataset_array_columns(dataset_id),
+            # Each unit tests its few samples: a region joined to the samples table would be read whole per unit.
+            region_joins=False,
         )
         if payload.get('filters')
         else ('TRUE', 1)
     )
     predicate = predicate.replace("AND rs.created_at > statement_timestamp() - interval '2 hours'", '')
+    # The same filter compiled with the record of which kind of row has which field (field_kinds), read now, when it is
+    # compiled: on a dataset with objects it skips a kind's rows for a field the kind has never had. It starts with
+    # require_field_kinds, which refuses it in a unit whose snapshot has seen a first value of a field it skips; the
+    # unit then runs the predicate above, which skips nothing (_unit_variants).
+    kinds_args: list = []
+    kinds_predicate = None
+
+    async def with_record():
+        nonlocal kinds_predicate
+        compiled, _ = datasets.parse_filter_node(
+            payload['filters'],
+            kinds_args,
+            1,
+            None,
+            None,
+            dataset_id,
+            array_columns=await datasets.get_dataset_array_columns(dataset_id),
+            region_joins=False,
+        )
+        if field_kinds.guarded_sql(compiled):
+            kinds_predicate = compiled.replace("AND rs.created_at > statement_timestamp() - interval '2 hours'", '')
+
+    if payload.get('filters'):
+        await field_kinds.reading(pool, dataset_id, payload['filters'], with_record)
     if operation == 'delete_embeddings' and payload.get('filters') and _matches_every_sample(predicate):
         # Only filters == {} deletes a whole field (delete_embedding_field); a filter is never a silent everything.
         raise HTTPException(
@@ -179,11 +212,7 @@ async def submit(pool, dataset_id, user_id, operation, payload):
                 await connection.execute('SET LOCAL enable_seqscan=off')
                 field = payload['field_name']
                 datasets._validate_field_name(field)
-                source = await connection.fetchrow(
-                    'SELECT * FROM dataset_fields WHERE dataset_id=$1 AND field_name=$2',
-                    dataset_id,
-                    field,
-                )
+                source = await datasets._definition(connection, dataset_id, field)
                 if source is not None and source['origin'] != 'metadata':
                     raise HTTPException(400, 'Field operations require a metadata field')
                 if source is not None and source['is_promoted']:
@@ -209,11 +238,23 @@ async def submit(pool, dataset_id, user_id, operation, payload):
                     )
                     await connection.execute(
                         """INSERT INTO dataset_fields
-                           (dataset_id,field_name,field_type,display_type,origin,overlay_config)
-                           SELECT dataset_id,$3,field_type,display_type,origin,overlay_config FROM dataset_fields
+                           (dataset_id,field_name,field_type,display_type,origin,overlay_config,description,unit,
+                            values_private)
+                           SELECT dataset_id,$3,field_type,display_type,origin,overlay_config,description,unit,
+                                  values_private
+                           FROM dataset_fields
                            WHERE dataset_id=$1 AND field_name=$2 ON CONFLICT(dataset_id,field_name) DO UPDATE
                            SET field_type=EXCLUDED.field_type,display_type=EXCLUDED.display_type,
-                               overlay_config=EXCLUDED.overlay_config""",
+                               overlay_config=EXCLUDED.overlay_config,origin=EXCLUDED.origin,
+                               -- a 'system' row there (a built-in's description, a flag kept when a field went)
+                               -- is taken over: what it says stays where the field brings nothing
+                               description=CASE WHEN dataset_fields.origin='system'
+                                   THEN COALESCE(EXCLUDED.description,dataset_fields.description)
+                                   ELSE EXCLUDED.description END,
+                               unit=CASE WHEN dataset_fields.origin='system'
+                                   THEN COALESCE(EXCLUDED.unit,dataset_fields.unit) ELSE EXCLUDED.unit END,
+                               values_private=EXCLUDED.values_private
+                                   OR (dataset_fields.origin='system' AND dataset_fields.values_private)""",
                         dataset_id,
                         field,
                         payload['new_name'],
@@ -251,6 +292,11 @@ async def submit(pool, dataset_id, user_id, operation, payload):
                     ),
                     'predicate': predicate,
                     'typed_predicate_args': _freeze_value(args),
+                    **(
+                        {'kinds_predicate': kinds_predicate, 'typed_kinds_predicate_args': _freeze_value(kinds_args)}
+                        if kinds_predicate is not None
+                        else {}
+                    ),
                     # Every vector of the field (Dataset.delete_embedding_field): each unit gives its map a new
                     # layout id with the delete, so a lasso drawn on it warns, whatever lays it out again after.
                     'stale_lassos': stale,
@@ -488,28 +534,33 @@ async def _mutate(connection, job, ids, removed_fields, targeted=None):
             )
         await invalidate_values(connection, dataset_id, [request['field_name']])
         return int(status.split()[-1])
-    names = set(request.get('metadata', {})) | set(request.get('remove_metadata_keys', []))
+    # A job queued before keys named as a sample's own fields were refused (field_registry.RESERVED_METADATA_KEYS)
+    # leaves them out.
+    protected = sorted(RESERVED_METADATA_KEYS)
+    setting = {k: v for k, v in request.get('metadata', {}).items() if k not in RESERVED_METADATA_KEYS}
+    names = set(setting) | set(request.get('remove_metadata_keys', []))
     if operation == 'set':
         if request.get('per_sample'):
             rows = await connection.fetch(
-                """UPDATE samples s SET metadata=COALESCE(s.metadata,'{}') || t.patch
+                """UPDATE samples s SET metadata=COALESCE(s.metadata,'{}') || (t.patch - $4::text[])
                    FROM bulk_job_targets t WHERE t.job_id=$1 AND t.sample_id=s.id
-                   AND s.dataset_id=$2 AND s.id=ANY($3::int[]) RETURNING t.patch""",
+                   AND s.dataset_id=$2 AND s.id=ANY($3::int[]) RETURNING t.patch - $4::text[] AS patch""",
                 job['id'],
                 dataset_id,
                 ids,
+                protected,
             )
             patches = [row['patch'] for row in rows]
             count = len(rows)
             names.update(key for patch in patches for key in patch)
         else:
-            patch = {k: v for k, v in request['metadata'].items() if k not in request['remove_metadata_keys']}
+            patch = {k: v for k, v in setting.items() if k not in request['remove_metadata_keys']}
             status = await connection.execute(
                 """UPDATE samples SET metadata=(COALESCE(metadata,'{}') || $3::jsonb)-$4::text[]
                    WHERE dataset_id=$1 AND id=ANY($2::int[])""",
                 dataset_id,
                 ids,
-                request['metadata'],
+                setting,
                 request['remove_metadata_keys'],
             )
             patches, count = [patch], int(status.split()[-1])
@@ -529,6 +580,7 @@ async def _mutate(connection, job, ids, removed_fields, targeted=None):
         )
         values = [dataset_id, ids, field]
         if operation != 'clear':
+            refuse_column_keys([request['new_name']])  # a rename queued before the refusal
             values.append(request['new_name'])
             names.add(request['new_name'])
         status = await connection.execute(
@@ -553,6 +605,27 @@ async def _mutate(connection, job, ids, removed_fields, targeted=None):
     if operation in ('rename', 'clone', 'clear'):
         await datasets._invalidate_field_derivations(connection, dataset_id, names)
     return count
+
+
+def _unit_variants(request):
+    """The predicates a unit tries in turn (field_kinds.retrying): the one compiled with the record of which kind of row
+    has which field, if the job has one, then the one that skips nothing, which nothing refuses. Each as (SQL, its
+    parameters, a fresh list). Older jobs used JSON-only parameters; preserve their resumability.
+
+    The first one's guard (require_field_kinds, an InitPlan) runs once, in the statement's snapshot. A row the unit's
+    SELECT ... FOR NO KEY UPDATE waits for is rechecked against the predicate after the wait, where a skipped test is
+    the constant FALSE and the guard isn't evaluated again: a row given its first value of a skipped field by a
+    transaction in flight when the unit started is left out, as it would be had that write committed just after the
+    unit (READ COMMITTED). A later unit's guard sees the committed mark and runs the second predicate."""
+    full = (
+        request['predicate'],
+        _restore_value(request['typed_predicate_args'])
+        if 'typed_predicate_args' in request
+        else list(request['predicate_args']),
+    )
+    if 'kinds_predicate' not in request:
+        return [full]
+    return [(request['kinds_predicate'], _restore_value(request['typed_kinds_predicate_args'])), full]
 
 
 def handler(pool):
@@ -634,12 +707,16 @@ def handler(pool):
                             job['dataset_id'],
                             names[index],
                         )
-                        if not present:
+                        if not present and request['operation'] == 'clear':
+                            # A private field keeps its flag, for when the field comes back.
+                            await forget_definitions(connection, job['dataset_id'], [names[index]])
+                        elif not present:  # renamed: its definition, flag included, went with it
                             await connection.execute(
                                 'DELETE FROM dataset_fields WHERE dataset_id=$1 AND field_name=$2',
                                 job['dataset_id'],
                                 names[index],
                             )
+                        if not present:
                             await connection.execute(
                                 'DELETE FROM dataset_field_stats WHERE dataset_id=$1 AND field_name=$2',
                                 job['dataset_id'],
@@ -721,43 +798,50 @@ def handler(pool):
             # Long ID lists (exclusions, `in` filters) bind as parameters. A generic plan scans
             # them linearly per row; a custom plan hashes them.
             await connection.execute('SET LOCAL plan_cache_mode = force_custom_plan')
-            # Older jobs used JSON-only parameters; preserve their resumability.
-            args = (
-                _restore_value(request['typed_predicate_args'])
-                if 'typed_predicate_args' in request
-                else list(request['predicate_args'])
+
+            async def attempt(variant):
+                """The unit with one of the job's predicates (_unit_variants); a refused one (require_field_kinds) left
+                nothing behind (its savepoint), and the next is run."""
+                where, args = variant
+                args.extend([job['dataset_id'], ids, request.get('excluded_ids', [])])
+                n = len(args)
+                where += f' AND dataset_id=${n - 2} AND id=ANY(${n - 1}::int[]) AND NOT(id=ANY(${n}::int[]))'
+                if request.get('selection_token'):
+                    args.append(request['selection_token'])
+                    where += f' AND id IN (SELECT sample_id FROM region_selections WHERE token=${len(args)})'
+                # PostgreSQL rechecks row predicates after waiting for a concurrent updater.
+                # Nonmatches never get row locks (and never dirty their heap pages). Only delete changes
+                # a key: edits leave FK writers (embeddings, hashes, scores) for matching rows unblocked.
+                lock = 'FOR UPDATE' if request['operation'] == 'delete' else 'FOR NO KEY UPDATE'  # vectors keep keys
+                selected = await connection.fetch(f'SELECT id FROM samples WHERE {where} ORDER BY id {lock}', *args)
+                # Re-evaluate subqueries in a fresh snapshot too, retaining only locked rows.
+                args[n - 2] = [row['id'] for row in selected]
+                selected = await connection.fetch(f'SELECT id FROM samples WHERE {where}', *args) if selected else []
+                removed = set(checkpoint.get('removed_fields', []))
+
+                async def targeted(candidates):
+                    """Those of these samples the job deletes itself, in this unit or a later one."""
+                    test = list(args)
+                    test[n - 2] = candidates
+                    extra = f" AND id <= {int(job['barrier']['max_id'])}"
+                    if request['explicit']:
+                        test.append(job['id'])
+                        extra += f' AND id IN (SELECT sample_id FROM bulk_job_targets WHERE job_id=${len(test)})'
+                    rows = await connection.fetch(f'SELECT id FROM samples WHERE {where}{extra}', *test)
+                    return {row['id'] for row in rows}
+
+                if not selected:
+                    return None, removed
+                return await _mutate(connection, job, [row['id'] for row in selected], removed, targeted), removed
+
+            variants = _unit_variants(request)
+            outcome, removed_fields = await field_kinds.retrying(
+                variants,
+                attempt,
+                savepoint=connection if len(variants) > 1 else None,
             )
-            where = request['predicate']
-            args.extend([job['dataset_id'], ids, request.get('excluded_ids', [])])
-            n = len(args)
-            where += f' AND dataset_id=${n - 2} AND id=ANY(${n - 1}::int[]) AND NOT(id=ANY(${n}::int[]))'
-            if request.get('selection_token'):
-                args.append(request['selection_token'])
-                where += f' AND id IN (SELECT sample_id FROM region_selections WHERE token=${len(args)})'
-            # PostgreSQL rechecks row predicates after waiting for a concurrent updater.
-            # Nonmatches never get row locks (and never dirty their heap pages). Only delete changes
-            # a key: edits leave FK writers (embeddings, hashes, scores) for matching rows unblocked.
-            lock = 'FOR UPDATE' if request['operation'] == 'delete' else 'FOR NO KEY UPDATE'  # vectors keep sample keys
-            selected = await connection.fetch(f'SELECT id FROM samples WHERE {where} ORDER BY id {lock}', *args)
-            # Re-evaluate subqueries in a fresh snapshot too, retaining only locked rows.
-            args[n - 2] = [row['id'] for row in selected]
-            selected = await connection.fetch(f'SELECT id FROM samples WHERE {where}', *args) if selected else []
-            removed_fields = set(checkpoint.get('removed_fields', []))
-
-            async def targeted(candidates):
-                """Those of these samples the job deletes itself, in this unit or a later one."""
-                test = list(args)
-                test[n - 2] = candidates
-                extra = f" AND id <= {int(job['barrier']['max_id'])}"
-                if request['explicit']:
-                    test.append(job['id'])
-                    extra += f' AND id IN (SELECT sample_id FROM bulk_job_targets WHERE job_id=${len(test)})'
-                rows = await connection.fetch(f'SELECT id FROM samples WHERE {where}{extra}', *test)
-                return {row['id'] for row in rows}
-
             affected = 0
-            if selected:
-                outcome = await _mutate(connection, job, [row['id'] for row in selected], removed_fields, targeted)
+            if outcome is not None:
                 if request['operation'] == 'delete':
                     affected, objects = outcome
                     checkpoint['objects'] = checkpoint.get('objects', 0) + objects

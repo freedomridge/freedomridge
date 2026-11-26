@@ -262,6 +262,7 @@ The generated values include:
 | `FRIDGE_DEMO_*`, `FRIDGE_GUEST_*`, `FRIDGE_DB_ACQUIRE_TIMEOUT_SECONDS` | Optional public-demo limits (demo-account caps per IP and in total, guest query timeout and concurrency, guest saved-view quota). The defaults in `.env.example` suit the demo; numeric limits must be positive; `FRIDGE_DEMO_IP_ALLOWLIST` accepts trusted IPs/CIDRs (see section 10) |
 | `DEMO_MODE` | `true`; shows the **Try as Guest** button on the login page |
 | `ALLOWED_ORIGINS` | `https://YOUR_DOMAIN`, exact browser origin |
+| `FRIDGE_PUBLIC_URL` | Optional: the address the assistant's links start with. Without it the first `ALLOWED_ORIGINS` entry is used, so that entry must be the server's public HTTPS origin |
 | `SESSION_COOKIE_SECURE` | `true` (also the production Compose default) |
 | `DOMAIN_NAME` | `YOUR_DOMAIN` |
 | `LETSENCRYPT_EMAIL` | Your notification email |
@@ -326,6 +327,8 @@ again on a working site just to renew it.
 
 `pull` fetches the release's images from ghcr.io. For a revision that isn't a release, build
 them from the checkout with `docker compose -f docker-compose.prod.yml build --pull` instead.
+Building needs BuildKit (`docker compose build`, or `docker build` with the buildx plugin); the
+legacy builder stops at the step that adds the region boundaries.
 
 ```bash
 docker compose -f docker-compose.prod.yml pull
@@ -1026,7 +1029,7 @@ metrics are absent. The module does not add a 5xx alarm or demo-login dashboard.
 Review security updates monthly and after relevant advisories. OS unattended
 upgrades do not update containers. Back up first, check out the release that has
 the fixes, pull its images with `docker compose -f docker-compose.prod.yml pull`
-(between releases, rebuild from the checkout with `build --pull`), stop the app
+(between releases, rebuild from the checkout with `build --pull`, which needs BuildKit), stop the app
 (`docker compose -f docker-compose.prod.yml stop backend job-runner worker backup frontend`),
 apply migrations using the explicit production DB container, and recreate with
 `up -d` ([Upgrading](UPGRADING.md), step 4). nginx re-resolves Docker service IPs

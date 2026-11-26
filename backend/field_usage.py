@@ -11,7 +11,8 @@ itself:
   uses in one role, so the waiting of a request filtering by three fields is counted once, not three
   times, and a fast field used beside a slow one does not take on the slow one's whole time.
 - Each worker adds its counts to `field_usage_daily` once a minute in one statement. The statement keeps
-  only fields the dataset defines (a forged or removed name is dropped) and skips deleting datasets.
+  only fields the dataset defines (a forged or removed name is dropped; so is a built-in such as created_at, whose
+  row with origin 'system' only holds its description) and skips deleting datasets.
   A worker that dies loses at most one minute of telemetry.
 - Rows older than the review window are pruned once a day, so the table holds at most
   (fields used) x 4 usages x (window + 1) days per dataset.
@@ -141,7 +142,8 @@ FROM unnest($1::int[], $2::text[], $3::text[], $4::date[], $5::bigint[], $6::flo
     AS r(dataset_id, usage, field_name, day, uses, total_ms, latency)
 JOIN datasets d ON d.id = r.dataset_id AND NOT d.deleting
 WHERE r.field_name = '' OR EXISTS (
-    SELECT 1 FROM dataset_fields f WHERE f.dataset_id = r.dataset_id AND f.field_name = r.field_name)
+    SELECT 1 FROM dataset_fields f WHERE f.dataset_id = r.dataset_id AND f.field_name = r.field_name
+    AND f.origin <> 'system')
 ORDER BY r.dataset_id, r.usage, r.field_name, r.day
 ON CONFLICT (dataset_id, usage, field_name, day) DO UPDATE SET
     uses = current.uses + EXCLUDED.uses,

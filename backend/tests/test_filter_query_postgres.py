@@ -7,6 +7,7 @@ from typing import Any
 import pytest
 from fastapi import HTTPException
 
+from backend import database as database_module
 from backend.filter_query import DATETIME, LIST, NUMBER, TEXT
 from backend.routers import datasets
 from backend.routers import filter_query as endpoints
@@ -92,21 +93,52 @@ def test_a_mistake_is_a_400_with_where_and_suggestions(query_database):
     query_database(scenario)
 
 
-def test_an_unchanged_part_keeps_its_chip_and_format_leaves_out_what_text_cannot_say(query_database):
+def test_an_unchanged_part_keeps_its_chip_and_format_leaves_out_what_text_cannot_say(query_database, monkeypatch):
+    """A map region, a lasso, a selection and a concept filter whose concept is gone have no text form; a concept
+    filter whose concept exists has one, and its chip is kept like any other's."""
+
     async def scenario(database_):
-        concept = {'field': '_concept', 'operator': 'concept_exclude', 'value': {'concept_id': 3, 'threshold': 0.9}}
+        # Any module that reads the app's database reads the test's: wherever a concept's name is looked up.
+        monkeypatch.setattr(database_module.db, 'pool', database_.pool)
+        concept_id = await database_.fetchval(
+            'INSERT INTO embedding_concepts (dataset_id, name, embedding_field, kind, weight) '
+            "VALUES (1, 'equipment', 'clip', 'seed', '[1,0]') RETURNING id",
+        )
+        concept = {
+            'field': '_concept',
+            'operator': 'concept_exclude',
+            'value': {'concept_id': concept_id, 'op': '>', 'threshold': 0.9},
+        }
+        gone = {
+            'field': '_concept',
+            'operator': 'concept_select',
+            'value': {'concept_id': concept_id + 1000, 'op': '>', 'threshold': 0.9},
+        }
+        polygon = [[0, 0], [1, 0], [1, 1]]
         current = [
+            {'field': 'location', 'operator': 'geo_polygon', 'value': polygon},
             concept,
+            {'field': 'clip', 'operator': 'embedding_polygon', 'value': polygon},
             {'logic': 'AND', 'filters': [{'field': 'split', 'operator': '==', 'value': 'train'}]},
+            {'field': 'id', 'operator': 'in_selection', 'value': 'token'},
+            gone,
             {'field': 'serial', 'operator': 'in', 'value': ['103000752']},
         ]
         formatted = await endpoints.format_filter_query(1, endpoints.FilterQueryFormat(filters=current))
         assert formatted == {
-            'parts': [None, 'split = "train"', 'serial in ("103000752")'],
-            'query': 'split = "train"\nAND serial in ("103000752")',
+            'parts': [
+                None,
+                'not concept "equipment" > 0.9',
+                None,
+                'split = "train"',
+                None,
+                None,
+                'serial in ("103000752")',
+            ],
+            'query': 'not concept "equipment" > 0.9\nAND split = "train"\nAND serial in ("103000752")',
         }
-        # Built differently (== and an AND around one filter) but the same filter: the chip is kept.
+        # Built differently (== and an AND around one filter) but the same filter: the chip is kept, the concept's too.
         parsed = await parse(formatted['query'] + '\nAND score > 0.5', current)
-        assert parsed['reuse'] == [1, 2, None]
+        assert parsed['reuse'] == [1, 3, 6, None]
 
     query_database(scenario)

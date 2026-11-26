@@ -96,6 +96,49 @@ interface Props {
     level?: AccessLevel | null;
 }
 
+// A field's description and unit as one text: the accessible description of its name (aria-description), so a screen
+// reader says what the field means on focus without the text sitting in the page while the tip is closed.
+function describedAs(field?: SchemaField): string | undefined {
+    if (!field?.description) return undefined;
+    return field.unit ? `${field.description} Unit: ${field.unit}` : field.description;
+}
+
+// What a field means (Dataset Settings → Fields), under its name: shown while the pointer is on the name or the name
+// has keyboard focus, and Escape hides it until the pointer or focus leaves. The element in `children` that holds the
+// name is focusable and carries describedAs(field) as its aria-description. The tip is in the page only while shown,
+// and takes no pointer events: what it covers stays clickable. A field without a description is `children` alone,
+// laid out as before.
+function FieldDescriptionTip({ field, children }: { field?: SchemaField; children: ReactNode }) {
+    const [hovered, setHovered] = useState(false);
+    const [focused, setFocused] = useState(false);
+    const [dismissed, setDismissed] = useState(false);
+    if (!field?.description) return <>{children}</>;
+    const shown = (hovered || focused) && !dismissed;
+    return (
+        <div
+            className="relative flex min-w-0"
+            onMouseEnter={() => setHovered(true)}
+            onMouseLeave={() => { setHovered(false); setDismissed(false); }}
+            // Keyboard focus only: a click leaves focus on a section's toggle, and the tip would stay over its body.
+            onFocus={event => setFocused(event.target.matches(':focus-visible'))}
+            onBlur={() => { setFocused(false); setDismissed(false); }}
+            onKeyDown={event => { if (event.key === 'Escape' && shown) setDismissed(true); }}
+        >
+            {children}
+            {shown && (
+                <div
+                    role="tooltip"
+                    data-testid={`field-description-${field.name}`}
+                    className="pointer-events-none absolute left-0 top-full z-30 mt-1 w-64 max-w-[80vw] whitespace-pre-line rounded border border-zinc-700 bg-zinc-900 px-2 py-1.5 text-xs font-normal normal-case text-zinc-300 shadow-lg"
+                >
+                    {field.description}
+                    {field.unit && <span className="mt-1 block text-zinc-400">Unit: {field.unit}</span>}
+                </div>
+            )}
+        </div>
+    );
+}
+
 // A field whose statistics are still pending shows only its header: there is nothing to expand.
 function isStatsPending(field: SchemaField): boolean {
     return !!field.stats_pending && (field.type === 'number' || field.type === 'datetime' || field.type === 'unknown');
@@ -538,9 +581,11 @@ export function FilterSidebar({
         const open = body !== undefined && isExpanded(schemaField);
         const bodyId = `${sectionIdPrefix}-field-${index}`;
         const filtered = filteredFields.has(name);
+        // A described field's name shows what it means (FieldDescriptionTip), dotted so it reads as having more.
+        const described = describedAs(schemaField);
         const title = (
             <>
-                <span className="truncate text-sm font-medium capitalize text-zinc-200">{name}</span>
+                <span className={`truncate text-sm font-medium capitalize text-zinc-200 ${described ? 'underline decoration-dotted decoration-zinc-500 underline-offset-2' : ''}`}>{name}</span>
                 <span className="shrink-0 text-[10px] text-zinc-500">{schemaField.type}</span>
                 {filtered && (
                     <span title="This field has a filter" className="relative h-1.5 w-1.5 shrink-0 rounded-full bg-cyan-400">
@@ -552,25 +597,32 @@ export function FilterSidebar({
         return (
             <div key={name} data-testid={`field-section-${name}`} data-filtered={filtered ? 'true' : undefined} className="space-y-2">
                 <div className="flex items-center justify-between gap-2">
-                    {body ? (
-                        <button
-                            type="button"
-                            data-testid={`field-toggle-${name}`}
-                            ref={element => {
-                                if (element) toggleRefs.current.set(name, element);
-                                else toggleRefs.current.delete(name);
-                            }}
-                            aria-expanded={open}
-                            aria-controls={open ? bodyId : undefined}
-                            onClick={() => toggleField(schemaField)}
-                            className="flex min-w-0 items-center gap-1.5 rounded text-left hover:bg-zinc-800/60 focus:outline-none focus-visible:ring-2 focus-visible:ring-cyan-500"
-                        >
-                            <span aria-hidden="true" className="w-3 shrink-0 text-xs text-zinc-500">{open ? '▾' : '▸'}</span>
-                            {title}
-                        </button>
-                    ) : (
-                        <div className="flex min-w-0 items-center gap-1.5 pl-[18px]">{title}</div>
-                    )}
+                    <FieldDescriptionTip field={schemaField}>
+                        {body ? (
+                            // eslint-disable-next-line jsx-a11y/role-supports-aria-props -- aria-description (ARIA 1.3) is global; the plugin's tables predate it
+                            <button
+                                type="button"
+                                data-testid={`field-toggle-${name}`}
+                                ref={element => {
+                                    if (element) toggleRefs.current.set(name, element);
+                                    else toggleRefs.current.delete(name);
+                                }}
+                                aria-expanded={open}
+                                aria-controls={open ? bodyId : undefined}
+                                aria-description={described}
+                                onClick={() => toggleField(schemaField)}
+                                className="flex min-w-0 items-center gap-1.5 rounded text-left hover:bg-zinc-800/60 focus:outline-none focus-visible:ring-2 focus-visible:ring-cyan-500"
+                            >
+                                <span aria-hidden="true" className="w-3 shrink-0 text-xs text-zinc-500">{open ? '▾' : '▸'}</span>
+                                {title}
+                            </button>
+                        ) : (
+                            <div tabIndex={described ? 0 : undefined} aria-description={described}
+                                className="flex min-w-0 items-center gap-1.5 rounded pl-[18px] focus:outline-none focus-visible:ring-2 focus-visible:ring-cyan-500">
+                                {title}
+                            </div>
+                        )}
+                    </FieldDescriptionTip>
                     {actions && <div className="flex shrink-0 items-center gap-2">{actions}</div>}
                 </div>
                 {renderFacetStatus(schemaField, open)}
@@ -598,6 +650,20 @@ export function FilterSidebar({
                 )}
                 {open && <div id={bodyId} className="space-y-2">{body()}</div>}
             </div>
+        );
+    };
+
+    // A field's name in a row outside the sections (System, Overlays), with its description when it has one.
+    const renderRowName = (name: string, label: string, title?: string) => {
+        const field = fullSchema.find(f => f.name === name);
+        const described = describedAs(field);
+        return (
+            <FieldDescriptionTip field={field}>
+                <label tabIndex={described ? 0 : undefined} aria-description={described} title={title}
+                    className={`truncate rounded text-sm font-medium text-zinc-300 focus:outline-none focus-visible:ring-2 focus-visible:ring-cyan-500 ${described ? 'underline decoration-dotted decoration-zinc-500 underline-offset-2' : ''}`}>
+                    {label}
+                </label>
+            </FieldDescriptionTip>
         );
     };
 
@@ -659,11 +725,11 @@ export function FilterSidebar({
                         <div className="space-y-2 pb-4 border-b border-zinc-800">
                             <h3 className="text-xs font-semibold text-zinc-500 uppercase tracking-wider">System</h3>
                             <div className="flex items-center justify-between">
-                                <label className="text-sm font-medium text-zinc-300">ID</label>
+                                {renderRowName('id', 'ID')}
                                 {renderOverlayToggle('id')}
                             </div>
                             <div className="flex items-center justify-between">
-                                <label className="text-sm font-medium text-zinc-300">Filepath</label>
+                                {renderRowName('filepath', 'Filepath')}
                                 {renderOverlayToggle('filepath')}
                             </div>
                         </div>
@@ -681,7 +747,7 @@ export function FilterSidebar({
                                     <h3 className="text-xs font-semibold text-zinc-500 uppercase tracking-wider">Overlays</h3>
                                     {overlayFields.map(f => (
                                         <div key={f.name} className="flex items-center justify-between">
-                                            <label className="text-sm font-medium text-zinc-300 truncate" title={f.name}>{f.name}</label>
+                                            {renderRowName(f.name, f.name, f.name)}
                                             <div className="flex items-center gap-1">
                                                 {renderPresenceFilter(f.name)}
                                                 {renderOverlayToggle(f.name)}

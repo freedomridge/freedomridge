@@ -1,20 +1,22 @@
 import type { ViewStage } from './api';
-import { type ExpiredSelection, filterHasInSelection, isReadOnlyStage } from './filter-query';
+import { type ExpiredSelection, filterHasInSelection, isConceptScoreStage, isReadOnlyStage, isRegionStage } from './filter-query';
 import { type SourceView, sameStages } from './source-view';
 
 // A link that opens a dataset: /datasets/<id>?<parameters>, each optional.
 //   view=<slug>          a saved view, as choosing it in Saved Views does
+//   w=<handle>           an assistant's working view (wv_…), for its user only and for 30 days after it was last used
 //   q=<text>             the filter as query-language text (docs/FILTER_QUERY.md), one chip per top-level AND part
 //   f=<version>.<data>   the filter stages, encoded, for chips the language can't write (map regions, lassos,
-//                        selections, searches, concepts)
+//                        selections, searches)
 //   sort=<field>, dir=asc|desc   the grid's sort
 //   sample=<id>          the sample whose view opens
-// `view` wins over `f`, and `f` over `q`. The dataset page's address is such a link to what it shows (FilterContext
-// writes it on each history entry). Copy link (datasetLink, viewLink) and the address write one of view, q or f,
-// never two.
+// `view` wins over `w`, `w` over `f`, and `f` over `q`. The dataset page's address is such a link to what it shows
+// (FilterContext writes it on each history entry). Copy link (datasetLink, viewLink) and the address write one of view,
+// q or f, never two, and never w: a working view's link opens its filters, which are then written as any others.
 
 export interface DatasetLink {
     view?: string;
+    w?: string;
     q?: string;
     f?: string;
     sort?: string;
@@ -25,7 +27,7 @@ export interface DatasetLink {
 /** The link in a page's query string, or null when it has none of the parameters. */
 export function readLink(params: { get(name: string): string | null }): DatasetLink | null {
     const link: DatasetLink = {};
-    for (const name of ['view', 'q', 'f', 'sort', 'sample'] as const) {
+    for (const name of ['view', 'w', 'q', 'f', 'sort', 'sample'] as const) {
         const value = params.get(name);
         if (value !== null) link[name] = value;
     }
@@ -34,9 +36,9 @@ export function readLink(params: { get(name: string): string | null }): DatasetL
     return Object.keys(link).length ? link : null;
 }
 
-/** Whether the link sets the filters (a view, a query or encoded stages). A sample or a sort alone doesn't. */
+/** Whether the link sets the filters (a view, a working view, a query or encoded stages). A sample or a sort alone doesn't. */
 export function linkSetsFilters(link: DatasetLink | null): boolean {
-    return !!link && (link.view !== undefined || link.f !== undefined || link.q !== undefined);
+    return !!link && (link.view !== undefined || link.w !== undefined || link.f !== undefined || link.q !== undefined);
 }
 
 // --- Opening the dataset page ---
@@ -105,6 +107,10 @@ export const LINK_VERSION = 1;
 export const MAX_INFLATED_BYTES = 1024 * 1024;
 
 export const UNKNOWN_VERSION_NOTICE = "This link was made by a different version of Freedom Ridge and can't be opened here.";
+// A `w=` link whose working view is of another dataset than the address names: told as an unknown handle is (the
+// server's words for that are its own).
+export const UNKNOWN_WORKING_VIEW_NOTICE = "This link's view doesn't exist or has expired: the assistant keeps the views it "
+    + 'makes for 30 days after they were last used.';
 export const BROKEN_LINK_NOTICE = "This link's filters can't be read. It may have been cut short when it was copied.";
 export const OVERSIZED_LINK_NOTICE = "This link's filters are too large to open.";
 
@@ -190,12 +196,13 @@ export const MAX_LINK_LENGTH = 6000;
 export const TOO_LONG_NOTICE = "Can't copy a link: the selection is too large for a link. Save a view and copy its link instead.";
 
 /**
- * Whether the stages may go in `q=`: every one an ordinary filter, which a filter card can show as text. Picked
- * samples and searches (id lists, a search's in rank order), map regions, lassos, concepts and duplicate collapses
- * go in `f=`, as their chips.
+ * Whether the stages may go in `q=`: every one an ordinary filter, which a filter card can show as text, a named
+ * region (`location within "US-KS"`) or a concept's exclude or show only, each of which reopens as the same chip.
+ * Picked samples and searches (id lists, a search's in rank order), drawn map regions, lassos, a concept's sources
+ * and duplicate collapses go in `f=`, as their chips.
  */
 export function mayBeText(stages: ViewStage[]): boolean {
-    return stages.length > 0 && !stages.some(isReadOnlyStage);
+    return stages.length > 0 && !stages.some(stage => isReadOnlyStage(stage) && !isConceptScoreStage(stage) && !isRegionStage(stage));
 }
 
 /** Text parts joined as one query, each part one chip (POST filter_query/format brackets a part that needs it). */

@@ -10,6 +10,7 @@ import asyncpg
 from fastapi import HTTPException
 
 from .datetimes import parse_instant
+from .field_descriptions import BUILT_IN_FIELDS
 from .label_fields import LABEL_CACHES, LEGACY_GEOMETRY_FIELDS, LEGACY_LABEL_FIELDS, label_context, overlay_type
 
 FIELD_TYPES = frozenset({'unknown', 'boolean', 'number', 'string', 'datetime', 'list', 'object'})
@@ -48,6 +49,90 @@ def canonical_type(field_type: str) -> str:
         'dict': 'object',
         'enum': 'string',
     }.get(field_type, field_type if field_type in FIELD_TYPES else 'unknown')
+
+
+# The names a metadata key can't have: a sample's own fields, which every filter, list and statistic by that name
+# reads. Stored in metadata, `id`, `dataset_id`, `filepath`, `created_at` and `last_modified_at` were registered as
+# fields beside the real ones; `tags` and `media_type` were never listed, filtered or shown, but for a field renamed or
+# cloned onto one, which stood in the field list in place of the sample's own. All seven are refused wherever metadata
+# is written: added, edited, set in bulk, a field's new name in a rename or clone, a quality score's field. An edit of
+# one sample may send one back with exactly the value the sample stores (unchanged_column_keys): a stored `created_at`
+# can be the only copy of an original date, so the five stay where they are stored, until removed. A stored one is no
+# field: it is never registered (infer_fields, without_reserved_fields; migration 0043 turned existing registrations
+# back into the sample's own field's row), and a filter, a histogram or a value search by its name doesn't read it.
+# `tags` and `media_type` (PROTECTED_METADATA_KEYS) are also taken out of what is kept: migration 0042 removed stored
+# ones and such fields, and a version revert leaves them out. `heading` stays allowed: no filter or list names its
+# column, so a metadata key of that name is a field like any other.
+RESERVED_METADATA_KEYS = frozenset(
+    {'id', 'dataset_id', 'filepath', 'created_at', 'last_modified_at', 'tags', 'media_type'},
+)
+PROTECTED_METADATA_KEYS = frozenset({'tags', 'media_type'})
+
+
+def refuse_column_keys(names: Iterable[str], refused: frozenset[str] = RESERVED_METADATA_KEYS) -> None:
+    """ValueError for metadata keys among `refused`, names of a sample's own fields. Removing such a key is no
+    setting of it: callers pass the keys a write sets."""
+    reserved = sorted(refused.intersection(names))
+    if reserved:
+        raise ValueError(f"metadata key(s) {reserved} name sample columns — set them on the sample itself")
+
+
+def without_reserved_fields(definitions: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Field definitions to write (a version's, a primary's), with a metadata field named as a sample's own field
+    (RESERVED_METADATA_KEYS) dealt with as forget_definitions deals with a built-in field's name: one that carries a
+    description or a unit becomes the sample's own field's row holding only those, any other is left out."""
+    kept = []
+    for definition in definitions:
+        if definition.get('field_name') in RESERVED_METADATA_KEYS and definition.get('origin') == 'metadata':
+            if definition.get('description') is None and definition.get('unit') is None:
+                continue
+            definition = {
+                **definition,
+                'field_type': 'unknown',
+                'origin': 'system',
+                'display_type': None,
+                'overlay_config': None,
+                **({'is_promoted': False} if 'is_promoted' in definition else {}),
+            }
+        kept.append(dict(definition))
+    return kept
+
+
+def leftover_row_sql(alias: str = '') -> str:
+    """SQL that is true for a dataset_fields row (aliased `alias`) that is a metadata field named as a sample's own
+    field: one an older release registered, before migration 0043 (0042 for tags and media_type) or on a mirror until
+    its next sync. Such a row is no field when read: what lists fields or reads a field's settings leaves it out, and
+    only what it says about the name (description, unit, private mark) counts."""
+    prefix = f'{alias}.' if alias else ''
+    names = ', '.join(f"'{name}'" for name in sorted(RESERVED_METADATA_KEYS))
+    return f"({prefix}origin = 'metadata' AND {prefix}field_name IN ({names}))"
+
+
+def _same_json(a: Any, b: Any) -> bool:
+    """Whether two decoded JSON values are the same JSON value: numbers of the same value (1 and 1.0) are, true and
+    false are no numbers, null is only null, and objects and lists are the same item by item."""
+    if isinstance(a, bool) or isinstance(b, bool):
+        return isinstance(a, bool) and isinstance(b, bool) and a == b
+    if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+        return a == b
+    if isinstance(a, dict) and isinstance(b, dict):
+        return a.keys() == b.keys() and all(_same_json(a[key], b[key]) for key in a)
+    if isinstance(a, list) and isinstance(b, list):
+        return len(a) == len(b) and all(_same_json(x, y) for x, y in zip(a, b))
+    return type(a) is type(b) and a == b
+
+
+def unchanged_column_keys(metadata: Mapping[str, Any], stored: Any) -> set[str]:
+    """The keys among RESERVED_METADATA_KEYS that `metadata` (an edit's, as decoded from its request) sends with exactly
+    the value `stored` (the sample's metadata as read) holds for them: sending one back is no setting of it. Both sides
+    are compared as the server decodes JSON, so a value read and sent back unchanged is the same."""
+    if not isinstance(stored, Mapping):
+        return set()
+    return {
+        key
+        for key in RESERVED_METADATA_KEYS.intersection(metadata)
+        if key in stored and _same_json(metadata[key], stored[key])
+    }
 
 
 def validate_metadata(metadata: dict[str, Any], *, allow_local: bool = False) -> dict[str, Any]:
@@ -94,11 +179,13 @@ def value_type(value: Any) -> str:
 
 
 def infer_fields(metadata: Iterable[Mapping[str, Any]]) -> dict[str, str]:
-    """Infer across the entire first write, ignoring nulls; heterogeneous values are strings."""
+    """Infer across the entire first write, ignoring nulls; heterogeneous values are strings. A key named as a sample's
+    own field (RESERVED_METADATA_KEYS) is no field: a stored one from before such keys were refused stays in its sample
+    only, whatever write carries it along."""
     fields: dict[str, str] = {}
     for item in metadata:
         for name, value in item.items():
-            if name in SYSTEM_FIELDS or name.startswith(LOCAL_PREFIX):
+            if name in SYSTEM_FIELDS or name in RESERVED_METADATA_KEYS or name.startswith(LOCAL_PREFIX):
                 continue
             inferred = value_type(value)
             previous = fields.get(name, 'unknown')
@@ -120,6 +207,9 @@ async def register_fields(
     Existing concrete definitions are read, not locked or rewritten. Missing/unknown
     definitions are visited in name order, including concurrent first writers.
     Call once after the sample writes, using only successfully written metadata.
+    A 'system' row of the name (a built-in's description, or a private flag kept when the
+    field went: forget_definitions) is a placeholder the definition takes over, keeping
+    its description, unit and values_private.
     """
     fields = infer_fields(metadata)
     if not fields:
@@ -136,9 +226,10 @@ async def register_fields(
             """INSERT INTO dataset_fields (dataset_id, field_name, field_type, origin)
                SELECT $1, name, kind, 'metadata'
                FROM unnest($2::text[], $3::text[]) AS definitions(name, kind) ORDER BY name
-               ON CONFLICT (dataset_id, field_name) DO UPDATE SET field_type = EXCLUDED.field_type
-               WHERE dataset_fields.field_type = 'unknown' AND EXCLUDED.field_type <> 'unknown'
-                 AND dataset_fields.origin = 'metadata'
+               ON CONFLICT (dataset_id, field_name) DO UPDATE SET field_type = EXCLUDED.field_type, origin = 'metadata'
+               WHERE dataset_fields.origin = 'system'
+                  OR (dataset_fields.field_type = 'unknown' AND EXCLUDED.field_type <> 'unknown'
+                      AND dataset_fields.origin = 'metadata')
                RETURNING field_name, xmax = 0 AS inserted""",
             dataset_id,
             candidates,
@@ -153,6 +244,47 @@ async def register_fields(
         )
         declared = {row['field_name']: row['field_type'] for row in existing}
     return declared
+
+
+# What a field definition becomes when it goes while this instance marks the field private (values_private, 0035):
+# an otherwise empty 'system' row instead of none. The registry's readers pass over it, so the field shows nowhere and
+# is measured by nothing; a definition of the name coming back takes the row over and is private again
+# (register_fields, local_writes.register, rename and clone, a version restore, a mirror's sync).
+EMPTIED_TO_FLAG = (
+    "field_type = 'unknown', origin = 'system', is_promoted = FALSE, display_type = NULL, overlay_config = NULL, "
+    'description = NULL, unit = NULL'
+)
+
+
+async def forget_definitions(connection: Any, dataset_id: int, names: Iterable[str]) -> None:
+    """Remove these fields' definitions, keeping a private flag on an emptied row (EMPTIED_TO_FLAG). A 'system' row
+    stays as it is: it is no definition, and holds a built-in field's description or a flag already. A metadata key
+    named as a built-in field (a sample PATCH or bulk-set can write `created_at`) shares that field's row: when it goes,
+    the row goes back to holding the built-in's description and unit too."""
+    names = sorted(set(names))
+    if not names:
+        return
+    await connection.execute(
+        "UPDATE dataset_fields SET field_type = 'unknown', origin = 'system', is_promoted = FALSE, "
+        'display_type = NULL, overlay_config = NULL '
+        'WHERE dataset_id = $1 AND field_name = ANY($2::text[]) AND field_name = ANY($3::text[]) '
+        "AND origin <> 'system' AND (description IS NOT NULL OR unit IS NOT NULL OR values_private)",
+        dataset_id,
+        names,
+        sorted(BUILT_IN_FIELDS),
+    )
+    await connection.execute(
+        f'UPDATE dataset_fields SET {EMPTIED_TO_FLAG} '
+        "WHERE dataset_id = $1 AND field_name = ANY($2::text[]) AND origin <> 'system' AND values_private",
+        dataset_id,
+        names,
+    )
+    await connection.execute(
+        'DELETE FROM dataset_fields '
+        "WHERE dataset_id = $1 AND field_name = ANY($2::text[]) AND origin <> 'system' AND NOT values_private",
+        dataset_id,
+        names,
+    )
 
 
 REQUEST_FULL_REFRESH = (
@@ -351,13 +483,16 @@ async def invalidate_values(connection: Any, dataset_id: int, names: Iterable[st
 
 
 async def prune_fields(connection: Any, dataset_id: int, names: Iterable[str]) -> None:
-    """Remove unused implicit declarations under the exclusive gate with first-match existence probes."""
+    """Remove unused implicit declarations under the exclusive gate with first-match existence probes. A field someone
+    gave a setting (an index, a display type, an overlay, a description, a unit) stays declared; one only marked
+    private goes, its flag kept (forget_definitions)."""
     candidates = sorted(set(names) - SYSTEM_FIELDS)
     if candidates:
         eligible = await connection.fetch(
             """SELECT field_name FROM dataset_fields WHERE dataset_id = $1
                AND field_name = ANY($2::text[]) AND origin = 'metadata'
                AND NOT is_promoted AND display_type IS NULL AND overlay_config IS NULL
+               AND description IS NULL AND unit IS NULL
                ORDER BY field_name""",
             dataset_id,
             candidates,
@@ -374,11 +509,7 @@ async def prune_fields(connection: Any, dataset_id: int, names: Iterable[str]) -
             ):
                 unused.append(field['field_name'])
         if unused:
-            await connection.execute(
-                'DELETE FROM dataset_fields WHERE dataset_id = $1 AND field_name = ANY($2::text[])',
-                dataset_id,
-                unused,
-            )
+            await forget_definitions(connection, dataset_id, unused)
             await connection.execute(
                 'DELETE FROM dataset_field_stats WHERE dataset_id = $1 AND field_name = ANY($2::text[])',
                 dataset_id,
@@ -559,6 +690,8 @@ async def field_stats(connection: Any, dataset_id: int) -> list[dict[str, Any]]:
            FROM dataset_fields f LEFT JOIN dataset_field_stats s
              ON s.dataset_id = f.dataset_id AND s.field_name = f.field_name
            WHERE f.dataset_id = $1 AND f.origin <> 'system'
+             -- a metadata row of a name a metadata key can't have is no field (an older release's, before 0043)
+             AND NOT (f.origin = 'metadata' AND f.field_name = ANY($5::text[]))
            UNION ALL
            SELECT s.field_name, field_type_canonical(s.field_type), 'system', FALSE,
                   CASE WHEN s.field_type = 'enum' THEN 'enum' END,
@@ -566,7 +699,8 @@ async def field_stats(connection: Any, dataset_id: int) -> list[dict[str, Any]]:
                   CASE WHEN EXISTS (SELECT 1 FROM mirrors WHERE dataset_id = $1) THEN 'primary' ELSE 'self' END
            FROM dataset_field_stats s WHERE s.dataset_id = $1
              AND NOT EXISTS (SELECT 1 FROM dataset_fields own WHERE own.dataset_id=s.dataset_id
-                             AND own.field_name=s.field_name AND own.origin<>'system')
+                             AND own.field_name=s.field_name AND own.origin<>'system'
+                             AND NOT (own.origin = 'metadata' AND own.field_name = ANY($5::text[])))
              AND ((s.field_name = ANY($2::text[]) AND s.field_name NOT LIKE '%.label') OR (
                  s.field_name LIKE '%.label' AND (left(s.field_name,-6)=ANY($4::text[]) OR EXISTS (
                      SELECT 1 FROM dataset_field_stats discovery WHERE discovery.dataset_id=s.dataset_id
@@ -586,5 +720,6 @@ async def field_stats(connection: Any, dataset_id: int) -> list[dict[str, Any]]:
         sorted(SYSTEM_FIELDS),
         list(LABEL_CACHES),
         sorted(LEGACY_GEOMETRY_FIELDS),
+        sorted(RESERVED_METADATA_KEYS),
     )
     return [dict(row) for row in rows]

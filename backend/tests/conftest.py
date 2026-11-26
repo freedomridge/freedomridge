@@ -3,6 +3,7 @@
 import asyncio
 import os
 import subprocess
+import tempfile
 from urllib.parse import unquote, urlsplit
 
 import asyncpg
@@ -15,6 +16,9 @@ IDENTITY_SQL = 'SELECT system_identifier FROM pg_control_system()'
 # Where the backend points in a unit-only run: a local port nothing listens on, so a connection fails at once.
 UNIT_ONLY_DATABASE_URL = 'postgres://fridge-unit-tests:unused@127.0.0.1:1/no_database'
 _patch = pytest.MonkeyPatch()
+# Where the suite's job runners look for boundary files: an empty directory, so no region set loads by itself
+# whether or not this checkout has fetched the file (docs/REGIONS.md). A test that wants a file puts one there.
+_regions_dir = tempfile.TemporaryDirectory(prefix='fridge-test-regions-')
 
 
 async def dsn_identity(dsn):
@@ -35,6 +39,7 @@ async def dsn_identity(dsn):
 
 def pytest_sessionstart(session):
     _patch.setenv('FRIDGE_TEST_MODE', '1')
+    _patch.setenv('FRIDGE_REGIONS_DIR', _regions_dir.name)
     dsn = os.getenv('FRIDGE_TEST_POSTGRES_DSN')
     container = os.getenv('FRIDGE_TEST_POSTGRES_CONTAINER')
     if not dsn and not container:
@@ -127,3 +132,4 @@ def pytest_collection_modifyitems(config, items):
 
 def pytest_unconfigure(config):
     _patch.undo()
+    _regions_dir.cleanup()

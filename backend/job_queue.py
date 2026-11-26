@@ -354,7 +354,8 @@ async def claim_job(
                 SELECT {JOB_COLUMNS} FROM {JOB_TABLE}
                 WHERE placement=ANY($1::text[]) AND ($2::text[] IS NULL OR kind=ANY($2::text[]))
                   AND ($3::text[] IS NULL OR lane=ANY($3::text[]))
-                  AND (NOT $4 OR (kind NOT IN ('statistics','concept_scoring','duplicate_maintenance','concept_rescore')
+                  AND (NOT $4 OR (kind NOT IN ('statistics','concept_scoring','duplicate_maintenance','concept_rescore',
+                                              'field_kinds')
                       -- A backup that already started may be the one a restored dump holds; recovery cancels it.
                       AND NOT (kind='backup' AND jobs.started_at IS NOT NULL)))
                   AND state='queued' AND available_at<=clock_timestamp()

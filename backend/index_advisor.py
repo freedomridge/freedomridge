@@ -42,6 +42,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from . import field_usage, job_queue
+from .field_registry import leftover_row_sql
 from .job_queue import JobPolicy
 from .job_runner import StepResult
 
@@ -62,7 +63,7 @@ _FIELD_EXPRESSION = re.compile(r"metadata ->> '((?:[^']|'')*)'")
 _CREATE_INDEX = re.compile(
     r'\bCREATE\s+(?:UNIQUE\s+)?INDEX\s+(?:CONCURRENTLY\s+)?(?:IF\s+NOT\s+EXISTS\s+)?([A-Za-z_][A-Za-z0-9_]*)'
     r'\s+ON\s+(?:ONLY\s+)?(?:public\.)?([A-Za-z_][A-Za-z0-9_]*)'
-    r'|\bDROP\s+INDEX\s+(?:CONCURRENTLY\s+)?(?:IF\s+EXISTS\s+)?([A-Za-z_][A-Za-z0-9_]*)',
+    r'|\bDROP\s+INDEX\s+(?:CONCURRENTLY\s+)?(?:IF\s+EXISTS\s+)?(?:public\.)?([A-Za-z_][A-Za-z0-9_]*)',
     re.I,
 )
 
@@ -97,6 +98,21 @@ def core_indexes() -> Dict[str, str]:
         else:
             indexes.pop(name, None)
     return indexes
+
+
+@lru_cache(maxsize=1)
+def core_index_statements() -> Dict[str, str]:
+    """name -> the CREATE INDEX statement schema.sql leaves for it, up to its semicolon: what the app's own index
+    quotes (the assistant's administration tools compare a live definition's quoted texts with it)."""
+    text = re.sub(r'--[^\n]*', '', (DB_DIR / 'schema.sql').read_text())
+    statements: Dict[str, str] = {}
+    for match in _CREATE_INDEX.finditer(text):
+        if match.group(1):
+            end = text.find(';', match.end())
+            statements[match.group(1)] = text[match.start() : end if end >= 0 else len(text)]
+        else:
+            statements.pop(match.group(3), None)
+    return statements
 
 
 # ---------------------------------------------------------------------------------------------------
@@ -216,8 +232,9 @@ async def collect(pool, dataset_id: Optional[int]) -> Dict[str, Any]:
             snapshot['fields'] = [
                 dict(row)
                 for row in await connection.fetch(
-                    """SELECT field_name, field_type, origin, is_promoted FROM dataset_fields
-                       WHERE dataset_id = $1 ORDER BY field_name""",
+                    # A metadata field an older release left under a sample's own field's name is no field.
+                    f"""SELECT field_name, field_type, origin, is_promoted FROM dataset_fields
+                       WHERE dataset_id = $1 AND NOT {leftover_row_sql()} ORDER BY field_name""",
                     dataset_id,
                 )
             ]

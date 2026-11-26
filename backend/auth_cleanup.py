@@ -1,4 +1,5 @@
-"""Reclaim temporary accounts and sessions using the existing runner's schedules."""
+"""Reclaim temporary accounts and sessions, and the assistant's working views and value lists unused for 30 days,
+using the existing runner's schedules."""
 
 DEMO_ACCOUNT_LOCK = 739128041
 
@@ -35,4 +36,8 @@ async def cleanup_accounts(pool) -> int:
 
 
 async def scheduled_cleanup(pool):
-    return await cleanup_accounts(pool)
+    from .assistant import store
+
+    removed = await cleanup_accounts(pool)
+    await store.prune(pool)
+    return removed

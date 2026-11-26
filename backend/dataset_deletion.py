@@ -52,6 +52,10 @@ DATASET_TABLES = (
     ('map_block_changes', ('dataset_id', 'transaction_id', 'field_name', 'block_id')),
     # A follower's copy held after its primary was restored: its matches with the primary (mirror_restores).
     ('mirror_restore_map', ('dataset_id', 'sample_id')),
+    # The assistant's working views and value lists of the dataset (0038), last: a deletion that stopped in an earlier
+    # release resumes at its place in this list. Any made after this pass go with the dataset's row (keys cascade).
+    ('assistant_views', ('dataset_id', 'handle')),
+    ('assistant_lists', ('dataset_id', 'handle')),
 )
 # A dataset's shares stay until its row goes, the deletion's last step, which takes them with it (their foreign keys
 # cascade): until then whoever started a deletion that stopped can still open the dataset and resume it.

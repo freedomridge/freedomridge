@@ -8,9 +8,10 @@ re-read this file and verify every item below still holds afterward.**
 
 Key code:
 - Backend: `_get_dataset_map_points_impl`, constants `_MAP_POINT_ZOOM`,
-  `_MAP_CLUSTER_MIN_POINTS`, `_cluster_cell_deg`, `_map_lon_window` in `backend/routers/datasets.py`.
-- Frontend: `frontend/components/map-panel.tsx`, `tileBbox` and `viewBbox` in `frontend/lib/map-bounds.ts`,
-  `getMapPoints` in `frontend/lib/api.ts`.
+  `_MAP_CLUSTER_MIN_POINTS`, `_cluster_cell_deg`, `_map_lon_window`, `get_dataset_map_extent` in
+  `backend/routers/datasets.py`.
+- Frontend: `frontend/components/map-panel.tsx`, `tileBbox`, `viewBbox`, `extentCorners` and `pointsCorners` in
+  `frontend/lib/map-bounds.ts`, `getMapPoints` and `getMapExtent` in `frontend/lib/api.ts`.
 
 ---
 
@@ -92,6 +93,32 @@ rely on whatever points happen to be loaded). Fit to the TRUE min/max lon/lat
 (`/map_extent`), NOT the bbox of coarse cluster centroids — those collapse to a single
 point for a small/polygon selection and make it over-zoom and miss most of the data.
 
+**Across the antimeridian.** Samples in Fiji at 177.4 and -178.2 used to come back from `/map_extent` as west -178.2,
+east 177.4, their smallest and largest longitude: nearly the whole world, and Zoom to Data zoomed out to it. When the
+samples fit in half the globe across the antimeridian, the box now crosses it and is answered with `w` greater than
+`e` (177.4 to -178.2), as GeoJSON and the regions' boxes are (docs/REGIONS.md). That is when the widest stretch of
+longitude with no sample doesn't include longitude 180 and is at least 180 degrees wide; the box runs from the sample
+east of that stretch round to the sample west of it, so `w` and `e` are the longitudes of real samples, and it is at
+most 180 degrees wide. Fiji, Chukotka with Alaska, Fiji with Europe, and the United States with Australia get it. In
+every other case the answer is exactly what it was, the smallest and largest longitude: a dataset over several
+continents (the United States, Europe and Australia; the United States and China) has a widest empty stretch too,
+but leaving it out would turn Zoom to Data round to centre on the Pacific for a few degrees' gain. Latitudes, `count`
+and `{"count": 0}` are as before. The answer still comes from one read of the samples, in every case: a stretch with
+no sample at least 180 degrees wide that avoids longitude 180 holds longitude 0, so it runs from the largest longitude
+below 0 to the smallest from 0 on, and today's smallest-and-largest statement takes those two values as well. That
+read costs about a tenth to a seventh more than it did (medians on a million samples: 162 to 179 ms in the United
+States, 170 to 196 ms worldwide). Don't fetch the two values as index probes instead: with a filter, a probe walks the
+index until a row passes it, and with one matching only the samples east of longitude 100 the probes took 3.2 s
+against the read's 0.24 s.
+
+Every fit to an extent fits the box across: `extentCorners` in `frontend/lib/map-bounds.ts` takes a `w` greater than
+`e` as a box whose east is 360 degrees on, past 180. That is Zoom to Data, and the fit after a region or a drawn
+polygon is applied (each asks `/map_extent`; a region with no sample in it falls back to its own box, which already
+crossed). The fit to selected samples (#12) fits their box by the same rule (`pointsCorners`). A bubble's
+extent (#14) and a drawn polygon's own corners are in the view's frame already, east past 180 across it. Tests:
+`backend/tests/test_map_extent_antimeridian_spec.py`, `e2e/map-extent-antimeridian.spec.ts`,
+`backend/tests/test_map_extent_half_globe.py`, `tests/map-fit-corners.test.cjs`.
+
 ## 8. NO auto-zoom on POLYGON delete
 
 Deleting a **drawn polygon / lasso** selection must **not** change the zoom or recenter
@@ -99,6 +126,23 @@ the map. (User was explicit: "I do not want any auto zooming when deleting the
 polygon.") Note this is about the map's drawn polygon — it does NOT override #12
 (selecting samples in the grid DOES fit the map). Drawing a polygon may fit to that
 polygon; deleting it must not move the map.
+
+**A polygon drawn across the antimeridian.** The draw tool sends a polygon's points in the view's frame, so one drawn
+across the antimeridian has longitudes past 180 (176 to 183 over Fiji), and one drawn on a repeated world copy has
+them a whole turn on (370 to 380 over 10 to 20). The server wrote them into one polygon as they came and tested each
+sample's own longitude against it: a sample at -178.2 was never inside 176 to 183, so the grid, its count, the map and
+the fit after the drawing (`/map_extent` with the polygon) had only the samples west of the line, and a polygon on
+another world copy had none. A sample is inside when its location, moved east or west by whole turns of 360 degrees,
+lies inside the shape: `_polygon_across_leaf` tests each copy of the shape moved by whole turns that overlaps -180 to
+180, so 176 to 183 holds 177.4 and -178.2, and the same shape one turn on (536 to 543) holds the same samples. Only a
+longitude outside -180 to 180 says "across": a polygon whose longitudes all lie from -180 to 180 runs the same SQL as
+before, and one with points at 170 and -170 stays the shape through longitude 0, as every polygon saved in a view, a
+link or a script is read. The exclude chip removes exactly what the include holds and keeps the samples with no
+location. Each copy is a search of the location index: on a million samples a count in a crossing polygon took
+0.87 ms against 0.79 in one the same size that doesn't cross, and 46 against 45 ms for one 30 by 50 degrees (excluded:
+101 against 92, and 103 against 94 ms). A polygon wider than 60 turns of the globe is refused (400), wider than the
+map's view at its least zoom on a 7,680 px panel. Tests: `backend/tests/test_polygon_across_leaf.py`,
+`backend/tests/test_polygon_across_180_spec.py`, `e2e/polygon-across-180.spec.ts`.
 
 ## 9. Loading indicator (initial AND background loads)
 

@@ -1,11 +1,13 @@
 'use client';
 
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { Copy, Trash2, Plus, Check } from 'lucide-react';
 import Link from 'next/link';
 import { Header } from '@/components/header';
 import { PermissionGate } from '@/components/PermissionGate';
+import { useUser } from '@/contexts/UserContext';
+import { claudeCodeCommand, MCP_TOKEN_HELP, MCP_TOKEN_KEPT, mcpAddress, mcpHeader } from '@/lib/mcp-connect';
 
 interface Token {
     id: number;
@@ -16,21 +18,42 @@ interface Token {
     expires_at?: string;
     is_active: boolean;
     // 'worker': for a compute worker (python -m fridge.worker); only the worker endpoints accept it.
-    scope: 'full' | 'worker';
+    // 'mcp': for an AI client; only the MCP server at /mcp accepts it.
+    scope: TokenScope;
+}
+
+type TokenScope = 'full' | 'worker' | 'mcp';
+
+/** The kind the create form starts with: the MCP kind when the address asks for it (?kind=mcp, the link on Settings →
+ * Assistant), else the first. Where the MCP kind isn't offered, the form shows the first kind all the same. */
+function startingScope(): TokenScope {
+    return new URLSearchParams(window.location.search).get('kind') === 'mcp' ? 'mcp' : 'full';
 }
 
 export default function TokensPage() {
     const [showCreateForm, setShowCreateForm] = useState(false);
     const [newTokenName, setNewTokenName] = useState('');
     const [expiryDays, setExpiryDays] = useState(90);
-    const [scope, setScope] = useState<'full' | 'worker'>('full');
+    const [scope, setScope] = useState<TokenScope>('full');
     const [createdToken, setCreatedToken] = useState<Token | null>(null);
     const [copiedToken, setCopiedToken] = useState(false);
+    const [copiedCommand, setCopiedCommand] = useState(false);
+    // The MCP kind is offered only to a user who could use the MCP server right now (GET /api/auth/me), read again as
+    // the page opens: an administrator may just have switched the server on, on Settings → Assistant, which links here.
+    // That read is ?fresh=1, so whichever server process answers reads the switch from the database.
+    const { user, checkAuth } = useUser();
+    const mcpOffered = user?.assistant?.mcp === true;
+    const chosenScope: TokenScope = scope === 'mcp' && !mcpOffered ? 'full' : scope;
+    const origin = typeof window === 'undefined' ? '' : window.location.origin;
+    useEffect(() => { void checkAuth({ fresh: true }); }, [checkAuth]);
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- the address is read once mounted, not while rendering on the server
+    useEffect(() => setScope(startingScope()), []);
 
     const queryClient = useQueryClient();
 
-    // Fetch tokens
-    const { data: tokens, isLoading } = useQuery<Token[]>({
+    // Fetch tokens. GET /api/tokens answers revoked ones too (is_active false: revoked here, by an administrator, or by
+    // a password change that revoked them); the page lists the others.
+    const { data: allTokens, isLoading } = useQuery<Token[]>({
         queryKey: ['api-tokens'],
         queryFn: async () => {
             const res = await fetch('/api/tokens', { credentials: 'include' });
@@ -38,10 +61,11 @@ export default function TokensPage() {
             return res.json();
         }
     });
+    const tokens = allTokens?.filter(token => token.is_active);
 
     // Create token
     const createMutation = useMutation({
-        mutationFn: async (data: { name: string, expires_days: number, scope: 'full' | 'worker' }) => {
+        mutationFn: async (data: { name: string, expires_days: number, scope: TokenScope }) => {
             const res = await fetch('/api/tokens', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -55,7 +79,7 @@ export default function TokensPage() {
             setCreatedToken(data);
             setShowCreateForm(false);
             setNewTokenName('');
-            setScope('full');
+            setScope(startingScope());
             queryClient.invalidateQueries({ queryKey: ['api-tokens'] });
         }
     });
@@ -69,7 +93,9 @@ export default function TokensPage() {
             });
             if (!res.ok) throw new Error('Failed to revoke token');
         },
-        onSuccess: () => {
+        onSuccess: (_, id) => {
+            // Gone from the list at once; the list read again agrees.
+            queryClient.setQueryData<Token[]>(['api-tokens'], previous => previous?.filter(token => token.id !== id));
             queryClient.invalidateQueries({ queryKey: ['api-tokens'] });
         }
     });
@@ -78,6 +104,12 @@ export default function TokensPage() {
         await navigator.clipboard.writeText(token);
         setCopiedToken(true);
         setTimeout(() => setCopiedToken(false), 2000);
+    };
+
+    const copyCommand = async (command: string) => {
+        await navigator.clipboard.writeText(command);
+        setCopiedCommand(true);
+        setTimeout(() => setCopiedCommand(false), 2000);
     };
 
 
@@ -125,11 +157,50 @@ export default function TokensPage() {
                                 {copiedToken ? <Check className="w-4 h-4" /> : <Copy className="w-4 h-4" />}
                             </button>
                         </div>
-                        {createdToken.scope === 'worker' ? (
+                        {createdToken.scope === 'mcp' ? (
+                            <section aria-labelledby="mcp-connect-heading" className="mt-4 text-sm text-zinc-300">
+                                <h4 id="mcp-connect-heading" className="font-semibold text-zinc-200 mb-2">
+                                    Connect an AI client
+                                </h4>
+                                <dl className="space-y-2">
+                                    <div>
+                                        <dt className="text-xs text-zinc-400">Address</dt>
+                                        <dd>
+                                            <code className="bg-zinc-800 px-2 py-1 rounded break-all">{mcpAddress(origin)}</code>
+                                        </dd>
+                                    </div>
+                                    <div>
+                                        <dt className="text-xs text-zinc-400">Header to send with every request</dt>
+                                        <dd>
+                                            <code className="bg-zinc-800 px-2 py-1 rounded break-all">{mcpHeader(createdToken.token!)}</code>
+                                        </dd>
+                                    </div>
+                                    <div>
+                                        <dt className="text-xs text-zinc-400">Claude Code</dt>
+                                        <dd className="flex gap-2 items-start">
+                                            <code className="flex-1 bg-zinc-800 px-2 py-1 rounded break-all">
+                                                {claudeCodeCommand(origin, createdToken.token!)}
+                                            </code>
+                                            <button
+                                                type="button"
+                                                onClick={() => copyCommand(claudeCodeCommand(origin, createdToken.token!))}
+                                                className="px-2 py-1 bg-cyan-600 hover:bg-cyan-700 text-white rounded"
+                                                aria-label="Copy Claude Code command"
+                                                aria-describedby="mcp-token-kept"
+                                                title="Copy Claude Code command"
+                                            >
+                                                {copiedCommand ? <Check className="w-4 h-4" /> : <Copy className="w-4 h-4" />}
+                                            </button>
+                                        </dd>
+                                    </div>
+                                </dl>
+                                <p id="mcp-token-kept" className="mt-2 text-xs text-zinc-400">{MCP_TOKEN_KEPT}</p>
+                            </section>
+                        ) : createdToken.scope === 'worker' ? (
                             <p data-testid="worker-token-command" className="mt-3 text-xs text-zinc-400">
                                 On the worker machine, with the Python SDK installed:{' '}
                                 <code className="bg-zinc-800 px-2 py-1 rounded break-all">
-                                    FRIDGE_API_URL={typeof window === 'undefined' ? '' : window.location.origin}/api FRIDGE_API_TOKEN={createdToken.token} python -m fridge.worker
+                                    FRIDGE_API_URL={origin}/api FRIDGE_API_TOKEN={createdToken.token} python -m fridge.worker
                                 </code>
                             </p>
                         ) : (
@@ -183,22 +254,30 @@ export default function TokensPage() {
                                     </select>
                                 </div>
                                 <div>
-                                    <label className="block text-sm font-medium mb-1 text-zinc-300">
+                                    <label htmlFor="token-scope" className="block text-sm font-medium mb-1 text-zinc-300">
                                         Used by
                                     </label>
                                     <select
+                                        id="token-scope"
                                         data-testid="token-scope"
-                                        value={scope}
-                                        onChange={(e) => setScope(e.target.value as 'full' | 'worker')}
+                                        value={chosenScope}
+                                        onChange={(e) => setScope(e.target.value as TokenScope)}
+                                        aria-describedby={chosenScope === 'mcp' ? 'token-scope-help' : undefined}
                                         className="w-full p-2 bg-zinc-800 border border-zinc-700 rounded text-white focus:outline-none focus:border-cyan-500"
                                     >
                                         <option value="full">Scripts and the SDK: everything your role can do</option>
                                         <option value="worker">A compute worker: only runs jobs for this server</option>
+                                        {mcpOffered && (
+                                            <option value="mcp">An AI client (MCP): only reads, through the assistant</option>
+                                        )}
                                     </select>
+                                    {chosenScope === 'mcp' && (
+                                        <p id="token-scope-help" className="mt-1 text-xs text-zinc-400">{MCP_TOKEN_HELP}</p>
+                                    )}
                                 </div>
                                 <div className="flex gap-2 pt-2">
                                     <button
-                                        onClick={() => createMutation.mutate({ name: newTokenName, expires_days: expiryDays, scope })}
+                                        onClick={() => createMutation.mutate({ name: newTokenName, expires_days: expiryDays, scope: chosenScope })}
                                         disabled={!newTokenName.trim() || createMutation.isPending}
                                         className="px-4 py-2 bg-cyan-600 hover:bg-cyan-700 disabled:bg-zinc-700 disabled:cursor-not-allowed text-white rounded font-medium"
                                     >
@@ -245,6 +324,11 @@ export default function TokensPage() {
                                                 Worker
                                             </span>
                                         )}
+                                        {token.scope === 'mcp' && (
+                                            <span data-testid="token-mcp-badge" className="ml-2 align-middle rounded border border-violet-700 px-1.5 py-0.5 text-xs font-medium text-violet-300">
+                                                MCP
+                                            </span>
+                                        )}
                                     </h3>
                                     <div className="mt-2 space-y-1 text-sm text-zinc-400">
                                         <p>
@@ -278,6 +362,9 @@ export default function TokensPage() {
                                             </p>
                                         )}
                                     </div>
+                                    {revokeMutation.isError && revokeMutation.variables === token.id && (
+                                        <p role="alert" className="mt-2 text-sm text-red-400">{revokeMutation.error.message}</p>
+                                    )}
                                 </div>
                                 <button
                                     onClick={() => {

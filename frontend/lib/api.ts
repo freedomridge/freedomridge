@@ -2,6 +2,8 @@ import type { PatchScaleInfo } from './patch-scales';
 import type { ClassRule } from './class-rules';
 import type { DefaultView } from './default-view';
 import type { AccessLevel } from './access-level';
+import type { MultiPolygon } from 'geojson';
+import type { AssistantCalls } from './assistant-calls';
 
 // Segmentation visualization configuration
 export interface FieldColorConfig {
@@ -52,6 +54,8 @@ export interface Dataset {
     map_layouts?: Record<string, string> | null;
     // Set when the dataset is a read-only mirror of one on a primary instance (docs/FOLLOWERS.md).
     mirror?: DatasetMirror | null;
+    // The assistant may not read it (docs/ASSISTANT.md): this server's own, a mirror's too. Set at manage.
+    assistant_closed?: boolean;
 }
 
 export interface DatasetMirror {
@@ -511,7 +515,7 @@ export interface ComplexFilter {
 
     // Leaf Node
     field?: string;
-    operator?: '=' | '!=' | '>' | '<' | '>=' | '<=' | 'in' | 'not in' | 'contains' | 'geo_polygon' | 'geo_polygon_exclude' | 'embedding_polygon' | 'embedding_polygon_exclude' | 'in_selection' | 'is_null' | 'is_not_null' | 'exists' | 'not_exists' | 'concept_select' | 'concept_exclude' | 'parent_matches' | 'has_matching_object' | 'cg_self' | 'unlinked_object';
+    operator?: '=' | '!=' | '>' | '<' | '>=' | '<=' | 'in' | 'not in' | 'contains' | 'geo_polygon' | 'geo_polygon_exclude' | 'geo_region' | 'geo_region_exclude' | 'embedding_polygon' | 'embedding_polygon_exclude' | 'in_selection' | 'is_null' | 'is_not_null' | 'exists' | 'not_exists' | 'concept_select' | 'concept_exclude' | 'parent_matches' | 'has_matching_object' | 'cg_self' | 'unlinked_object';
     // Leaf value shape depends on the operator: scalar for comparisons, an array
     // for in/not-in, a ring of [lon,lat]/[x,y] points for geo_/embedding_polygon, a
     // string token for in_selection, an object {concept_id, op, threshold} for
@@ -567,6 +571,13 @@ export interface SchemaField {
     provenance?: FacetProvenance;
     // Per-field overlay display config (heatmaps): UI-set colormap/range/opacity.
     config?: { colormap?: string; range?: [number, number]; opacity?: number } | null;
+    // What the field means (Dataset Settings → Fields): 'set' when someone wrote the description, 'default' when the
+    // server supplies one (the built-in fields and the SDK's metrics), null when there is none. A unit falls back to
+    // the default's on its own. values_private: its values aren't given to the assistant (not shown in the app).
+    description?: string | null;
+    unit?: string | null;
+    description_source?: 'set' | 'default' | null;
+    values_private?: boolean;
 }
 
 export interface HistogramBucket {
@@ -732,8 +743,9 @@ export class ApiError extends Error {
         // the single choke point every status-bearing API error flows through — so
         // the app logs out even when the caller swallows this error (e.g. a
         // background grid prefetch that does `.catch(() => {})`). Fires before the
-        // throw propagates; providers.tsx listens and redirects to login.
-        if (status === 401 && typeof window !== 'undefined') {
+        // throw propagates; providers.tsx listens and redirects to login. A deactivated account's session is
+        // refused with a 403 saying so (backend/routers/auth.py): it is over too.
+        if ((status === 401 || (status === 403 && message === 'Account is inactive')) && typeof window !== 'undefined') {
             window.dispatchEvent(new Event('fridge:unauthorized'));
         }
         noticeLevelRefusal(status, message);
@@ -821,6 +833,21 @@ export async function createView(datasetId: number, view: Partial<View> & { user
 export async function getDatasetViews(datasetId: number): Promise<View[]> {
     const res = await fetch(`${API_BASE}/datasets/${datasetId}/views`);
     await ensureOk(res, 'Failed to fetch views');
+    return res.json();
+}
+
+// An assistant's working view, for its user (a `w=` link, lib/links.ts): its stages as the filter bar keeps them. Anyone
+// else, and a handle that is unknown or has expired, gets a 404 whose message says which.
+export interface WorkingView {
+    dataset_id: number;
+    stages: ViewStage[];
+    created_at: string;
+    expires_at: string;
+}
+
+export async function getWorkingView(handle: string): Promise<WorkingView> {
+    const res = await fetch(`${API_BASE}/assistant/views/${encodeURIComponent(handle)}`, { credentials: 'include' });
+    await ensureOk(res, "Couldn't read the assistant's view");
     return res.json();
 }
 
@@ -998,6 +1025,70 @@ export async function renameGroup(id: number, name: string): Promise<void> {
 export async function deleteGroup(id: number): Promise<void> {
     const res = await fetch(`${API_BASE}/groups/${id}`, { method: 'DELETE', credentials: 'include' });
     await ensureOk(res, 'Could not delete the group');
+}
+
+// Settings → Assistant (administrators): whether the MCP server is on, who may use the assistant, whether new
+// datasets start closed to it, and the administration tools' switch (docs/ASSISTANT.md). Every change answers the
+// whole settings.
+export interface AssistantSettings {
+    mcp_enabled: boolean;
+    roles: { admin: boolean; power_user: boolean; guest: boolean };
+    // The groups whose members may use it.
+    groups: { id: number; name: string }[];
+    // Users with an answer of their own, which decides before their groups and role.
+    users: { id: number; username: string; allowed: boolean }[];
+    new_datasets_closed: boolean;
+    // Whether a tool may read samples' own fields and file paths (get_samples' `fields`).
+    sample_fields: boolean;
+    // Whether an administrator's AI client may use the administration tools (status, jobs, backups, index advice).
+    admin_tools: boolean;
+}
+
+export async function getAssistantSettings(): Promise<AssistantSettings> {
+    const res = await fetch(`${API_BASE}/admin/assistant`, { credentials: 'include' });
+    await ensureOk(res, 'Could not read the assistant settings');
+    return res.json();
+}
+
+export async function updateAssistantSettings(
+    changes: Partial<Pick<AssistantSettings, 'mcp_enabled' | 'new_datasets_closed' | 'sample_fields' | 'admin_tools'>> & { roles?: Partial<AssistantSettings['roles']> },
+): Promise<AssistantSettings> {
+    const res = await fetch(`${API_BASE}/admin/assistant`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify(changes),
+    });
+    await ensureOk(res, 'Could not save the assistant settings');
+    return res.json();
+}
+
+/** Let a group's members use the assistant (listed), or take that back. */
+export async function setAssistantGroup(groupId: number, listed: boolean): Promise<AssistantSettings> {
+    const res = await fetch(`${API_BASE}/admin/assistant/groups/${groupId}`, {
+        method: listed ? 'PUT' : 'DELETE',
+        credentials: 'include',
+    });
+    await ensureOk(res, 'Could not change the group');
+    return res.json();
+}
+
+/** A user's own answer (true or false), or null to remove it: their groups and role decide again. */
+export async function setAssistantUser(userId: number, allowed: boolean | null): Promise<AssistantSettings> {
+    const res = await fetch(`${API_BASE}/admin/assistant/users/${userId}`, {
+        method: allowed === null ? 'DELETE' : 'PUT',
+        credentials: 'include',
+        ...(allowed === null ? {} : { headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ allowed }) }),
+    });
+    await ensureOk(res, "Could not change the user's answer");
+    return res.json();
+}
+
+/** The assistant's recent calls (administrators), newest first: `limit` from `offset`. */
+export async function getAssistantCalls(limit: number, offset: number): Promise<AssistantCalls> {
+    const res = await fetch(`${API_BASE}/admin/assistant/calls?limit=${limit}&offset=${offset}`, { credentials: 'include' });
+    await ensureOk(res, "Could not read the assistant's recent calls");
+    return res.json();
 }
 
 export async function setGroupMember(id: number, userId: number, member: boolean): Promise<void> {
@@ -1206,7 +1297,8 @@ export async function formatFilterQuery(datasetId: number, filters: ComplexFilte
     return res.json();
 }
 
-// True data extent (min/max lon/lat) for the current filters — used by "Zoom to Data".
+// True data extent for the current filters, used by "Zoom to Data". When the located samples fit in half the globe
+// across the antimeridian, the box crosses it and `w` is greater than `e` (lib/map-bounds.ts extentCorners).
 export async function getMapExtent(
     datasetId: number,
     filters?: ComplexFilter,
@@ -1217,6 +1309,67 @@ export async function getMapExtent(
         body: JSON.stringify({ filters }),
     });
     await ensureOk(res, 'Failed to fetch map extent');
+    return res.json();
+}
+
+// --- Named regions (docs/REGIONS.md): countries, states or provinces, and groups of states ---
+
+export interface Region {
+    key: string;
+    kind: 'country' | 'state' | 'group';
+    name: string;
+    country_key: string;
+    country_name: string;
+    set: string;
+    version: string;
+    // [west, south, east, north]; west is greater than east across the antimeridian.
+    bbox: [number, number, number, number];
+    // With `outline`: the region simplified to at most 5,000 vertices, for drawing on a map.
+    outline?: MultiPolygon;
+}
+
+// A key the server has no region for is a 404 whose message is the filter's refusal (with close keys).
+export async function getRegion(key: string, outline = false): Promise<Region> {
+    const res = await fetch(`${API_BASE}/regions/${encodeURIComponent(key)}${outline ? '?outline=true' : ''}`, { credentials: 'include' });
+    await ensureOk(res, `Could not read the region ${key}`);
+    return res.json();
+}
+
+// A boundary set this server can load, and what is loaded of it (null until it is).
+export interface RegionSet {
+    name: string;
+    title?: string;
+    version?: string;
+    url?: string;
+    licence?: string;
+    loaded: {
+        version: string;
+        verified: boolean;
+        loaded_from: string;  // 'bundled' (the file that came with this release), 'download' or 'file'
+        loaded_at: string;
+        loaded_by: { id: number; username: string } | null;  // null: loaded by the server itself, or from a file on it
+        counts: { country: number; state: number; group: number };
+        removed_keys: string[];  // the keys the last load took away
+    } | null;
+    // The region load queued or running for the set, whoever started it; null when there is none.
+    load_job?: { job_id: string; state: string } | null;
+}
+
+export async function getRegionSets(): Promise<RegionSet[]> {
+    const res = await fetch(`${API_BASE}/admin/regions`, { credentials: 'include' });
+    await ensureOk(res, 'Could not read the region boundaries');
+    return (await res.json()).sets;
+}
+
+/** Queues the load of a boundary set (from the file that came with this release, else downloaded), or returns the region load already queued or running (`started: false`). */
+export async function loadRegionSet(set: string): Promise<{ job_id: string; state: string; started: boolean }> {
+    const res = await fetch(`${API_BASE}/admin/regions/load`, {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ set }),
+    });
+    await ensureOk(res, 'Could not start loading the boundaries');
     return res.json();
 }
 
@@ -1832,6 +1985,21 @@ export async function setFieldType(datasetId: number, fieldName: string, fieldTy
         body: JSON.stringify({ field_type: fieldType }),
     });
     await ensureOk(res, 'Failed to change field type');
+}
+
+/** A field's description and unit (needs edit): only the keys given change, and "" clears one. Answers the field's
+ * values as the schema shows them, a default description included. */
+export async function setFieldDescription(
+    datasetId: number, fieldName: string, changes: { description?: string; unit?: string; values_private?: boolean },
+): Promise<Pick<SchemaField, 'description' | 'unit' | 'description_source' | 'values_private'>> {
+    const res = await fetch(`${API_BASE}/datasets/${datasetId}/fields/${encodeURIComponent(fieldName)}/description`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify(changes),
+    });
+    await ensureOk(res, 'Saving the description failed');
+    return res.json();
 }
 
 export async function setFieldDisplayType(datasetId: number, fieldName: string, displayType: string | null): Promise<void> {

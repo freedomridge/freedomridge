@@ -54,15 +54,19 @@ SHAPES = {
     'cross-grain image': (cross_grain({'logic': 'AND', 'filters': [exclude(4), select(9)]}), [4, 9]),
     'cross-grain object': (cross_grain({'logic': 'AND', 'filters': [exclude(4)]}, 'parent_matches'), [4]),
 }
-GUARD = re.compile(r'\(\(SELECT require_concept_scores\(\$(\d+)::int\[\]\)\) AND ')
+GUARD = re.compile(
+    r'\(\(SELECT require_dataset_concepts\(\$(\d+)::int\[\], \$(\d+)::int\)\) '
+    r'AND \(SELECT require_concept_scores\(\$\1::int\[\]\)\) AND ',
+)
 
 
-def assert_one_top_level_guard(sql: str, args: list, concept_ids: list) -> None:
-    assert sql.count('require_concept_scores') == 1, sql
-    # The guard is the first conjunct of the filter's own top-level AND: in no EXISTS, ARRAY() or OR.
+def assert_one_top_level_guard(sql: str, args: list, concept_ids: list, dataset_id: int = 1) -> None:
+    assert sql.count('require_dataset_concepts') == 1 and sql.count('require_concept_scores') == 1, sql
+    # The guards are the first conjuncts of the filter's own top-level AND, in no EXISTS, ARRAY() or OR: the ownership
+    # check (the ids and the dataset), then the readiness check on the same ids.
     found = GUARD.match(sql)
     assert found, sql
-    assert args[int(found.group(1)) - 1] == concept_ids
+    assert args[int(found.group(1)) - 1] == concept_ids and args[int(found.group(2)) - 1] == dataset_id
 
 
 @pytest.mark.parametrize('shape', sorted(SHAPES))
@@ -146,6 +150,10 @@ def test_one_guard_call_per_statement_and_the_parallel_plan_is_kept(registry_dat
                 "SELECT calls FROM pg_stat_xact_user_functions WHERE funcname = 'require_concept_scores'",
             )
             assert calls == 1
+            owned = await connection.fetchval(
+                "SELECT calls FROM pg_stat_xact_user_functions WHERE funcname = 'require_dataset_concepts'",
+            )
+            assert owned == 1
             plan = '\n'.join(row[0] for row in await connection.fetch(f'EXPLAIN {query}', *args))
             assert 'One-Time Filter' in plan and 'InitPlan' in plan, plan
             # Free workers make a parallel plan the cheapest: it appears unless something is parallel unsafe.
@@ -166,16 +174,52 @@ def test_one_guard_call_per_statement_and_the_parallel_plan_is_kept(registry_dat
 
 @needs_postgres
 def test_the_guard_refuses_before_any_row_is_read(registry_database):
-    """A One-Time Filter runs even when no row matches: an empty dataset refuses like a full one."""
+    """A One-Time Filter runs even when no row matches: an empty dataset refuses like a full one. The dataset's own
+    concept being rescored is the 409; another dataset's concept being rescored is the 400 for a concept this dataset
+    doesn't have, naming nothing of it."""
+    from starlette.requests import Request
+
+    from backend import main
+
+    async def status_of(error: Exception) -> int:
+        """The status the app answers this error with."""
+        handler = next(
+            main.app.exception_handlers[kind] for kind in type(error).__mro__ if kind in main.app.exception_handlers
+        )
+        scope = {
+            'type': 'http',
+            'method': 'POST',
+            'path': '/api/datasets/2/samples',
+            'raw_path': b'/api/datasets/2/samples',
+            'query_string': b'',
+            'headers': [],
+            'scheme': 'http',
+            'server': ('test', 80),
+        }
+        answer: Any = handler(Request(scope), error)  # the app's handlers are coroutines
+        return (await answer).status_code
 
     async def scenario(database):
         await seed(database)
-        await database.execute('UPDATE embedding_concepts SET scores_ready = FALSE WHERE id = 4')
-        for dataset_id in (1, 2):
+        await database.execute(
+            'INSERT INTO embedding_concepts (id,dataset_id,name,embedding_field,kind,weight) '
+            "VALUES (12,2,'river','clip','seed','[1,0]')",
+        )
+        await database.execute('UPDATE embedding_concepts SET scores_ready = FALSE WHERE id IN (4, 12)')
+        for dataset_id, concept_id in ((1, 4), (2, 12)):  # its own: dataset 1 full, dataset 2 empty
             args: list[Any] = [dataset_id]
-            sql, _ = datasets.parse_filter_node(exclude(4), args, 2, None, None, dataset_id)
+            sql, _ = datasets.parse_filter_node(exclude(concept_id), args, 2, None, None, dataset_id)
             with pytest.raises(asyncpg.ObjectNotInPrerequisiteStateError, match='is being rescored'):
                 await database.fetchval(f'SELECT count(*) FROM samples WHERE dataset_id = $1 AND {sql}', *args)
+        for dataset_id, concept_id, name in ((2, 4, 'sky'), (1, 12, 'river')):  # another dataset's, being rescored
+            args = [dataset_id]
+            sql, _ = datasets.parse_filter_node(exclude(concept_id), args, 2, None, None, dataset_id)
+            with pytest.raises(asyncpg.PostgresError) as refused:
+                await database.fetchval(f'SELECT count(*) FROM samples WHERE dataset_id = $1 AND {sql}', *args)
+            message = str(refused.value).lower()
+            assert 'concept' in message and 'exist' in message and 'rescored' not in message, message
+            assert name not in message and 'training' not in message, message  # the concept, dataset 1's name
+            assert await status_of(refused.value) == 400, message
 
     registry_database(scenario)
 

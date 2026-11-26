@@ -42,7 +42,9 @@ LANGUAGE SQL IMMUTABLE PARALLEL SAFE AS $$
                     THEN COALESCE(field->>'display_type', 'enum') ELSE field->>'display_type' END,
                 'overlay_config', field->'overlay_config',
                 'origin', COALESCE(field->>'origin',
-                    CASE WHEN field->>'field_type' = 'array' THEN 'native_array' ELSE 'metadata' END)
+                    CASE WHEN field->>'field_type' = 'array' THEN 'native_array' ELSE 'metadata' END),
+                'description', field->>'description',
+                'unit', field->>'unit'
             ) ORDER BY field->>'field_name')
             FROM jsonb_array_elements(COALESCE(snapshot->'fields', '[]'::jsonb)) field
             WHERE COALESCE(field->>'origin', 'metadata') <> 'system'
@@ -79,6 +81,8 @@ LANGUAGE SQL IMMUTABLE PARALLEL SAFE AS $$
                     THEN COALESCE(lhs_field, rhs_field)->>'origin' <> 'metadata'
                       OR COALESCE(lhs_field, rhs_field)->>'display_type' IS NOT NULL
                       OR COALESCE(lhs_field, rhs_field)->>'overlay_config' IS NOT NULL
+                      OR COALESCE(lhs_field, rhs_field)->>'description' IS NOT NULL
+                      OR COALESCE(lhs_field, rhs_field)->>'unit' IS NOT NULL
                     ELSE TRUE
                 END
         )
@@ -591,12 +595,34 @@ CREATE OR REPLACE FUNCTION require_concept_scores(target_concepts INTEGER[])
 RETURNS BOOLEAN AS $$
 DECLARE
     concept_name TEXT;
+    missing INTEGER;
 BEGIN
+    SELECT wanted INTO missing FROM unnest(target_concepts) AS wanted
+    WHERE NOT EXISTS (SELECT 1 FROM embedding_concepts WHERE id = wanted) ORDER BY wanted LIMIT 1;
+    IF FOUND THEN
+        RAISE EXCEPTION 'Concept % doesn''t exist; it may have been deleted', missing USING ERRCODE = '22023';
+    END IF;
     SELECT name INTO concept_name FROM embedding_concepts
     WHERE id = ANY(target_concepts) AND NOT scores_ready ORDER BY id LIMIT 1;
     IF FOUND THEN
         RAISE EXCEPTION 'Concept "%" is being rescored; use it again when its scoring job finishes', concept_name
             USING ERRCODE = '55000';
+    END IF;
+    RETURN TRUE;
+END;
+$$ LANGUAGE plpgsql STABLE PARALLEL SAFE;
+
+CREATE OR REPLACE FUNCTION require_dataset_concepts(target_concepts INTEGER[], target_dataset INTEGER)
+RETURNS BOOLEAN AS $$
+DECLARE
+    missing INTEGER;
+BEGIN
+    SELECT wanted INTO missing FROM unnest(target_concepts) AS wanted
+    WHERE NOT EXISTS (SELECT 1 FROM embedding_concepts WHERE id = wanted AND dataset_id = target_dataset)
+    ORDER BY wanted LIMIT 1;
+    IF FOUND THEN
+        RAISE EXCEPTION 'Concept % doesn''t exist in this dataset; it may have been deleted', missing
+            USING ERRCODE = '22023';
     END IF;
     RETURN TRUE;
 END;
@@ -934,6 +960,12 @@ BEGIN
     target_dataset := CASE WHEN TG_OP = 'DELETE' THEN OLD.dataset_id ELSE NEW.dataset_id END;
     -- Bulk field jobs visit every captured block; definition changes need no full rebuild.
     IF current_setting('fridge.bulk_dataset', TRUE) = target_dataset::text THEN
+        RETURN NULL;
+    END IF;
+    -- (0035) A built-in field's row (origin 'system') holds only what is written about it: nothing to measure. A field
+    -- that becomes one (a mirror's private flag kept once its primary removed the field) goes as if deleted.
+    IF COALESCE(CASE WHEN TG_OP <> 'INSERT' THEN OLD.origin END, 'system') = 'system'
+       AND COALESCE(CASE WHEN TG_OP <> 'DELETE' THEN NEW.origin END, 'system') = 'system' THEN
         RETURN NULL;
     END IF;
     IF TG_OP = 'INSERT' AND NEW.origin = 'metadata' AND EXISTS (
@@ -1281,7 +1313,7 @@ BEGIN
     IF restored THEN
         -- Block queue writers while merging keys. No samples or embeddings are scanned.
         LOCK TABLE dataset_stats_pending,concept_embedding_pending,concept_score_pending,
-            concept_score_count_deltas,duplicate_pending,embedding_concepts
+            concept_score_count_deltas,duplicate_pending,embedding_concepts,dataset_field_kinds_pending
             IN SHARE ROW EXCLUSIVE MODE;
         WITH removed AS (
             -- A dataset being deleted is left alone: its guard refuses these writes, schedulers
@@ -1324,6 +1356,12 @@ BEGIN
         SELECT DISTINCT dataset_id,block_id,3 FROM removed;
         GET DIAGNOSTICS merged_rows = ROW_COUNT;
         RAISE LOG 'Restore recovery: duplicate_pending merged to % rows', merged_rows;
+        -- The record of which kind of sample has which field (0044): a note's writing transaction becomes 3, visible in
+        -- every snapshot, so the next clearing pass forgets it (and checks every mark first). A check's token left on a
+        -- mark stays: it costs the next writer of that field one write of the mark.
+        UPDATE dataset_field_kinds_pending SET xact='3';
+        GET DIAGNOSTICS merged_rows = ROW_COUNT;
+        RAISE LOG 'Restore recovery: dataset_field_kinds_pending normalized % rows', merged_rows;
 
         UPDATE embedding_concepts SET score_definition_transaction=3,
             score_manual_snapshot=NULL,score_manual_transaction=NULL
@@ -1362,10 +1400,12 @@ BEGIN
             lease_token=NULL,lease_expires_at=NULL,worker_id=NULL,heartbeat_at=NULL,
             available_at=clock_timestamp(),updated_at=clock_timestamp(),
             message='Restarted after database restore'
-        WHERE kind IN ('statistics','concept_scoring','duplicate_maintenance') AND state IN ('queued','running');
+        WHERE kind IN ('statistics','concept_scoring','duplicate_maintenance','field_kinds')
+            AND state IN ('queued','running');
         -- Failed/cancelled work can be resumed by a later explicit request too.
         UPDATE jobs SET barrier='{}',checkpoint='{}'
-        WHERE kind IN ('statistics','concept_scoring','duplicate_maintenance') AND state IN ('failed','cancelled');
+        WHERE kind IN ('statistics','concept_scoring','duplicate_maintenance','field_kinds')
+            AND state IN ('failed','cancelled');
     END IF;
     INSERT INTO transaction_high_water(singleton,transaction_id,system_identifier)
     VALUES(TRUE,current_transaction,current_system)
@@ -1514,9 +1554,16 @@ $$ LANGUAGE plpgsql;
 CREATE OR REPLACE FUNCTION guard_mirror_fields() RETURNS trigger AS $$
 BEGIN
     IF TG_OP = 'UPDATE' AND (OLD.dataset_id, OLD.field_name, OLD.field_type, OLD.origin, OLD.display_type,
-                             OLD.overlay_config)
+                             OLD.overlay_config, OLD.description, OLD.unit)
         IS NOT DISTINCT FROM (NEW.dataset_id, NEW.field_name, NEW.field_type, NEW.origin, NEW.display_type,
-                              NEW.overlay_config) THEN
+                              NEW.overlay_config, NEW.description, NEW.unit) THEN
+        RETURN NULL;
+    END IF;
+    -- (0035) A row that says nothing about the field but holds this instance's values_private: what a mirror's
+    -- private flag on a field its primary gave no row (id, filepath, ...) is stored in.
+    IF TG_OP = 'INSERT' AND NEW.origin = 'system' AND NEW.field_type = 'unknown' AND NOT NEW.is_promoted
+       AND (NEW.display_type, NEW.overlay_config, NEW.description, NEW.unit) IS NOT DISTINCT FROM
+           (NULL::text, NULL::jsonb, NULL::text, NULL::text) THEN
         RETURN NULL;
     END IF;
     IF TG_OP <> 'INSERT' AND current_setting('fridge.deletion_dataset', TRUE) = OLD.dataset_id::text THEN
@@ -1614,3 +1661,244 @@ BEGIN
     RETURN NULL;
 END;
 $$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION region_suggestions(written TEXT, how_many INTEGER DEFAULT 3)
+RETURNS TEXT[] AS $$
+    WITH typed AS (
+        SELECT lower(written) AS text,
+               ARRAY(SELECT DISTINCT substr(lower(written), i, 2) FROM generate_series(1, length(written) - 1) AS i) AS pairs
+    ), scored AS (
+        SELECT r.key, r.name, array_position(ARRAY['country', 'state', 'group'], r.kind) AS kind_order,
+               CASE WHEN lower(r.key) = t.text THEN 0
+                    WHEN lower(r.name) = t.text THEN 1
+                    WHEN starts_with(lower(r.name), t.text) THEN 2
+                    ELSE 3 END AS rank,
+               greatest(
+                   2.0 * (SELECT count(*) FROM unnest(t.pairs) AS pair WHERE strpos(lower(r.key), pair) > 0)
+                       / NULLIF(length(r.key) - 1 + cardinality(t.pairs), 0),
+                   2.0 * (SELECT count(*) FROM unnest(t.pairs) AS pair WHERE strpos(lower(r.name), pair) > 0)
+                       / NULLIF(length(r.name) - 1 + cardinality(t.pairs), 0)
+               ) AS likeness
+        FROM regions r, typed t
+    )
+    SELECT COALESCE(array_agg(key ORDER BY rank, likeness DESC, kind_order, name, key), '{}') FROM (
+        SELECT * FROM scored WHERE rank < 3 OR likeness >= 0.6
+        ORDER BY rank, likeness DESC, kind_order, name, key
+        LIMIT how_many
+    ) best
+$$ LANGUAGE sql STABLE PARALLEL SAFE;
+
+CREATE OR REPLACE FUNCTION unknown_region_message(region_key TEXT)
+RETURNS TEXT AS $$
+DECLARE
+    close TEXT;
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM regions) THEN
+        RETURN format('Unknown region %L: no boundary set is loaded on this server', region_key);
+    END IF;
+    SELECT string_agg(format('%L (%s)', r.key, r.name), ' or ' ORDER BY s.position) INTO close
+    FROM unnest(region_suggestions(region_key)) WITH ORDINALITY AS s(key, position) JOIN regions r USING (key);
+    RETURN format('Unknown region %L: the boundary set isn''t loaded on this server or has no such region', region_key)
+        || CASE WHEN close IS NULL THEN '' ELSE format(' (did you mean %s?)', close) END;
+END;
+$$ LANGUAGE plpgsql STABLE PARALLEL SAFE;
+
+CREATE OR REPLACE FUNCTION region_id(region_key TEXT)
+RETURNS INTEGER AS $$
+DECLARE
+    region INTEGER;
+BEGIN
+    SELECT id INTO region FROM regions WHERE key = region_key;
+    IF region IS NULL THEN
+        RAISE EXCEPTION '%', unknown_region_message(region_key) USING ERRCODE = '22023';
+    END IF;
+    RETURN region;
+END;
+$$ LANGUAGE plpgsql STABLE PARALLEL SAFE;
+
+CREATE OR REPLACE FUNCTION require_regions(region_keys TEXT[])
+RETURNS BOOLEAN AS $$
+BEGIN
+    PERFORM region_id(region_key) FROM unnest(region_keys) AS region_key;
+    RETURN TRUE;
+END;
+$$ LANGUAGE plpgsql STABLE PARALLEL SAFE;
+
+CREATE OR REPLACE FUNCTION field_kinds_mark(target_dataset INTEGER, image_names TEXT[], object_names TEXT[])
+RETURNS VOID AS $$
+BEGIN
+    image_names := COALESCE(image_names, '{}');
+    object_names := COALESCE(object_names, '{}');
+    IF target_dataset IS NULL OR cardinality(image_names) + cardinality(object_names) = 0 THEN
+        RETURN;
+    END IF;
+    PERFORM pg_advisory_xact_lock_shared(20261125, target_dataset);
+    IF current_setting('transaction_isolation') = 'read committed' THEN
+        image_names := ARRAY(
+            SELECT DISTINCT wanted.key FROM unnest(image_names) AS wanted(key)
+            WHERE NOT EXISTS (
+                SELECT 1 FROM dataset_field_kinds k
+                WHERE k.dataset_id = target_dataset AND k.field_name = wanted.key
+                  AND k.on_images AND k.checking_images IS NULL));
+        object_names := ARRAY(
+            SELECT DISTINCT wanted.key FROM unnest(object_names) AS wanted(key)
+            WHERE NOT EXISTS (
+                SELECT 1 FROM dataset_field_kinds k
+                WHERE k.dataset_id = target_dataset AND k.field_name = wanted.key
+                  AND k.on_objects AND k.checking_objects IS NULL));
+        IF cardinality(image_names) + cardinality(object_names) = 0 THEN
+            RETURN;
+        END IF;
+    END IF;
+    INSERT INTO dataset_field_kinds AS k (dataset_id, field_name, on_images, on_objects)
+    SELECT target_dataset, wanted.key, wanted.key = ANY(image_names), wanted.key = ANY(object_names)
+    FROM (SELECT DISTINCT unnest(image_names || object_names) AS key) wanted ORDER BY wanted.key
+    ON CONFLICT (dataset_id, field_name) DO UPDATE
+    SET on_images = k.on_images OR EXCLUDED.on_images, on_objects = k.on_objects OR EXCLUDED.on_objects,
+        checking_images = CASE WHEN EXCLUDED.on_images THEN NULL ELSE k.checking_images END,
+        checking_objects = CASE WHEN EXCLUDED.on_objects THEN NULL ELSE k.checking_objects END
+    WHERE (EXCLUDED.on_images AND (NOT k.on_images OR k.checking_images IS NOT NULL))
+       OR (EXCLUDED.on_objects AND (NOT k.on_objects OR k.checking_objects IS NOT NULL));
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION field_kinds_note(target_dataset INTEGER)
+RETURNS VOID AS $$
+BEGIN
+    IF target_dataset IS NULL OR current_setting('fridge.deletion_dataset', TRUE) = target_dataset::text
+       OR current_setting('fridge.field_kinds_noted_' || target_dataset, TRUE) = 'on' THEN
+        RETURN;
+    END IF;
+    INSERT INTO dataset_field_kinds_pending (dataset_id)
+    SELECT target_dataset WHERE EXISTS (SELECT 1 FROM datasets WHERE id = target_dataset);
+    PERFORM set_config('fridge.field_kinds_noted_' || target_dataset, 'on', TRUE);
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION field_kinds_inserted() RETURNS trigger AS $$
+DECLARE
+    target RECORD;
+BEGIN
+    FOR target IN
+        SELECT seen.dataset_id,
+               COALESCE(array_agg(seen.key ORDER BY seen.key) FILTER (WHERE NOT seen.is_object), '{}') AS images,
+               COALESCE(array_agg(seen.key ORDER BY seen.key) FILTER (WHERE seen.is_object), '{}') AS objects
+        FROM (
+            SELECT r.dataset_id, r.media_type = 'object' AS is_object, k.key
+            FROM field_kinds_new r CROSS JOIN LATERAL jsonb_object_keys(
+                CASE WHEN jsonb_typeof(r.metadata) = 'object' THEN r.metadata ELSE '{}'::jsonb END) AS k(key)
+            UNION
+            SELECT r.dataset_id, r.media_type = 'object', '@local.' || k.key
+            FROM field_kinds_new r CROSS JOIN LATERAL jsonb_object_keys(
+                CASE WHEN jsonb_typeof(r.local_metadata) = 'object' THEN r.local_metadata ELSE '{}'::jsonb END) AS k(key)
+            UNION
+            SELECT r.dataset_id, r.media_type = 'object', 'location' FROM field_kinds_new r WHERE r.location IS NOT NULL
+        ) seen
+        GROUP BY seen.dataset_id
+        ORDER BY seen.dataset_id
+    LOOP
+        PERFORM field_kinds_mark(target.dataset_id, target.images, target.objects);
+    END LOOP;
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION field_kinds_keys(document JSONB) RETURNS TEXT[] AS $$
+    SELECT CASE WHEN jsonb_typeof(document) = 'object' THEN ARRAY(SELECT jsonb_object_keys(document))
+                ELSE '{}'::text[] END
+$$ LANGUAGE sql IMMUTABLE PARALLEL SAFE;
+
+CREATE OR REPLACE FUNCTION field_kinds_same_keys(a JSONB, b JSONB) RETURNS BOOLEAN AS $$
+    SELECT CASE WHEN jsonb_typeof(a) = 'object' THEN ARRAY(SELECT jsonb_object_keys(a)) ELSE '{}'::text[] END
+         = CASE WHEN jsonb_typeof(b) = 'object' THEN ARRAY(SELECT jsonb_object_keys(b)) ELSE '{}'::text[] END
+$$ LANGUAGE sql IMMUTABLE PARALLEL SAFE;
+
+CREATE OR REPLACE FUNCTION field_kinds_updated() RETURNS trigger AS $$
+DECLARE
+    is_object BOOLEAN := NEW.media_type = 'object';
+    moved BOOLEAN := OLD.dataset_id IS DISTINCT FROM NEW.dataset_id
+        OR (OLD.media_type = 'object') IS DISTINCT FROM (NEW.media_type = 'object');
+    old_keys TEXT[] := field_kinds_keys(OLD.metadata);
+    new_keys TEXT[] := field_kinds_keys(NEW.metadata);
+    local_changed BOOLEAN := moved OR OLD.local_metadata IS DISTINCT FROM NEW.local_metadata;
+    old_local TEXT[] := CASE WHEN local_changed THEN field_kinds_keys(OLD.local_metadata) ELSE '{}' END;
+    new_local TEXT[] := CASE WHEN local_changed THEN field_kinds_keys(NEW.local_metadata) ELSE '{}' END;
+    located BOOLEAN := NEW.location IS NOT NULL AND (moved OR OLD.location IS NULL);
+    note TEXT := 'fridge.field_kinds_' || NEW.dataset_id || CASE WHEN is_object THEN '_objects' ELSE '_images' END;
+    marked TEXT[];
+    marked_local TEXT[];
+    names TEXT[];
+    local_names TEXT[];
+BEGIN
+    IF moved OR NOT (old_keys <@ new_keys) OR NOT (old_local <@ new_local)
+       OR (OLD.location IS NOT NULL AND NEW.location IS NULL) THEN
+        IF current_setting('fridge.field_kinds_noted_' || OLD.dataset_id, TRUE) IS DISTINCT FROM 'on' THEN
+            PERFORM field_kinds_note(OLD.dataset_id);
+        END IF;
+    END IF;
+    IF NEW.dataset_id IS NULL THEN
+        RETURN NULL;  -- a sample in no dataset: nothing to mark (its old dataset was noted above)
+    END IF;
+    IF moved THEN
+        old_keys := '{}';
+        old_local := '{}';
+    END IF;
+    marked := COALESCE(NULLIF(current_setting(note, TRUE), ''), '{}')::text[];
+    marked_local := COALESCE(NULLIF(current_setting(note || '_local', TRUE), ''), '{}')::text[];
+    IF new_keys <@ (old_keys || marked) AND new_local <@ (old_local || marked_local)
+       AND (NOT located OR 'location' = ANY(marked)) THEN
+        RETURN NULL;
+    END IF;
+    names := ARRAY(SELECT key FROM unnest(new_keys) AS k(key) WHERE key <> ALL(old_keys) AND key <> ALL(marked));
+    IF located AND NOT 'location' = ANY(marked) THEN
+        names := names || 'location'::text;
+    END IF;
+    local_names := ARRAY(SELECT key FROM unnest(new_local) AS k(key) WHERE key <> ALL(old_local) AND key <> ALL(marked_local));
+    IF cardinality(names) = 0 AND cardinality(local_names) = 0 THEN
+        RETURN NULL;
+    END IF;
+    marked := marked || names;
+    names := names || ARRAY(SELECT '@local.' || key FROM unnest(local_names) AS k(key));
+    PERFORM field_kinds_mark(
+        NEW.dataset_id, CASE WHEN is_object THEN '{}' ELSE names END, CASE WHEN is_object THEN names END);
+    PERFORM set_config(note, marked::text, TRUE);
+    PERFORM set_config(note || '_local', (marked_local || local_names)::text, TRUE);
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION field_kinds_deleted() RETURNS trigger AS $$
+BEGIN
+    PERFORM field_kinds_note(gone.dataset_id)
+    FROM (SELECT DISTINCT dataset_id FROM field_kinds_old) gone ORDER BY gone.dataset_id;
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION field_kinds_truncated() RETURNS trigger AS $$
+BEGIN
+    INSERT INTO dataset_field_kinds_pending (dataset_id) SELECT id FROM datasets ORDER BY id;
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION field_kinds_dataset_created() RETURNS trigger AS $$
+BEGIN
+    INSERT INTO dataset_field_kinds_state (dataset_id) VALUES (NEW.id) ON CONFLICT DO NOTHING;
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION require_field_kinds(target_dataset INTEGER, image_names TEXT[], object_names TEXT[])
+RETURNS BOOLEAN AS $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM dataset_field_kinds_state WHERE dataset_id = target_dataset)
+       OR EXISTS (SELECT 1 FROM dataset_field_kinds
+                  WHERE dataset_id = target_dataset AND ((on_images AND field_name = ANY(image_names))
+                                                         OR (on_objects AND field_name = ANY(object_names)))) THEN
+        RAISE EXCEPTION 'The fields seen on each kind of sample changed while the filter was read'
+            USING ERRCODE = '40001';
+    END IF;
+    RETURN TRUE;
+END;
+$$ LANGUAGE plpgsql STABLE PARALLEL SAFE;

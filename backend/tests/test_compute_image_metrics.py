@@ -234,7 +234,28 @@ def test_dataset_compute_metrics_writes_the_same_dict_in_batches(monkeypatch):
         SimpleNamespace(id=3, filepath="c", metadata={}),
     ]
     writes = []
+
+    class DescribingClient:
+        """The client the compute describes the fields it wrote through (computed field descriptions, 2.2): the schema
+        lists the eight metric fields with nothing written about them, and each description write is recorded and
+        changes nothing else."""
+
+        def __init__(self):
+            self.described: list[str] = []
+
+        def get_schema(self, dataset_id, filters=None, lightning_mode=True):
+            nothing = {"description": None, "unit": None, "description_source": None, "values_private": False}
+            return [{"name": name, "type": "number", **nothing} for name in sorted(KEYS)]
+
+        def set_field_description(self, dataset_id, field_name, description=None, unit=None):
+            self.described.append(field_name)
+            source = "set" if description else None
+            return {"description": description, "unit": unit, "values_private": False, "description_source": source}
+
+    client = DescribingClient()
     ds = object.__new__(Dataset)
+    monkeypatch.setattr(ds, "_id", 7, raising=False)
+    monkeypatch.setattr(ds, "client", client, raising=False)
     monkeypatch.setattr(ds, "iter_samples", lambda **kwargs: iter(samples), raising=False)
     monkeypatch.setattr(ds, "set_values_per_sample_multi", lambda pending: writes.append(dict(pending)), raising=False)
     monkeypatch.setattr(ds, "refresh_stats", lambda: None, raising=False)
@@ -242,3 +263,4 @@ def test_dataset_compute_metrics_writes_the_same_dict_in_batches(monkeypatch):
     ds.compute_metrics(image_loader=images.__getitem__, batch_size=1)
 
     assert writes == [{1: reference_metrics(images["a"])}, {3: reference_metrics(images["c"])}]
+    assert set(client.described) <= KEYS, client.described  # only the fields the run wrote are described

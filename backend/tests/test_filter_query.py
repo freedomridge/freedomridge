@@ -187,20 +187,28 @@ def test_the_sdks_older_between_and_like_still_work():
 
 
 def test_formatting_writes_one_part_per_filter_and_leaves_out_what_it_cannot_express():
+    """Map regions, lassos and selections have no text form, nor does a value text can't hold, nor anything that holds
+    one of them. (A concept filter's text names a concept of the dataset, so whether it has one depends on the dataset:
+    test_filter_query_postgres.py and test_filter_query_concept_spec.py check it through the API.)"""
     assert format_filter(leaf('split', '==', 'a')) == 'split = "a"'
     assert format_filter(leaf('tags', 'nin', 'x')) == 'tags not in ("x")'
     assert format_filter({'logic': 'AND', 'filters': [leaf('split', '=', 'a')]}) == 'split = "a"'
     assert format_filter({'logic': 'AND', 'filters': [leaf('a', '=', 1), leaf('b', '=', 2)]}) == '(a = 1 AND b = 2)'
-    concept = {'field': '_concept', 'operator': 'concept_exclude', 'value': {'concept_id': 3, 'threshold': 0.9}}
-    region = {'field': 'location', 'operator': 'geo_polygon', 'value': [[0, 0], [1, 0], [1, 1]]}
+    polygon = [[0, 0], [1, 0], [1, 1]]
+    region = {'field': 'location', 'operator': 'geo_polygon', 'value': polygon}
+    lasso = {'field': 'clip', 'operator': 'embedding_polygon', 'value': polygon}
     for node in (
-        concept,
         region,
+        {'field': 'location', 'operator': 'geo_polygon_exclude', 'value': polygon},
+        lasso,
+        {'field': 'clip', 'operator': 'embedding_polygon_exclude', 'value': polygon},
         {'field': 'id', 'operator': 'in_selection', 'value': 'token'},
         leaf('split', '=', None),
         leaf('split', '=', {'nested': 1}),
         leaf('score', '=', float('nan')),
         {'logic': 'AND', 'filters': []},
-        {'logic': 'OR', 'filters': [leaf('split', '=', 'a'), concept]},
+        {'logic': 'OR', 'filters': [leaf('split', '=', 'a'), region]},
+        {'logic': 'AND', 'filters': [leaf('split', '=', 'a'), lasso]},
+        {'logic': 'NOT', 'filters': [lasso]},
     ):
         assert format_filter(node) is None, node

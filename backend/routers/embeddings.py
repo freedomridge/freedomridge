@@ -27,7 +27,7 @@ from ..coordinates import (
 )
 from ..database import db
 from ..diskspace import COORDINATE_ROW_BYTES, INGEST_ROW_BYTES, estimate_viz_rank_bytes, require_free_space
-from ..field_registry import lock_field_lifecycle, map_swap_holder, map_swap_refusal
+from ..field_registry import RESERVED_METADATA_KEYS, lock_field_lifecycle, map_swap_holder, map_swap_refusal
 from ..index_jobs import ann_index_name
 from ..local_fields import local_field
 from ..map_artifacts import LocalArtifactStore
@@ -114,6 +114,11 @@ def _build_include_fields(
                     continue
                 parent, child = parts
                 alias = fn.replace('.', '_')
+                if parent in RESERVED_METADATA_KEYS:
+                    # Into a stored key named as a sample's own field: null, as the plain name gives.
+                    qualified.append(f"NULL::text as {alias}")
+                    unqualified.append(alias)
+                    continue
                 qualified.append(
                     f"COALESCE("
                     f"{table_prefix}.metadata->'{parent}'->0->>'{child}', "
@@ -125,6 +130,10 @@ def _build_include_fields(
                 continue
             elif fn in _DIRECT_FIELDS or (array_fields is not None and fn in array_fields):
                 qualified.append(f"{table_prefix}.{fn}")
+                unqualified.append(fn)
+            elif fn in RESERVED_METADATA_KEYS:
+                # A stored key named as a sample's own field is no field: null, as where no sample has the key.
+                qualified.append(f"NULL::text as {fn}")
                 unqualified.append(fn)
             else:
                 qualified.append(f"{table_prefix}.metadata->>'{fn}' as {fn}")
@@ -989,7 +998,8 @@ def _scatter_rejections(node, args):
     # scopes every source to the requested dataset/field and excludes missing coords.
     rejected = ' UNION '.join(sources)
     if concept_ids:
-        # One guard for every concept, outside the sources (as parse_filter_node places it).
+        # One guard for every concept, outside the sources (as parse_filter_node places it). That they are the
+        # dataset's is checked before the statement runs (_query_broad_exclusions).
         args.append(sorted(concept_ids))
         rejected = f"SELECT id FROM ({rejected}) _rejected WHERE (SELECT require_concept_scores(${len(args)}::int[]))"
     return rejected, has_tags, probed
@@ -1009,6 +1019,10 @@ async def _query_broad_exclusions(dataset_id, request):
     if compiled is None:
         return None
     rejected, has_tags, probed = compiled
+    # The concepts are the dataset's (a 400), before the statement's readiness guard could name another dataset's.
+    from .datasets import require_known_concepts
+
+    await require_known_concepts(request.filters, dataset_id)
     pct = max(0, min(100, request.sample_pct))
     # Admission: a bounded index-only count of each probed source, before any probe runs. The
     # sum bounds the probes (overlaps count twice, which only makes the bound stricter). Over

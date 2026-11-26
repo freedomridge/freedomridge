@@ -427,7 +427,10 @@ loads. Use one of the two options above.
 
 Media stays where the sample filepaths point: local files below `FRIDGE_DATA_ROOT`,
 or S3 objects. A restored database loads its media only when the target sees the
-same files at the same absolute paths, or has access to the same buckets. The S3
+same files at the same paths (relative paths against its own `FRIDGE_DATA_ROOT`),
+or has access to the same buckets. Sample paths can't be changed in place: when
+the media is elsewhere on the target, see
+[Paths, and when media moves](SDK.md#paths-and-when-media-moves). The S3
 download cache (`S3_LOCAL_CACHE_PATH`) is not included; it refills as media is viewed.
 
 ## Secrets and configuration to keep off-box

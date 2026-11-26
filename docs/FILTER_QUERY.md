@@ -7,12 +7,13 @@ A filter written as text. The same text works in four places:
 - **The HTTP API:** `POST /api/datasets/{id}/filter_query/parse` and `.../format` convert between text and filters, for scripts and for AI tools.
 - **Links:** `/datasets/<id>?q=<text>` opens the dataset on the filter, one chip per top-level `AND` part, and **Copy link** writes one when every chip has a text form ([links](DATASET_MANAGEMENT.md#links-to-a-filter-a-view-or-a-sample)).
 
-The server parses every query against the dataset's own fields (`backend/filter_query.py`). A misspelt field, an operator that doesn't apply, or a value of the wrong type is reported with its line, column and suggestions. It is never quietly turned into a filter that matches nothing.
+The server parses every query against the dataset's own fields and concepts (`backend/filter_query.py`). A misspelt field or concept, an operator that doesn't apply, or a value of the wrong type is reported with its line, column and suggestions. It is never quietly turned into a filter that matches nothing.
 
 ```
 serial_number in (103000752 103001025 103004080)
 AND split = "train"
 AND NOT (score < 0.2 OR note exists)
+AND not concept "equipment" > 0.62
 ```
 
 ## In the filter cards
@@ -41,6 +42,8 @@ A query is an AND of parts. In the SDK and the API, each top-level `AND` part be
 - On a mirror, its own fields are named `@local.<name>` and written as they are: `@local.weeds > 3`,
   `@local.tags in ("checked")` ([FOLLOWERS.md](FOLLOWERS.md#fields-of-its-own)).
 - A name that isn't a plain word, or that is one of the language's keywords, goes in backticks: `` `weather station` = "A" `` or `` `in` = 1 ``.
+- A field named `concept` needs no backticks: followed by an operator, `concept` is the field (`concept = "a"`,
+  `concept exists`, `concept in (a b)`), and only followed by a name is it a [concept part](#concept-scores).
 - Names are case sensitive. `Split` gets "unknown field 'Split'" with the suggestion `split`.
 
 ## Operators
@@ -51,16 +54,176 @@ A query is an AND of parts. In the SDK and the API, each top-level `AND` part be
 | `>` `>=` `<` `<=` | compare | numbers, dates |
 | `in (...)`, `not in (...)` | one of the listed values, or none of them | numbers, dates, text, lists |
 | `between A and B` | `>= A` and `<= B`, as one part | numbers, dates |
-| `contains "x"` (also `like "%x%"`) | case-insensitive substring | text, lists |
+| `contains "x"` (also `like "%x%"`) | case-insensitive substring | text, lists, `id` |
 | `exists`, `not exists` | the field is present, or absent | all |
 | `is null`, `is not null` | no value (absent or null), or a value | all |
 
-Logic: `AND`, `OR` and `NOT`, with brackets. Keywords aren't case sensitive.
+`id contains "12"` keeps the samples whose id, written in decimal, contains `12` (12, 112, 1203, ...), and
+`NOT (id contains "12")` every other sample. Text that isn't digits matches no sample.
+
+Logic: `AND`, `OR` and `NOT`, with brackets. Keywords aren't case sensitive. `concept` is a keyword only where it
+starts a [concept part](#concept-scores): followed by a name (quoted, or a plain word) it is a concept's score,
+followed by an operator it is a field named concept. `within` counts as an operator there, so `concept within "US-KS"`
+is the [region form](#regions)'s mistake (`within` applies only to `location`).
+
+A negation of a field (`!=`, `not in`, or a `NOT` around one field's tests) keeps the samples with another value. On
+a dataset without objects it keeps the samples without the field too: `split != "train"` keeps the samples that have
+no `split`. On a dataset with objects it keeps only the samples that have the field, and a `NOT` around tests of
+several fields only those that have every one of them ([below](#on-a-dataset-with-objects)).
+
+## Concept scores
+
+A [concept](SDK.md#concepts-learned-scores) scores every sample from 0 to 1. A concept part keeps or hides the
+samples by that score, as the Concepts panel's **show only** and **exclude** do:
+
+- `concept "equipment" > 0.62` keeps the samples whose score for the dataset's concept named `equipment` passes the
+  comparison: `>`, `>=`, `<` or `<=`.
+- `not concept "equipment" > 0.62` hides them and keeps the rest, as the panel's exclude does. On a dataset without
+  objects the rest includes the samples the concept has no score for; on a dataset with objects it is only the
+  samples that have a score, here those at or below 0.62 ([below](#on-a-dataset-with-objects)).
+  `NOT (concept "equipment" > 0.62)` is the same filter. A `NOT` around more than the one concept part, such as
+  `NOT (concept "equipment" > 0.62 AND split = "train")`, is a `NOT` of its parts.
+- `concept "equipment"`, with no comparison, takes the concept's saved threshold with `>`, as it is when the text is
+  read. The text the app and `format` write always has the comparison, so a link keeps its meaning when the saved
+  threshold changes.
+- The name is quoted, or written bare when it is a plain word: `concept equipment > 0.62`. A name that is one of the
+  language's keywords, or `within`, is quoted: `concept "in" > 0.5`, `concept "within" > 0.5`. Names are case
+  sensitive.
+- A concept part combines like any other: `split = "train" AND not concept "equipment" > 0.62`, inside brackets and
+  with `OR`.
+
+A concept is named by its name, so text that names one stops working when the concept is deleted or renamed: the
+error names the unknown concept and suggests the dataset's close names. On a mirror, a `?q=` link names a concept,
+so it resolves against that server's own concepts, since concepts and their ids belong to each instance.
+
+An `f=` link, a saved view or the default view holds a concept by its id. A stage naming a concept the dataset no
+longer has opens without that filter, and the app says so, naming the stage by its label: `From this link, “Exclude:
+scrap” was left out: it filters by a concept this dataset no longer has.` A concept test inside a larger stage takes
+that whole stage with it, as what is left would filter differently. A view that lost a stage this way differs from
+what is applied, so **Update this view** is offered. The default view's notice is shown once in each browser, and
+again when the view's filters change. Stages are checked against the dataset's concepts before they are applied: on a
+slow server they wait for the list.
+
+The server refuses a filter naming a concept that isn't the dataset's, deleted, never made or another dataset's,
+wherever a filter is read (400: `Concept 12 doesn't exist; it may have been deleted`, or, for one that exists in
+another dataset, `Concept 12 doesn't exist in this dataset; it may have been deleted`), and a bulk edit
+naming one when it is submitted, with nothing queued. It used to keep every sample or none. The dataset's own
+concept being rescored is still refused with a 409 until its job ends; another dataset's gets the 400 even then.
+
+## Regions
+
+`location within` names a loaded region ([REGIONS.md](REGIONS.md)): a country, a state or province, or a group of
+them.
+
+```
+location within "US-KS"
+location not within US:midwest
+location within Kansas AND split = train
+```
+
+- **`location within R`** keeps the samples located inside R; **`location not within R`** keeps every other sample,
+  samples with no location included (on a dataset with objects, see [below](#on-a-dataset-with-objects)). They are the
+  filters `geo_region` and `geo_region_exclude`.
+- **R is a key or a name, in any case,** quoted or not: `"US-KS"`, `us-ks`, `Kansas`, `"New South Wales"` (a name
+  with spaces needs quotes). The text is always written back with the key: `location within "US-KS"`.
+- **A name that several regions have is a mistake** whose suggestions are their keys, with their kinds and countries
+  in the message: `'Georgia' names 2 regions: GE (country), US-GA (state or province of United States of America);
+  write the key of the one you mean`.
+- **A region this server doesn't have** (no boundary set loaded, or no such key or name) is a mistake too, with close
+  keys as suggestions: `unknown region 'US-KZ': the boundary set isn't loaded on this server or has no such region`
+  (suggestions `US-KS`, `US-KY`, `KZ-KUS`).
+- **`within` and `not within` after `location` are the region form; `location` with any other operator is the
+  dataset's own field named `location`,** as it was before regions: `location = "north field"` filters that field. On a
+  dataset with no such field, `location = ...` is a mistake that points to `within`. `within` applies only to
+  `location`.
+
+## On a dataset with objects
+
+On a dataset with object rows (each naming its image in `parent_id`), an image and its objects hold different fields:
+the images have `colour`, say, and the objects `label`. The dataset's page reads a filter on an image together with
+its objects, and on an object together with its image, and never asks a row about a field it has no value for (a
+value is there and isn't `null`). The assistant reads filters the same way. A filter sent without the page's wrapping
+(from the SDK, say) reads each sample on its own values, as on a dataset without objects.
+
+- **A test is met when either row meets it.** The images' grid shows an image when the filter is met by its own
+  values together with those of one of its objects, or by its own values alone. So tests joined by `AND` are met with
+  the same object: `colour = "red" AND label = "car"` shows the red images that have a car, and `label = "car" AND
+  score > 0.9` needs one object that is a car with that score. The objects' grid shows an object when the filter is
+  met by its own values together with its image's: there `colour = "red" AND label = "car"` shows the cars of the red
+  images. An object with no image has only its own values, and so has an image with no objects. The two bounds of a
+  range (`between`, a slider, a histogram's bar) are one test, met by one row's value. `is not null` and `exists` are
+  tests like any other.
+- **A negation keeps only the rows that have the fields it compares.** `NOT (X)` shows a row when the row has a value
+  for every field compared inside X, and X doesn't show it (X read as above, with one object). On the images' grid
+  both are asked of the image as a whole, its own values and those of any of its objects; on the objects' grid, of
+  the object with its image. `colour != "red"` is `NOT (colour = "red")`, `label not in (car)` is `NOT (label in
+  (car))`, and `not concept "equipment" > 0.62` keeps only the rows that have a score. So on the images' grid `label
+  != "car"` shows the images whose objects are labelled and none is a car; `NOT (label = "car" AND score > 0.9)`
+  hides an image that has a car with that score, and shows one whose car scores lower and whose truck higher; and a
+  field that both kinds have hides a row when either it or its partner has the value.
+- **`is null` and `not exists` show the rows with nothing for the field**: no value for `is null` (absent or `null`),
+  no key for `not exists` (a `null` under the key counts as there). On the images' grid neither the image nor any of
+  its objects may have one; on the objects' grid, neither the object nor its image. On `location` these tests are
+  about the sample's own location, the one a place tests, read the same way: on the images' grid `location is null`
+  shows the images that have no location and none of whose objects has one. The built-in fields (`id`, `filepath`,
+  `media_type`, `created_at`, `last_modified_at`) are on every row, so there `is null`, `is not null`, `exists` and
+  `not exists` are answered by the grid's own row.
+- **A `NOT`, an `is null` or a `not exists` inside a larger filter is read first, for the row as a whole**, and the
+  rest as above. So on the images' grid `label = "car" AND NOT (occluded = true)` shows the images that have a car
+  and no occluded object, and `label = "car" AND score is null` the images that have a car and in which neither the
+  image nor any object has a `score`. A car that is not occluded is a question for the objects' grid, where the same
+  filter shows each car whose `occluded` is set and isn't true.
+
+Five images: 1 red with a car and a truck; 2 red with a truck; 3 blue with a car; 4 with no `colour`, with a car; 5
+red with no objects.
+
+| Filter | Images' grid | Objects' grid | Why the other images are out |
+|---|---|---|---|
+| `colour = "red" AND label = "car"` | 1 | the car of 1 | |
+| `colour != "red"` | 3 | the car of 3 | 4 has no `colour` |
+| `NOT (colour = "red")` | 3 | the car of 3 | the same filter as `!=` |
+| `label != "car"` | 2 | the trucks of 1 and 2 | 1, 3 and 4 have a car; 5 has no `label` |
+| `NOT (label = "car")` | 2 | the trucks of 1 and 2 | the same filter as `!=` |
+| `NOT (colour = "red" AND label = "car")` | 2, 3 | the truck of 1, the truck of 2, the car of 3 | 1 is red with a car; 4 has no `colour`; 5 has no `label` |
+| `colour is null` | 4 | the car of 4 | |
+| `label is null` | 5 | none | |
+
+- **An excluded place or lasso** (`location not within`, a map region or a lasso excluded) leaves out an image when
+  it or one of its objects is inside, and an object when it or its image is inside. The rows with no location (or no
+  point on the lasso's map) stay, as on a dataset without objects. It reads the same as a chip of its own, sharing a
+  filter card with another test, inside an `OR`, or written as `NOT (location within "US-KS")`.
+- **A hiding test of a field every row has**, `id`, `filepath`, `media_type`, `created_at` or `last_modified_at`
+  (`id not in (...)`, `filepath != "..."`), or of a list (`tags`, or a list field kept in a column of its own, which
+  keep the samples with no value: `tags not in (rejected)` keeps the samples without tags), is answered by the grid's
+  own row: the row it names isn't shown, whichever row meets the rest of the filter. `NOT (tags in (rejected))` is the
+  same filter as `tags not in (rejected)`. The app's collapse of duplicates is read the same way: a duplicate image it
+  hides doesn't come back through its objects, and on the objects' grid an object is hidden only when it is a
+  duplicate itself, whatever its image. A `NOT` around tests of the
+  built-in fields alone reads each row on its own: on the images' grid `NOT (filepath contains "x")` also shows an
+  image whose path holds `x` when one of its objects' paths doesn't.
+
+### What the server skips
+
+The server notes, for each field of a dataset, whether images and whether objects have been seen with it: its key on a
+sample of that kind (a `null` under the key counts), a mirror's own `@local.` field included, and for `location` the
+sample's location too (the field list's `on_images` and `on_objects`,
+[Dataset management](DATASET_MANAGEMENT.md#which-kinds-of-sample-have-a-field)). Every reader of the page's filter
+asks no row of a kind about a field that kind has never been seen with: no test of that row, no lookup of its partner.
+That is the grids' pages and counts (the top bar's included), the sidebar's values and ranges, the histogram, the
+aggregates, autocomplete, the map's points and extent, Select all, sparse sampling, the export, bulk edits by filter and
+the assistant's tools. A bulk edit reads the note when it is submitted; a part of it that runs after a kind got its
+first value of a field it skips runs without the note.
+So a field that only one kind has costs about what it costs on a dataset without objects, give or take the join to the
+partner the reading needs (an image field asked on the objects' grid). An answer never depends on it: a row with no
+value for a field never meets a test of it (above), the note never says a kind lacks a field one of its samples has,
+and a filter read while a kind gets its first value of a field is read again. A concept's scores, a lasso's points and
+the built-in fields and lists are always asked. A dataset from before this was added is examined once by the job runner
+after the upgrade; until then nothing is skipped.
 
 ## Values
 
-- **Text:** `"double"` or `'single'` quotes, with `\"`, `\\`, `\n` and `\t` escapes. A plain word needs no quotes: `split = train`. `and`, `or`, `not`, `in`, `contains`, `exists`, `is`, `null`, `between` and `like` always need quotes.
-- **Numbers:** `12`, `-1.5`, `1e3`.
+- **Text:** `"double"` or `'single'` quotes, with `\"`, `\\`, `\n` and `\t` escapes. A plain word needs no quotes: `split = train`. `and`, `or`, `not`, `in`, `contains`, `exists`, `is`, `null`, `between` and `like` always need quotes. `within` is a keyword only after `location`: a field or a value named within needs none. `concept`, a keyword only before a concept's name, doesn't need them either.
+- **Numbers:** `12`, `-1.5`, `1e3`. A number too large for a double, such as `1e999`, is an error: `'1e999' is out of range for a number`.
 - **Dates:** ISO text, quoted or not: `created_at >= 2026-01-01T00:00:00Z`. Text that isn't an ISO date and time is an error.
   On `created_at`, `last_modified_at` and any field declared `datetime`, dates compare as moments: `2026-01-01T10:00:00+02:00` is the same
   moment as `2026-01-01T08:00:00Z`, and a date or time written without an offset is UTC. A value written to the day,
@@ -86,11 +249,13 @@ A value takes the field's type:
 
 ## Limits
 
-A query takes at most 500 comparisons, and brackets and `NOT` nest at most 100 deep. A list in `in (...)` is one comparison however many values it holds, so put many values in one list rather than writing `a = 1 OR a = 2 OR …`.
+A query takes at most 500 comparisons, and brackets and `NOT` nest at most 100 deep. A list in `in (...)` is one comparison however many values it holds, so put many values in one list rather than writing `a = 1 OR a = 2 OR …`. A concept part is one comparison.
 
 ## What stays a chip
 
-These filters have no text form: concept scores, map regions, lassos, selections and similarity searches. Their values are ids, polygons or tokens rather than something to type. `format` returns `null` for each of them, and they stay stages of their own. Their chips have no card: a click on a map region, a lasso, a selection or a search toggles it between including and excluding what it holds.
+These filters have no text form: regions drawn on the map, lassos, selections and similarity searches. Their values are ids, polygons or tokens rather than something to type. `format` returns `null` for each of them, and for a concept filter whose concept no longer exists, and they stay stages of their own. Their chips have no card: a click on a drawn map region, a lasso, a selection or a search toggles it between including and excluding what it holds. A named region (`location within "US-KS"`) has a text form, so it is a part like any other.
+
+A concept's chip has no card either: its text is for links and for typing. A concept part on its own, in a link or in a filter card's text, makes the Concepts panel's chip (**Exclude:** or **Only:** and the concept's name), which the panel changes. So does a stage that is one concept test in a view saved by the SDK (`create_view(query=...)`) or the API, when the app opens that view. Inside a larger part it is one rule of that part's chip, which has a card.
 
 ## HTTP API
 
@@ -137,6 +302,8 @@ Other messages include:
 - `'>' does not apply to the text field 'split'; use one of: =, !=, in, not in, ...`
 - `'abc' is not a number, and 'score' is a number field`
 - `expected ) to close the ( at line 1, column 1`
+- `unknown concept 'equpment'`, with the suggestion `equipment`
+- `'=' does not apply to the concept 'equipment'; use one of: >, >=, <, <=`
 
 **`POST /api/datasets/{id}/filter_query/format`**
 

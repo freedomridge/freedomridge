@@ -242,6 +242,9 @@ jobs:
         env:
           # Optional repo secret; without it the map spec skips itself.
           NEXT_PUBLIC_MAPBOX_TOKEN: ${{ secrets.NEXT_PUBLIC_MAPBOX_TOKEN }}
+          # This job's database is thrown away: the region specs may load their boundary fixture into it
+          # (frontend/e2e/regions-fixture.ts). Without it they skip, touching no database.
+          FRIDGE_E2E_LOAD_REGIONS: '1'
         run: npx playwright test
       - name: Backend log
         if: failure()

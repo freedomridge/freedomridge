@@ -4,6 +4,454 @@ Freedom Ridge has one version for the server, the web app and the Python SDK (th
 file), following [Semantic Versioning](https://semver.org). A release lists **upgrade notes** when
 it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
 
+## 2.14.0 (2026-11-25)
+
+This release adds an AI assistant: Claude Code and other MCP clients answer questions about a server's datasets
+through thirteen read-only tools at `/mcp`, reading as the person using them, and an administrator's client can read
+the server's status, background jobs, backups and index advice through four more. It is off until an administrator
+switches it on. Also new: named regions as a filter, a text form for concept filters, and a description and unit for
+each field. On a dataset with objects the page now reads a filter on an image together with its objects, which
+changes what some filters find (Changed). Eleven migrations: one removes the metadata keys named `tags` or
+`media_type`, which are refused from now on; the others touch no sample.
+
+### Upgrade notes
+
+- Eleven database migrations, `0034_regions.sql` to `0044_field_kinds.sql`, and changed database functions, applied
+  with `scripts/apply_migrations.sh` (step 4 of [Upgrading](docs/UPGRADING.md)). The first eight add empty tables and
+  columns and touch no rows. `0041` builds two indexes on the jobs table, about a second per million jobs, while job
+  writes wait. `0042` is the next item; `0043` changes only the field list (the item after it). `0044` adds three empty
+  tables and the triggers that fill them (the item on which kinds of sample have a field), and restore recovery covers
+  them too.
+- **Each dataset is examined once after the upgrade, in the background.** The job runner reads every sample of each
+  dataset once to note which fields images and objects have (job `field_kinds`, "Updating which kinds of sample have
+  each field", one dataset at a time per lane): about 13 seconds for a dataset of a million images and four million
+  objects, 2 seconds for a million images. Nothing waits for it, and until a dataset's turn every field counts as seen
+  on both kinds (its filters read as before, its fields answer `on_images` and `on_objects` true). A dataset made after
+  the upgrade is followed from its first sample. A statement that writes samples with the triggers disabled (`ALTER
+  TABLE samples DISABLE TRIGGER USER`, `session_replication_role = replica`, as some import recipes suggest) and adds or
+  removes metadata keys must also run `DELETE FROM dataset_field_kinds_state WHERE dataset_id = ...` for the datasets it
+  wrote, in the same transaction, so that they are examined again.
+- **Metadata keys named `tags` or `media_type` are refused, and the stored ones are removed for good.** Such a key
+  names a sample's own field, so it was stored but never listed, filtered or shown. A script that writes one (an
+  upload, an edit, a bulk edit, a rename or clone onto the name) is now refused with an error that names the key
+  (`metadata key(s) ['tags'] name sample columns`). `0042_protected_metadata_keys.sql` removes the stored keys from the
+  samples that carry them, and a revert to an older version doesn't bring them back: **the values are gone.** It
+  prints a line for each dataset, with the keys it removed and from how many samples; with such keys it runs with the
+  app stopped, as step 4 has it, and refuses while anything else is connected. A field renamed or cloned onto one of
+  the names, which earlier releases allowed, goes too (on a dataset that is no mirror): the field list shows the
+  sample's own `tags` and `media_type` again, counted from the samples by the statistics job once the app is up, with
+  the description, unit and private mark written about the name kept, and the migration names any index left over
+  that key for you to remove (`DROP INDEX CONCURRENTLY`). To see beforehand
+  which datasets carry such keys:
+
+  ```sql
+  SELECT d.id, d.name, count(*) FILTER (WHERE s.metadata ? 'tags') AS tags,
+         count(*) FILTER (WHERE s.metadata ? 'media_type') AS media_type
+    FROM samples s JOIN datasets d ON d.id = s.dataset_id
+   WHERE s.metadata ?| ARRAY['tags', 'media_type'] GROUP BY d.id ORDER BY d.id;
+  ```
+
+  To keep the values, give them another key before upgrading, a name no sample uses yet (here `old_tags`; the same for
+  `media_type`), and register it as a field (`list` instead of `string` where the values are lists). A mirror's
+  samples are left out: a mirror refuses the change, and its values are kept on its primary, where the same statement
+  keeps them.
+
+  ```sql
+  BEGIN;
+  UPDATE samples SET metadata = (metadata - 'tags') || jsonb_build_object('old_tags', metadata->'tags')
+   WHERE metadata ? 'tags' AND dataset_id NOT IN (SELECT dataset_id FROM mirrors);
+  INSERT INTO dataset_fields (dataset_id, field_name, field_type)
+  SELECT DISTINCT dataset_id, 'old_tags', 'string' FROM samples WHERE metadata ? 'old_tags'
+  ON CONFLICT (dataset_id, field_name) DO NOTHING;
+  COMMIT;
+  ```
+
+  A dataset version saved before the upgrade counts the samples the migration cleaned as modified when compared with
+  the dataset, also after a revert to it: a version keeps a fingerprint of each sample's metadata, the removed key
+  included. Save a version after upgrading: the dataset then shows as at that version.
+- **Metadata keys named `id`, `dataset_id`, `filepath`, `created_at` or `last_modified_at` are refused on edits too.**
+  They were refused only when samples were added. A script that sets one in an edit of a sample, a bulk edit or a
+  quality score's field, or as a field's new name in a rename or clone, is now refused with the same error, and nothing
+  is written. Stored ones stay, with no migration (a stored `created_at` can be the only copy of an original date), and
+  a sample that carries one stays editable: `sample.save()` may send the key back with the value it has, and the key
+  can be removed.
+- **A stored key named `id`, `dataset_id`, `filepath`, `created_at` or `last_modified_at` is no longer a field.**
+  `0043_reserved_names_never_fields.sql` changes the field list only: the metadata fields an older release registered
+  under those names go back to the sample's own field (what was written about the name, its description, unit and
+  private mark, is kept), and the statistics of those names are counted again from the samples once the app is up.
+  The stored values stay in the samples' metadata. It reads and writes no sample, so it takes moments; it prints a line
+  for each field it changed, naming any index left over that key for you to remove (`DROP INDEX CONCURRENTLY`).
+- The job runner loads the region boundaries by itself on its first start after the upgrade: its image now carries
+  the boundary file (40.7 MB more). The load takes about half a minute on a desktop computer, a few minutes on a
+  small server, and adds 151 MB to the database. A development checkout runs `python -m backend.regions fetch` once
+  ([Upgrading](docs/UPGRADING.md#a-development-checkout)).
+- The assistant ships off, and an upgraded server keeps it off; existing datasets stay open to it once it is on. Its
+  administration tools have a switch of their own, also off.
+- **What switching it on means:** the server calls no AI service and needs no key, but each person you let in can have
+  their own AI client read what they can already see in their datasets and send it to that client's AI service
+  (Anthropic for Claude Code). Who may use it, closing a dataset and keeping a field's values back narrow it; it never
+  writes, deletes or shares ([docs/ASSISTANT.md](docs/ASSISTANT.md#what-switching-it-on-means)).
+- Before switching it on, set `FRIDGE_PUBLIC_URL` in `.env` to the server's public address (`.env.example`; the
+  production Compose file passes it on): the assistant's links start with it. Without it they start with the first
+  `ALLOWED_ORIGINS` entry, which must then be the public HTTPS origin.
+- The bundled nginx routes `/mcp` to the backend, unbuffered. nginx reads its configuration when its container
+  starts, so after step 4 recreate it: `docker compose -f docker-compose.prod.yml up -d --force-recreate nginx` (the
+  site is away for a second or two). If you keep your own web server in front, route it too
+  ([Docker deployment](docs/DOCKER_DEPLOYMENT.md#your-own-web-server-in-front)).
+- The server has a new dependency, the official MCP SDK (`mcp` 2.3), in the images.
+
+### Added
+
+- **An AI assistant, through an MCP server at `/mcp`** ([docs/ASSISTANT.md](docs/ASSISTANT.md)).
+  - **What it reads.** Its tools call the API in process as the person using it, so it sees what they can open, at
+    their level, and changes nothing. It speaks the Model Context Protocol (revisions 2026-07-28, 2025-11-25 and
+    2025-06-18, streamable HTTP) and keeps nothing between requests, so any backend process answers any request.
+  - **Who may use it.** It is off on every server until an administrator switches the MCP server on in the new
+    **Settings → Assistant**, which also says who may use it: by role (as shipped, administrators only), by group,
+    and by a person's own answer, which decides first; a guest or a demo account never may (`GET`/`PATCH
+    /api/admin/assistant`, `PUT`/`DELETE /api/admin/assistant/groups/{id}` and `.../users/{id}`). A guest is refused
+    by the server, not only for having no tokens; the setting for guests is kept for the chat in the app. `GET
+    /api/auth/me` says whether its user could use it now (`?fresh=1` reads the switch from the database, as the API
+    Tokens page does when it opens). Each request checks that afresh (403, saying why).
+  - **What it may not read.** A dataset's manager can close it to the assistant in Dataset Settings → Access
+    (`assistant_closed` on `PATCH /api/datasets/{id}`, carried by every answer that describes a dataset): its tools
+    then refuse it however they come to it and leave it out of lists, and nothing changes outside the assistant.
+    **New datasets start closed to the assistant** makes datasets created afterwards closed. Someone with edit can
+    tick **Keep this field's values from the assistant** under a field in Dataset Settings → Fields: a tool never gets
+    one of its values, and may not compare it, range it, sort by it or summarise it (the API refuses such a request
+    made for a tool, with words that say what works instead). **The assistant may read samples' fields** (off as
+    shipped) decides whether it reads samples' own fields.
+  - **Connecting.** An AI client opens `/mcp` with an **MCP token**, a new kind on Settings → API Tokens
+    (`"scope": "mcp"`), offered to a person who may use the assistant (Settings → Assistant links there once the MCP
+    server is on); after making one the page shows the address, the header and Claude Code's `claude mcp add`
+    command. An MCP token opens `/mcp` and nothing else: every other route refuses it as a token that doesn't exist,
+    and `/mcp` takes no other token and no browser session. A request from another origin is refused.
+  - **The tools.** `list_datasets` and `describe_dataset` (a dataset's samples and object rows, and its fields with
+    their meaning, type, counts, ranges and examples of their values, from the statistics the server keeps,
+    `complete: false` where they aren't up to date). `make_view` and `refine_view` keep each step of a conversation as
+    a working view (a handle, its person's only, kept 30 days after its last use) with its exact count and a link that
+    opens it in the app: a `?q=` link when it can be written as text, else a `?w=` link for the person.
+    `field_values` counts a field's values in a view and keeps the whole list for filtering by it (up to 10,000
+    values) and for the person's CSV download; `field_summary` gives a number's or a date's range, quantiles and
+    histogram, or a text field's commonest values; `get_samples` gives a page of samples with their links. Every
+    number is over the view's images, never its object rows, as the dataset's page shows them. `find_place` gives the
+    regions a name could mean, each with the filter text that keeps its samples; `list_concepts` and
+    `concept_preview` say exactly how many of a view's images a concept's cut keeps or removes, with the images
+    nearest the cut for a whole dataset; `search_similar` finds the images of a view most like some words or samples,
+    as a working view whose last stage can be turned around to remove them; `list_saved_views` and `open_saved_view`
+    open a saved view as a working view, its stages worded by the server and its link the view's own.
+  - **Limits.** Each server process runs at most 4 tool calls of one person at once and 16 in all
+    (`FRIDGE_ASSISTANT_CALLS_AT_ONCE`, `FRIDGE_ASSISTANT_CALLS_PER_PROCESS`; the next is answered "busy" at once), a
+    call at most 60 seconds, after which its work is cancelled, and a request of at most 256 KB. Every statement run
+    for a tool has a 45-second limit, so a slow count answers `too_slow`. One person keeps at most 2,000 views and
+    500 lists, one view at most 50 stages and 50,000 list values. Filter text is at most 20,000 characters, and an
+    error's message is cut to 2,000, so every answer stays small whatever its arguments.
+  - **What is quick and what is slow.** `describe_dataset` marks each field `indexed`, and the instructions tell the
+    model that a filter on an indexed field with `=`, `in` or a narrow range is quick at any size, while
+    `field_values` and `field_summary` read every sample of the view whatever the field, so it narrows a large view
+    first. Those two now count the view and then read its samples once (twice for a number's or a datetime's summary)
+    instead of three and eight times, and look the field up without reading the samples: on 4 million samples
+    `field_values` takes about 2 s instead of 10 to 26, a number's summary 5 to 9 s instead of 37 to 49. A summary
+    whose second read runs out of time still answers its first read's numbers, each exact, with a `note`; `too_slow`
+    says what ran out and what to do, names the fields of a filter that are not indexed, and no longer advises an index
+    where one would not help ([docs/ASSISTANT.md](docs/ASSISTANT.md#what-is-quick-and-what-is-slow)).
+  - **Administration tools** ([docs/ASSISTANT.md](docs/ASSISTANT.md#administration-tools)). `system_status`,
+    `backup_status`, `list_jobs` (background jobs across every dataset, failures first) and `index_advice` (the index
+    advisor's last review: overlapping, possibly unused, suggested and needed indexes) read for an administrator what
+    Settings → System status shows, and change nothing: each answer links to the page where the administrator acts.
+    They are listed and answer only to an administrator who may use the MCP server, while **Administration tools** is
+    on in Settings → Assistant (off as shipped; `admin_tools` on `GET`/`PATCH /api/admin/assistant`), read again at
+    every request. Their answers are built from named facts: the names of datasets and of their indexes with the
+    indexes' sizes (closed datasets too), usernames, error messages and the backup folder reach the AI client; never a token, password, storage key, email or IP address,
+    host name, hash, or a path outside the backup folder. A job's messages are kept back when a dataset it is about
+    (a follower's sync: its link's mirrors) is closed to the assistant or has a private field, or when it belongs to no
+    dataset and its kind isn't one known to be about none (a restore isn't: it reads every row its index covers); an
+    index's definition when it holds a constant (a quoted text or a number) the server doesn't write itself, unless it
+    is one of schema.sql's own holding only constants schema.sql's statement for it holds. New route
+    `GET /api/admin/jobs/all` (administrators): every job of the server by state, kind, dataset and window (the window
+    bounds the jobs that have ended; a queued or running job is listed however old), with counts by state and the
+    kinds present, never a job's result but a backup's own file, size and tables.
+  - **The call log.** Every tool call is logged (who, tool, dataset, when, how long, the outcome; never the arguments
+    or the result) for 30 days: administrators read it under Settings → Assistant, **Recent calls**, and at
+    `GET /api/admin/assistant/calls`.
+  - **New routes for the person:** `GET /api/assistant/views/{handle}` and `GET /api/assistant/lists/{handle}/csv` (a
+    value a spreadsheet would run as a formula is written with a leading apostrophe). **`w=` links** open a working
+    view in the app: `/datasets/<id>?w=<handle>` opens its filters as chips, as a `view=` link does, for the person
+    whose conversation made it; the address then shows the page's own `q=` or `f=` link, and Copy link never writes
+    `w=`. Anyone else, an expired or unknown handle, or a view of another dataset is told why, and the dataset opens
+    without those filters ([DATASET_MANAGEMENT.md](docs/DATASET_MANAGEMENT.md#links-to-a-filter-a-view-or-a-sample)).
+  - **Along the way:** asked with `?stale=true`, each field of `GET /api/datasets/{id}/schema` that the statistics
+    measure carries `stats_stale` (changes to the samples wait to be counted for it), and asked with `?values=false`
+    it reads no samples (media_type's, tags' and an indexed field's lists of values are left out). The aggregate route
+    takes `distinct_count`, orders ties by value, and reads a datetime as seconds since 1970 in its numeric
+    aggregations. It answers the operations on one field from one read of the filtered samples, in parallel workers
+    and without sorting whole sample rows to disk, a list of any length still coming back whole (the SDK's `aggregate`
+    too), and takes two more: `with_value`, the samples that have the field, and `histogram` (`bins`), the buckets
+    `POST .../histogram` gives over the values `bounds` counts (a number field's numeric text included, which the
+    histogram route leaves out).
+    `GET /api/views/{slug}` answers a private view its caller may not see as missing before anything else, as it
+    always did for a person. Migrations `0036_assistant.sql` (three small tables and `datasets.assistant_closed`,
+    false on every existing dataset), `0037_mcp_tokens_and_assistant_calls.sql` (the token kind and the empty log
+    table), `0038_assistant_working_views.sql` (two tables and `assistant_settings.sample_fields`),
+    `0040_assistant_admin_tools.sql` (`assistant_settings.admin_tools`) and `0041_jobs_across_datasets.sql` (two
+    indexes of the jobs table, for `GET /api/admin/jobs/all`).
+- **Named regions, and a filter for the samples in one** ([docs/REGIONS.md](docs/REGIONS.md)). They come with the
+  install: the job runner's Docker image carries Natural Earth's 1:10m states and provinces (version 5.1.1, public
+  domain), checked against a pinned SHA-256 when the image is built, and the job runner loads them by itself when it
+  starts on a database that has never loaded them, so they are ready a few minutes after a new server's first start.
+  A source checkout downloads the file once with `python -m backend.regions fetch`. The server never downloads by
+  itself, and never loads a set again once it is loaded. Settings → System status shows what is loaded and how, and
+  its **Load** button (`POST /api/admin/regions/load`) loads the set again: from the file that came with the release
+  when the server has it, else a background download checked against the pinned SHA-256; a server with no internet
+  and no file loads one with `python -m backend.regions load <file> --set natural-earth-admin1`. That gives 251
+  countries, 4,596 states or provinces and 313 groups of them, keyed by ISO code (`US-KS`, `US`) or by country and
+  group (`US:midwest`). `location within "US-KS"` then keeps the samples located in Kansas and
+  `location not within "US-KS"` removes them, in filter text, links, the SDK's `dataset.query()` and the API
+  (`geo_region`, `geo_region_exclude`), with islands and holes exact. The text takes a name too
+  (`location within Kansas`); one that several regions share, or a region the server doesn't have, is a mistake with
+  suggestions, never a filter that matches nothing. `GET /api/regions?search=` finds regions by name, and
+  `GET /api/regions/{key}` gives one's bounding box and an outline to draw. In the app a region filter is a chip that
+  names the region ("In Kansas, United States of America"), however it came (typed text, a link, a saved view), and a
+  click turns it into "Not in Kansas" and back. While it is applied the map outlines the region, dashed when excluded,
+  across the antimeridian too, and applying one moves the map to the samples inside as drawing a polygon does. Views
+  with region chips are written as `?q=` links. Migration `0034_regions.sql` adds the empty region tables, and
+  `0039_region_sets_bundled.sql` records a set loaded from the file that came with the release (`loaded_from`
+  `bundled`).
+- **A concept filter has a text form**, so a view that keeps or hides samples by a concept's score is a readable
+  `?q=` link and can be typed in a filter card's Query box or `dataset.query()`: `concept "equipment" > 0.62` keeps
+  the samples whose score passes (`>`, `>=`, `<` or `<=`), and `not concept "equipment" > 0.62` hides them, as the
+  Concepts panel's show only and exclude do. Without a comparison, `concept "equipment"` takes the concept's saved
+  threshold. Copy link and the address now write such views as `q=` instead of the encoded `f=`; a concept part opens
+  as the panel's chip, and old `f=` links keep opening. `concept` is a keyword only before a concept's name, so a
+  field named concept is written as before. An unknown concept name is an error that suggests the close names, so a
+  link naming a deleted concept says so ([filter query language](docs/FILTER_QUERY.md#concept-scores)). A saved
+  view's stage that is one concept test, such as one `create_view(query=...)` saves, opens as the panel's chip too.
+- **A description and a unit for each field** ([SDK](docs/SDK.md#field-descriptions),
+  [REST](docs/DATASET_MANAGEMENT.md#describe-a-field-edit)). Someone with edit in a dataset says what a field means
+  and its unit under Dataset Settings → Fields, with `dataset.set_field_description(field, description, unit)`, or
+  with `PATCH /api/datasets/{id}/fields/{field}/description`. The filter sidebar shows a field's description on its
+  name, on hover or keyboard focus, and every field of the schema and field-stats answers carries `description`,
+  `unit`, `description_source` (`"set"`, `"default"` or null) and `values_private`. The server describes by name only
+  the fields it makes itself, the ones every dataset has (`id`, `filepath`, `created_at`, `last_modified_at`, `tags`,
+  `media_type`), until someone writes their own. The SDK describes the fields it computes, when it computes them:
+  `compute_metadata()` and `compute_metrics()` give each field a run wrote a value of its description and unit
+  (brightness, blurriness, entropy and the rest, each as it is computed), as the user running them, where the field
+  has none of its own, and warn instead when the server refuses. A run that skipped a sample because it already had
+  its values describes nothing, as those values may be the user's own, and neither is a field described that a
+  sample the run didn't write it for already holds. Nobody describes a field by guessing from its name: a field of
+  your own called `brightness` has no description until you write one. `fridge.COMPUTED_FIELD_DESCRIPTIONS` holds
+  the SDK's texts, to describe a dataset computed before. A mirror takes its primary's descriptions with its field
+  settings, and a version saves them with the field types. `values_private` marks a field whose values
+  aren't given to the assistant (above). It is each server's own, never versioned or synced, and outlives the field:
+  a private field that goes and comes back is still private. Migration `0035_field_descriptions.sql` adds three
+  columns to `dataset_fields` and touches no rows. A follower still on 2.13 receives the primary's described built-in
+  fields as rows it ignores; each new one queues one pass of statistics there that finds nothing to measure.
+- **A copy can give its samples new paths, for media that moved**
+  ([Paths, and when media moves](docs/SDK.md#paths-and-when-media-moves)). A sample's path can't be changed once it
+  is added; `dataset.add_samples_from(source, path_prefixes={"/media/usb/photos": "/data/photos"})` copies the samples
+  into another dataset with the start of each path replaced, at a folder boundary (the longest start that fits wins), and
+  the same start replaced in every text value of the metadata, at any depth, so masks, heatmaps and extra media
+  fields follow. A copy that stops part-way resumes when run again: samples are matched by their new path. The copy
+  is refused before it writes anything when the rule would give two samples the same path, with an example; the
+  answer gains `rewritten`, the number of samples added with a new path. The source is a dataset, a view of one or
+  a version's view, whose samples are copied as the version holds them; anything else is refused before anything is
+  read. The docs now say how each kind of path is read (relative to `FRIDGE_DATA_ROOT`, full local inside it,
+  `s3://`), why relative paths are the better choice for local media, the three ways to handle media that moved, and
+  that a field marked private must be marked again on the copy before the assistant is used on it.
+
+### Changed
+
+- **On a dataset with objects, a filter is read on an image together with its objects, and on an object together
+  with its image** ([FILTER_QUERY.md](docs/FILTER_QUERY.md#on-a-dataset-with-objects)), in both grids and their
+  counts, the top bar's count, the sidebar, the histogram, the map, Sparse Sample, the export, Select All, bulk edits
+  by filter and the assistant. The page read a filter on one row at a time, so it asked images about the objects'
+  fields and objects about the images'. Now:
+  - a filter over a field of the images and a field of the objects finds the pairs: `colour = "red" AND label =
+    "car"` shows the red images that have a car, and on the objects' grid their cars (it found nothing). Tests joined
+    by `AND` are met with the same object;
+  - on the images' grid `label != "car"` shows the images whose objects are labelled and none is a car (it showed
+    the images with a labelled object that isn't a car);
+  - a `NOT` over several fields needs all of them, and no longer brings an image back through its objects;
+  - `is null` no longer shows every row of the other kind: on the images' grid `label is null` shows the images in
+    which no object has a `label`, and on the objects' grid `colour is null` the objects whose image has no `colour`
+    either;
+  - for a field both kinds have, a negation hides a row when either it or its partner has the value;
+  - `NOT (location within …)`, `location not within` inside an `OR`, and an exclusion sharing a filter card leave out
+    an image inside the place whatever its objects, as the exclusion standing alone does;
+  - a hiding test of a built-in field (`id not in (...)`, as the page sends for rows unticked in a selection and for
+    the duplicates panel) hides the row it names even when another row meets the rest of the filter, and a duplicate
+    hidden by the collapse no longer comes back through its objects;
+  - a `null` value no longer counts as a value for a negation: `colour != "red"` leaves out an image whose `colour`
+    is `null`.
+
+  A dataset without objects, and a filter sent without the page's wrapping (the SDK), read as before. A patch search
+  relayed to a follower ([FOLLOWERS.md](docs/FOLLOWERS.md)) is filtered by the follower's own server, which takes the
+  page's wrapped filter: a follower on an older version reads it the old way until it is upgraded.
+- **On a dataset with objects, every reader of the filter skips a kind of row for a field that kind has never had**
+  ([FILTER_QUERY.md](docs/FILTER_QUERY.md#what-the-server-skips)). The server notes which fields images and objects have
+  been seen with, in the same transaction as every write that adds one, and clears a note in a check the job runner runs
+  after the statistics are next counted, once a kind's last value is gone; the check reads samples without holding
+  writes back (they wait only for two one-row changes to the record) and finishes on a dataset of any size. The grids'
+  pages and counts, the top bar's count, the sidebar, the histogram, the aggregates, autocomplete, the map, Select all,
+  sparse sampling, the export, bulk edits by filter and the assistant then ask no row about a field its kind lacks (the
+  map's clusters for an image field on the images' grid 1.0 s to 0.1 s, its extent 0.7 s to 0.1 s; the histogram for
+  `label != "car"` there 6.7 s to 2.4 s). On a million images with four million objects, against the reading above: the
+  objects' grid's `label != "car"` first page 1.5 s to 0.3 s and count 1.3 s to 0.3 s; the images' grid's `NOT (colour =
+  "red" AND label = "car")` first page 3.2 s to 0.01 s and count 4.1 s to 1.3 s; a place on the objects' grid 0.7 s to
+  0.05 s; an image field on the images' grid 0.18 s to 0.01 s. The images' grid's count of an object field is slower
+  (0.95 s to 1.3 s; its first page 0.27 s to 0.03 s): the database now joins the objects to their images where it looked
+  each image up in a hashed list. No answer changes. Writes cost a little more: a bulk update of 10,000 samples with 5
+  KB of metadata each takes about 10% longer when it changes values only and about 23% longer when it adds or removes a
+  key; with 50 KB each, about 2.5% and 7%. The field-stats answers say for each field which kinds have it (`on_images`,
+  `on_objects`, [Dataset management](docs/DATASET_MANAGEMENT.md#which-kinds-of-sample-have-a-field)).
+
+### Fixed
+
+- **A metadata key named `id`, `dataset_id`, `filepath`, `created_at` or `last_modified_at` is refused on edits, not
+  only when samples are added.** An edit stored it, and it was registered as a field: its values went into the real
+  field's statistics (a `created_at` of `1999-…` beside the real dates), or showed as a second `dataset_id` field. The
+  seven names now have one rule on every route that writes metadata; an edit of one sample may send a stored one back
+  with the value it has.
+- **A stored key named like a sample's own field is not a field.** Keys stored before such keys were refused were still
+  registered as fields: a stored `dataset_id` showed as a field of its own, stored strings went into the statistics of
+  `created_at` and the others, the value search offered them, and a filter on `dataset_id` read them. Such a key is
+  now never registered, by any write, a revert to an older version or a mirror's sync, and a filter, a histogram, a
+  value search or a value count by the name (the assistant's `field_values` too) reads the sample's own field
+  (`dataset_id` answers as if no sample had the key). A registration an older release left is not a field even before
+  migration `0043` turns it back (Upgrade notes): the field list and the field routes by name (describe, promote,
+  rename, clone, clear) answer as on a dataset without such keys. The values stay in the samples.
+- **A metadata key named `tags` or `media_type` is refused instead of kept out of sight**, as `id`, `dataset_id`,
+  `filepath`, `created_at` and `last_modified_at` already were when samples are added. The two are refused wherever
+  metadata is written: adding samples (every `on_duplicate` mode), `PATCH`, both kinds of bulk-set, a field's new
+  name in a rename or clone, and a quality score's field; removing such a key still works. Migration `0042` removes the
+  stored ones, and a field renamed or cloned onto one of the names, so the field list shows the sample's own field
+  again (Upgrade notes). The SDK shows the server's sentence, and `fridge.sync_between_instances` leaves such keys out
+  of a copy from an older server, saying how many samples had one.
+- **A CSV from the Export dialog can't run a formula in a spreadsheet.** A cell that starts with `=`, `+`, `-`, `@`,
+  a tab or a carriage return (a metadata value such as `=HYPERLINK(...)`, put there by whoever supplied the data) was
+  written as it was, and a spreadsheet opening the file ran it as a formula. A text that would start a formula, the
+  header's too, is now written with an apostrophe in front, which a spreadsheet shows as text, as the assistant's value
+  list download does: at the start of a cell (after any leading spaces or double quotes, and for look-alike signs such
+  as `＝` too), and also after each `;`, tab or line break inside one, where a spreadsheet that reads the file with `;`
+  (Excel in much of Europe) or tabs begins a new cell. A program reading the file sees those apostrophes, and ordinary
+  text is touched too: `range 3; -5 to 5` becomes `range 3;' -5 to 5`, a list `["a", "=b"]` becomes `a;'=b`, and
+  `a;-5` becomes `a;'-5`; a text made only of numbers (`-5`, `-5;3`) gets none. Every text cell, the header's too, is
+  now in double quotes, and a number is written bare: a spreadsheet that reads the file with `;` takes a line with no
+  `;` for one cell, with the comma as its decimal mark, so a number followed by an unquoted text could read as one
+  formula ([DATASET_MANAGEMENT.md](docs/DATASET_MANAGEMENT.md#export-samples-as-csv)).
+- **"Select all" in the Export dialog also ticks a field the dialog lists after the click.** It ticked only the fields
+  listed at that moment, so a field the page's field list brought later (the list was still loading, or a bulk edit
+  added the field while the dialog was open) stayed unticked, the count didn't show it, and the file lacked its column.
+  After "Select all" every listed field is ticked, a later one when it appears, until a field is unticked or Reset is
+  pressed; from then on the ticks are the ones you set, as before. The file is otherwise as it was.
+- **A place excluded from a filter card's Builder tab is kept out on a dataset with objects**, as one excluded from
+  the Query tab is. The Builder tab saves `location not within "US-KS"` as the one rule of a group: the same filter
+  and the same "Not in Kansas" chip, which the page and the assistant now link to the objects as they link the bare
+  one, so the images inside the place no longer come back through objects that have no location.
+- **Text that reads as a number but is too large for one is text.** A value such as the hex id `0347677e05719710`
+  matched the aggregate route's number pattern and overflowed when cast, so `count_values` (which orders ties by
+  number) and every number operation failed with a 500 on a field holding one. It is now counted and listed as the
+  text it is, and the number operations pass over it, as the histogram route already did.
+- **A page of samples that runs out of time answers as its count does.** `POST /api/datasets/{id}/samples/query`
+  answered a statement that ran out of time while it fetched the page's rows with a 500 ("Internal query error"),
+  where the same timeout in its count was answered as a timeout (504 under a request's own time limit, a guest's or the
+  assistant's). The page now answers as the count does, and the assistant's tools say `too_slow` instead of failing.
+- **A panel layout a person arranged is kept.** A dataset page opened on the layout from the last visit and, under a
+  second later, wrote over it with the default panels, so an arrangement lasted one visit. The layout is now saved
+  only when a person changes it (a split, a close, a panel's type, a divider). A stored layout the page can't read
+  opens the default layout, where every wrong shape but text that isn't JSON crashed the page into "Something went
+  wrong".
+- **A revoked API token is no longer listed.** On Settings → API Tokens a token's card stayed, with its Revoke
+  button, after Revoke succeeded, and tokens revoked elsewhere (an administrator's revoke, a password change or reset
+  with "also revoke") stayed listed. The page now lists the tokens that still work and removes a card at once; a
+  Revoke that fails says so on the card. `GET /api/tokens` is unchanged and still answers revoked tokens, marked
+  inactive.
+- **A tab whose session ended reaches the sign-in page.** After an administrator deactivated an account, that
+  person's open tab showed "Loading..." for good on a reload, or an empty page; a tab left open after signing out in
+  another one showed "No datasets yet". The app now reads the server's "Account is inactive" as the end of the
+  session, and asks who is signed in at each navigation inside the app, so the tab goes to sign in; signing in again
+  lands on the page the person was on. A request that merely fails (the network, a server error, a page the person
+  may not see) sends no one to sign in.
+- **A link whose request fails is kept, not lost.** Opening a `q=`, `view=` or `w=` link, a request the browser
+  dropped is asked again (up to three times), and one that still fails (the network, a server error) no longer opens
+  the dataset without the link and rewrites the address: the page says so, with **Try again** and **Open the dataset
+  without it**, and the link stays in the address, so a reload opens it again. A link that is refused (a view that
+  doesn't exist, text the dataset can't take) is told as before.
+- **"Zoom to Data" fits data either side of longitude 180.** For samples in Fiji, or in Chukotka and Alaska, Zoom to
+  Data, the fit to selected samples and the fit after a region or a drawn polygon is applied all zoomed out to the
+  whole world. `POST /api/datasets/{id}/map_extent` now answers a box across the antimeridian, with `w` greater than
+  `e` as GeoJSON writes it (west 177.4, east -178.2), when the samples fit in half the globe that way, and the map
+  fits it. Data anywhere else, and data spread round the globe or over continents that don't fit in half of it across
+  180 (the United States, Europe and Australia; the United States and China), gets the box and the view it always
+  got. A program that reads this route should expect `w` greater than `e`
+  ([MAP_REQUIREMENTS.md](docs/MAP_REQUIREMENTS.md)).
+- **A polygon drawn on the map across longitude 180 holds the samples on both sides**, and one drawn on a repeated
+  copy of the world the samples under it: they held only those west of the line, or none. A `geo_polygon` whose
+  longitudes all lie from -180 to 180 selects what it did; one wider than 60 turns of the globe is refused (400). A
+  value that is not a list of `[longitude, latitude]` points (text, a GeoJSON object, an entry that is no point, a
+  coordinate that is no finite number) is refused with a 400 that says what the filter takes: it ended in a server
+  error, and an object silently kept every sample. A ring of fewer than three points, such as three equal points, is
+  no polygon and keeps every sample, as `null` and a list of fewer than three points do, instead of a server error. A
+  coordinate may be text that reads as a number. A mirror on an older version reads a relayed polygon the old way
+  until it is upgraded.
+- **A number too large for a double in filter text is an error, not a 500.** `score > 1e999` (and the same in `in`,
+  `between` or a concept's threshold) parsed to infinity, which the parse route then failed to send. It is now
+  `'1e999' is out of range for a number`, with its line and column. A concept filter sent as JSON with a threshold
+  that isn't a number a double can hold (a 400-digit integer, text, a list) was a 500 too, and is now a 400; so is
+  one of infinity or NaN, which JSON readers accept and which kept every sample or none.
+- **A filter naming a concept that isn't the dataset's is refused, not silently all or nothing.** A concept filter
+  whose concept was deleted, never existed, or belongs to another dataset kept every sample (exclude) or none (show
+  only), with nothing said; value suggestions (autocomplete) dropped it, and a bulk edit was accepted and failed
+  later. Every reader of filters now answers 400, `Concept 12 doesn't exist; it may have been deleted` (`... doesn't
+  exist in this dataset; ...` for another dataset's), and a bulk tag, set or delete naming one is refused when it is
+  submitted, with nothing queued; another dataset's concept is refused this way even while it is being rescored. This
+  adds the `require_dataset_concepts` database function and changes `require_concept_scores`, which
+  `scripts/apply_migrations.sh` applies in the standard upgrade steps. An `f=` link, a saved view or the default view
+  holding such a stage opens without it and says so (the default view once in each browser, until its filters
+  change), and a saved view that lost one offers **Update this view**. Filters the browser kept from an earlier visit
+  still hold such a stage, and the grid then shows the server's message until its chip is removed.
+- **`id contains` is a filter, not a server error.** `{"field": "id", "operator": "contains", "value": "12"}` failed
+  with a 500 wherever a filter is read (samples, counts, the map, selections), a bulk edit using it was accepted and
+  failed later as a job, and the filter text refused the `id contains "12"` its own formatter writes. It now keeps
+  the samples whose id, written in decimal, contains the text; text that isn't digits matches nothing.
+- **The assistant's `describe_dataset` reads the samples once.** One call counted or scanned the dataset's samples
+  seven times; it now sends one statement that counts, and takes the values of `tags` and `media_type` from the kept
+  field statistics. Its answer is the same; while changes wait to be counted those two lists are the kept ones,
+  marked `complete: false`.
+- **The filter docs say what `not` keeps on a dataset with objects.** [FILTER_QUERY.md](docs/FILTER_QUERY.md) said a
+  negated concept keeps the samples the concept has no score for. That holds on a dataset without objects; on one
+  with objects a negation of one field or score keeps only the rows that have it, and the docs now say so, with the
+  cases that aren't guarded (a `NOT` around several fields or around a place, a place exclusion inside an `OR` or
+  sharing a filter card with another test). The server is unchanged.
+- **A search by words that can't load the text model says so (501), not 500.** On a server with no internet for
+  the model's first download, the app's search by words, a text concept, and the assistant's `search_similar` answer
+  that the text model could not be loaded and that a search by samples still works; the details go to the log. A
+  failed load is remembered for a minute in each process, so searches in that minute don't each try it again.
+- **Bad filter values answer 400, not 500, on three sample reads.** The grid's page asked for without its count, a
+  page of chosen fields (`samples/query` with `fields`) and the GET sample list caught every query error as a 500
+  "Internal query error". A data error (any class-22 error: a value that can't be cast, a number out of range, a
+  concept that isn't the dataset's) now answers 400 "Invalid input: …", as the other reads do.
+- **Changing a sample's path says it can't, instead of being ignored.** `sample.filepath = ...; sample.save()`
+  returned normally, wrote the sample's other changes and kept the old path; it now raises a `ValueError` ("filepath
+  can't be changed", with what to do instead) and sends nothing. A `PATCH` of a sample whose body carries a
+  different `filepath` answered 200 and is now refused (422) with nothing written; the sample's own path sent back is
+  still accepted. The docs that called an object's path its image's, or every local path absolute, are corrected.
+- **`add_samples_from` keeps objects with their images.** It copied each object's `metadata.parent_id` as it was:
+  the id of its image in the source. On the same server every copied object was left without an image (listed as
+  unlinked, and removed by default by "delete objects with no image" once the source was deleted); copied to
+  another server, an object could be linked to an unrelated image of the target, and deleted with it. The copy now
+  writes the images first and gives each object the target's id of the image at its image's path (after
+  `path_prefixes`), or null when the target has no image there; the answer's `objects_without_image` counts every
+  object it added without an image, whenever the copied view holds objects. Samples that aren't objects keep their `parent_id`. Objects copied by an
+  earlier version are skipped by a new copy as already there: delete them in the copy
+  (`copy.filter(media_type="object").delete_samples()`) and copy again
+  ([details](docs/SDK.md#paths-and-when-media-moves)).
+- **A sample's heading without a location is read back, and copied.** An upload or an edit can set a heading on a
+  sample with no location, but `POST /api/datasets/{id}/samples/query`, which the SDK reads samples with, carried
+  the heading only inside `location`, so it never came back and `add_samples_from` dropped it. Such a sample's row
+  now has `heading` beside its null `location` (`sample.heading` in the SDK); a sample with a location carries it
+  inside `location` as before.
+
 ## 2.13.2 (2026-11-18)
 
 2.13.2 updates the production nginx to 1.31.9 for the nginx advisories of 18 November 2026. No migrations: the

@@ -372,24 +372,37 @@ test('members aren\'t offered; with hundreds of people every one is offered with
     }
 });
 
+/**
+ * A dataset whose deletion stopped before it finished: it stays sealed (`deleting`) until the deletion is resumed. The
+ * deletion is cancelled as soon as it is admitted, which on a busy server can come after a small dataset is already
+ * gone; then a larger one is made and stopped the same way. Only this setup is repeated, never what a test checks.
+ */
+async function stoppedDeletion(name: string, prepare: (id: number) => Promise<unknown>): Promise<number> {
+    for (const size of [3_000, 30_000, 120_000]) {
+        const { id } = await apiFetch(cookie, '/datasets', { method: 'POST', body: JSON.stringify({ name }) });
+        for (let from = 0; from < size; from += 10_000) {
+            const samples = Array.from({ length: Math.min(10_000, size - from) }, (_, i) => ({ filepath: `s3://e2e-sealed/img_${from + i}.jpg` }));
+            await apiFetch(cookie, `/datasets/${id}/samples`, { method: 'POST', body: JSON.stringify({ samples }) });
+        }
+        await prepare(id);
+        const { job_id: jobId } = await apiFetch(cookie, `/datasets/${id}`, { method: 'DELETE' });
+        await apiFetch(cookie, `/jobs/${jobId}/cancel`, { method: 'POST' }).catch(() => undefined);  // refused once it has ended
+        await expect.poll(async () => (await apiFetch(cookie, `/jobs/${jobId}`)).state, { timeout: 60_000 }).toMatch(/^(cancelled|failed|succeeded)$/);
+        if ((await apiFetch(cookie, `/jobs/${jobId}`)).state !== 'succeeded') {
+            datasetIds.push(id);  // afterAll resumes the deletion and waits for it
+            return id;
+        }
+    }
+    throw new Error(`Every deletion of ${name} finished before it could be stopped`);
+}
+
 test('a dataset being deleted stays listed for its group, marked in words; the API says it is deleting', async ({ page }) => {
     test.setTimeout(180_000);
     const group = await newGroup('sealed');
     const kept = await createSmallDataset(cookie, `gp-${S}-kept`);
     datasetIds.push(kept);
-    // Big enough that its deletion can't finish before it is stopped.
-    const { id: sealed } = await apiFetch(cookie, '/datasets', { method: 'POST', body: JSON.stringify({ name: `gp-${S}-sealed` }) });
-    datasetIds.push(sealed);
-    await apiFetch(cookie, `/datasets/${sealed}/samples`, {
-        method: 'POST',
-        body: JSON.stringify({ samples: Array.from({ length: 3000 }, (_, i) => ({ filepath: `s3://e2e-sealed/img_${i}.jpg` })) }),
-    });
     await share(cookie, kept, { group: group.name }, 'edit');
-    await share(cookie, sealed, { group: group.name }, 'view');
-    // A deletion that stopped: the dataset stays sealed (deleting) until it is resumed.
-    const { job_id: jobId } = await apiFetch(cookie, `/datasets/${sealed}`, { method: 'DELETE' });
-    await apiFetch(cookie, `/jobs/${jobId}/cancel`, { method: 'POST' });
-    await expect.poll(async () => (await apiFetch(cookie, `/jobs/${jobId}`)).state, { timeout: 30_000 }).toMatch(/^(cancelled|failed)$/);
+    const sealed = await stoppedDeletion(`gp-${S}-sealed`, id => share(cookie, id, { group: group.name }, 'view'));
     const listed = (await apiFetch(cookie, '/datasets')) as Array<{ id: number; deleting: boolean }>;
     expect(listed.find(dataset => dataset.id === sealed)?.deleting, 'the deletion stopped before it finished').toBe(true);
 

@@ -10,13 +10,23 @@ on this contract without introducing comprehensive audit logging.
 
 `dataset_fields` owns the declared type, origin, display override, promotion state,
 and overlay configuration. Declared types are `unknown`, `boolean`, `number`,
-`string`, `datetime`, `list`, and `object`.
+`string`, `datetime`, `list`, and `object`. It also holds what a field means: its
+description and unit, written by people and versioned with the definition, and
+`values_private`, which belongs to the instance like the promotion state (0035).
 
 - `metadata` means a JSON metadata key. A JSON list is always `list`, never a column.
 - `native_array` means a registered physical `TEXT[]` column belonging to this dataset.
   Only the native-array creation endpoint creates this origin.
 - `system` means a built-in or derived field. These definitions are not versioned.
-  Built-in tags and derived annotation labels may instead be computed views.
+  Built-in tags and derived annotation labels may instead be computed views. A built-in
+  field (`id`, `tags`, ...) gets a `system` row when someone describes it; the row holds
+  only its description, unit and `values_private`, and queues no statistics. A field
+  marked private keeps its flag when its definition goes (clear, bulk clear, its last
+  sample deleted, a revert without it, a mirror's own field emptied, the primary dropping
+  it): the row is emptied to `system` instead of deleted (`forget_definitions`). Such a
+  row is a placeholder: a definition of the name coming back (registration, a rename or
+  clone onto the name, a version restore, a mirror's sync) takes it over, keeping its
+  description, unit and flag, so the field is private again.
 
 The global `sample_array_columns` catalog describes physical storage, not dataset
 membership. Query builders receive dataset-scoped native-array names explicitly;

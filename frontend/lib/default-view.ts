@@ -13,6 +13,9 @@ export interface DefaultView {
     user_id?: number | null;
     from_primary?: boolean;
     updated_at?: string | null;  // when its filters were last replaced: the app takes the new ones
+    // Set by the app when it left stages out of content.viewStages (a deleted concept's): the stages as the view holds
+    // them, which are its source (defaultViewSaved), so the applied ones differ from it and it may be updated.
+    savedStages?: ViewStage[];
 }
 
 /** The default view's filters as view stages, each marked with the view's id so the filter bar labels it. */
@@ -25,6 +28,11 @@ export function defaultViewStages(view: DefaultView | null | undefined): ViewSta
     const filter = view.content?.filters;
     if (filter?.filters?.length || filter?.field) return [mark({ type: 'filter', description: view.name, filter })];
     return [];
+}
+
+/** The default view's stages as it holds them, marked as defaultViewStages marks them: the source of what it applies. */
+export function defaultViewSaved(view: DefaultView | null | undefined): ViewStage[] {
+    return view?.savedStages ? defaultViewStages({ ...view, content: { ...view.content, viewStages: view.savedStages } }) : defaultViewStages(view);
 }
 
 /** Whether `stage` came from the dataset's current default view (not from an earlier default view). */

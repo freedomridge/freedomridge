@@ -66,6 +66,8 @@ backend.log
 # Data directories
 /data/
 /media/
+# Region boundary files (python -m backend.regions fetch; docs/REGIONS.md)
+/backend/boundaries/
 
 # Temporary files
 *.log

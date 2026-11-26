@@ -32,6 +32,9 @@ def test_metadata_keys_naming_sample_columns_are_refused(key):
 
 
 def test_imported_metadata_keys_stay_allowed():
-    # Importers may carry heading and tags in metadata alongside the sample columns.
-    s = SampleCreate(filepath="x.jpg", metadata={"heading": 12.5, "tags": "x", "media_type": "image"})
-    assert s.metadata["heading"] == 12.5
+    # Importers may carry a compass heading in metadata alongside the sample columns, and keys that only contain a
+    # sample column's name are ordinary keys. `tags` and `media_type` are refused now
+    # (test_protected_metadata_keys_spec.py).
+    metadata = {"heading": 12.5, "source_tags": "a", "tags_v2": "b", "media_type_guess": "c"}
+    s = SampleCreate(filepath="x.jpg", metadata=metadata)
+    assert s.metadata == metadata

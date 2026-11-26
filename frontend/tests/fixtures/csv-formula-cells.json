@@ -1,0 +1,775 @@
+{
+  "about": "A CSV cell the app writes never runs as a formula in a spreadsheet: each value and the cell written for it (the whole cell, quotes included), and whole rows of the Export dialog. Read by frontend/tests/csv-cells-spec.test.cjs (escapeCsvField), frontend/e2e/export-csv-formula-cells.spec.ts (the Export dialog) and backend/tests/test_csv_formula_cells_spec.py (the value list download, text values). \"where\": \"both\" places; \"export\", the Export dialog only (lists, objects and null, which a value list never holds, and numbers, which the value list test checks in a number field of its own); \"header\", the Export dialog's header row.",
+  "cases": [
+    {
+      "case": "=1+1",
+      "value": "=1+1",
+      "cell": "\"'=1+1\"",
+      "contract": "3",
+      "where": "both"
+    },
+    {
+      "case": "=HYPERLINK(\"http://x\",\"y\")",
+      "value": "=HYPERLINK(\"http://x\",\"y\")",
+      "cell": "\"'=HYPERLINK(\"\"http://x\"\",\"\"y\"\")\"",
+      "contract": "3",
+      "where": "both"
+    },
+    {
+      "case": "+cmd",
+      "value": "+cmd",
+      "cell": "\"'+cmd\"",
+      "contract": "3",
+      "where": "both"
+    },
+    {
+      "case": "-cmd",
+      "value": "-cmd",
+      "cell": "\"'-cmd\"",
+      "contract": "3",
+      "where": "both"
+    },
+    {
+      "case": "@SUM(A1)",
+      "value": "@SUM(A1)",
+      "cell": "\"'@SUM(A1)\"",
+      "contract": "3",
+      "where": "both"
+    },
+    {
+      "case": "a tab then =1",
+      "value": "\t=1",
+      "cell": "\"'\t'=1\"",
+      "contract": "3",
+      "where": "both"
+    },
+    {
+      "case": "the number -5",
+      "value": -5,
+      "cell": "-5",
+      "contract": "3",
+      "where": "export",
+      "note": "bare; the value list test has the number -5 in a number field"
+    },
+    {
+      "case": "the text -5",
+      "value": "-5",
+      "cell": "\"-5\"",
+      "contract": "3",
+      "where": "both"
+    },
+    {
+      "case": "the text +3.2",
+      "value": "+3.2",
+      "cell": "\"+3.2\"",
+      "contract": "3",
+      "where": "both"
+    },
+    {
+      "case": "the text -5 apples",
+      "value": "-5 apples",
+      "cell": "\"'-5 apples\"",
+      "contract": "3",
+      "where": "both"
+    },
+    {
+      "case": "the text --5",
+      "value": "--5",
+      "cell": "\"'--5\"",
+      "contract": "3",
+      "where": "both"
+    },
+    {
+      "case": "a,b",
+      "value": "a,b",
+      "cell": "\"a,b\"",
+      "contract": "3",
+      "where": "both"
+    },
+    {
+      "case": "say \"hi\"",
+      "value": "say \"hi\"",
+      "cell": "\"say \"\"hi\"\"\"",
+      "contract": "3",
+      "where": "both"
+    },
+    {
+      "case": "a text with a line break",
+      "value": "line one\nline two",
+      "cell": "\"line one\nline two\"",
+      "contract": "3",
+      "where": "both"
+    },
+    {
+      "case": "plain",
+      "value": "plain",
+      "cell": "\"plain\"",
+      "contract": "3",
+      "where": "both"
+    },
+    {
+      "case": "null",
+      "value": null,
+      "cell": "",
+      "contract": "3",
+      "where": "export"
+    },
+    {
+      "case": "the list [\"=a\", \"b\"]",
+      "value": [
+        "=a",
+        "b"
+      ],
+      "cell": "\"'=a;b\"",
+      "contract": "3",
+      "where": "export"
+    },
+    {
+      "case": "the list [\"a\", \"=b\"]",
+      "value": [
+        "a",
+        "=b"
+      ],
+      "cell": "\"a;'=b\"",
+      "contract": "3",
+      "where": "export"
+    },
+    {
+      "case": "a field named =x (header)",
+      "value": "=x",
+      "cell": "\"'=x\"",
+      "contract": "3",
+      "where": "header",
+      "note": "the Export dialog writes field names with the same function"
+    },
+    {
+      "case": "a field named width (header)",
+      "value": "width",
+      "cell": "\"width\"",
+      "contract": "3",
+      "where": "header",
+      "note": "the Export dialog writes field names with the same function"
+    },
+    {
+      "case": "a space then =1+1",
+      "value": " =1+1",
+      "cell": "\"' =1+1\"",
+      "contract": "3",
+      "where": "both"
+    },
+    {
+      "case": "a line break then =1+1",
+      "value": "\n=1+1",
+      "cell": "\"\n'=1+1\"",
+      "contract": "3",
+      "where": "both"
+    },
+    {
+      "case": "full-width =1+1",
+      "value": "＝1+1",
+      "cell": "\"'＝1+1\"",
+      "contract": "3",
+      "where": "both"
+    },
+    {
+      "case": "- 5",
+      "value": "- 5",
+      "cell": "\"'- 5\"",
+      "contract": "3",
+      "where": "both"
+    },
+    {
+      "case": "the text -inf",
+      "value": "-inf",
+      "cell": "\"'-inf\"",
+      "contract": "3",
+      "where": "both"
+    },
+    {
+      "case": "the list [-5, 3]",
+      "value": [
+        -5,
+        3
+      ],
+      "cell": "\"-5;3\"",
+      "contract": "3",
+      "where": "export"
+    },
+    {
+      "case": "the list [-5]",
+      "value": [
+        -5
+      ],
+      "cell": "\"-5\"",
+      "contract": "3",
+      "where": "export"
+    },
+    {
+      "case": "the text a;=1+1",
+      "value": "a;=1+1",
+      "cell": "\"a;'=1+1\"",
+      "contract": "3",
+      "where": "both"
+    },
+    {
+      "case": "the text x;@SUM(A1:A9)",
+      "value": "x;@SUM(A1:A9)",
+      "cell": "\"x;'@SUM(A1:A9)\"",
+      "contract": "3",
+      "where": "both"
+    },
+    {
+      "case": "a, a tab, =1+1",
+      "value": "a\t=1+1",
+      "cell": "\"a\t'=1+1\"",
+      "contract": "3",
+      "where": "both"
+    },
+    {
+      "case": "one, a line break, =1+1",
+      "value": "one\n=1+1",
+      "cell": "\"one\n'=1+1\"",
+      "contract": "3",
+      "where": "both"
+    },
+    {
+      "case": "a;b",
+      "value": "a;b",
+      "cell": "\"a;b\"",
+      "contract": "3",
+      "where": "both"
+    },
+    {
+      "case": "a;-5;+3.2",
+      "value": "a;-5;+3.2",
+      "cell": "\"a;'-5;'+3.2\"",
+      "contract": "3",
+      "where": "both"
+    },
+    {
+      "case": "-5;3;+3.2",
+      "value": "-5;3;+3.2",
+      "cell": "\"-5;3;+3.2\"",
+      "contract": "3",
+      "where": "both"
+    },
+    {
+      "case": "a no-break space then =1",
+      "value": "\u00a0=1",
+      "cell": "\"'\u00a0=1\"",
+      "contract": "3",
+      "where": "both"
+    },
+    {
+      "case": "the minus sign U+2212 then 1+1",
+      "value": "−1+1",
+      "cell": "\"'−1+1\"",
+      "contract": "3",
+      "where": "both"
+    },
+    {
+      "case": "the text a;\"=1+1",
+      "value": "a;\"=1+1",
+      "cell": "\"a;'\"\"=1+1\"",
+      "contract": "3",
+      "where": "both"
+    },
+    {
+      "case": "the text range 3; -5 to 5",
+      "value": "range 3; -5 to 5",
+      "cell": "\"range 3;' -5 to 5\"",
+      "contract": "3",
+      "where": "both"
+    },
+    {
+      "case": "the list [\"@ann\", \"@bob\"]",
+      "value": [
+        "@ann",
+        "@bob"
+      ],
+      "cell": "\"'@ann;'@bob\"",
+      "contract": "3",
+      "where": "export"
+    },
+    {
+      "case": "-5, a line break, *HYPERLINK(A1)",
+      "value": "-5\n*HYPERLINK(A1)",
+      "cell": "\"'-5\n*HYPERLINK(A1)\"",
+      "contract": "3",
+      "where": "both"
+    },
+    {
+      "case": "-2, a tab, *cmd",
+      "value": "-2\t*cmd",
+      "cell": "\"'-2\t*cmd\"",
+      "contract": "3",
+      "where": "both"
+    },
+    {
+      "case": "+3.2, a line break, /1+X(A1)",
+      "value": "+3.2\n/1+X(A1)",
+      "cell": "\"'+3.2\n/1+X(A1)\"",
+      "contract": "3",
+      "where": "both"
+    },
+    {
+      "case": "full-width +cmd",
+      "value": "＋cmd",
+      "cell": "\"'＋cmd\"",
+      "contract": "1.1",
+      "where": "both"
+    },
+    {
+      "case": "full-width -cmd",
+      "value": "－cmd",
+      "cell": "\"'－cmd\"",
+      "contract": "1.1",
+      "where": "both"
+    },
+    {
+      "case": "full-width @SUM(A1)",
+      "value": "＠SUM(A1)",
+      "cell": "\"'＠SUM(A1)\"",
+      "contract": "1.1",
+      "where": "both"
+    },
+    {
+      "case": "small plus U+FE62 then cmd",
+      "value": "﹢cmd",
+      "cell": "\"'﹢cmd\"",
+      "contract": "1.1",
+      "where": "both"
+    },
+    {
+      "case": "small hyphen U+FE63 then cmd",
+      "value": "﹣cmd",
+      "cell": "\"'﹣cmd\"",
+      "contract": "1.1",
+      "where": "both"
+    },
+    {
+      "case": "small equals U+FE66 then 1+1",
+      "value": "﹦1+1",
+      "cell": "\"'﹦1+1\"",
+      "contract": "1.1",
+      "where": "both"
+    },
+    {
+      "case": "full-width -5",
+      "value": "－5",
+      "cell": "\"'－5\"",
+      "contract": "1.1 steps",
+      "where": "both",
+      "note": "only an ASCII sign makes a number"
+    },
+    {
+      "case": "the minus sign U+2212 then 5",
+      "value": "−5",
+      "cell": "\"'−5\"",
+      "contract": "1.1 steps",
+      "where": "both",
+      "note": "only an ASCII sign makes a number"
+    },
+    {
+      "case": "a vertical tab then =1",
+      "value": "\u000b=1",
+      "cell": "\"'\u000b=1\"",
+      "contract": "1.1",
+      "where": "both"
+    },
+    {
+      "case": "a form feed then =1",
+      "value": "\f=1",
+      "cell": "\"'\f=1\"",
+      "contract": "1.1",
+      "where": "both"
+    },
+    {
+      "case": "a carriage return then =1",
+      "value": "\r=1",
+      "cell": "\"'\r'=1\"",
+      "contract": "1.1",
+      "where": "both",
+      "note": "the carriage return start, and the piece =1"
+    },
+    {
+      "case": "an ideographic space U+3000 then =1",
+      "value": "\u3000=1",
+      "cell": "\"'\u3000=1\"",
+      "contract": "1.1",
+      "where": "both"
+    },
+    {
+      "case": "a zero-width space U+200B then =1",
+      "value": "\u200b=1",
+      "cell": "\"'\u200b=1\"",
+      "contract": "1.1",
+      "where": "both"
+    },
+    {
+      "case": "a byte-order mark U+FEFF then =1",
+      "value": "\ufeff=1",
+      "cell": "\"'\ufeff=1\"",
+      "contract": "1.1",
+      "where": "both"
+    },
+    {
+      "case": "a tab then plain",
+      "value": "\tplain",
+      "cell": "\"'\tplain\"",
+      "contract": "1.1",
+      "where": "both",
+      "note": "a tab start gets the apostrophe whatever follows"
+    },
+    {
+      "case": "a carriage return then plain",
+      "value": "\rplain",
+      "cell": "\"'\rplain\"",
+      "contract": "1.1",
+      "where": "both",
+      "note": "a carriage return start likewise"
+    },
+    {
+      "case": "a space then plain",
+      "value": " plain",
+      "cell": "\" plain\"",
+      "contract": "1.1",
+      "where": "both",
+      "note": "white space alone starts no formula"
+    },
+    {
+      "case": "a line break then plain",
+      "value": "\nplain",
+      "cell": "\"\nplain\"",
+      "contract": "1.1",
+      "where": "both",
+      "note": "only a tab or a carriage return start does"
+    },
+    {
+      "case": "a formula in the first piece: =1;a",
+      "value": "=1;a",
+      "cell": "\"'=1;a\"",
+      "contract": "1.1",
+      "where": "both"
+    },
+    {
+      "case": "a formula in a middle piece: a;=1;b",
+      "value": "a;=1;b",
+      "cell": "\"a;'=1;b\"",
+      "contract": "1.1",
+      "where": "both"
+    },
+    {
+      "case": "a formula in the last piece: a;b;=1",
+      "value": "a;b;=1",
+      "cell": "\"a;b;'=1\"",
+      "contract": "1.1",
+      "where": "both"
+    },
+    {
+      "case": "a ; then a formula: ;=1",
+      "value": ";=1",
+      "cell": "\";'=1\"",
+      "contract": "1.1",
+      "where": "both"
+    },
+    {
+      "case": "one, a carriage return, =1",
+      "value": "one\r=1",
+      "cell": "\"one\r'=1\"",
+      "contract": "1.1",
+      "where": "both"
+    },
+    {
+      "case": "a comma, U+0085, =1",
+      "value": "x,\u0085=1",
+      "cell": "\"x,\u0085'=1\"",
+      "contract": "1.1",
+      "where": "both"
+    },
+    {
+      "case": "a comma, U+2028, =1",
+      "value": "x,\u2028=1",
+      "cell": "\"x,\u2028'=1\"",
+      "contract": "1.1",
+      "where": "both"
+    },
+    {
+      "case": "a comma, U+2029, =1",
+      "value": "x,\u2029=1",
+      "cell": "\"x,\u2029'=1\"",
+      "contract": "1.1",
+      "where": "both"
+    },
+    {
+      "case": "a ;, a no-break space, =1",
+      "value": "a;\u00a0=1",
+      "cell": "\"a;'\u00a0=1\"",
+      "contract": "1.1",
+      "where": "both"
+    },
+    {
+      "case": "a ;, an ideographic space, @x",
+      "value": "a;\u3000@x",
+      "cell": "\"a;'\u3000@x\"",
+      "contract": "1.1",
+      "where": "both"
+    },
+    {
+      "case": "one, CR, LF, =1",
+      "value": "one\r\n=1",
+      "cell": "\"one\r\n'=1\"",
+      "contract": "1.1 steps",
+      "where": "both",
+      "note": "one apostrophe, before =1"
+    },
+    {
+      "case": "a;, a line break, =1",
+      "value": "a;\n=1",
+      "cell": "\"a;\n'=1\"",
+      "contract": "1.1 steps",
+      "where": "both",
+      "note": "one apostrophe, before =1"
+    },
+    {
+      "case": "U+2028 at the very start, then =1,x",
+      "value": "\u2028=1,x",
+      "cell": "\"\u2028'=1,x\"",
+      "contract": "1.1 steps",
+      "where": "both",
+      "note": "none at the start"
+    },
+    {
+      "case": "-5;-cmd",
+      "value": "-5;-cmd",
+      "cell": "\"'-5;'-cmd\"",
+      "contract": "1.1",
+      "where": "both",
+      "note": "not every piece is a number"
+    },
+    {
+      "case": "a;-5",
+      "value": "a;-5",
+      "cell": "\"a;'-5\"",
+      "contract": "1.1 steps",
+      "where": "both",
+      "note": "not every piece is a number"
+    },
+    {
+      "case": "a tab then -5",
+      "value": "\t-5",
+      "cell": "\"'\t-5\"",
+      "contract": "1.1",
+      "where": "both",
+      "note": "every piece empty or a number; the tab start"
+    },
+    {
+      "case": "a, a tab, -5",
+      "value": "a\t-5",
+      "cell": "\"a\t'-5\"",
+      "contract": "1.1",
+      "where": "both",
+      "note": "not every piece is a number"
+    },
+    {
+      "case": "one, a line break, +3.2",
+      "value": "one\n+3.2",
+      "cell": "\"one\n'+3.2\"",
+      "contract": "1.1",
+      "where": "both",
+      "note": "not every piece is a number"
+    },
+    {
+      "case": "a;-5 apples",
+      "value": "a;-5 apples",
+      "cell": "\"a;'-5 apples\"",
+      "contract": "1.1",
+      "where": "both"
+    },
+    {
+      "case": "a line break then -5",
+      "value": "\n-5",
+      "cell": "\"\n-5\"",
+      "contract": "1.1 steps",
+      "where": "both",
+      "note": "its pieces are empty and a number"
+    },
+    {
+      "case": "the list [-5, \"x\"]",
+      "value": [
+        -5,
+        "x"
+      ],
+      "cell": "\"'-5;x\"",
+      "contract": "1.1, 1.3",
+      "where": "export",
+      "note": "not every piece is a number"
+    },
+    {
+      "case": "the text \"=1+1",
+      "value": "\"=1+1",
+      "cell": "\"'\"\"=1+1\"",
+      "contract": "1.1",
+      "where": "both"
+    },
+    {
+      "case": "the text \"\"=1",
+      "value": "\"\"=1",
+      "cell": "\"'\"\"\"\"=1\"",
+      "contract": "1.1",
+      "where": "both"
+    },
+    {
+      "case": "the text a; \"@x",
+      "value": "a; \"@x",
+      "cell": "\"a;' \"\"@x\"",
+      "contract": "1.1",
+      "where": "both",
+      "note": "a space and a quote, both skipped"
+    },
+    {
+      "case": "the text x \"=1\"",
+      "value": "x \"=1\"",
+      "cell": "\"x \"\"=1\"\"\"",
+      "contract": "1.1",
+      "where": "both",
+      "note": "a quote inside a piece is not at its start"
+    },
+    {
+      "case": "the text \"-5",
+      "value": "\"-5",
+      "cell": "\"'\"\"-5\"",
+      "contract": "1.1 steps",
+      "where": "both",
+      "note": "with its quote it is not a number"
+    },
+    {
+      "case": "a space then -5",
+      "value": " -5",
+      "cell": "\"' -5\"",
+      "contract": "1.1, 1.2",
+      "where": "both",
+      "note": "a number has no space"
+    },
+    {
+      "case": "-5 then a space",
+      "value": "-5 ",
+      "cell": "\"'-5 \"",
+      "contract": "1.2",
+      "where": "both",
+      "note": "a number has no space"
+    },
+    {
+      "case": "the text .5",
+      "value": ".5",
+      "cell": "\".5\"",
+      "contract": "1.2",
+      "where": "both"
+    },
+    {
+      "case": "the text -.5",
+      "value": "-.5",
+      "cell": "\"-.5\"",
+      "contract": "1.2",
+      "where": "both",
+      "note": "read as an optional sign followed by .5, which 1.2 names a number"
+    },
+    {
+      "case": "the text -1e-3",
+      "value": "-1e-3",
+      "cell": "\"-1e-3\"",
+      "contract": "1.2",
+      "where": "both"
+    },
+    {
+      "case": "the text +1e5",
+      "value": "+1e5",
+      "cell": "\"+1e5\"",
+      "contract": "1.2",
+      "where": "both"
+    },
+    {
+      "case": "the text -nan",
+      "value": "-nan",
+      "cell": "\"'-nan\"",
+      "contract": "1.2",
+      "where": "both"
+    },
+    {
+      "case": "the text -1_000",
+      "value": "-1_000",
+      "cell": "\"'-1_000\"",
+      "contract": "1.2",
+      "where": "both"
+    },
+    {
+      "case": "the text -5%",
+      "value": "-5%",
+      "cell": "\"'-5%\"",
+      "contract": "1.2",
+      "where": "both"
+    },
+    {
+      "case": "the text -1,000",
+      "value": "-1,000",
+      "cell": "\"'-1,000\"",
+      "contract": "1.2",
+      "where": "both"
+    },
+    {
+      "case": "the text -0x1F",
+      "value": "-0x1F",
+      "cell": "\"'-0x1F\"",
+      "contract": "1.2",
+      "where": "both"
+    },
+    {
+      "case": "the number -0.5",
+      "value": -0.5,
+      "cell": "-0.5",
+      "contract": "1.2, 1.4",
+      "where": "export",
+      "note": "bare"
+    },
+    {
+      "case": "the object {\"a\": \"=1\"}",
+      "value": {
+        "a": "=1"
+      },
+      "cell": "\"{\"\"a\"\":\"\"=1\"\"}\"",
+      "contract": "1.3, 1.5",
+      "where": "export",
+      "note": "written as JSON (today, no spaces)"
+    },
+    {
+      "case": "the list [\"=a,b\", \"c\"]",
+      "value": [
+        "=a,b",
+        "c"
+      ],
+      "cell": "\"'=a,b;c\"",
+      "contract": "1.3",
+      "where": "export"
+    }
+  ],
+  "rows": [
+    {
+      "case": "the Export row [number -5, text 5*HYPERLINK(A1)]",
+      "values": [
+        -5,
+        "5*HYPERLINK(A1)"
+      ],
+      "line": "-5,\"5*HYPERLINK(A1)\"",
+      "contract": "3"
+    },
+    {
+      "case": "the Export row [number -5, text *X(A1)]",
+      "values": [
+        -5,
+        "*X(A1)"
+      ],
+      "line": "-5,\"*X(A1)\"",
+      "contract": "3"
+    }
+  ]
+}

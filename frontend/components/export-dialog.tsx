@@ -9,6 +9,7 @@ import { useState, useMemo, useCallback, useRef, useEffect } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { useFilters, withGrain } from '@/contexts/FilterContext';
 import { getSamples, type ComplexFilter, type SchemaField, type Dataset } from '@/lib/api';
+import { escapeCsvField } from '@/lib/csv';
 import { isLocalField, localValue, type LocalFieldsHolder } from '@/lib/local-fields';
 
 const SYSTEM_FIELDS = ['filepath', 'id', 'media_type', 'tags', 'created_at', 'last_modified_at'] as const;
@@ -32,22 +33,6 @@ interface ExportDialogProps {
     /** False when the grid it was opened from doesn't show the selection (one of the other grain). */
     offerSelection?: boolean;
     onClose: () => void;
-}
-
-function escapeCsvField(value: unknown): string {
-    if (value === null || value === undefined) return '';
-    if (Array.isArray(value)) {
-        const joined = value.map(v => (v === null || v === undefined) ? '' : String(v)).join(';');
-        if (joined.includes(',') || joined.includes('"') || joined.includes('\n') || joined.includes('\r')) {
-            return `"${joined.replace(/"/g, '""')}"`;
-        }
-        return joined;
-    }
-    const str = typeof value === 'object' ? JSON.stringify(value) : String(value);
-    if (str.includes(',') || str.includes('"') || str.includes('\n') || str.includes('\r')) {
-        return `"${str.replace(/"/g, '""')}"`;
-    }
-    return str;
 }
 
 // Slim sample row from /samples/query: id + requested top-level fields, with
@@ -120,12 +105,21 @@ export function ExportDialog({ datasetId, schema, dataset, appliedCount, hasObje
         return { fields: regular, promoted };
     }, [schema]);
 
-    // Field selection state
-    const [selectedFields, setSelectedFields] = useState<Set<string>>(() => new Set(['filepath']));
+    // Field selection state. After "Select all" the selection is every listed field, also one the page's field list
+    // brings later (it may still be filling in), until a field is unticked or Reset is pressed.
+    const [pickedFields, setPickedFields] = useState<Set<string>>(() => new Set(['filepath']));
+    const [allPicked, setAllPicked] = useState(false);
+    const selectedFields = useMemo(
+        () => (allPicked ? new Set<string>([...SYSTEM_FIELDS, ...metadataFields.fields]) : pickedFields),
+        [allPicked, metadataFields, pickedFields],
+    );
 
     const toggleField = (field: string) => {
-        setSelectedFields(prev => {
-            const next = new Set(prev);
+        // Unticking after "Select all" keeps the other listed fields ticked; later fields are no longer added.
+        const start = allPicked ? selectedFields : null;
+        setAllPicked(false);
+        setPickedFields(prev => {
+            const next = new Set(start ?? prev);
             if (next.has(field)) next.delete(field);
             else next.add(field);
             return next;
@@ -133,12 +127,12 @@ export function ExportDialog({ datasetId, schema, dataset, appliedCount, hasObje
     };
 
     const selectAllFields = () => {
-        const all = new Set<string>([...SYSTEM_FIELDS, ...metadataFields.fields]);
-        setSelectedFields(all);
+        setAllPicked(true);
     };
 
     const resetFields = () => {
-        setSelectedFields(new Set(['filepath']));
+        setAllPicked(false);
+        setPickedFields(new Set(['filepath']));
     };
 
     // Export is always IMAGE grain. Objects are an opt-in per-grid grain; every other consumer of

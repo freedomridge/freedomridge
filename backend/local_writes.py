@@ -6,7 +6,7 @@ from typing import Any, Iterable
 
 from fastapi import HTTPException
 
-from .field_registry import LOCAL_PREFIX, invalidate_values, lock_field_lifecycle, value_type
+from .field_registry import EMPTIED_TO_FLAG, LOCAL_PREFIX, invalidate_values, lock_field_lifecycle, value_type
 from .local_fields import LOCAL_TAGS, local_field
 
 NOT_A_MIRROR = "Only a mirror has fields of its own (@local.): on this dataset, add the field itself"
@@ -70,7 +70,7 @@ async def register(connection, dataset_id: int, values: list) -> None:
     Every write touches the field's row, so a bulk job's walk that started before it sees a new xmin and leaves the
     field registered (bulk_jobs, unregister). Keep the update unconditional: it costs one dead tuple per write and
     makes two writers of one field wait on its row for a unit, both small on this table, and making it conditional
-    reopens that race."""
+    reopens that race. A private flag kept when the field went (unregister) is taken over, and stays."""
     kinds: dict[str, str] = {}
     for item in values:
         for name, value in item.items():
@@ -87,8 +87,8 @@ async def register(connection, dataset_id: int, values: list) -> None:
            SELECT $1, $2 || name, kind, 'local' FROM unnest($3::text[], $4::text[]) AS definitions(name, kind)
            ORDER BY name
            ON CONFLICT (dataset_id, field_name) DO UPDATE SET field_type = CASE
-               WHEN dataset_fields.field_type = 'unknown' THEN EXCLUDED.field_type
-               ELSE dataset_fields.field_type END""",
+               WHEN dataset_fields.field_type = 'unknown' OR dataset_fields.origin = 'system' THEN EXCLUDED.field_type
+               ELSE dataset_fields.field_type END, origin = 'local'""",
         dataset_id,
         LOCAL_PREFIX,
         names,
@@ -100,7 +100,8 @@ async def register_tags(connection, dataset_id: int, tags: list, user_id: int | 
     """`@local.tags` as a field, and the tags added to it in the tag registry, as bulk-tag records any array field's."""
     await connection.execute(
         """INSERT INTO dataset_fields (dataset_id, field_name, field_type, origin) VALUES ($1, $2, 'list', 'local')
-           ON CONFLICT (dataset_id, field_name) DO NOTHING""",
+           ON CONFLICT (dataset_id, field_name) DO UPDATE SET field_type = 'list', origin = 'local'
+           WHERE dataset_fields.origin = 'system'""",
         dataset_id,
         LOCAL_TAGS,
     )
@@ -163,10 +164,20 @@ async def prune(connection, dataset_id: int, removed: Iterable[str]) -> None:
 
 async def unregister(connection, dataset_id: int, name: str, mark: str | None = None) -> None:
     """A removed field's definition and statistics. With `mark` (its row's xmin when a walk began), only if no write
-    has touched the row since: a sample given the field meanwhile keeps it registered."""
-    deleted = await connection.fetchval(
-        "DELETE FROM dataset_fields WHERE dataset_id = $1 AND field_name = $2 AND origin = 'local' AND NOT is_promoted "
-        'AND ($3::text IS NULL OR xmin::text = $3) RETURNING 1',
+    has touched the row since: a sample given the field meanwhile keeps it registered. A field marked private keeps
+    its flag on an emptied row (field_registry.forget_definitions), which a later write takes over."""
+    removable = (
+        "dataset_id = $1 AND field_name = $2 AND origin = 'local' AND NOT is_promoted "
+        'AND ($3::text IS NULL OR xmin::text = $3)'
+    )
+    emptied = await connection.fetchval(
+        f'UPDATE dataset_fields SET {EMPTIED_TO_FLAG} WHERE {removable} AND values_private RETURNING 1',
+        dataset_id,
+        LOCAL_PREFIX + name,
+        mark,
+    )
+    deleted = emptied or await connection.fetchval(
+        f'DELETE FROM dataset_fields WHERE {removable} AND NOT values_private RETURNING 1',
         dataset_id,
         LOCAL_PREFIX + name,
         mark,

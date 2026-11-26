@@ -19,8 +19,10 @@ etc.) must be refused by the caller, not encoded anyway.
 
 import asyncio
 import io
+import logging
 import os
 import threading
+import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List, Optional
@@ -76,7 +78,21 @@ _MODEL_ALIASES = {
     "clip-ViT-L-14": "openai/clip-vit-large-patch14",
 }
 
+log = logging.getLogger('fridge.encoders')
+# What a text search answers (501) when this server can't load the text model: its first download needs the
+# internet, once per server process.
+TEXT_MODEL_UNAVAILABLE = (
+    'The text model {checkpoint} could not be loaded on this server ({kind}), so a search by words is not available '
+    "until it can be; an administrator finds why in the server's log. A search by samples still works."
+)
+
 _cache: Dict[str, tuple] = {}  # hf checkpoint -> (tokenizer, text_model)
+# A load that failed is remembered this long, per process: a search by words in that time gets the same answer at
+# once, without queueing another attempt (a network timeout each, in the one encoding thread, which a model in a loop
+# would keep busy). The next search after it tries again. A model that loaded is never forgotten.
+FAILED_LOAD_SECONDS = 60.0
+_failed: Dict[str, tuple] = {}  # hf checkpoint -> (when it failed, the 501's words)
+_now = time.monotonic  # the clock the failures are kept by (a test stands in for it)
 _image_cache: Dict[str, tuple] = {}  # hf checkpoint -> (image_processor, vision_model)
 _lock = threading.Lock()
 
@@ -141,14 +157,26 @@ def _encode_sync(prompt: str, checkpoint: str) -> List[float]:
     with _lock:
         cached = _cache.get(checkpoint)
     if cached is None:
-        download_only_loaded_weights()
-        tokenizer = CLIPTokenizer.from_pretrained(checkpoint)  # the fast tokenizer in transformers 5
-        # Pass the tower's own config. transformers 4.57 takes each class's config_class from
-        # its `config:` annotation in cls.__dict__, which Python 3.14's lazy annotations leave
-        # empty, so the towers inherit the full CLIPConfig and loading fails (no hidden_size).
-        config = CLIPTextConfig.from_pretrained(checkpoint)
-        model = CLIPTextModelWithProjection.from_pretrained(checkpoint, config=config).eval()
+        _refuse_if_recently_failed(checkpoint)
+        try:
+            download_only_loaded_weights()
+            tokenizer = CLIPTokenizer.from_pretrained(checkpoint)  # the fast tokenizer in transformers 5
+            # Pass the tower's own config. transformers 4.57 takes each class's config_class from
+            # its `config:` annotation in cls.__dict__, which Python 3.14's lazy annotations leave
+            # empty, so the towers inherit the full CLIPConfig and loading fails (no hidden_size).
+            config = CLIPTextConfig.from_pretrained(checkpoint)
+            model = CLIPTextModelWithProjection.from_pretrained(checkpoint, config=config).eval()
+        except Exception as error:
+            # A model this server can't load (no internet for its first download, no disk, a checkpoint that
+            # isn't one) is what it can't do, said in its words, not a fault: the details go to the log, where
+            # a path or an address in them stays.
+            log.exception('The text model %s could not be loaded', checkpoint)
+            detail = TEXT_MODEL_UNAVAILABLE.format(checkpoint=checkpoint, kind=type(error).__name__)
+            with _lock:
+                _failed[checkpoint] = (_now(), detail)
+            raise HTTPException(status_code=501, detail=detail) from error
         with _lock:
+            _failed.pop(checkpoint, None)
             cached = _cache.setdefault(checkpoint, (tokenizer, model))
     tokenizer, model = cached
     inputs = tokenizer([prompt], padding=True, truncation=True, return_tensors="pt")
@@ -157,9 +185,21 @@ def _encode_sync(prompt: str, checkpoint: str) -> List[float]:
     return out.text_embeds[0].tolist()
 
 
+def _refuse_if_recently_failed(checkpoint: str) -> None:
+    """The same 501 as the load that failed less than FAILED_LOAD_SECONDS ago, without trying it again."""
+    with _lock:
+        failed = _failed.get(checkpoint)
+    if failed is not None and _now() - failed[0] < FAILED_LOAD_SECONDS:
+        raise HTTPException(status_code=501, detail=failed[1])
+
+
 async def encode_text(prompt: str, registered_model: Optional[str] = None) -> List[float]:
     """Encode a prompt with the field's CLIP text tower (dedicated worker thread)."""
     checkpoint = resolve_checkpoint(registered_model)
+    with _lock:
+        loaded = checkpoint in _cache
+    if not loaded:
+        _refuse_if_recently_failed(checkpoint)  # at once, without queueing behind the encoding thread
     return await asyncio.get_running_loop().run_in_executor(_executor, _encode_sync, prompt, checkpoint)
 
 

@@ -25,9 +25,10 @@ import numpy as np
 from fastapi import HTTPException
 
 from . import job_heartbeat, job_queue, patch_search
+from .assistant.rule import NEW_DATASET_CLOSED_SQL
 from .crypto import decrypt_secret
 from .diskspace import INGEST_ROW_BYTES, require_free_space
-from .field_registry import LOCAL_PREFIX, lock_field_lifecycle
+from .field_registry import EMPTIED_TO_FLAG, LOCAL_PREFIX, lock_field_lifecycle, without_reserved_fields
 from .job_runner import StepResult
 from .routers import datasets as datasets_router
 from .routers import followers
@@ -759,27 +760,47 @@ async def take_layouts(connection, dataset_id: int) -> None:
 
 
 async def write_fields(connection, dataset_id: int, fields: list) -> None:
-    """The primary's field registry. is_promoted stays this instance's: it stands for an index here, and so do this
-    instance's own `@local.` fields. An older primary's metadata key by such a name, unreachable there, is skipped."""
-    fields = [field for field in fields if not field['field_name'].startswith(LOCAL_PREFIX)]
+    """The primary's field registry, with each field's description and unit (none from a primary too old to send
+    them). is_promoted and values_private stay this instance's: is_promoted stands for an index here. So do this
+    instance's own `@local.` fields. An older primary's metadata key by such a name, unreachable there, is skipped.
+
+    A field the primary no longer has goes, except a private flag set here (values_private): its row stays, emptied to
+    the 'system' row that holds a flag on a field with no row of its own (field_registry.EMPTIED_TO_FLAG), so the field
+    is private again if the primary sends it back. The primary renaming a field reads as one going and another
+    coming: the flag stays with the old name, and the new one arrives unflagged.
+
+    An older primary may still list a metadata field named as a sample's own field (`created_at`): it is no field here
+    (without_reserved_fields), so it reads as one the primary doesn't have, or as the built-in's description."""
+    fields = without_reserved_fields(field for field in fields if not field['field_name'].startswith(LOCAL_PREFIX))
+    names = [field['field_name'] for field in fields]
     await connection.execute(
-        """DELETE FROM dataset_fields
-           WHERE dataset_id = $1 AND owner = 'primary' AND NOT (field_name = ANY($2::text[]))""",
+        f"""UPDATE dataset_fields SET {EMPTIED_TO_FLAG}
+           WHERE dataset_id = $1 AND owner = 'primary' AND values_private AND NOT (field_name = ANY($2::text[]))
+             AND (field_type, origin, is_promoted, display_type, overlay_config, description, unit)
+                 IS DISTINCT FROM ('unknown', 'system', FALSE, NULL::text, NULL::jsonb, NULL::text, NULL::text)""",
         dataset_id,
-        [field['field_name'] for field in fields],
+        names,
     )
     await connection.execute(
-        """INSERT INTO dataset_fields (dataset_id, field_name, field_type, origin, display_type, overlay_config)
-           SELECT $1, f.field_name, f.field_type, f.origin, f.display_type, f.overlay_config
+        """DELETE FROM dataset_fields
+           WHERE dataset_id = $1 AND owner = 'primary' AND NOT values_private AND NOT (field_name = ANY($2::text[]))""",
+        dataset_id,
+        names,
+    )
+    await connection.execute(
+        """INSERT INTO dataset_fields
+               (dataset_id, field_name, field_type, origin, display_type, overlay_config, description, unit)
+           SELECT $1, f.field_name, f.field_type, f.origin, f.display_type, f.overlay_config, f.description, f.unit
            FROM jsonb_to_recordset($2::jsonb)
-                AS f(field_name text, field_type text, origin text, display_type text, overlay_config jsonb)
+                AS f(field_name text, field_type text, origin text, display_type text, overlay_config jsonb,
+                     description text, unit text)
            ON CONFLICT (dataset_id, field_name) DO UPDATE
            SET field_type = EXCLUDED.field_type, origin = EXCLUDED.origin, display_type = EXCLUDED.display_type,
-               overlay_config = EXCLUDED.overlay_config
+               overlay_config = EXCLUDED.overlay_config, description = EXCLUDED.description, unit = EXCLUDED.unit
            WHERE (dataset_fields.field_type, dataset_fields.origin, dataset_fields.display_type,
-                  dataset_fields.overlay_config)
+                  dataset_fields.overlay_config, dataset_fields.description, dataset_fields.unit)
                  IS DISTINCT FROM (EXCLUDED.field_type, EXCLUDED.origin, EXCLUDED.display_type,
-                                   EXCLUDED.overlay_config)""",
+                                   EXCLUDED.overlay_config, EXCLUDED.description, EXCLUDED.unit)""",
         dataset_id,
         fields,
     )
@@ -1463,8 +1484,10 @@ async def configure(pool, link, client, checkpoint: dict) -> StepResult:
                 resumed.append(previous['dataset_id'])
                 continue
             name = await local_name(connection, entry['name'], host_of(link), origin)
+            # Closed to the assistant while this server's new datasets start closed: the switch is this server's own.
             dataset_id = await connection.fetchval(
-                'INSERT INTO datasets (name, owner_id, is_global) VALUES ($1, $2, FALSE) RETURNING id',
+                'INSERT INTO datasets (name, owner_id, is_global, assistant_closed) '
+                f'VALUES ($1, $2, FALSE, {NEW_DATASET_CLOSED_SQL}) RETURNING id',
                 name,
                 link['created_by'],
             )

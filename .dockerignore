@@ -60,6 +60,8 @@ docs/_build/
 data/
 *.tar.gz
 *.zip
+# A checkout's fetched boundary files: Dockerfile.worker adds the pinned one itself
+backend/boundaries/
 
 # Git
 .git/

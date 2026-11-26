@@ -77,8 +77,10 @@ test('a big Select All chip stays expired after a reload: it filters nothing, co
     expect(await saved(page)).not.toContain('e2e-expired-token');
     await historyHolds(page, 0, 1);  // and so does the entry a reload reopens
 
+    // What the reloaded page sends, from its first request: not one the page before it was still sending as the reload
+    // began (the sidebar's per-field values for the live selection, asked once its field list for it answers).
+    await page.reload({ waitUntil: 'commit' });
     const sent = recordRequests(page);
-    await page.reload();
     await expectTotal(page, TOTAL);
     await expectExpired(page, description);
     await expect(page.getByTestId('no-filters')).toHaveCount(0);

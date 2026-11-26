@@ -33,6 +33,14 @@ Restrict public tokens to your deployed URLs; never use a secret token here.
 - Inter, fetched by `next/font/google` and self-hosted in frontend builds, uses
   the SIL Open Font License 1.1.
 
+## Region boundaries
+
+The job runner's Docker image (`Dockerfile.worker`) includes Natural Earth's 1:10m "Admin 1 – States, Provinces"
+boundaries, version 5.1.1, as the GeoJSON file published with that version's tag in Natural Earth's vector
+repository (https://github.com/nvkelso/natural-earth-vector). A source checkout downloads the same file with
+`python -m backend.regions fetch`. [Natural Earth](https://www.naturalearthdata.com/) is in the public domain
+([terms of use](https://www.naturalearthdata.com/about/terms-of-use/)); see [docs/REGIONS.md](docs/REGIONS.md).
+
 ## Model weights and datasets
 
 Model weights are downloaded separately, not included in this repository.

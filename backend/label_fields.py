@@ -63,10 +63,14 @@ def overlay_type(value):
 
 
 async def append_discovery(connection, dataset_id, metadata):
+    from .field_registry import RESERVED_METADATA_KEYS  # (field_registry imports this module)
+
     members: dict[str, set[str]] = {}
     by_type = {kind: cache for cache, kind in DISCOVERY_TYPES.items()}
     for row in metadata:
         for name, value in row.items():
+            if name in RESERVED_METADATA_KEYS:  # a stored key named as a sample's own field is no field
+                continue
             kind = overlay_type(value)
             if kind is None or (kind == 'segmentation' and name == 'segmentation'):
                 continue
@@ -171,10 +175,14 @@ async def discover_fields(pool, dataset_id, cache, cached=None):
             ):
                 return []
             scanning = True
+            from .field_registry import RESERVED_METADATA_KEYS  # (field_registry imports this module)
+
+            # A stored key named as a sample's own field is no field, whatever its value looks like.
             rows = await connection.fetch(
                 "SELECT DISTINCT key AS field FROM samples s, jsonb_each(s.metadata) AS je(key,value) "
-                f"WHERE s.dataset_id=$1 AND ({DISCOVERY_SQL[cache]}) ORDER BY key",
+                f"WHERE s.dataset_id=$1 AND ({DISCOVERY_SQL[cache]}) AND NOT (key = ANY($2::text[])) ORDER BY key",
                 dataset_id,
+                sorted(RESERVED_METADATA_KEYS),
             )
             scanning = False
             fields = [row['field'] for row in rows]
@@ -287,8 +295,11 @@ def label_path(field, columns=None):
 
 async def label_context(connection, dataset_id, columns=()):
     """Filter/write context is cache-only; discovery belongs exclusively to field-stats."""
+    from .field_registry import leftover_row_sql  # (field_registry imports this module)
+
     registered = await connection.fetch(
-        "SELECT field_name, field_type, is_promoted FROM dataset_fields WHERE dataset_id=$1 AND origin<>'system'",
+        "SELECT field_name, field_type, is_promoted FROM dataset_fields WHERE dataset_id=$1 AND origin<>'system' "
+        f"AND NOT {leftover_row_sql()}",  # a metadata field an older release left under a sample's own field's name
         dataset_id,
     )
     lists = {row['field_name'] for row in registered if row['field_type'] == 'list'}

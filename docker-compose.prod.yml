@@ -14,7 +14,7 @@ services:
   # PostgreSQL Database with PostGIS and pgvector
   db:
     logging: *default-logging
-    image: ghcr.io/freedomridge/db:2.13.2
+    image: ghcr.io/freedomridge/db:2.14.0
     build:
       context: .
       dockerfile: Dockerfile.db
@@ -52,7 +52,7 @@ services:
   # Backend API (FastAPI)
   backend:
     logging: *default-logging
-    image: ghcr.io/freedomridge/backend:2.13.2
+    image: ghcr.io/freedomridge/backend:2.14.0
     build:
       context: .
       dockerfile: Dockerfile.backend
@@ -86,6 +86,8 @@ services:
       # [PRODUCTION] Set to the real frontend origin(s). The browser must load
       # the app from one of these — CSRF and CORS both key off it.
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:?Set ALLOWED_ORIGINS to the HTTPS public origin}
+      # The address the assistant's links start with; without it, the first ALLOWED_ORIGINS entry (docs/ASSISTANT.md).
+      FRIDGE_PUBLIC_URL: ${FRIDGE_PUBLIC_URL:-}
       # Production nginx terminates TLS; development compose stays plain HTTP.
       SESSION_COOKIE_SECURE: ${SESSION_COOKIE_SECURE:-true}
       # Demo mode: enables public guest account creation on login page
@@ -104,6 +106,9 @@ services:
       FRIDGE_CACHE_MAX_BYTES: ${FRIDGE_CACHE_MAX_BYTES:-10737418240}
       # Thumbnails, crops and overlays each backend process renders at once (.env.example); empty: its CPU count.
       FRIDGE_MEDIA_RENDERS: ${FRIDGE_MEDIA_RENDERS:-}
+      # The MCP server's tool calls at once in each backend process, per user and in all (.env.example); empty: 4, 16.
+      FRIDGE_ASSISTANT_CALLS_AT_ONCE: ${FRIDGE_ASSISTANT_CALLS_AT_ONCE:-}
+      FRIDGE_ASSISTANT_CALLS_PER_PROCESS: ${FRIDGE_ASSISTANT_CALLS_PER_PROCESS:-}
       # The login throttle reads X-Real-IP only from these peers. The API is reached only
       # through nginx on the compose bridge (no host port below), so every peer here is a container.
       FRIDGE_TRUSTED_PROXIES: ${FRIDGE_TRUSTED_PROXIES:-172.16.0.0/12,10.0.0.0/8,192.168.0.0/16}
@@ -128,7 +133,7 @@ services:
   # Database upkeep runs in job-runner. Shares the cache volume with the backend.
   worker:
     logging: *default-logging
-    image: ghcr.io/freedomridge/worker:2.13.2
+    image: ghcr.io/freedomridge/worker:2.14.0
     build:
       context: .
       dockerfile: Dockerfile.worker
@@ -149,7 +154,7 @@ services:
 
   job-runner:
     logging: *default-logging
-    image: ghcr.io/freedomridge/worker:2.13.2
+    image: ghcr.io/freedomridge/worker:2.14.0
     build:
       context: .
       dockerfile: Dockerfile.worker
@@ -189,7 +194,7 @@ services:
   # instance role for off-box copies. The application Backups card is separate.
   backup:
     logging: *default-logging
-    image: ghcr.io/freedomridge/backup:2.13.2
+    image: ghcr.io/freedomridge/backup:2.14.0
     build:
       context: .
       dockerfile: Dockerfile.backup
@@ -213,7 +218,7 @@ services:
     # Frontend (Next.js)
   frontend:
     logging: *default-logging
-    image: ghcr.io/freedomridge/frontend:2.13.2
+    image: ghcr.io/freedomridge/frontend:2.14.0
     build:
       context: .
       dockerfile: Dockerfile.frontend

@@ -13,6 +13,9 @@ from pydantic import BaseModel
 
 from .. import public_settings
 from ..api_errors import CodedHTTPException
+from ..assistant import rule as assistant_rule
+from ..assistant.api import NOT_ALLOWED_CODE, ROUTE_REFUSED_CODE
+from ..assistant.identity import ADMIN_TOOL_KEY, ASSISTANT_KEY, Identity, administrators_route, scope_identity
 from ..auth_cleanup import DEMO_ACCOUNT_LOCK, cleanup_accounts
 from ..auth_policy import validate_new_password
 from ..crypto import hash_token
@@ -133,6 +136,8 @@ class UserResponse(BaseModel):
     is_active: bool
     is_demo_account: bool = False
     can_share_views: bool = True
+    # Whether this user could use each of the assistant's doors right now (backend/assistant/rule.py).
+    assistant: dict[str, bool] = {'mcp': False}
 
 
 # A user flagged must_change_password may reach ONLY the endpoints needed to change it / check
@@ -145,25 +150,38 @@ _PW_CHANGE_ALLOWED = ("/auth/change-password", "/auth/me", "/auth/logout")
 async def revoke_api_tokens(connection, user_id: int) -> dict[str, int]:
     """Revoke every active API token of the user and return how many of each scope. By scope, so the page can say
     what stops working: a follower that connects with one of these stops syncing until it is given a new token, and
-    on-demand machines started under a worker token end."""
+    on-demand machines started under a worker token end. MCP tokens (AI clients at /mcp) are counted under 'mcp' when
+    there were any."""
     revoked = await connection.fetch(
         "UPDATE api_tokens SET is_active = FALSE WHERE user_id = $1 AND is_active RETURNING scope",
         user_id,
     )
-    return {scope: sum(1 for row in revoked if row['scope'] == scope) for scope in ('full', 'follower', 'worker')}
+    counts = {
+        scope: sum(1 for row in revoked if row['scope'] == scope) for scope in ('full', 'follower', 'worker', 'mcp')
+    }
+    if not counts['mcp']:
+        del counts['mcp']
+    return counts
 
 
 def _enforce_password_change(user: dict, request: Request) -> None:
     if user.get("must_change_password") and not request.url.path.endswith(_PW_CHANGE_ALLOWED):
-        raise HTTPException(
-            status_code=403,
-            detail="Password change required before using the API — call /api/auth/change-password.",
-        )
+        raise HTTPException(status_code=403, detail=assistant_rule.PASSWORD_CHANGE_REQUIRED)
 
 
-async def _token_user(auth_header: str) -> tuple[dict, str]:
+MCP_TOKEN_NEEDED = (
+    "The MCP server takes an MCP token, and nothing else: make one in Settings → API tokens (kind: MCP) and send it "
+    "as the header 'Authorization: Bearer <token>'"
+)
+
+
+async def _token_user(auth_header: str, *, mcp: bool = False) -> tuple[dict, str]:
     """(user, token scope) for an Authorization "Bearer <token>" header; 401 for an unknown, revoked or expired
-    token, 403 for an inactive account."""
+    token, 403 for an inactive account.
+
+    An MCP token opens /mcp and nothing else. Anywhere else it is refused exactly as a token that doesn't exist, and
+    isn't marked used. At /mcp (`mcp`), every other kind is refused with MCP_TOKEN_NEEDED, and the account's state is
+    left to the assistant's door check (backend/mcp_door.py), which says it in the same words."""
     token = auth_header.replace("Bearer ", "").strip()
     # Tokens are stored hashed; look up by the hash of the presented token.
     query = """
@@ -176,10 +194,12 @@ async def _token_user(auth_header: str) -> tuple[dict, str]:
           AND (t.expires_at IS NULL OR t.expires_at > NOW())
     """
     user = await db.fetchrow(query, hash_token(token))
-    if not user:
+    if not user or (user['scope'] == 'mcp' and not mcp):
         raise HTTPException(status_code=401, detail="Invalid or expired token")
-    if not user['is_active']:
-        raise HTTPException(status_code=403, detail="Account is inactive")
+    if mcp and user['scope'] != 'mcp':
+        raise HTTPException(status_code=401, detail=MCP_TOKEN_NEEDED)
+    if not user['is_active'] and not mcp:
+        raise HTTPException(status_code=403, detail=assistant_rule.ACCOUNT_INACTIVE)
     await db.execute("UPDATE api_tokens SET last_used_at = NOW() WHERE id = $1", user['token_id'])
     user_dict = dict(user)
     del user_dict['token_id'], user_dict['scope']
@@ -221,15 +241,65 @@ async def get_follower_user(request: Request) -> dict:
     return user
 
 
+async def get_mcp_user(request: Request) -> dict:
+    """The user behind an MCP token, at /mcp (backend/mcp_door.py). /mcp accepts these tokens and nothing else: no
+    session cookie, no full, worker or follower token, so a token pasted into an AI client opens /mcp and no more.
+    Whether the account may use the assistant (active, no password owed, let in) is the door's check, after this."""
+    auth_header = request.headers.get("Authorization")
+    if not (auth_header and auth_header.startswith("Bearer ")):
+        raise HTTPException(status_code=401, detail=MCP_TOKEN_NEEDED)
+    user, _ = await _token_user(auth_header, mcp=True)
+    await set_request_user(user)
+    return user
+
+
+async def _assistant_user(identity: Identity, request: Request) -> dict:
+    """The user of an assistant's request made in process (backend/assistant/inner.py), read afresh: refused (403,
+    code assistant_not_allowed) unless the account is active, owes no password change and may use the assistant
+    through the request's door now; refused too (code assistant_route_refused) when the route serving the request isn't
+    one the calling tool lists, or is an administrators' route (/api/admin/..., and the administrators-only reads
+    elsewhere: identity.administrators_route), whoever the user is: those answer across datasets and know nothing of a
+    dataset closed to the assistant. The user answered carries the door (ASSISTANT_KEY), which the access rule reads
+    (backend/access.py).
+
+    An administration tool's request (Identity.admin, backend/assistant/admin.py) may reach the administrators' routes
+    its tool lists, and only while its user is an administrator and the administration tools are switched on, read
+    afresh here with the rule (assistant_not_allowed otherwise). Its user also carries ADMIN_TOOL_KEY."""
+    verdict = await assistant_rule.verdict(identity.user_id, identity.door, db)
+    if verdict.refusal is not None or verdict.user is None:
+        raise CodedHTTPException(403, verdict.refusal or assistant_rule.ACCOUNT_INACTIVE, NOT_ALLOWED_CODE)
+    route = request.scope.get('route')
+    if identity.admin:
+        refusal = assistant_rule.admin_refusal(verdict)
+        if refusal is not None:
+            raise CodedHTTPException(403, refusal, NOT_ALLOWED_CODE)
+    elif administrators_route(request.url.path):
+        raise CodedHTTPException(403, "The assistant may not call the administrators' routes", ROUTE_REFUSED_CODE)
+    if request.url.path.startswith('/api/assistant/'):  # the people's own: a view's link, a list's download
+        raise CodedHTTPException(403, "The assistant may not call the people's assistant routes", ROUTE_REFUSED_CODE)
+    if (request.method, getattr(route, 'endpoint', None)) not in identity.routes:
+        raise CodedHTTPException(403, 'This route is not one the assistant\'s tool may call', ROUTE_REFUSED_CODE)
+    user = {**verdict.user, ASSISTANT_KEY: identity.door}
+    if identity.admin:
+        user[ADMIN_TOOL_KEY] = True
+    await set_request_user(user)
+    return user
+
+
 async def get_current_user(request: Request):
     """
-    Authenticate via API token (Bearer) OR session cookie.
+    Authenticate an assistant's request made in process, OR via API token (Bearer), OR session cookie.
 
-    Checks Authorization header first for "Bearer <token>",
+    An assistant's request carries its user on the ASGI scope (backend/assistant/identity.py), where nothing from
+    outside can put one: read first, and never with a token or a cookie.
+    Then checks Authorization header for "Bearer <token>",
     then falls back to session_id cookie for browser sessions.
 
     Tokens inherit user's role permissions.
     """
+    identity = scope_identity(request.scope)
+    if identity is not None:
+        return await _assistant_user(identity, request)
     # Check for Bearer token first
     auth_header = request.headers.get("Authorization")
     if auth_header and auth_header.startswith("Bearer "):
@@ -266,7 +336,7 @@ async def get_current_user(request: Request):
         raise HTTPException(status_code=401, detail="Invalid or expired session")
 
     if not user['is_active']:
-        raise HTTPException(status_code=403, detail="Account is inactive")
+        raise HTTPException(status_code=403, detail=assistant_rule.ACCOUNT_INACTIVE)
 
     await set_request_user(dict(user))
 
@@ -306,6 +376,8 @@ async def get_optional_user(request: Request) -> Optional[dict]:
     anonymous makes a script with a bad token see empty results instead of an
     error. A 403 (inactive account) is always propagated.
     """
+    if scope_identity(request.scope) is not None:
+        return await get_current_user(request)  # an assistant's request is never served as anonymous
     try:
         return await get_current_user(request)
     except HTTPException as e:
@@ -415,8 +487,27 @@ async def logout(request: Request, response: Response):
 
 
 @router.get("/auth/me", response_model=UserResponse)
-async def get_me(user: dict = Depends(get_current_user)):
-    return {**user, 'can_share_views': not private_guest(user)}
+async def get_me(fresh: bool = False, user: dict = Depends(get_current_user)):
+    """`fresh` (?fresh=1): whether the user could use the MCP server is read from the database for this request,
+    not from this process's memory of the switch (the API Tokens page asks so as it opens). Nothing else changes."""
+    mcp = await _could_use_mcp(user, fresh)
+    return {**user, 'can_share_views': not private_guest(user), 'assistant': {'mcp': mcp}}
+
+
+async def _could_use_mcp(user: dict, fresh: bool = False) -> bool:
+    """Whether the user could use the MCP server now, a hint for the app. A guest never may: no query. While the server
+    is switched off, no query either (the switch is read at most every few seconds per process), unless `fresh`; while
+    it is on, or `fresh`, the rule's one query, which reads the switch itself. Its failure is logged and answered as
+    false: it never fails the account's own answer."""
+    if user.get('role') == 'guest':  # the rule refuses every guest at the MCP door (backend/assistant/rule.py)
+        return False
+    try:
+        if not fresh and not await assistant_rule.mcp_switched_on(db):
+            return False
+        return await assistant_rule.door_refusal(user_id=user['id'], door='mcp', source=db) is None
+    except Exception:  # noqa: BLE001 - a hint; the rest of /auth/me stands
+        logging.getLogger('fridge.auth').exception("could not read whether user %s may use the assistant", user['id'])
+        return False
 
 
 @router.post("/auth/change-password")

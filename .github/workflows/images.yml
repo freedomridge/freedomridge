@@ -196,5 +196,26 @@ jobs:
           curl -fsS -o /dev/null -X POST http://127.0.0.1:3000/api/auth/login \
             -H 'Content-Type: application/json' -d '{"username": "admin", "password": "admin123"}'
           echo "logged in through the frontend"
+      # The job runner loads the region boundaries by itself from the file its image carries (docs/REGIONS.md):
+      # this checks the image's file, the queueing and the load on each architecture.
+      - name: The job runner loads the region boundaries from the image's file, by itself
+        run: |
+          query="SELECT count(*) FROM region_sets WHERE loaded_from = 'bundled'"
+          loaded=
+          for _ in $(seq 60); do
+            loaded=$(docker compose -f docker-compose.try.yml exec -T db \
+              psql -U freedomridge -d freedomridge -tAc "$query" 2> /dev/null || true)
+            [ "$loaded" = 1 ] && break
+            sleep 10
+          done
+          if [ "$loaded" != 1 ]; then
+            echo "No region set was loaded from the image's file within 10 minutes" >&2
+            docker compose -f docker-compose.try.yml exec -T db psql -U freedomridge -d freedomridge \
+              -c "SELECT id, state, args, error, message FROM jobs WHERE kind = 'region_load'" || true
+            docker compose -f docker-compose.try.yml logs --tail=300 job-runner
+            exit 1
+          fi
+          docker compose -f docker-compose.try.yml exec -T db psql -U freedomridge -d freedomridge \
+            -c "SELECT name, version, verified, loaded_from, loaded_by, loaded_at FROM region_sets"
       - if: failure()
         run: docker compose -f docker-compose.try.yml logs --tail=200

@@ -22,6 +22,9 @@ samples, served whole, without sampling and without truncation.
 - **Labels and objects.** Boxes, masks, keypoints, polylines and 3D boxes, plus an objects view
   with one row per annotation.
 - **Python SDK.** `fridge` ingests, queries, tags, embeds and versions datasets from scripts.
+- **AI assistant.** Claude Code and other MCP clients answer questions about your datasets through the server's
+  `/mcp`, reading as you and changing nothing; your AI client sends what it reads to its own AI service, and the server
+  calls none. Off until an administrator switches it on ([docs/ASSISTANT.md](docs/ASSISTANT.md)).
 
 Freedom Ridge is deliberately narrow. It is the data layer (ingest, index, search, curate,
 version), not an experiment tracker or a model zoo. The design target is to stay fast with
@@ -130,7 +133,8 @@ Filters can also be written as text, checked against the dataset's fields:
 `ds.query("category in (dog cat) AND score >= 0.5")` ([docs/FILTER_QUERY.md](docs/FILTER_QUERY.md)).
 
 [docs/SDK.md](docs/SDK.md) is the full reference, and [docs/AUTHENTICATION.md](docs/AUTHENTICATION.md)
-covers accounts, roles and tokens.
+covers accounts, roles and tokens. To ask an AI client about your datasets instead, connect it to the assistant
+([docs/ASSISTANT.md](docs/ASSISTANT.md)).
 
 ## Deploy
 

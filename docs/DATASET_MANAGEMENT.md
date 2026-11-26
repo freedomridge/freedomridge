@@ -91,12 +91,12 @@ Use `"skip"` for a script you may re-run. Send smaller batches if you get HTTP 4
 
 | Field | Notes |
 |-------|-------|
-| `filepath` | Required. A local path that resolves inside the backend's `FRIDGE_DATA_ROOT`, or `s3://bucket/key`. Paths outside the data root are not served. |
+| `filepath` | Required. A path relative to the backend's `FRIDGE_DATA_ROOT`, a full local path inside it, or `s3://bucket/key`. Paths outside the data root are not served. It can't be changed once the sample is added: see [Paths, and when media moves](SDK.md#paths-and-when-media-moves) for the kinds of path and what to do when media moves. |
 | `media_type` | Optional; detected from the extension (`image`, `video`, `audio`). |
 | `tags` | List of strings. |
 | `metadata` | Free-form JSON. Types are detected from the values; ISO-8601 dates and times become datetimes ([below](#dates-and-times)). |
 | `location` | GeoJSON Point, `{"type": "Point", "coordinates": [lon, lat]}`. |
-| `heading` | Compass heading in degrees. |
+| `heading` | Compass heading in degrees. A sample read back with `samples/query` carries it inside `location`, or, when it has no location, as `heading` beside it. |
 | `embeddings` | `{field_name: [floats]}`. A field name's dimension is fixed server-wide by its first vectors. |
 | `hashes` | `{name: "hex string"}`, for example `{"phash_8": "c3a1..."}`. |
 | `array_fields` | `{field_name: [strings]}` for array fields created on the dataset. |
@@ -151,6 +151,9 @@ requests.patch(
 ).raise_for_status()
 ```
 
+A sample's `filepath` can't be changed: a body whose `filepath` differs from the sample's is refused (422, "filepath
+can't be changed") and nothing is written; the sample's own path sent back is accepted and changes nothing.
+
 For many samples, `POST /api/datasets/{id}/samples/bulk-set` merges the same
 `metadata` into every listed sample (`{"sample_ids": [...], "metadata": {...}}`),
 or a different patch per sample (`{"updates": [{"sample_id": 1, "metadata": {...}}, ...]}`).
@@ -182,6 +185,82 @@ for sample in page["items"]:   # page["total"] is the dataset size
 ```
 
 Increase `offset` by `limit` until it reaches `total`.
+
+## Export samples as CSV
+
+In the web app, the grid's **Export** button opens the Export dialog, which writes a CSV of the whole dataset, the
+applied filters, the current view or the selected samples, with the fields you tick: a header row of field names, then
+one row a sample. The browser builds it from `POST /api/datasets/{id}/samples/query` (`fields`, `slim: true`, a page
+at a time by `after_id`). A list is written as its values joined with `;`, an object as JSON, a missing value as an
+empty cell. Every text cell, the header's too, is in double quotes, and a number is written bare: a spreadsheet that
+reads the file with `;` takes a line with no `;` for one cell, with the comma as its decimal mark, so a number followed
+by an unquoted text could read as one formula.
+
+A text that would start a formula when a spreadsheet opens the file (`=`, `+`, `-`, `@` or a look-alike such as `＝`,
+after any leading spaces or double quotes, or a tab or a carriage return first) is written with an apostrophe in front,
+which a spreadsheet shows as text: at the start of a cell, and also after a `;`, a tab or a line break inside one,
+where a spreadsheet that reads the file with `;` (Excel in much of Europe) or tabs begins a new cell. A program reading
+the file sees those apostrophes, and ordinary text is touched too: `range 3; -5 to 5` becomes `range 3;' -5 to 5`. A
+text made only of numbers (`-5`, `-5;3`) gets none; one with anything else gets one before each number that has a sign
+too (`a;-5` becomes `a;'-5`). The assistant's value list download keeps the same rule ([ASSISTANT.md](ASSISTANT.md)).
+
+## Describe a field (edit)
+
+A field's description and unit say what it means, in the app (Dataset Settings → Fields, and on the field's name in
+the filters) and to the assistant:
+
+```python
+field = requests.patch(
+    f"{API_URL}/datasets/{dataset_id}/fields/digital_gain/description",
+    headers=headers,
+    json={"description": "Sensor gain applied before readout; higher in dark scenes.", "unit": "dB"},
+).json()
+# {"field_name": "digital_gain", "description": "Sensor gain ...", "unit": "dB",
+#  "values_private": false, "description_source": "set"}
+```
+
+- Send any of `description` (at most 1,000 characters), `unit` (at most 40) and `values_private` (true or false: the
+  field's values aren't given to the [assistant](ASSISTANT.md#keeping-a-fields-values-back)). A key left out stays as it is; `null` or `""`
+  clears a description or unit. Text is trimmed; a description may hold line breaks, and neither may hold other
+  control characters. Too long or a control character: 422.
+- A field the dataset's schema lists takes a description: its own fields, its built-in ones (`id`, `filepath`,
+  `created_at`, `last_modified_at`, `tags`, `media_type`) and label fields such as `detections.label`. Anything else
+  is a 404, a key that exists only in some samples' metadata and that nothing registered (neither the schema nor the
+  field statistics list it) included. Below edit: 403 "This needs edit access to the dataset". A dataset being
+  deleted: 409.
+- The answer, and every field of `GET /datasets/{id}/schema` and of the field-stats answers, carries `description`,
+  `unit`, `values_private` and `description_source`: `"set"` when someone wrote the description, `"default"` when it
+  is the server's own, `null` when there is none. The server describes by name only the fields it makes itself, the
+  built-in ones (with no unit); clearing what someone wrote on one brings the default back. Every other field has the
+  description and unit someone wrote for it, or none: nobody describes a field by guessing from its name, so a field
+  of your own called `brightness` has no description until you write one. The SDK's `compute_metadata()` and
+  `compute_metrics()` describe the fields they compute when they compute them, as the user running them, where a
+  field has none of its own ([details](SDK.md#field-descriptions)). `description_source` speaks of the description
+  only.
+- On a mirror, the primary's fields are described on the primary and arrive with its field settings: changing their
+  description or unit here is refused (409), and such a request changes nothing, its `values_private` included.
+  `values_private` belongs to each server: a mirror sets it on any field, the built-in ones included, and the sync
+  never resets it (see [the SDK guide](SDK.md#field-descriptions) for a field the primary removes or renames). A
+  version saves descriptions and units with the field types, and a revert restores them; the built-in and label
+  fields' descriptions aren't in a version (a revert changes `width`'s, never `created_at`'s). `values_private` is
+  never versioned, and outlives the field: a private field that is removed (cleared, emptied of its last sample, or
+  removed by a revert) stays private if it comes back. While it is gone nothing lists it (a request about it is a
+  404, as for a name the dataset never had), so its mark can only be taken off once the field exists again
+  ([details](SDK.md#field-descriptions)).
+
+## Which kinds of sample have a field
+
+On a dataset with objects, images (every sample that isn't an object) and objects hold different fields. Each field the
+field-stats answers (`GET` and `POST /datasets/{id}/field-stats`) list with its `sample_count` also carries `on_images`
+and `on_objects`: whether a sample of that kind has been seen with the field, its key on the sample (a `null` under the
+key counts). `false` means no sample of that kind has the field. `true` means one has it, or had it: a kind's mark is
+cleared by a check the job runner runs after the dataset's statistics are next counted, once the last such sample lost
+the field or went. The check reads the samples without holding writes back (they wait only for two one-row changes to
+the record) and finishes on a dataset of any size; one a write in progress holds off is tried again after 20 seconds,
+then 40, doubling up to 5 minutes, and a write noted while a check runs is checked by the next one. Both are
+`true` for a field the server doesn't follow this way (lists such as `tags`, a mirror's `@local.tags`), and for every
+field of a dataset it hasn't examined yet after the upgrade that added them. `sample_count` counts both kinds together.
+The filter reader uses the same record to skip a kind's rows ([Filter query](FILTER_QUERY.md#what-the-server-skips)).
 
 ## Embeddings and the map
 
@@ -285,8 +364,9 @@ A link is `/datasets/<id>?<parameters>`, each optional:
 | Parameter | Meaning |
 |---|---|
 | `q=<text>` | The filters in the [filter query language](FILTER_QUERY.md), one chip per top-level `AND` part. Empty (`q=`) means no filters, which is what Copy link writes when none are applied. |
-| `f=<version>.<data>` | The filters encoded, when a chip has no text form: a map region, a lasso, picked samples, a search, a concept, a duplicate collapse. |
+| `f=<version>.<data>` | The filters encoded, when a chip has no text form: a map region, a lasso, picked samples, a search, a concept's sources, a duplicate collapse. |
 | `view=<slug>` | A saved view. The address and Copy link write it while a public view's filters are applied as it was saved. |
+| `w=<handle>` | A working view of the assistant, which it links to when the filters can't be `q=` text (below). Only read: the address and Copy link never write it. |
 | `sort=<field>`, `dir=asc` or `desc` | The grid's sort. |
 | `sample=<id>` | The sample whose view opens. |
 
@@ -295,7 +375,9 @@ write one: `/datasets/12?q=split = train AND score > 0.5` (the browser encodes t
 and `#` in a value as `%2B`, `%26` and `%23`). The link's
 filters replace the ones the browser kept for the dataset; Back doesn't return to those. The address then
 shows the page's own link to the same filters (the query as the app writes it). A link that can't be opened
-says why, and the dataset opens, with its address, as it would without the link.
+says why, and the dataset opens, with its address, as it would without the link. A link whose request fails (the
+network, the server) waits instead, saying so, with **Try again** and **Open the dataset without it**, and stays in
+the address, so a reload opens it again.
 
 An address carries what the filters name: field names, values, class names and map region coordinates (as
 text in `q=`, or in `f=`, which anyone can decode). It is kept in the browser's history, and in whatever the
@@ -326,6 +408,13 @@ selection's chip expired.
 
 An `f=` made by a version of Freedom Ridge that encodes filters differently says so, and the dataset opens
 without it.
+
+A `w=<handle>` link is the assistant's, for a view it made in a conversation that can't be written as `q=` text (too
+long for an address, or a chip with no text form). It opens for the person who had the conversation, for 30 days after
+the view was last used, on the view's filters as chips, like a `view=` link; the address then shows the page's own
+link to those filters. A filter of the view whose values can no longer be read is left out, and the page says so.
+Opened by anyone else, or after it has expired, it says so and the dataset opens without it. To share such filters,
+save a view and share that.
 
 ### Switching the live address off
 
@@ -381,7 +470,7 @@ Who may call each one: the admin role, or a [level in the dataset](AUTHENTICATIO
 |----------|--------|------|-------------|
 | `/datasets` | POST | admin | Create a dataset; `"is_global": true` makes it global at `everyone_level` (view unless given) |
 | `/datasets/{id}` | GET | view | Dataset details, with your `access_level` |
-| `/datasets/{id}` | PATCH | edit; manage for `name`, `is_global` and `everyone_level`; admin for `storage_config_id` | Update name, description, media fields, `segmentation_config`, `default_view_id`, visibility |
+| `/datasets/{id}` | PATCH | edit; manage for `name`, `is_global`, `everyone_level` and `assistant_closed`; admin for `storage_config_id` | Update name, description, media fields, `segmentation_config`, `default_view_id`, visibility, whether the [assistant](ASSISTANT.md#closing-a-dataset) may read it |
 | `/datasets/{id}` | DELETE | manage | Delete (202, server job) |
 | `/datasets/{id}/samples` | POST | edit | Add samples |
 | `/datasets/{id}/samples` | GET | view | List samples (`{"items", "total"}`) |
@@ -393,6 +482,7 @@ Who may call each one: the admin role, or a [level in the dataset](AUTHENTICATIO
 | `/datasets/{id}/samples/bulk-set` | POST | edit | Merge metadata into many samples |
 | `/datasets/{id}/samples/bulk-tag` | POST | tag for `tags` (and a mirror's `@local.tags`), edit for another field | Add or remove tags |
 | `/datasets/{id}/embeddings` | POST | edit | Upload vectors |
+| `/datasets/{id}/fields/{field}/description` | PATCH | edit | A field's description, unit and `values_private` |
 
 ## Troubleshooting
 

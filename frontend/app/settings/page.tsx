@@ -5,7 +5,7 @@ import { Header } from '@/components/header';
 import { ProtectedRoute } from '@/components/ProtectedRoute';
 import { useUser } from '@/contexts/UserContext';
 import Link from 'next/link';
-import { Key, Users, Shield, Cloud, Activity, Cpu, Share2, Download } from 'lucide-react';
+import { Key, Users, Shield, Cloud, Activity, Cpu, Share2, Download, Bot } from 'lucide-react';
 import { ChangePasswordModal } from '@/components/ChangePasswordModal';
 
 export default function SettingsPage() {
@@ -121,6 +121,27 @@ export default function SettingsPage() {
                                 </div>
                                 <p className="text-zinc-400 text-sm">
                                     Administer users, roles, and permissions for the organization.
+                                </p>
+                            </Link>
+                        )}
+
+                        {/* Assistant Card (Admin Only): the MCP server, who may use the assistant */}
+                        {(user?.role === 'admin') && (
+                            <Link
+                                href="/settings/assistant"
+                                data-testid="settings-assistant-card"
+                                className="group block p-6 bg-zinc-900/50 border border-zinc-800 rounded-xl hover:border-cyan-500/50 hover:ring-1 hover:ring-cyan-500/50 transition-all shadow-lg hover:shadow-cyan-900/10"
+                            >
+                                <div className="flex items-center gap-4 mb-4">
+                                    <div className="p-3 bg-cyan-500/10 rounded-lg text-cyan-400 group-hover:bg-cyan-500/20 transition-colors">
+                                        <Bot size={24} />
+                                    </div>
+                                    <h3 className="text-xl font-semibold text-white group-hover:text-cyan-400 transition-colors">
+                                        Assistant
+                                    </h3>
+                                </div>
+                                <p className="text-zinc-400 text-sm">
+                                    Let an AI assistant read datasets through the MCP server, and choose who may use it.
                                 </p>
                             </Link>
                         )}

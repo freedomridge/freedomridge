@@ -48,6 +48,27 @@ class RequestContext:
 
 
 request_context: ContextVar[RequestContext | None] = ContextVar('database_request', default=None)
+# Every statement run for a request made for one of the assistant's tools (docs/ASSISTANT.md) has this limit, for every
+# user, so a slow count ends as the tool's too_slow, with its advice, before the door's own limit. People's own
+# requests keep theirs (a guest's, or none).
+ASSISTANT_STATEMENT_SECONDS = 45.0
+
+
+def statement_seconds(context: 'RequestContext | None') -> float | None:
+    """The time limit of each statement this request runs: a guest's, a tool's, the smaller of both; None for any
+    other request."""
+    from .assistant.identity import SCOPE_KEY
+
+    if context is None:
+        return None
+    limits = []
+    if private_guest(context.user or {}):
+        limits.append(public_settings.settings.guest_statement_seconds)
+    if context.scope.get(SCOPE_KEY) is not None:
+        limits.append(ASSISTANT_STATEMENT_SECONDS)
+    return min(limits) if limits else None
+
+
 _guest_slots: dict[int, GuestSlots] = {}
 
 
@@ -169,12 +190,11 @@ class RequestLimitsMiddleware:
 def guest_query(method):
     @wraps(method)
     async def bounded(connection, *args, **kwargs):
-        context = request_context.get()
-        if context is None or not private_guest(context.user or {}):
+        budget = statement_seconds(request_context.get())
+        if budget is None:
             return await method(connection, *args, **kwargs)
         # The session default set at checkout lets routes use a tighter SET LOCAL. An asyncpg
         # deadline also enforces the ceiling if a route raises/disables the server timeout.
-        budget = public_settings.settings.guest_statement_seconds
         timeout = kwargs.get('timeout')
         kwargs['timeout'] = budget if timeout is None else min(timeout, budget)
         try:
@@ -212,8 +232,8 @@ class _Acquire:
             if not public_mode():
                 raise
             raise unavailable(503, 'The database is busy. Please try again shortly.') from error
-        context = request_context.get()
-        if context is not None and private_guest(context.user or {}):
+        limit = statement_seconds(request_context.get())
+        if limit is not None:
             try:
                 # One setting per checkout, no per-statement BEGIN/SET/COMMIT. asyncpg's reset
                 # on release clears the session setting before a privileged caller can reuse it.
@@ -222,7 +242,7 @@ class _Acquire:
                     "WHEN current_setting('statement_timeout')::interval = interval '0' "
                     "OR current_setting('statement_timeout')::interval > $1::text::interval "
                     "THEN $1 ELSE current_setting('statement_timeout') END, false)",
-                    f'{max(1, int(public_settings.settings.guest_statement_seconds * 1000))}ms',
+                    f'{max(1, int(limit * 1000))}ms',
                 )
             except BaseException:
                 await self.pool.release(self.connection)

@@ -16,6 +16,7 @@ const NAMES: Record<string, string> = {
     statistics: 'Updating statistics',
     concept_scoring: 'Scoring concepts',
     duplicate_maintenance: 'Updating duplicate groups',
+    field_kinds: 'Updating which kinds of sample have each field',
     refresh_stats: 'Updating statistics',
     statistics_refresh: 'Updating statistics',
     create_version: 'Creating version',
@@ -28,6 +29,7 @@ const NAMES: Record<string, string> = {
     index_review: 'Reviewing indexes',
     index_drop: 'Removing an index',
     index_restore: 'Restoring an index',
+    region_load: 'Loading region boundaries',
 };
 
 // Jobs whose end changes what the page shows: their completion refreshes the dataset's views,

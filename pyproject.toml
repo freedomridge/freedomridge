@@ -7,7 +7,7 @@
 # Always pass one of the two extras: they choose which PyTorch build is installed.
 [project]
 name = "freedomridge-app"
-version = "2.13.2"
+version = "2.14.0"
 requires-python = ">=3.12"
 dependencies = [
     # API server
@@ -28,6 +28,9 @@ dependencies = [
     "pyarrow",
     "httpx",
     "cryptography",
+    # The official Model Context Protocol SDK: serves the MCP server at /mcp (backend/mcp_door.py).
+    # 2.x speaks the 2026-07-28 revision and the earlier ones from one endpoint.
+    "mcp>=2.3",
     # Python SDK (python/)
     "freedomridge",
 ]

@@ -225,7 +225,8 @@ to an existing one needs edit in it ([Sharing a dataset](#sharing-a-dataset)).
 
 Use `dataset.add_samples(batch, on_duplicate="skip")` on the **first attempt and
 every retry**. Keep each sample's `filepath` stable (for S3, use the same
-`s3://bucket/key`); uniqueness is per dataset and filepath. Put metadata, labels
+`s3://bucket/key`); uniqueness is per dataset and filepath, and a path can't be
+changed once added ([Paths, and when media moves](#paths-and-when-media-moves)). Put metadata, labels
 (in metadata), tags, registered array fields, named embeddings, and hashes on
 each `Sample` before calling add. The SDK sends the entire list in one request:
 `POST /api/datasets/{id}/samples` with
@@ -555,6 +556,124 @@ embedding, embeddings, hashes, array_fields)`, so pass everything after
 
 Local `filepath`s must resolve inside the backend's `FRIDGE_DATA_ROOT`; anything
 else is not served. Use `s3://bucket/key` for objects in S3.
+
+**Names a metadata key can't have.** Seven names are a sample's own fields, set on the `Sample` itself: `id`,
+`dataset_id`, `filepath`, `created_at`, `last_modified_at`, `tags` and `media_type`. The server refuses a metadata
+key named like any of them wherever metadata is written, with an error that names it (`metadata key(s) ['tags'] name
+sample columns`), and nothing of the request is written: when samples are added, by `sample.save()`, `set_values` and
+other bulk edits, and as a field's new name in a rename or clone. A sample that already carries one (an older release
+stored them) keeps it until it is removed: `sample.save()` may send it back with the value it has, while a changed
+value is refused. Such a stored key is not a field: it is not listed, and a filter or a value search by its name reads
+the sample's own field (for `dataset_id`, it answers as if no sample had the key), never the stored key. Removing such
+a key is allowed, from one sample or from many with a bulk edit's `remove_metadata_keys`. A name that only contains one
+(`source_tags`, `created_at_source`) is an ordinary key, and so is `heading`.
+
+#### Paths, and when media moves
+
+A sample's `filepath` is stored as you give it and **can't be changed afterwards**: it is how Freedom Ridge recognises
+the sample (adding it again, `dataset[filepath]`, `merge_samples`, a copy and a mirror all match samples by it).
+`sample.save()` after giving a sample another `filepath` raises a `ValueError` and sends nothing, and a `PATCH` of a
+sample with a different `filepath` is refused (422).
+
+The server reads three kinds of path:
+
+| Path | Read from |
+|------|-----------|
+| relative: `photos/2026/a.jpg` | the server's data root, `FRIDGE_DATA_ROOT`, put in front of it |
+| full local: `/data/photos/2026/a.jpg` | the server's disk, only inside `FRIDGE_DATA_ROOT` (anything else is refused, 403, a link that leads outside included) |
+| cloud: `s3://bucket/photos/a.jpg` | S3, through a storage configuration that covers the bucket ([S3 permissions](S3_PERMISSIONS.md)) |
+
+Other schemes (`gs://`, `file://`, ...) are not read. An `https://` address isn't read either: the full view sends the
+browser to it, and it gets no thumbnail.
+
+**For local media, prefer relative paths.** Then moving all of it is one setting: move the folder and point
+`FRIDGE_DATA_ROOT` at its new place. The SDK, when it reads media on your machine (to compute embeddings or hashes),
+puts its own `FRIDGE_DATA_ROOT` in front of a relative path. A full path names the old place in every sample.
+
+When media has moved, do one of three things:
+
+1. **Put it back where the paths say.** Mount the drive at the path it had, or, for relative paths, change
+   `FRIDGE_DATA_ROOT`. Nothing in the database changes.
+2. **Copy the samples into a new dataset with new paths.** `add_samples_from` with `path_prefixes` gives each copy
+   a new path. Copy into a new, empty dataset: a sample the target already has at a new path is kept, and the
+   source's is skipped as copied.
+
+   ```python
+   old = Dataset("field photos")
+   moved = Dataset("field photos (moved)")
+   moved.add_samples_from(old, path_prefixes={"/media/usb/field": "/data/field"})   # the drive copied to /data
+   # {"seen": 120000, "added": 120000, "skipped": 0, "rewritten": 120000}
+   ```
+
+   To make the paths relative to the data root instead, name the folder under it:
+   `path_prefixes={"/media/usb/field": "field"}` (with `FRIDGE_DATA_ROOT=/data`). Every old path contains `field`,
+   so this check reads every path of the source once before copying (below).
+
+   Open a few samples of the new dataset, and when it is right, delete the old one (`old.delete()`).
+3. **Add the samples again** from where they came from (your import script) with the new paths. The samples under the
+   old paths stay until you delete them.
+
+How `path_prefixes={old: new}` works:
+
+- A path that starts with `old` at a folder boundary (it is `old`, or `old` then `/`) has that start replaced by
+  `new`, and keeps the rest exactly: `/media/old` touches `/media/old/a.jpg`, not `/media/older/a.jpg`. A trailing
+  `/` makes no difference. When several `old`s fit, the longest wins. A path no `old` fits is copied unchanged.
+- `new` (and `old`) may be a local folder, a path relative to the data root (`""` is the data root itself), or a cloud
+  location: `{"/media/usb/field": "s3://bucket/field"}` gives S3 paths.
+- The same replacement is made in every text value of the sample's metadata, at any depth: the other media paths
+  (extra media fields, a heatmap's `map_path`, a mask's `maskPath`, a point cloud's `path`, an object's
+  `parent_filepath`). Any text value that starts with `old` at a folder boundary is replaced, so choose an `old`
+  that only paths start with. Nothing else changes.
+- A sample is matched in the target by its new path, so a copy that stops part-way is resumed by running it again
+  with the same arguments: what it copied is skipped. The answer's `rewritten` counts the samples added with a new
+  `filepath`.
+- **It never merges two samples.** When the rule would give two samples of the source the same path (a new path
+  equal to another sample's path, new or unchanged), the copy is refused before anything is written, with a
+  `ValueError` that names the two. Checking costs little in the usual case: the server looks for paths already
+  under each `new` (one pass over the source's rows, which sends nothing back when the folder is new). A `new` that
+  most paths contain (the data root `""`, `"/"`, a short relative folder), or two `old`s sent to the same folder,
+  can make the client read every path of the source once before copying (about a minute per million samples at the
+  default `batch_size`, half that at 5,000), keeping one page in memory. A source held in memory (below) is
+  checked there.
+- The source is only read. A copy into the dataset it comes from is refused.
+
+**A copy keeps objects with their images.** An object (`media_type` `object`) names its image by sample id
+(`metadata.parent_id`), and each server numbers its samples itself, so the copy writes the images before the objects
+(also when it is run again) and gives each object the id, in the target, of the sample at its image's path (after
+`path_prefixes`). An image the target already has at that path counts, whether an earlier copy brought it or it was
+there before the copy. An object whose image isn't in the target (not in the copied view and not there already, or a
+`parent_id` that names no image of the source) is copied with `parent_id` null, never pointing at another sample.
+The answer's `objects_without_image` counts every object the copy added without an image there, for whatever
+reason (one with no `parent_id`, or one that isn't a sample id, too); that key is there whenever the copied view
+holds objects. Only
+objects are touched: another sample's `parent_id` (a `to_patches` crop names its image in another dataset) and a
+`parent_id` that isn't a sample id are copied as they are. A copy made with an earlier version of the SDK left its
+objects without their images, and copying again skips them as already there: delete them in the copy
+(`copy.filter(media_type="object").delete_samples()`) and copy again. A view with no objects costs one count more
+than before. With objects, each batch of objects adds two small reads: about 15 seconds for 200,000 objects on a
+test server, a fifth of the time that copy took without vectors, and less of a copy that carries vectors. A view
+cut with `limit()` or `skip()` reads its ids and media types once first, and a similarity result is fetched again
+by id (its rows lack the heading and the array fields).
+
+What a copy carries: every sample with its metadata, tags, location, heading, array fields, vectors and hashes
+(`embedding_fields` and `hash_fields` choose which), and objects with their images. What it doesn't: the dataset's
+versions, saved views, field descriptions and private marks, access settings, promoted indexes, its id (links name
+the old dataset) and its mirrors (a follower keeps following the old dataset). A large dataset sends every vector
+again, through the machine running the copy, and the database needs room for both datasets until the old one is
+deleted. **Mark private fields again on the copy before the assistant is used on it**, and write the descriptions
+again: a field whose values were kept from the assistant in the old dataset isn't marked in the copy, so the
+assistant can read it there until it is ([keeping a field's values back](ASSISTANT.md#keeping-a-fields-values-back)).
+Sharing fails safe: a new dataset is private.
+
+A copy reads a dataset, a view of one (a filter, a selection cut with `limit()` or `skip()`, a similarity result)
+or a version's view (`dataset.version("v1")`): a version's samples are copied as the version holds them, with the
+same path rule, check and objects; their vectors and hashes are the dataset's current ones (a version doesn't keep
+them), none for a sample deleted since. Anything else is refused before anything is read.
+
+A copy reads its source a page at a time, in bounded memory, except a source that filters would change: a view cut
+with `limit()` or `skip()`, a similarity result, and a version's view cut with `limit()`. Such a source is held in
+memory for the copy, as the id, path and media type of each of its samples: about 400 MB per million samples
+(measured with paths of about 55 characters; shorter paths take less), a tenth more with `path_prefixes`.
 
 #### Sample Properties
 
@@ -915,9 +1034,15 @@ results = dataset.filter(scene="highway").aggregate([
 # results is a list, one entry per aggregation (each {"op", "field", "value"})
 ```
 
-Supported ops: `count`, `sum`, `mean`, `std`, `min`, `max`, `bounds`,
-`quantiles` (numeric); `count_values`, `distinct`, `values` (categorical/any,
-with optional `limit`). `view.schema()` returns the dataset field schema.
+Supported ops: `count`, `with_value` (how many samples have the field, as an
+`exists` filter counts them), `sum`, `mean`, `std`, `min`, `max`, `bounds`,
+`quantiles`, `histogram` (with `bins`: the buckets `histogram_values` gives, over
+the values `bounds` counts) (numeric; a datetime field's instants as seconds since
+1970 UTC); `count_values` (commonest first, ties by value), `distinct`, `values`
+(categorical/any, with optional `limit`) and `distinct_count` (how many distinct
+values). The operations on one field are answered from one read of the samples
+where one read can give them, so batching them costs about what one does.
+`view.schema()` returns the dataset field schema.
 
 ---
 
@@ -1280,7 +1405,100 @@ dataset.merge_samples(preds, key_field="source_id", fields=["predictions"], skip
 target.add_samples_from(source.filter(split="eval"))          # a view, or a whole Dataset
 target.add_samples_from(source.filter(source_id__in=ids), embedding_fields=["dinov3"], hash_fields=[])
 # Matches by filepath; samples already in the target are left untouched. Streams in batches.
+# The copies can get new paths (media moved; a sample's own path can't be changed):
+target.add_samples_from(source, path_prefixes={"/media/usb/field": "/data/field"})
+# -> {"seen", "added", "skipped", "rewritten"}; see "Paths, and when media moves"
+# Objects are linked to the copies of their images; "objects_without_image" counts those whose image isn't there.
 ```
+
+### Field descriptions
+
+Say what a field means, and its unit, so the people filtering on it (and the assistant) know what
+`digital_gain` is. It needs edit access to the dataset; the app has the same under Dataset Settings → Fields, and
+the filter sidebar shows a field's description on its name.
+
+```python
+dataset.set_field_description("digital_gain", "Sensor gain applied before readout; higher in dark scenes.", unit="dB")
+dataset.set_field_description("digital_gain", unit="")    # only the arguments given change; "" clears one
+# {"field_name": "digital_gain", "description": "Sensor gain ...", "unit": None,
+#  "values_private": False, "description_source": "set"}
+
+for field in dataset.get_schema():
+    print(field["name"], field["description"], field["unit"], field["description_source"])
+```
+
+- A description holds at most 1,000 characters and a unit 40, trimmed; a description may hold line breaks, and
+  neither may hold other control characters (422).
+- Every field in `get_schema()` carries `description`, `unit`, `description_source` and `values_private`.
+  `description_source` is `"set"` when someone wrote the description, `"default"` when it is the server's own,
+  and None when there is none. It speaks of the description only.
+- **Defaults.** The server describes by name only the fields it makes itself, the ones every dataset has (`id`,
+  `filepath`, `created_at`, `last_modified_at`, `tags`, `media_type`), while nobody has set a description: setting
+  one replaces the default (`"set"`), clearing it brings the default back (`"default"`). None of them has a unit.
+  Every other field has the description and unit someone wrote for it, or none: nobody describes a field by
+  guessing from its name, so a field of your own called `brightness` has no description until you write one.
+- **Computed fields.** `compute_metadata()` and `compute_metrics()` describe the fields they compute, when they
+  compute them. After writing values, a run gives each field it wrote a value of its description and unit, where the
+  field has none of its own, with `set_field_description`, as you. The description and the unit are each filled on
+  their own, and what someone wrote is never replaced. A field the run wrote no value for is left alone, and a run
+  that skipped any sample because it already had its values (`skip_existing=True`) describes nothing: those values
+  may be your own, in another scale. Nor does a run describe a field that a sample it didn't write that field for
+  already holds: the sample of an image that could not be read, or an `s3://` sample's `file_size_bytes` (written
+  only for local files). So a dataset computed in several runs gets its descriptions from the first, if that run
+  ran to its end: describing is a run's last step, so a run that stops partway describes nothing, and the run that
+  resumes it skips the samples done. Otherwise apply them by hand with the lines below. If the server refuses (you
+  have less than edit, or it is older than field descriptions), the values are stored all the same and the SDK warns
+  once, naming the fields it could not describe and why. The units they give:
+
+  | Unit | Fields |
+  |---|---|
+  | `px` | `width`, `height` |
+  | `MP` | `megapixels` |
+  | `bytes` | `file_size_bytes` |
+  | `bits` | `entropy` |
+  | `%` | `salt_and_pepper`, `pct_underexposed`, `pct_overexposed` |
+  | none | `aspect_ratio`, `brightness`, `blurriness`, `contrast`, `saturation` |
+
+  `fridge.COMPUTED_FIELD_DESCRIPTIONS` holds the descriptions and units, field name to `(description, unit)` (`unit`
+  None where there is none). To describe a dataset computed before, apply them to the fields it has. Unlike a run,
+  this replaces the description and the unit someone wrote (`""` clears a unit where the field has none here), and
+  it fits only values these methods computed:
+
+  ```python
+  fields = {field["name"] for field in dataset.get_schema()}
+  for name in fields & fridge.COMPUTED_FIELD_DESCRIPTIONS.keys():
+      description, unit = fridge.COMPUTED_FIELD_DESCRIPTIONS[name]
+      dataset.set_field_description(name, description, unit=unit or "")
+  ```
+
+- **Which fields.** A field the dataset's schema lists takes a description: its own fields, the built-in ones and
+  label fields such as `detections.label`. Anything else is a 404, a key that exists only in some samples' metadata
+  and that nothing registered (so neither the schema nor the field statistics list it) included.
+- `rename_field` takes the description, unit and `values_private` to the new name, and `clone_field` copies them.
+  `clear_field` removes the description and unit with the field. A field no sample holds any more stays listed
+  while it has a description or a unit, as one with a display type does.
+- `values_private` marks a field whose values aren't given to the
+  [assistant](ASSISTANT.md#keeping-a-fields-values-back) (`PATCH .../description` with `{"values_private": true}`).
+  It outlives the field: when a
+  private field goes (`clear_field`, a bulk clear, its last sample deleted, a revert to a version without it), the
+  flag stays behind, shown nowhere and costing nothing, and the field is private again when it comes back (written
+  again, restored by a revert, or a field renamed or cloned onto its name). While it is gone, the name is no field
+  of the dataset (404, as for a name it never had; clearing it again does nothing), so the mark can only be taken
+  off once the field exists again. A flag whose field never comes back stays with the dataset and goes when the
+  dataset is deleted. A rename takes the flag along: the old name keeps
+  none.
+- **Versions** save a field's description and unit with its type, and a revert restores them (from a version made
+  before fields had descriptions, the current ones stay). Those of the built-in and label fields aren't versioned,
+  like their types: a revert changes `width`'s description but never `created_at`'s. `values_private` never is, and
+  a revert neither sets nor clears it.
+- **On a mirror**, the primary's fields take their description and unit from the primary, with the rest of its field
+  settings: changing them on the mirror is refused (409), as changing their type is, and a request that carries one
+  of them changes nothing, its `values_private` included. The mirror's own `@local.` fields are described on the
+  mirror. `values_private` belongs to each instance and isn't synced: a mirror sets it on any field of the dataset,
+  the built-in ones included (`filepath`, say). The sync never resets it: a field the primary describes later keeps
+  it, and a field the primary removes (cleared, or its last sample deleted) keeps its flag here, so it is private
+  again if it comes back. The primary renaming a field reaches the mirror as one field going and another coming, so
+  the flag stays with the old name and the new name starts unflagged: mark it again.
 
 ## Geospatial filtering
 
@@ -1292,7 +1510,17 @@ s = dataset.samples
 
 near = s[geo_near([-122.42, 37.77], max_distance=5000)]   # within 5 km (metres)
 region = s[geo_within([[-122.5, 37.7], [-122.35, 37.7], [-122.35, 37.82], [-122.5, 37.82]])]
+fiji = s[geo_within([[176, -20], [183, -20], [183, -15], [176, -15]])]  # across the antimeridian
 ```
+
+A polygon's points are in one frame, as the map draws them: longitudes past 180 or below -180 make a shape across the
+antimeridian. A sample is inside when its location, moved east or west by whole turns of 360 degrees, lies inside the
+shape, so 176 to 183 holds samples at 177.4 and at -178.2, and the same shape one turn on (536 to 543) holds the same
+samples. A polygon whose longitudes all lie from -180 to 180 is read as before: points at 170 and -170 make the shape
+through longitude 0. One wider than 60 turns of the globe is refused. A coordinate may be text that reads as a
+number. A value that is not a list of points is refused with a 400 that says what the filter takes, a GeoJSON polygon
+object included (pass its ring, `polygon["coordinates"][0]`); `null`, fewer than three points, or three points of
+which the last is the first again, are no polygon and keep every sample.
 
 ---
 
@@ -1465,6 +1693,9 @@ ds.compute_metadata()  # width / height / aspect_ratio / megapixels / file_size_
 ds.compute_metrics()   # brightness / blurriness / contrast / entropy / salt_and_pepper /
                        # saturation / pct_underexposed / pct_overexposed
 ```
+
+Both also describe the fields they write, where nobody has, in a run that skipped no sample
+([field descriptions](#field-descriptions)).
 
 ### Lassos drawn on an earlier map layout
 
@@ -2039,8 +2270,9 @@ and `dataset.samples[...]` all produce them.
 | `contains` | Case-insensitive substring on text; membership on array fields | `{"field": "filename", "operator": "contains", "value": "cat"}` |
 | `exists` / `not_exists` | The metadata key is present / absent | `{"field": "reviewed", "operator": "exists"}` |
 | `is_null` / `is_not_null` | The value is null or missing / has a value | `{"field": "score", "operator": "is_null"}` |
-| `geo_polygon` | Location inside a polygon given as a list of `[lon, lat]` points (not a GeoJSON object) | `{"field": "location", "operator": "geo_polygon", "value": [[-122.5, 37.7], [-122.35, 37.7], [-122.35, 37.82], [-122.5, 37.82]]}` |
+| `geo_polygon` | Location inside a polygon given as a list of `[lon, lat]` points (not a GeoJSON object). Longitudes past 180 or below -180 make a shape across the antimeridian (176 to 183 holds 177.4 and -178.2); a polygon within -180 to 180 is read as before. A value that is not a list of points, a GeoJSON object included, is refused (400) ([Geospatial filtering](#geospatial-filtering)) | `{"field": "location", "operator": "geo_polygon", "value": [[-122.5, 37.7], [-122.35, 37.7], [-122.35, 37.82], [-122.5, 37.82]]}` |
 | `geo_near` | Location within `max_distance` metres of a point | `{"field": "location", "operator": "geo_near", "value": {"point": [-122.42, 37.77], "max_distance": 5000}}` |
+| `geo_region` / `geo_region_exclude` | Location inside a loaded region (a country, a state or province, or a group of them, by its key: [REGIONS.md](REGIONS.md)) / every other sample, those with no location included | `{"field": "location", "operator": "geo_region", "value": "US-KS"}` |
 
 ### Custom Embeddings
 
@@ -2191,8 +2423,8 @@ in_sf = dataset.samples[geo_within(san_francisco)]
 print(f"Found {in_sf.count()} samples in San Francisco")
 
 # The same filter as a raw dict. The value is the point list, NOT a GeoJSON
-# Polygon object: a GeoJSON dict is read as "fewer than 3 points" and silently
-# matches every sample.
+# Polygon object: a GeoJSON dict is refused (400); pass its ring,
+# polygon["coordinates"][0].
 result = dataset.client.query_samples(dataset.id, filters={
     "logic": "AND",
     "filters": [{"field": "location", "operator": "geo_polygon", "value": san_francisco}],
@@ -2302,12 +2534,16 @@ class Dataset:
     def export(export_dir, format="coco", label_field="ground_truth")   # also on DatasetView
 
     # Field management & merge
+    def get_schema(filters=None) -> list[dict]   # each field with description, unit, description_source, values_private
+    def set_field_description(field, description=None, unit=None) -> dict   # needs edit; "" clears one
     # Each waits for its server job; wait=False returns the Job
     def rename_field(field_name, new_name, *, wait=True, timeout=1800) -> dict | Job
     def clone_field(field_name, new_name, *, wait=True, timeout=1800) -> dict | Job
     def clear_field(field_name, *, wait=True, timeout=1800) -> dict | Job
     def merge_samples(source, key_field="filepath", fields=None, skip_existing=False) -> int
-    def add_samples_from(source, *, embedding_fields=None, hash_fields=None, batch_size=500) -> dict  # {"seen","added","skipped"}
+    # {"seen","added","skipped"}, "rewritten" (added with a new filepath) with path_prefixes={old: new}, and
+    # "objects_without_image" (objects added with parent_id null) when the view holds objects
+    def add_samples_from(source, *, embedding_fields=None, hash_fields=None, batch_size=500, path_prefixes=None) -> dict
 
     # Embeddings & visualization
     # Both return {"total", "written", "dropped", "dropped_sample_ids"}

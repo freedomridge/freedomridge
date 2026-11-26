@@ -374,6 +374,18 @@ async def seed_user(c: Ctx) -> None:
     )
 
 
+async def seed_assistant_group(c: Ctx) -> None:
+    """A group the assistant's settings let in."""
+    await seed_group(c)
+    await c.admin('PUT', f'/api/admin/assistant/groups/{c.group}')
+
+
+async def seed_assistant_user(c: Ctx) -> None:
+    """A user with an answer of their own in the assistant's settings."""
+    await seed_user(c)
+    await c.admin('PUT', f'/api/admin/assistant/users/{c.user}', json={'allowed': True})
+
+
 async def seed_storage_config(c: Ctx) -> None:
     made = await c.admin('POST', '/api/storage/configs', json={'name': f'config-{c.d}', 'bucket_name': 'bucket'})
     c.config = made['id']
@@ -455,6 +467,48 @@ def patch_dataset(field_name: str, level: str, value: Callable[[Ctx], Any], *see
 ROUTES: list[Route] = [
     # --- datasets.py ---
     route('POST', '/api/datasets', 'admin', lambda c: Call('/api/datasets', {'name': f'created-{c.d}'})),
+    # The assistant's settings: administrators only.
+    route(
+        'PATCH',
+        '/api/admin/assistant',
+        'admin',
+        lambda c: Call('/api/admin/assistant', {'new_datasets_closed': False}),
+    ),
+    route(
+        'PUT',
+        '/api/admin/assistant/groups/{group_id}',
+        'admin',
+        lambda c: Call(f'/api/admin/assistant/groups/{c.group}'),
+        seed_group,
+    ),
+    route(
+        'DELETE',
+        '/api/admin/assistant/groups/{group_id}',
+        'admin',
+        lambda c: Call(f'/api/admin/assistant/groups/{c.group}'),
+        seed_assistant_group,
+    ),
+    route(
+        'PUT',
+        '/api/admin/assistant/users/{user_id}',
+        'admin',
+        lambda c: Call(f'/api/admin/assistant/users/{c.user}', {'allowed': True}),
+        seed_user,
+    ),
+    route(
+        'DELETE',
+        '/api/admin/assistant/users/{user_id}',
+        'admin',
+        lambda c: Call(f'/api/admin/assistant/users/{c.user}'),
+        seed_assistant_user,
+    ),
+    # Queues the boundary set's download; no runner runs it here.
+    route(
+        'POST',
+        '/api/admin/regions/load',
+        'admin',
+        lambda c: Call('/api/admin/regions/load', {'set': 'natural-earth-admin1'}),
+    ),
     patch_dataset('name', 'manage', lambda c: f'renamed-{c.d}'),
     patch_dataset('description', 'edit', lambda c: 'notes'),
     patch_dataset('media_fields', 'edit', lambda c: ['filepath']),
@@ -464,6 +518,7 @@ ROUTES: list[Route] = [
     patch_dataset('default_view_id', 'edit', lambda c: c.view, seed_others_public_view),
     patch_dataset('is_global', 'manage', lambda c: True),
     patch_dataset('everyone_level', 'manage', lambda c: 'view'),
+    patch_dataset('assistant_closed', 'manage', lambda c: True),
     patch_dataset('storage_config_id', 'admin', lambda c: c.config, seed_storage_config),
     route('PUT', D + '/class-rules/{field_name}', 'edit', lambda c: Call(f'/api/datasets/{c.d}/class-rules/label', {})),
     route('DELETE', D, 'manage', lambda c: Call(f'/api/datasets/{c.d}')),
@@ -547,6 +602,15 @@ ROUTES: list[Route] = [
         F + '/display-type',
         'edit',
         lambda c: Call(f'/api/datasets/{c.d}/fields/score/display-type', {'display_type': 'enum'}),
+    ),
+    route(
+        'PATCH',
+        F + '/description',
+        'edit',
+        lambda c: Call(
+            f'/api/datasets/{c.d}/fields/score/description',
+            {'description': 'How sure the model is.', 'unit': 'probability', 'values_private': True},
+        ),
     ),
     route(
         'POST',
@@ -2432,12 +2496,17 @@ SAMPLE_CHANGES: dict[str, Any] = {
     'heading': 90.0,
     'array_fields': {'labels_x': ['a']},
 }
+# Fields of the body that no edit ever writes, so no change of them succeeds at any level: a sample's path can't be
+# changed (paths contract 2.3). The body may carry one so the server can refuse a different value; what each level
+# may do with it is test_a_sample_patch_never_changes_the_filepath_at_any_level.
+NEVER_WRITTEN = {'filepath'}
 
 
 def test_a_sample_patch_at_tag_level_changes_tags_and_no_other_field_of_the_model(world):
     """Every field of the sample-update body (datasets.SampleUpdate) other than tags needs edit, alone or beside
-    tags. The fields come from the model, so one added later is covered, and one with no example here fails."""
-    fields = set(datasets.SampleUpdate.model_fields) - {'tags'}
+    tags. The fields come from the model, so one added later is covered, and one with no example here fails; a field
+    no edit ever writes (NEVER_WRITTEN) is checked on its own, below."""
+    fields = set(datasets.SampleUpdate.model_fields) - {'tags'} - NEVER_WRITTEN
     assert 'tags' in datasets.SampleUpdate.model_fields
     missing, stale = sorted(fields - SAMPLE_CHANGES.keys()), sorted(SAMPLE_CHANGES.keys() - fields)
     assert not missing, f'fields of SampleUpdate with no example change in SAMPLE_CHANGES: {missing}'
@@ -2459,6 +2528,40 @@ def test_a_sample_patch_at_tag_level_changes_tags_and_no_other_field_of_the_mode
         for field in sorted(fields):
             done = await w.call(POWER, 'PATCH', sample, json={field: SAMPLE_CHANGES[field]})
             assert done.status_code == 200, (field, done.text)
+
+    world(scenario)
+
+
+def test_a_sample_patch_never_changes_the_filepath_at_any_level(world):
+    """Paths contract 2.3, the field NEVER_WRITTEN: a body carrying a filepath other than the sample's is refused at
+    every level and writes nothing, its tags included (below edit by the level or by the path; at edit with 422 and
+    the text `filepath can't be changed` as its detail). The sample's own path sent back doesn't raise the level an
+    edit needs: tags and the path are still a tag-level edit, and write the tags."""
+
+    async def scenario(w):
+        await prepare(w)
+        c = await new_dataset(w)
+        sample = f'/api/datasets/{c.d}/samples/{c.s0}'
+        own = await w.database.fetchval('SELECT filepath FROM samples WHERE id = $1', c.s0)
+        state = 'SELECT filepath, tags, metadata, last_modified_at FROM samples WHERE id = $1'
+        other = f'moved/{own}'
+        for level in ('tag', 'edit'):
+            await set_share(w, c.d, POWER, level)
+            before = tuple(await w.database.fetchrow(state, c.s0))
+            for body in ({'filepath': other}, {'tags': ['x'], 'filepath': other}):
+                refused = await w.call(POWER, 'PATCH', sample, json=body)
+                said = (refused.status_code, detail(refused))
+                if level == 'tag' and refused.status_code == 403:
+                    assert said == (403, needs('edit')), (level, body, refused.text)
+                else:
+                    assert refused.status_code == 422, (level, body, refused.text)
+                    assert isinstance(said[1], str) and "filepath can't be changed" in said[1], (level, refused.text)
+            assert tuple(await w.database.fetchrow(state, c.s0)) == before, level
+        await set_share(w, c.d, POWER, 'tag')
+        kept = await w.call(POWER, 'PATCH', sample, json={'tags': ['kept'], 'filepath': own})
+        assert kept.status_code == 200, kept.text
+        row = await w.database.fetchrow(state, c.s0)
+        assert (row['filepath'], row['tags']) == (own, ['kept']), tuple(row)
 
     world(scenario)
 

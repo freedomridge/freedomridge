@@ -25,6 +25,15 @@ declaration, hard to forget, impossible to skip by accident — and
 `require_level(...)` for a level above view. A level that depends on the request
 (its body, or a row it names) is checked in code marked with `checks_level`.
 Every write route declares who may call it; tests/test_route_levels.py checks.
+
+The assistant (docs/ASSISTANT.md): a request a tool makes in process carries its user marked as the assistant's
+(identity.assistant_door). For such a request, and only for it, a dataset closed to the assistant (assistant_closed)
+is refused by check_dataset_access, after the access check, with ASSISTANT_CLOSED, and left out by
+filter_datasets_for_user. An administrator's request through a tool is checked the same way: caller_level doesn't
+skip the lookup for it. The same user reads the dataset in the app and through the API as before. An administration
+tool's request (identity.admin_tool) is neither refused a closed dataset nor has it left out: it reaches only the
+routes its tool lists (private.SPANNING_ROUTES), which name closed datasets as they name every other, and the tool
+keeps their answers to named facts with nothing of a closed dataset's samples (backend/assistant/private.py).
 """
 
 from contextlib import contextmanager
@@ -32,6 +41,7 @@ from typing import Any, Callable, Iterator, Literal, Optional, TypeVar
 
 from fastapi import Depends, HTTPException, Request
 
+from .assistant.identity import admin_tool, assistant_door
 from .database import db
 
 # The levels of a share, lowest first: each includes the ones before it. Stored as their numbers (1 to 4), so SQL
@@ -77,11 +87,20 @@ _READ_ONLY_DATASET_POSTS = frozenset(
     },
 )
 _DELETING = 'Dataset is being deleted; writes are disabled. Resume deletion to finish.'
+ASSISTANT_CLOSED = 'The assistant may not read this dataset'
 
 
 class LevelRefused(HTTPException):
     """403 below the level an action needs. The caller can open the dataset, so missing_unless_allowed lets it
     through: a row they can see isn't answered as missing."""
+
+
+class AssistantClosed(LevelRefused):
+    """403 for an assistant's request in a dataset closed to the assistant. The user can open the dataset, so a row
+    of it (a view, a job) reached through a tool is refused with these words, not answered as missing."""
+
+    def __init__(self) -> None:
+        super().__init__(status_code=403, detail=ASSISTANT_CLOSED)
 
 
 def level_refusal(level: str) -> LevelRefused:
@@ -169,7 +188,7 @@ async def check_dataset_access(
     if dataset is None or dataset['id'] != dataset_id:
         row = await db.fetchrow(
             """
-            SELECT id, name, storage_config_id, owner_id, is_global, everyone_level, deleting
+            SELECT id, name, storage_config_id, owner_id, is_global, everyone_level, deleting, assistant_closed
             FROM datasets WHERE id = $1
             """,
             dataset_id,
@@ -182,11 +201,12 @@ async def check_dataset_access(
 
     # A global dataset gives every signed-in user view at least, and its everyone level: when that covers the
     # request, no shares query, the hot path for reads.
-    if dataset['is_global'] and (needed == 1 or _capped(dataset['everyone_level'], user) >= needed):
-        return dataset
-
-    if await _level(dataset, user, state) < needed:
-        raise level_refusal(level)
+    if not (dataset['is_global'] and (needed == 1 or _capped(dataset['everyone_level'], user) >= needed)):
+        if await _level(dataset, user, state) < needed:
+            raise level_refusal(level)
+    # After the access check: a user who can't open the dataset learns nothing about it from a tool.
+    if dataset.get('assistant_closed') and assistant_door(user) and not admin_tool(user):
+        raise AssistantClosed()
     return dataset
 
 
@@ -203,8 +223,9 @@ async def _level(dataset: dict, user: dict, state: Any) -> int:
 
 async def caller_level(dataset_id: int, user: dict, state: Any = None) -> int:
     """The caller's level in a dataset, as a number, raising as check_dataset_access does when they can't open it.
-    An administrator's is manage without a lookup, so a caller that must 404 a missing dataset checks that first."""
-    if user.get('role') == 'admin':
+    An administrator's is manage without a lookup, so a caller that must 404 a missing dataset checks that first;
+    except through the assistant, which looks the dataset up for the closed-dataset rule."""
+    if user.get('role') == 'admin' and not assistant_door(user):
         return MANAGE
     return await _level(await check_dataset_access(dataset_id, user, state=state), user, state)
 
@@ -311,12 +332,14 @@ async def filter_datasets_for_user(user: Optional[dict]) -> tuple[str, list]:
     if user is None:
         # Login required for all access — anonymous callers see no datasets.
         return ("FALSE", [])
+    # Through the assistant, a dataset closed to it is left out (not for an administration tool: identity.admin_tool).
+    closed = " AND NOT assistant_closed" if assistant_door(user) and not admin_tool(user) else ""
     if user.get('role') == 'admin':
-        return ("TRUE", [])
+        return ("NOT assistant_closed" if closed else "TRUE", [])
     return (
-        "(is_global = TRUE OR id IN (SELECT dataset_id FROM dataset_access WHERE user_id = $1)"
+        "((is_global = TRUE OR id IN (SELECT dataset_id FROM dataset_access WHERE user_id = $1)"
         " OR id IN (SELECT g.dataset_id FROM dataset_group_access g JOIN group_members m ON m.group_id = g.group_id"
-        " WHERE m.user_id = $1))",
+        f" WHERE m.user_id = $1)){closed})",
         [user['id']],
     )
 

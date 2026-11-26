@@ -46,6 +46,19 @@ async function openWith(page: Page, datasetId: number, stages: object[], drafts:
     await page.goto(`/datasets/${datasetId}`);
 }
 
+/** POSTs `data` from the page's session, sending it again while the server answers 409 with Retry-After: a refusal
+ * with no effect that asks for a retry, which apiFetch honours for setup requests too. A bulk submit waits at most
+ * 100 ms for its locks, and another spec's first array field (an ALTER TABLE on samples, queued behind a transaction
+ * that uses samples) holds every samples lock behind it for up to 2 s. A few tries, as long apart as the header says. */
+async function postRetrying(page: Page, url: string, data: object) {
+    for (let attempt = 1; ; attempt++) {
+        const response = await page.request.post(url, { data });
+        const retryAfter = Number(response.headers()['retry-after']);
+        if (response.status() !== 409 || !Number.isFinite(retryAfter) || attempt === 5) return response;
+        await page.waitForTimeout(Math.max(1, retryAfter) * 1_000);
+    }
+}
+
 const gridCount = (page: Page) => page.getByTestId('grid-view-count');
 const NOT_HIDDEN = { type: 'filter', description: 'not hidden', filter: { field: 'tags', operator: '!=', value: 'hide' } };
 
@@ -204,8 +217,8 @@ test.describe('datasets of its own', () => {
         const { id } = await dataset('e2e-one-count-job', sixImages('e2e-one-count-job'));
         await openNotHidden(page, id, 6);
         const seen = recordQueries(page, id);
-        const submitted = await page.request.post(`/api/datasets/${id}/samples/bulk-tag`, {
-            data: { filters: { field: 'idx', operator: '<', value: 2 }, add_tags: ['hide'] },
+        const submitted = await postRetrying(page, `/api/datasets/${id}/samples/bulk-tag`, {
+            filters: { field: 'idx', operator: '<', value: 2 }, add_tags: ['hide'],
         });
         expect(submitted.status()).toBe(202);
         await expect.poll(async () => ((await (await page.request.get(`/api/datasets/${id}/jobs`)).json()).items ?? [])

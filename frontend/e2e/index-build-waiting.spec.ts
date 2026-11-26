@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { test as base, expect } from '@playwright/test';
-import { AUTH_STATE } from './helpers';
+import { AUTH_STATE, retryOnReset } from './helpers';
 
 // One index build at a time (backend index_jobs.enqueue_build): a build queued while another runs hasn't started,
 // holds no dataset lane, and says what it waits for instead of "Waiting for an execution slot".
@@ -12,7 +12,7 @@ const test = base.extend<{ datasetId: number }>({
         try {
             await provide(dataset.id);
         } finally {
-            const deleted = await request.delete(`/api/datasets/${dataset.id}`);
+            const deleted = await retryOnReset(() => request.delete(`/api/datasets/${dataset.id}`));
             expect(deleted.ok()).toBeTruthy();
         }
     },

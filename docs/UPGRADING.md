@@ -33,7 +33,8 @@ From the checkout the server runs, with `docker-compose.prod.yml`:
    docker compose -f docker-compose.prod.yml pull
    ```
    To build them from the checkout instead, as releases before 2.2.0 need, run
-   `docker compose -f docker-compose.prod.yml build --pull`.
+   `docker compose -f docker-compose.prod.yml build --pull`. Building needs BuildKit (`docker compose build`, or
+   `docker build` with the buildx plugin); the legacy builder stops at the step that adds the region boundaries.
 4. Stop the app, apply the migrations with it stopped, then recreate the containers. Crossing 2.9.0, read
    [Upgrading across 2.9.0](#upgrading-across-290) first: its migration takes longer. Crossing 2.11.0, read
    [Upgrading to 2.11.0](#upgrading-to-2110).
@@ -189,6 +190,9 @@ Don't run an older version against the upgraded database: its migration runner a
 ```bash
 git pull --ff-only
 uv sync --extra cuda          # or --extra cpu
+# Region boundaries, for filters by place: a 41 MB download, made once. A backend that was running
+# during it loads them once restarted.
+python -m backend.regions fetch
 cd frontend && npm ci && cd ..
 # When the pull brought new backend/db/migrations (the Quick Start's database container), with the
 # backend, the job runner and the frontend stopped:

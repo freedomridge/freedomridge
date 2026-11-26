@@ -18,6 +18,9 @@ in the folder's `.env`, then run `npx freedomridge stop` and start it again.
 It puts this release's Compose file in `~/freedomridge`, pulls the release's images from ghcr.io (a few GB the
 first time), starts them and opens http://localhost:3000. Log in as `admin` / `admin123` the first time, and
 choose a new password. Put your images in `~/freedomridge/data`: the app sees them at the same paths.
+Named regions, for filters such as `location within "US-KS"`, are ready a few minutes after the first start: the
+images carry the boundary file and the server loads it by itself
+([Regions](https://github.com/freedomridge/freedomridge/blob/main/docs/REGIONS.md)).
 
 The Python SDK connects to the API on port 8000:
 

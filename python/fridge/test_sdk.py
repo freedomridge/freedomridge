@@ -7,13 +7,34 @@ Usage (requires FRIDGE_TEST_URL pointing to a disposable backend):
     python -m fridge.test_sdk
 """
 
+import contextlib
+import importlib.util
+import io
+import math
+import os
+import re
 import sys
 import tempfile
 import traceback
+import warnings
+from collections.abc import Mapping
+from types import ModuleType
+from urllib.parse import unquote, urlsplit
 
 import requests
+from PIL import Image
 
-from fridge import ClassProbabilities, Dataset, DatasetView, Sample, connect, geo_within, threshold_rule
+import fridge
+from fridge import (
+    ClassProbabilities,
+    Dataset,
+    DatasetView,
+    Sample,
+    compute_image_metrics,
+    connect,
+    geo_within,
+    threshold_rule,
+)
 from fridge._test_safety import require_test_url
 from fridge.core import client as client_module
 from fridge.core.client import Client, get_client
@@ -239,6 +260,84 @@ def run_tests():
             assert False, "Should have raised KeyError"
         except KeyError:
             pass
+
+    _()
+
+    def refused_with_the_servers_sentence(key, write, undo):
+        """`write` raises the server's refusal of a metadata key named like a sample's own column. A server that
+        takes it gets `undo` first, so the samples the later tests count stay as they were."""
+        sentence = f"metadata key(s) ['{key}'] name sample columns — set them on the sample itself"
+        try:
+            write()
+        except requests.HTTPError as error:
+            assert error.response is not None and error.response.status_code == 422, error
+            assert sentence in str(error), error
+        else:
+            undo()
+            raise AssertionError(f"a metadata key named {key!r} was accepted")
+
+    def delete_if_stored(fp):
+        try:
+            ds.delete_sample(ds[fp].id)
+        except KeyError:
+            pass
+
+    @test("add_samples refuses a metadata key named created_at with the server's sentence, storing nothing")
+    def _():
+        fp = 's3://test/reserved_created_at.jpg'
+        refused_with_the_servers_sentence(
+            'created_at',
+            lambda: ds.add_samples([Sample(filepath=fp, metadata={'created_at': 'x', 'kept': 1})]),
+            lambda: delete_if_stored(fp),
+        )
+        try:
+            ds[fp]
+            assert False, "the refused sample was stored"
+        except KeyError:
+            pass
+
+    _()
+
+    @test("a metadata key named tags or media_type is refused with the server's sentence, on upload and on save()")
+    def _():
+        for key in ('tags', 'media_type'):
+            fp = f's3://test/reserved_{key}.jpg'
+            refused_with_the_servers_sentence(
+                key,
+                lambda: ds.add_samples([Sample(filepath=fp, metadata={key: 'x', 'kept': 1})]),
+                lambda: delete_if_stored(fp),
+            )
+            try:
+                ds[fp]
+                assert False, f"the sample with a metadata key named {key} was stored"
+            except KeyError:
+                pass
+            s = ds['s3://test/img_6.jpg']
+            before = dict(s.metadata)
+            s.metadata[key] = 'x'
+            refused_with_the_servers_sentence(
+                key,
+                s.save,
+                lambda: ds.client.update_sample(ds._id, s.id, remove_metadata_keys=[key]),
+            )
+            assert ds['s3://test/img_6.jpg'].metadata == before, "a refused save changed the sample"
+
+    _()
+
+    @test("save() and set_values with a metadata key named like one of the five older sample columns are refused")
+    def _():
+        for key in ('id', 'dataset_id', 'filepath', 'created_at', 'last_modified_at'):
+            s = ds['s3://test/img_6.jpg']
+            before = dict(s.metadata)
+
+            def undo():
+                ds.client.update_sample(ds._id, s.id, remove_metadata_keys=[key])
+
+            s.metadata[key] = 'x'
+            refused_with_the_servers_sentence(key, s.save, undo)
+            assert ds['s3://test/img_6.jpg'].metadata == before, "a refused save changed the sample"
+            refused_with_the_servers_sentence(key, lambda: ds.set_values([s.id], key, 'x'), undo)
+            assert ds['s3://test/img_6.jpg'].metadata == before, "a refused set_values changed the sample"
 
     _()
 
@@ -2119,6 +2218,8 @@ def run_tests():
     _()
 
     _run_access_tests(client)
+    _run_computed_description_tests(client)
+    _run_path_tests(client)
 
     # --- CLEANUP ---
     print("\n--- Cleanup ---")
@@ -2740,6 +2841,854 @@ def _run_access_tests(client):
             print(f"Deleted {ACCESS_DATASET}, its users and its group")
         except Exception as error:  # a cleanup failure must not hide the results above
             print(f"Access cleanup failed: {error}")
+
+
+# =========================================================================
+# COMPUTED FIELD DESCRIPTIONS
+# compute_metadata() and compute_metrics() give each field they wrote in a run its description and unit, where the
+# field has none of its own, and fridge.COMPUTED_FIELD_DESCRIPTIONS holds them (m1-contract-computed-field-descriptions,
+# section 2). Written from the contract, not from the code, and read back through the schema as the SDK returns it.
+# Where the contract leaves a shape open, these tests read it this way:
+# - The images are small real PNGs made here at local paths, read with an image_loader of the test's, so
+#   compute_metadata() writes file_size_bytes too. One more image, in memory, stands at an s3:// path, for which
+#   compute_metadata() writes no file_size_bytes: there, that field is one "the run wrote no value for". An image that
+#   can't be read is a file of bytes that aren't an image.
+# - "Skipped because it already had its values" is what the summary line counts as skipped; "describes nothing" is no
+#   description request sent and every field reading none (or, after an earlier run, what it read before).
+# - A field the run can't vouch for (a sample it wrote no value of it for already holds one: an unreadable image
+#   with the user's own brightness, an s3:// sample with the user's own file_size_bytes) reads none, while the
+#   other fields the run wrote read the SDK's.
+# - The backend-tests job installs no OpenCV, which compute_metrics() needs. Where it is missing, a stand-in for the two
+#   OpenCV calls compute_image_metrics() makes is put in sys.modules['cv2'] while the metrics run: its values are not
+#   OpenCV's, but which fields a run writes and describes is the same. Where OpenCV is installed, it is used.
+# - No level lets a user write values but not describe a field (both need edit), so the server's refusal is made on the
+#   session the dataset's client uses: its description requests (PATCH .../fields/<name>/description) are sent to a
+#   route the server doesn't have (its 404, as an older server without the route answers), or to the same route as a
+#   user with a view share in the dataset (its 403, as the user's level refuses). "Can't be reached" is the same
+#   requests raising requests.ConnectionError, as a connection the server refuses does.
+# - "Warns once" is one Python warning (warnings.warn) that names every field the run wrote; "why" is the refusal's
+#   status code or the server's words, or for the unreachable server the connection error's words or that it could not
+#   connect or reach the server, in it.
+# - A pair is a tuple. What the two methods return today is None; their progress output is checked by the summary line
+#   each prints.
+# =========================================================================
+CFD_DATASETS = {
+    key: f'sdk-test-cfd-{key}'
+    for key in (
+        'fresh',
+        'own',
+        'skip',
+        'some',
+        'overwrite',
+        'broken',
+        'unvouched-metric',
+        'unvouched-metadata',
+        'old-server',
+        'unreachable',
+        'level',
+    )
+}
+CFD_VIEWER = 'sdk_cfd_viewer'
+CFD_PASSWORD = 'sdk-cfd-pass-1'
+METADATA_FIELDS = ('width', 'height', 'aspect_ratio', 'megapixels', 'file_size_bytes')  # compute_metadata()
+METRIC_FIELDS = (  # compute_metrics()
+    'brightness',
+    'blurriness',
+    'contrast',
+    'entropy',
+    'salt_and_pepper',
+    'saturation',
+    'pct_underexposed',
+    'pct_overexposed',
+)
+COMPUTED_FIELDS = METADATA_FIELDS + METRIC_FIELDS
+# What the server gave each of them by name before this change, word for word, with its unit: the words and units move
+# to the SDK unchanged.
+SERVER_TEXTS_BEFORE = {
+    'width': ("The image's width in pixels, as stored in the file (a camera's rotation tag isn't applied).", 'px'),
+    'height': ("The image's height in pixels, as stored in the file (a camera's rotation tag isn't applied).", 'px'),
+    'aspect_ratio': (
+        'Width divided by height, rounded to 4 decimal places: above 1 for a landscape image, below 1 for portrait.',
+        None,
+    ),
+    'megapixels': ('Width times height in millions of pixels, rounded to 3 decimal places.', 'MP'),
+    'file_size_bytes': (
+        "The image file's size, recorded only when the sample's path named a file on the disk of the machine that "
+        'ran compute_metadata() (never for s3:// files).',
+        'bytes',
+    ),
+    'brightness': (
+        "Perceived brightness of the image's average colour, the square root of 0.241·R² + 0.691·G² + 0.068·B² of "
+        'its mean red, green and blue values, from 0 (black) to 255 (white).',
+        None,
+    ),
+    'blurriness': (
+        'Variance of the Laplacian of the grey-level image: low values suggest a blurry image and high values a '
+        'sharp one, despite the name.',
+        None,
+    ),
+    'contrast': ('The highest minus the lowest value over all pixels and all three colour channels, 0 to 255.', None),
+    'entropy': (
+        'Shannon entropy of the red, green and blue values taken as one 768-bin histogram, from about 1.6 for a single '
+        'flat colour to about 9.6 when every value is equally common.',
+        'bits',
+    ),
+    'salt_and_pepper': (
+        'Share of pixels that are lone near-white (grey level 244 or more) or near-black (10 or less) specks, the '
+        'ones a 2×2 morphological opening removes: a sign of salt-and-pepper noise.',
+        '%',
+    ),
+    'saturation': (
+        'Mean colour saturation of the pixels on the HSV scale, from 0 (grey) to 255 (fully saturated colour).',
+        None,
+    ),
+    'pct_underexposed': ('Share of pixels whose grey level is 5 or less (of 255): crushed shadows.', '%'),
+    'pct_overexposed': ('Share of pixels whose grey level is 250 or more (of 255): blown highlights.', '%'),
+}
+# The units among them, as they are today.
+UNITS_BEFORE = {
+    'width': 'px',
+    'height': 'px',
+    'megapixels': 'MP',
+    'file_size_bytes': 'bytes',
+    'entropy': 'bits',
+    'salt_and_pepper': '%',
+    'pct_underexposed': '%',
+    'pct_overexposed': '%',
+}
+CFD_IMAGES = ((8, 6, (250, 250, 250)), (12, 10, (20, 40, 200)), (16, 16, (128, 128, 128)))  # width, height, colour
+IN_MEMORY = 's3://sdk-test-cfd/in-memory.png'
+IN_MEMORY_SIZE = (10, 4)
+NOTHING_WRITTEN = (None, None, None)  # (description, unit, description_source) of a field nobody described
+
+
+def _cfd_images(folder):
+    """The images of CFD_IMAGES as PNG files in `folder`; their paths."""
+    paths = []
+    for index, (width, height, colour) in enumerate(CFD_IMAGES):
+        image = Image.new('RGB', (width, height), colour)
+        image.putpixel((0, 0), (0, 0, 0))
+        image.putpixel((width - 1, height - 1), (255, 255, 255))
+        path = os.path.join(folder, f'cfd-{index}.png')
+        image.save(path)
+        paths.append(path)
+    return paths
+
+
+def _cfd_open(path):
+    """The tests' image_loader: a file at a local path, or the image in memory at IN_MEMORY."""
+    if path == IN_MEMORY:
+        return Image.new('RGB', IN_MEMORY_SIZE, (200, 30, 30))
+    with Image.open(path) as image:
+        return image.convert('RGB')
+
+
+def _own_values(index):
+    """A sample's values of the user's own for the thirteen fields, each on a scale of its own."""
+    return {
+        'width': 12.5 + index,  # centimetres on the print
+        'height': 9.0,
+        'aspect_ratio': 1.39,
+        'megapixels': 0.5,
+        'file_size_bytes': 2.5 + index,  # kilobytes
+        'brightness': 0.25 * (index + 1),  # from 0 to 1
+        'blurriness': 0.1 * index,
+        'contrast': 0.8,
+        'entropy': 0.3,
+        'salt_and_pepper': 0.01,
+        'saturation': 0.4,
+        'pct_underexposed': 0.02,
+        'pct_overexposed': 0.03,
+    }
+
+
+@contextlib.contextmanager
+def _metric_dependencies():
+    """OpenCV for compute_metrics(), or where it isn't installed a stand-in for its two calls (see above)."""
+    if importlib.util.find_spec('cv2') is not None:
+        yield
+        return
+    import numpy as np
+
+    def laplacian(source, depth):
+        grey = np.asarray(source, dtype=np.float64)
+        around = np.pad(grey, 1, mode='reflect')
+        return around[:-2, 1:-1] + around[2:, 1:-1] + around[1:-1, :-2] + around[1:-1, 2:] - 4 * grey
+
+    def opening(source, operation, kernel):
+        return np.array(source)
+
+    stand_in = ModuleType('cv2')
+    vars(stand_in).update(CV_64F=6, MORPH_OPEN=2, Laplacian=laplacian, morphologyEx=opening)
+    sys.modules['cv2'] = stand_in
+    try:
+        yield
+    finally:
+        sys.modules.pop('cv2', None)
+
+
+@contextlib.contextmanager
+def _description_requests(session, divert=None):
+    """The description requests (PATCH .../fields/<name>/description) sent on `session`, as (field name, body); with
+    `divert`, each is answered by divert(method, url, ...) in place of the server's route."""
+    sent: list = []
+    original = session.request
+
+    def request(method, url, *args, **kwargs):
+        found = re.search(r'/fields/([^/]+)/description$', urlsplit(url).path)
+        if str(method).upper() == 'PATCH' and found:
+            sent.append((unquote(found.group(1)), kwargs.get('json')))
+            if divert is not None:
+                return divert(method, url, *args, **kwargs)
+        return original(method, url, *args, **kwargs)
+
+    vars(session)['request'] = request
+    try:
+        yield sent
+    finally:
+        vars(session).pop('request', None)
+
+
+def _schema_descriptions(ds):
+    """{field name: (description, unit, description_source)}, from the schema as the SDK returns it."""
+    return {
+        field['name']: (field['description'], field['unit'], field['description_source']) for field in ds.get_schema()
+    }
+
+
+def _sdk_described(name):
+    """What a field the SDK described reads: its words and unit, description_source "set"."""
+    description, unit = SERVER_TEXTS_BEFORE[name]
+    return description, unit, 'set'
+
+
+def _differences(seen, expected):
+    """{field name: (what it reads, what it should)} for each field of `expected` that reads otherwise."""
+    return {name: (seen.get(name), want) for name, want in expected.items() if seen.get(name) != want}
+
+
+def _stored_metadata(ds):
+    """Each sample's metadata, by filepath."""
+    return {sample.filepath: dict(sample.metadata) for sample in ds.iter_samples()}
+
+
+def _quietly(call, *args, **kwargs):
+    """call(*args, **kwargs), keeping what it prints: (its answer, the text printed)."""
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        answer = call(*args, **kwargs)
+    return answer, out.getvalue()
+
+
+def _warnings_naming(caught):
+    """The texts of the caught warnings that name any of the computed fields."""
+    texts = [str(warning.message) for warning in caught]
+    return [text for text in texts if any(re.search(rf'\b{name}\b', text) for name in COMPUTED_FIELDS)]
+
+
+def _names_each(text, fields):
+    """The fields `text` doesn't name."""
+    return [name for name in fields if not re.search(rf'\b{name}\b', text)]
+
+
+def _run_computed_description_tests(client):
+    print("\n--- Computed field descriptions ---")
+    base = client.base_url
+    admin = client.session
+    ctx: dict = {}
+
+    def ok(response):
+        assert response.ok, f"{response.request.method} {response.url}: {response.status_code} {response.text[:300]}"
+        return response
+
+    def remove_leftovers():
+        for d in client.get_datasets():
+            if d['name'] in CFD_DATASETS.values():
+                client.delete_dataset(d['id'])
+        for u in ok(admin.get(f"{base}/users")).json():
+            if u['username'] == CFD_VIEWER:
+                ok(admin.delete(f"{base}/users/{u['id']}"))
+
+    try:
+        remove_leftovers()
+    except Exception as error:
+        print(f"  Computed descriptions: leftovers not removed: {error}")
+
+    with tempfile.TemporaryDirectory(prefix='sdk-test-cfd-') as folder:
+        paths = _cfd_images(folder)
+        broken = os.path.join(folder, 'cfd-broken.png')  # not an image: it can't be read
+        with open(broken, 'wb') as out:
+            out.write(b'not an image')
+
+        def images_dataset(key, values=None):
+            """A new dataset of the local images, each sample with values(index) as its metadata when given."""
+            ds = Dataset(CFD_DATASETS[key])
+            ds.add_samples(
+                [Sample(filepath=path, metadata=values(index) if values else {}) for index, path in enumerate(paths)],
+            )
+            return ds
+
+        try:
+
+            @test(
+                "COMPUTED_FIELD_DESCRIPTIONS: the thirteen fields compute_metadata() and compute_metrics() write, each "
+                "(description, unit), in the words and units the server gave them by name",
+            )
+            def _():
+                table = getattr(fridge, 'COMPUTED_FIELD_DESCRIPTIONS', None)
+                assert table is not None, "fridge has no COMPUTED_FIELD_DESCRIPTIONS"
+                assert isinstance(table, Mapping), type(table)
+                assert sorted(table) == sorted(COMPUTED_FIELDS), sorted(table)
+                for name, pair in table.items():
+                    assert isinstance(pair, tuple) and len(pair) == 2, (name, pair)
+                    description, unit = pair
+                    assert isinstance(description, str) and description.strip(), (name, pair)
+                    assert unit is None or isinstance(unit, str), (name, pair)
+                    assert pair == SERVER_TEXTS_BEFORE[name], (name, pair, SERVER_TEXTS_BEFORE[name])
+                assert {name: unit for name, (_, unit) in table.items() if unit is not None} == UNITS_BEFORE
+
+            _()
+
+            @test(
+                "compute_metadata() and compute_metrics() write the values they wrote before, return None and print "
+                "their summary",
+            )
+            def _():
+                ds = images_dataset('fresh')
+                ctx['fresh'] = ds
+                with _metric_dependencies():
+                    from_metadata, printed = _quietly(ds.compute_metadata, image_loader=_cfd_open)
+                    from_metrics, printed_metrics = _quietly(ds.compute_metrics, image_loader=_cfd_open)
+                    expected = {path: compute_image_metrics(_cfd_open(path)) for path in paths}
+                assert (from_metadata, from_metrics) == (None, None)
+                assert 'Metadata: 3 computed, 0 skipped, 0 errors' in printed, printed
+                assert 'Metrics: 3 computed, 0 skipped, 0 errors' in printed_metrics, printed_metrics
+                stored = _stored_metadata(ds)
+                for path, (width, height, _colour) in zip(paths, CFD_IMAGES):
+                    meta = stored[path]
+                    assert {name: meta.get(name) for name in METADATA_FIELDS} == {
+                        'width': width,
+                        'height': height,
+                        'aspect_ratio': round(width / height, 4),
+                        'megapixels': round(width * height / 1e6, 3),
+                        'file_size_bytes': os.path.getsize(path),
+                    }, (path, meta)
+                    for name, value in expected[path].items():
+                        assert math.isclose(meta[name], value, rel_tol=1e-9, abs_tol=1e-9), (path, name, meta, value)
+
+            _()
+
+            @test("compute_metadata() gives each field it wrote the SDK's description and unit, description_source set")
+            def _():
+                seen = _schema_descriptions(ctx['fresh'])
+                differ = _differences(seen, {name: _sdk_described(name) for name in METADATA_FIELDS})
+                assert not differ, differ
+
+            _()
+
+            @test("compute_metrics() gives each field it wrote the SDK's description and unit, description_source set")
+            def _():
+                seen = _schema_descriptions(ctx['fresh'])
+                differ = _differences(seen, {name: _sdk_described(name) for name in METRIC_FIELDS})
+                assert not differ, differ
+
+            _()
+
+            @test(
+                "what someone wrote is kept: a field with only a description gains the unit, one with only a unit "
+                "gains the description, one with both is untouched",
+            )
+            def _():
+                ds = images_dataset('own', _own_values)
+                written = {
+                    'width': ('Print width, ours.', None),  # a description only: gains the unit
+                    'height': (None, 'cm'),  # a unit only: gains the description
+                    'megapixels': ('Million pixels, ours.', 'Mpx'),  # both: untouched
+                    'entropy': ('Our entropy.', None),
+                    'salt_and_pepper': (None, 'ppm'),
+                    'pct_overexposed': ('Blown pixels, ours.', 'share'),
+                }
+                for name, (description, unit) in written.items():
+                    ds.set_field_description(name, description, unit=unit)
+                with _metric_dependencies():
+                    _quietly(ds.compute_metadata, image_loader=_cfd_open, skip_existing=False)
+                    _quietly(ds.compute_metrics, image_loader=_cfd_open, skip_existing=False)
+                expected = {name: _sdk_described(name) for name in COMPUTED_FIELDS}
+                for name, (description, unit) in written.items():
+                    words, sdk_unit = SERVER_TEXTS_BEFORE[name]
+                    expected[name] = (description or words, unit or sdk_unit, 'set')
+                differ = _differences(_schema_descriptions(ds), expected)
+                assert not differ, differ
+
+            _()
+
+            @test(
+                "skip_existing=True where every sample already has the values (the user's own) writes no value and "
+                "describes nothing",
+            )
+            def _():
+                ds = images_dataset('skip', _own_values)
+                before = _stored_metadata(ds)
+                with _metric_dependencies(), _description_requests(ds.client.session) as sent:
+                    from_metadata, printed = _quietly(ds.compute_metadata, image_loader=_cfd_open, skip_existing=True)
+                    from_metrics, printed_metrics = _quietly(
+                        ds.compute_metrics,
+                        image_loader=_cfd_open,
+                        skip_existing=True,
+                    )
+                assert (from_metadata, from_metrics) == (None, None)
+                assert 'Metadata: 0 computed, 3 skipped, 0 errors' in printed, printed
+                assert 'Metrics: 0 computed, 3 skipped, 0 errors' in printed_metrics, printed_metrics
+                assert _stored_metadata(ds) == before
+                assert sent == [], sent
+                differ = _differences(_schema_descriptions(ds), dict.fromkeys(COMPUTED_FIELDS, NOTHING_WRITTEN))
+                assert not differ, differ
+
+            _()
+
+            def mixed_dataset(key):
+                """Two local images holding the user's own values (brightness from 0 to 1), and one in memory with
+                none."""
+                ds = Dataset(CFD_DATASETS[key])
+                ds.add_samples(
+                    [Sample(filepath=path, metadata=_own_values(index)) for index, path in enumerate(paths[:2])]
+                    + [Sample(filepath=IN_MEMORY)],
+                )
+                return ds
+
+            @test(
+                "skip_existing=True where some samples already have the values (the user's own): the run writes the "
+                "others and describes nothing",
+            )
+            def _():
+                ds = mixed_dataset('some')
+                before = _stored_metadata(ds)
+                with _metric_dependencies(), _description_requests(ds.client.session) as sent:
+                    _, printed = _quietly(ds.compute_metadata, image_loader=_cfd_open, skip_existing=True)
+                    _, printed_metrics = _quietly(ds.compute_metrics, image_loader=_cfd_open, skip_existing=True)
+                assert 'Metadata: 1 computed, 2 skipped, 0 errors' in printed, printed
+                assert 'Metrics: 1 computed, 2 skipped, 0 errors' in printed_metrics, printed_metrics
+                stored = _stored_metadata(ds)
+                for path in paths[:2]:
+                    assert stored[path] == before[path], (path, stored[path])  # the user's own values stay
+                made = stored[IN_MEMORY]
+                assert made.get('width') == IN_MEMORY_SIZE[0] and isinstance(made.get('brightness'), float), made
+                assert sent == [], sent
+                differ = _differences(_schema_descriptions(ds), dict.fromkeys(COMPUTED_FIELDS, NOTHING_WRITTEN))
+                assert not differ, differ
+
+            _()
+
+            @test(
+                "skip_existing=False on the same kind of dataset writes every sample and describes the fields it wrote",
+            )
+            def _():
+                ds = mixed_dataset('overwrite')
+                with _metric_dependencies():
+                    _, printed = _quietly(ds.compute_metadata, image_loader=_cfd_open, skip_existing=False)
+                    _, printed_metrics = _quietly(ds.compute_metrics, image_loader=_cfd_open, skip_existing=False)
+                assert 'Metadata: 3 computed, 0 skipped, 0 errors' in printed, printed
+                assert 'Metrics: 3 computed, 0 skipped, 0 errors' in printed_metrics, printed_metrics
+                stored = _stored_metadata(ds)
+                for path, (width, height, _colour) in zip(paths[:2], CFD_IMAGES):
+                    meta = stored[path]
+                    assert (meta.get('width'), meta.get('height')) == (width, height), meta  # the SDK's values now
+                    assert meta.get('file_size_bytes') == os.path.getsize(path), meta
+                differ = _differences(
+                    _schema_descriptions(ds),
+                    {name: _sdk_described(name) for name in COMPUTED_FIELDS},
+                )
+                assert not differ, differ
+
+            _()
+
+            @test(
+                "a second run with skip_existing=True on a dataset the SDK computed skips every sample, changes no "
+                "description and sends no description request",
+            )
+            def _():
+                ds = ctx['fresh']
+                values, described = _stored_metadata(ds), _schema_descriptions(ds)
+                with _metric_dependencies(), _description_requests(ds.client.session) as sent:
+                    _, printed = _quietly(ds.compute_metadata, image_loader=_cfd_open, skip_existing=True)
+                    _, printed_metrics = _quietly(ds.compute_metrics, image_loader=_cfd_open, skip_existing=True)
+                assert 'Metadata: 0 computed, 3 skipped, 0 errors' in printed, printed
+                assert 'Metrics: 0 computed, 3 skipped, 0 errors' in printed_metrics, printed_metrics
+                assert sent == [], sent
+                assert _stored_metadata(ds) == values
+                differ = _differences(_schema_descriptions(ds), {name: described.get(name) for name in COMPUTED_FIELDS})
+                assert not differ, differ
+
+            _()
+
+            @test(
+                "a sample whose image can't be read is not a skip: the run describes the fields it wrote, and leaves "
+                "alone one it wrote no value for",
+            )
+            def _():
+                ds = Dataset(CFD_DATASETS['broken'])
+                ds.add_samples(
+                    [
+                        Sample(filepath=IN_MEMORY, metadata={'file_size_bytes': 2.5}),  # the user's own, in kilobytes
+                        Sample(filepath=broken),
+                    ],
+                )
+                with _metric_dependencies():
+                    _, printed = _quietly(ds.compute_metadata, image_loader=_cfd_open)
+                    _, printed_metrics = _quietly(ds.compute_metrics, image_loader=_cfd_open)
+                assert 'Metadata: 1 computed, 0 skipped, 1 errors' in printed, printed
+                assert 'Metrics: 1 computed, 0 skipped, 1 errors' in printed_metrics, printed_metrics
+                stored = _stored_metadata(ds)
+                assert stored[IN_MEMORY].get('width') == IN_MEMORY_SIZE[0], stored[IN_MEMORY]
+                assert stored[IN_MEMORY].get('file_size_bytes') == 2.5, stored[IN_MEMORY]
+                expected = {name: _sdk_described(name) for name in COMPUTED_FIELDS}
+                expected['file_size_bytes'] = NOTHING_WRITTEN  # the user's own: the run wrote none
+                differ = _differences(_schema_descriptions(ds), expected)
+                assert not differ, differ
+
+            _()
+
+            @test(
+                "compute_metrics(skip_existing=False) with an unreadable image that holds the user's own brightness: "
+                "brightness is not described, the other metrics the run wrote are",
+            )
+            def _():
+                ds = Dataset(CFD_DATASETS['unvouched-metric'])
+                ds.add_samples(
+                    [Sample(filepath=path) for path in paths[:2]]
+                    + [Sample(filepath=broken, metadata={'brightness': 0.5})],  # the user's own, from 0 to 1
+                )
+                with _metric_dependencies():
+                    _, printed = _quietly(ds.compute_metrics, image_loader=_cfd_open, skip_existing=False)
+                assert 'Metrics: 2 computed, 0 skipped, 1 errors' in printed, printed
+                stored = _stored_metadata(ds)
+                for path in paths[:2]:
+                    assert all(isinstance(stored[path].get(name), float) for name in METRIC_FIELDS), stored[path]
+                assert stored[broken] == {'brightness': 0.5}, stored[broken]
+                expected = {name: _sdk_described(name) for name in METRIC_FIELDS}
+                expected['brightness'] = NOTHING_WRITTEN  # one of its values is the user's own
+                differ = _differences(_schema_descriptions(ds), expected)
+                assert not differ, differ
+
+            _()
+
+            @test(
+                "compute_metadata() with an s3:// sample that holds the user's own file_size_bytes beside local "
+                "files: file_size_bytes is not described, the other fields the run wrote are",
+            )
+            def _():
+                ds = Dataset(CFD_DATASETS['unvouched-metadata'])
+                ds.add_samples(
+                    [Sample(filepath=path) for path in paths]
+                    + [Sample(filepath=IN_MEMORY, metadata={'file_size_bytes': 2.5})],  # the user's own, in kilobytes
+                )
+                _, printed = _quietly(ds.compute_metadata, image_loader=_cfd_open)
+                assert 'Metadata: 4 computed, 0 skipped, 0 errors' in printed, printed
+                stored = _stored_metadata(ds)
+                for path in paths:
+                    assert stored[path].get('file_size_bytes') == os.path.getsize(path), stored[path]
+                assert stored[IN_MEMORY].get('file_size_bytes') == 2.5, stored[IN_MEMORY]
+                assert stored[IN_MEMORY].get('width') == IN_MEMORY_SIZE[0], stored[IN_MEMORY]
+                expected = {name: _sdk_described(name) for name in METADATA_FIELDS}
+                expected['file_size_bytes'] = NOTHING_WRITTEN  # one of its values is the user's own
+                differ = _differences(_schema_descriptions(ds), expected)
+                assert not differ, differ
+
+            _()
+
+            @test(
+                "a description the server refuses (an older server without the route: 404): compute_metadata() still "
+                "writes the values and returns None, and warns once, naming the fields and why",
+            )
+            def _():
+                ds = images_dataset('old-server')
+                session = ds.client.session
+
+                def to_a_missing_route(method, url, *args, **kwargs):
+                    return session.request(method, f'{url}-on-a-newer-server', *args, **kwargs)
+
+                with (
+                    warnings.catch_warnings(record=True) as caught,
+                    _description_requests(session, to_a_missing_route) as sent,
+                ):
+                    warnings.simplefilter('always')
+                    returned, printed = _quietly(ds.compute_metadata, image_loader=_cfd_open)
+                assert returned is None, returned
+                assert 'Metadata: 3 computed, 0 skipped, 0 errors' in printed, printed
+                stored = _stored_metadata(ds)
+                for path, (width, height, _colour) in zip(paths, CFD_IMAGES):
+                    assert (stored[path].get('width'), stored[path].get('height')) == (width, height), stored[path]
+                asked = {name for name, _body in sent}
+                assert asked and asked <= set(METADATA_FIELDS), sent
+                named = _warnings_naming(caught)
+                assert len(named) == 1, named
+                assert not _names_each(named[0], METADATA_FIELDS), (_names_each(named[0], METADATA_FIELDS), named[0])
+                assert '404' in named[0] or 'not found' in named[0].lower(), named[0]
+                differ = _differences(_schema_descriptions(ds), dict.fromkeys(METADATA_FIELDS, NOTHING_WRITTEN))
+                assert not differ, differ
+
+            _()
+
+            @test(
+                "the server can't be reached for the description: compute_metadata() still writes the values and "
+                "returns None, and warns once, naming the fields and why",
+            )
+            def _():
+                ds = images_dataset('unreachable')
+
+                def unreachable(method, url, *args, **kwargs):
+                    raise requests.ConnectionError('Connection refused (the test cut the line)')
+
+                with (
+                    warnings.catch_warnings(record=True) as caught,
+                    _description_requests(ds.client.session, unreachable) as sent,
+                ):
+                    warnings.simplefilter('always')
+                    returned, printed = _quietly(ds.compute_metadata, image_loader=_cfd_open)
+                assert returned is None, returned
+                assert 'Metadata: 3 computed, 0 skipped, 0 errors' in printed, printed
+                stored = _stored_metadata(ds)
+                for path, (width, height, _colour) in zip(paths, CFD_IMAGES):
+                    assert (stored[path].get('width'), stored[path].get('height')) == (width, height), stored[path]
+                asked = {name for name, _body in sent}
+                assert asked and asked <= set(METADATA_FIELDS), sent
+                named = _warnings_naming(caught)
+                assert len(named) == 1, named
+                assert not _names_each(named[0], METADATA_FIELDS), (_names_each(named[0], METADATA_FIELDS), named[0])
+                assert re.search(r'connect|reach|cut the line', named[0], re.I), named[0]
+                differ = _differences(_schema_descriptions(ds), dict.fromkeys(METADATA_FIELDS, NOTHING_WRITTEN))
+                assert not differ, differ
+
+            _()
+
+            @test(
+                "a description the server refuses (the user's level: 403): compute_metrics() still writes the values "
+                "and returns None, and warns once, naming the fields and why",
+            )
+            def _():
+                ds = images_dataset('level')
+                created = ok(
+                    admin.post(
+                        f"{base}/users",
+                        json={'username': CFD_VIEWER, 'password': CFD_PASSWORD, 'role': 'power_user'},
+                    ),
+                )
+                viewer = Client(base)
+                viewer.login(CFD_VIEWER, CFD_PASSWORD)
+                ok(
+                    viewer.session.post(
+                        f"{base}/auth/change-password",
+                        json={'current_password': CFD_PASSWORD, 'new_password': CFD_PASSWORD},
+                    ),
+                )
+                ok(
+                    admin.post(
+                        f"{base}/datasets/{ds.id}/access",
+                        json={'user_id': created.json()['id'], 'level': 'view'},
+                    ),
+                )
+
+                def as_the_viewer(method, url, *args, **kwargs):
+                    return viewer.session.request(method, url, *args, **kwargs)
+
+                with (
+                    warnings.catch_warnings(record=True) as caught,
+                    _metric_dependencies(),
+                    _description_requests(ds.client.session, as_the_viewer) as sent,
+                ):
+                    warnings.simplefilter('always')
+                    returned, printed = _quietly(ds.compute_metrics, image_loader=_cfd_open)
+                assert returned is None, returned
+                assert 'Metrics: 3 computed, 0 skipped, 0 errors' in printed, printed
+                stored = _stored_metadata(ds)
+                for path in paths:
+                    assert all(isinstance(stored[path].get(name), (int, float)) for name in METRIC_FIELDS), stored[path]
+                asked = {name for name, _body in sent}
+                assert asked and asked <= set(METRIC_FIELDS), sent
+                named = _warnings_naming(caught)
+                assert len(named) == 1, named
+                assert not _names_each(named[0], METRIC_FIELDS), (_names_each(named[0], METRIC_FIELDS), named[0])
+                assert '403' in named[0] or 'needs edit access' in named[0], named[0]
+                differ = _differences(_schema_descriptions(ds), dict.fromkeys(METRIC_FIELDS, NOTHING_WRITTEN))
+                assert not differ, differ
+
+            _()
+
+        finally:
+            try:
+                remove_leftovers()
+                print("Deleted the computed-description datasets and their user")
+            except Exception as error:  # a cleanup failure must not hide the results above
+                print(f"Computed descriptions cleanup failed: {error}")
+
+
+# =========================================================================
+# PATHS DO NOT CHANGE; A COPY CAN GIVE NEW ONES
+# add_samples_from(..., path_prefixes={old: new}) gives the copies new paths, in filepath and in the texts inside
+# metadata; a rule that would give two samples one path is refused before anything is written; sample.save() after a
+# changed filepath raises and sends nothing; a PATCH carrying another filepath is a 422; a copy keeps objects with
+# their images. The full set of cases is
+# backend/tests/test_paths_do_not_change_spec.py (the app in-process); these check the same rules on a running server.
+# =========================================================================
+PATH_DATASETS = (
+    'sdk-test-paths-source',
+    'sdk-test-paths-target',
+    'sdk-test-paths-collide',
+    'sdk-test-paths-refused',
+    'sdk-test-paths-objects',
+    'sdk-test-paths-objects-copy',
+)
+PATH_PHRASE = "filepath can't be changed"
+
+
+def _run_path_tests(client):
+    print("\n--- Paths do not change ---")
+    base = client.base_url
+
+    def remove_leftovers():
+        for d in client.get_datasets():
+            if d['name'] in PATH_DATASETS:
+                client.delete_dataset(d['id'])
+
+    remove_leftovers()
+    try:
+        source = Dataset('sdk-test-paths-source')
+        source.add_samples(
+            [
+                Sample(
+                    filepath='/media/old/a.jpg',
+                    tags=['t', '/media/old/tag'],
+                    metadata={
+                        'mask': {'maskPath': '/media/old/masks/a.png'},
+                        'lidar': [{'path': '/media/old/lidar/a.bin'}, 3],
+                        'note': 'see /media/old/a.jpg',
+                        'older': '/media/older/a.jpg',
+                        'by_path': {'/media/old/k.jpg': 'v'},
+                    },
+                    location=(-93.5, 41.2),
+                    heading=90.0,
+                    embeddings={'sdk_test_paths_vec': [1.0, 2.0, 3.0]},
+                    hashes={'phash': '00ff00ff00ff00ff'},
+                ),
+                Sample(filepath='/media/older/b.jpg', metadata={'p': '/media/old/b.png'}),
+                Sample(filepath='s3://bucket/c.jpg', metadata={'n': 1}),
+            ],
+        )
+        rule = {'/media/old': '/media/new'}
+
+        @test("add_samples_from with path_prefixes gives the copies new paths in filepath and metadata, the rest kept")
+        def _():
+            target = Dataset('sdk-test-paths-target')
+            result = target.add_samples_from(source, path_prefixes=rule)
+            counted = {key: result.get(key) for key in ('seen', 'added', 'skipped', 'rewritten')}
+            assert counted == {'seen': 3, 'added': 3, 'skipped': 0, 'rewritten': 1}, result
+            a = target['/media/new/a.jpg']
+            assert a.metadata == {
+                'mask': {'maskPath': '/media/new/masks/a.png'},
+                'lidar': [{'path': '/media/new/lidar/a.bin'}, 3],
+                'note': 'see /media/old/a.jpg',
+                'older': '/media/older/a.jpg',
+                'by_path': {'/media/old/k.jpg': 'v'},
+            }, a.metadata
+            assert a.tags == ['t', '/media/old/tag'], a.tags
+            assert target['/media/older/b.jpg'].metadata == {'p': '/media/new/b.png'}
+            assert target['s3://bucket/c.jpg'].metadata == {'n': 1}
+            assert client.get_vectors_by_ids(target.id, [a.id], ['sdk_test_paths_vec']) == {
+                a.id: {'sdk_test_paths_vec': [1.0, 2.0, 3.0]},
+            }
+            assert client.get_hashes_by_ids(target.id, [a.id], ['phash']) == {a.id: {'phash': '00ff00ff00ff00ff'}}
+            again = target.add_samples_from(source, path_prefixes=rule)
+            counted = {key: again.get(key) for key in ('seen', 'added', 'skipped', 'rewritten')}
+            assert counted == {'seen': 3, 'added': 0, 'skipped': 3, 'rewritten': 0}, again
+            assert len(target) == 3
+            assert source['/media/old/a.jpg'].metadata['mask'] == {'maskPath': '/media/old/masks/a.png'}
+
+        _()
+
+        @test("add_samples_from refuses a rule that would give two samples one path, before writing anything")
+        def _():
+            collide = Dataset('sdk-test-paths-collide')
+            paths = ['/media/old/a.jpg', 'fill/0.jpg', 'fill/1.jpg', '/media/new/a.jpg']
+            collide.add_samples([Sample(filepath=path) for path in paths])
+            refused = Dataset('sdk-test-paths-refused')
+            raised = _raises(ValueError, refused.add_samples_from, collide, path_prefixes=rule, batch_size=1)
+            assert '/media/new/a.jpg' in str(raised) or '/media/old/a.jpg' in str(raised), raised
+            assert len(refused) == 0, f"{len(refused)} samples were written before the refusal"
+
+        _()
+
+        @test("add_samples_from refuses a bad rule (not a dict, an empty old, a non-text new)")
+        def _():
+            refused = Dataset('sdk-test-paths-refused')
+            for bad in ([('/media/old', '/media/new')], {'': '/media/new'}, {'/media/old': 1}):
+                _raises(ValueError, refused.add_samples_from, source, path_prefixes=bad)
+            assert len(refused) == 0
+
+        _()
+
+        @test("sample.save() after a changed filepath raises ValueError and writes nothing; the path put back saves")
+        def _():
+            s = source['/media/old/a.jpg']
+            s.filepath = '/media/new/a.jpg'
+            s.metadata['changed'] = True
+            raised = _raises(ValueError, s.save)
+            assert PATH_PHRASE in str(raised), raised
+            assert 'changed' not in source['/media/old/a.jpg'].metadata
+            s.filepath = '/media/old/a.jpg'
+            s.save()
+            assert source['/media/old/a.jpg'].metadata['changed'] is True
+
+        _()
+
+        @test("PATCH with another filepath is a 422 that writes nothing; with the sample's own path it is accepted")
+        def _():
+            sample_id = source['/media/old/a.jpg'].id
+            url = f"{base}/datasets/{source.id}/samples/{sample_id}"
+            moved = client.session.patch(url, json={'filepath': '/media/new/a.jpg', 'metadata': {'patched': 1}})
+            assert moved.status_code == 422 and PATH_PHRASE in moved.text, (moved.status_code, moved.text[:300])
+            assert 'patched' not in source['/media/old/a.jpg'].metadata
+            same = client.session.patch(url, json={'filepath': '/media/old/a.jpg', 'metadata': {'patched': 1}})
+            assert same.status_code == 200, (same.status_code, same.text[:300])
+            assert source['/media/old/a.jpg'].metadata['patched'] == 1
+
+        _()
+
+        @test("add_samples_from links each copied object to the copy of its image")
+        def _():
+            with_objects = Dataset('sdk-test-paths-objects')
+            image = with_objects.add_samples([Sample(filepath='s3://test/paths/img.jpg', metadata={'img': 'I'})])
+            objects = []
+            for name in ('o0', 'o1'):
+                crop = Sample(
+                    filepath=f's3://test/paths/crops/{name}.png',
+                    metadata={'parent_id': image['ids'][0], 'obj': name},
+                )
+                crop.media_type = 'object'
+                objects.append(crop)
+            with_objects.add_samples(objects)
+            copy = Dataset('sdk-test-paths-objects-copy')
+            result = copy.add_samples_from(with_objects, batch_size=1)
+            assert result == {'seen': 3, 'added': 3, 'skipped': 0, 'objects_without_image': 0}, result
+            copied_image = copy['s3://test/paths/img.jpg'].id
+            pivot = {
+                'logic': 'AND',
+                'filters': [
+                    {'field': 'media_type', 'operator': '=', 'value': 'object'},
+                    {'field': 'parent_id', 'operator': 'in', 'value': [copied_image]},
+                ],
+            }
+            found = client.query_samples(copy.id, filters=pivot)['items']
+            assert sorted(item['metadata']['obj'] for item in found) == ['o0', 'o1'], found
+            finder = client.session.post(f"{base}/datasets/{copy.id}/objects/unlinked")
+            assert finder.status_code == 200 and finder.json()['total'] == 0, finder.text[:300]
+
+        _()
+    finally:
+        try:
+            remove_leftovers()
+            print("Deleted the path datasets")
+        except Exception as error:  # a cleanup failure must not hide the results above
+            print(f"Path datasets cleanup failed: {error}")
 
 
 if __name__ == "__main__":

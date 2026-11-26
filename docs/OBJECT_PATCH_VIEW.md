@@ -12,7 +12,7 @@ Each detection becomes a real `samples` row **in the same `dataset_id` as its pa
 |---|---|
 | `dataset_id` | **same as the parent image** — this is what makes it "one dataset" |
 | `media_type` | `'object'` — the only new convention |
-| `filepath` | the **parent image's** filepath (`s3://…`); the grid crops it on the fly |
+| `filepath` | the object's **own** path: a dataset never holds two samples with the same path, so it is not its image's (the SDK's object crops and `to_patches` write a file for each). The link to the image is by id, `metadata.parent_id`, never by path. `?crop=meta` crops the file this path names with `metadata.crop_bbox` |
 | `metadata.parent_id` | the parent image's `samples.id`: what clients write and read |
 | `parent_id` (a column) | the same id, kept by triggers from `metadata.parent_id` when that names an image (any non-object) of the same dataset, whichever of the two is written first; empty otherwise, and on every image. A direct write of it is overridden by that rule. |
 | `metadata.crop_bbox` | the box `[x,y,w,h]` (≤2 ⇒ normalized) — the `?crop=meta` endpoint reads this |
@@ -87,7 +87,7 @@ text, links and the SDK filter on it, and the sample modal shows it with the res
 
 With a distinct field, the object scatter is just `field='clip_obj'` — its own rank set, its own disjoint HNSW index, **zero backend change**. (The earlier draft's "add `media_type` to the `embedding_viz_rank` WHERE" was wrong: that table has no `media_type` column, and the filtered scatter path already routes `media_type` through its `_fids` temp table.)
 
-The grain switch is therefore **two derived effects of one toggle**: a `media_type='object'` filter for the grid/facets/map, and an `embeddingField: 'clip' → 'clip_obj'` swap for the scatter.
+The grain switch is therefore **two derived effects of one toggle**: a `media_type='object'` filter for the grid, and an `embeddingField: 'clip' → 'clip_obj'` swap for the scatter. The facets (the sidebar and the histogram) and the map always read the images, whichever grid is shown.
 
 ## The 4 bidirectional behaviors
 

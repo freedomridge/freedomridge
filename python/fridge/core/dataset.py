@@ -8,11 +8,21 @@ import warnings
 from datetime import datetime
 from itertools import islice
 from types import SimpleNamespace
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
 from .client import _check_everyone_level, get_client
+from .copy_objects import (
+    OBJECT,
+    copy_passes,
+    image_paths,
+    listing,
+    parent_sample_id,
+    parents_in_target,
+    refuse_unknown,
+)
+from .path_prefixes import PathRule, check_collisions
 from .sample import Sample, _jsonable
 from .version_view import VersionView
 from .view import Condition, DatasetView, SampleQuery, filters_from_view_content
@@ -490,6 +500,61 @@ def compute_image_metrics(img):
         "pct_underexposed": under,
         "pct_overexposed": over,
     }
+
+
+# What each field Dataset.compute_metadata() and compute_metrics() write means, as (description, unit), unit None
+# where there is none: true of how the code above makes each value (the metrics are compute_image_metrics() on the
+# image as 8-bit RGB, its grey levels Pillow's convert("L"); the metadata is _media_metadata()). A run of either
+# gives them to the fields it wrote a value of, where a field has none of its own (Dataset._describe_computed).
+# Exported as fridge.COMPUTED_FIELD_DESCRIPTIONS, so a dataset computed before can be given them with
+# set_field_description.
+COMPUTED_FIELD_DESCRIPTIONS: Dict[str, tuple[str, Optional[str]]] = {
+    'width': ("The image's width in pixels, as stored in the file (a camera's rotation tag isn't applied).", 'px'),
+    'height': ("The image's height in pixels, as stored in the file (a camera's rotation tag isn't applied).", 'px'),
+    'aspect_ratio': (
+        'Width divided by height, rounded to 4 decimal places: above 1 for a landscape image, below 1 for portrait.',
+        None,
+    ),
+    'megapixels': ('Width times height in millions of pixels, rounded to 3 decimal places.', 'MP'),
+    'file_size_bytes': (
+        "The image file's size, recorded only when the sample's path named a file on the disk of the machine that "
+        'ran compute_metadata() (never for s3:// files).',
+        'bytes',
+    ),
+    'brightness': (
+        "Perceived brightness of the image's average colour, the square root of 0.241·R² + 0.691·G² + 0.068·B² of "
+        'its mean red, green and blue values, from 0 (black) to 255 (white).',
+        None,
+    ),
+    'blurriness': (
+        'Variance of the Laplacian of the grey-level image: low values suggest a blurry image and high values a '
+        'sharp one, despite the name.',
+        None,
+    ),
+    'contrast': ('The highest minus the lowest value over all pixels and all three colour channels, 0 to 255.', None),
+    'entropy': (
+        'Shannon entropy of the red, green and blue values taken as one 768-bin histogram, from about 1.6 for a single '
+        'flat colour to about 9.6 when every value is equally common.',
+        'bits',
+    ),
+    'salt_and_pepper': (
+        'Share of pixels that are lone near-white (grey level 244 or more) or near-black (10 or less) specks, the '
+        'ones a 2×2 morphological opening removes: a sign of salt-and-pepper noise.',
+        '%',
+    ),
+    'saturation': (
+        'Mean colour saturation of the pixels on the HSV scale, from 0 (grey) to 255 (fully saturated colour).',
+        None,
+    ),
+    'pct_underexposed': ('Share of pixels whose grey level is 5 or less (of 255): crushed shadows.', '%'),
+    'pct_overexposed': ('Share of pixels whose grey level is 250 or more (of 255): blown highlights.', '%'),
+}
+
+
+def _held_values(metadata, written=()):
+    """The COMPUTED_FIELD_DESCRIPTIONS fields a sample already holds a value of, less those a run wrote for it
+    (`written`): values the run can't vouch for, which keep their field from its description."""
+    return {name for name in COMPUTED_FIELD_DESCRIPTIONS if name not in written and metadata.get(name) is not None}
 
 
 def _default_s3_image_loader():
@@ -986,7 +1051,10 @@ class Dataset:
     def get_schema(self, filters=None) -> list:
         """Get the field schema for this dataset.
 
-        Returns list of field dicts with name, type, min/max, values, etc.
+        Returns list of field dicts with name, type, min/max, values, etc., and what each field means:
+        ``description``, ``unit``, ``description_source`` (``"set"`` when someone wrote it, ``"default"`` for the
+        server's own description of a field every dataset has, such as ``created_at``, None when there is none) and
+        ``values_private``.
         """
         return self.client.get_schema(self._id, filters=filters)
 
@@ -999,6 +1067,16 @@ class Dataset:
         result = self.client.set_field_type(self._id, field_name, field_type)
         self._dirty = True
         return result
+
+    def set_field_description(self, field: str, description: Optional[str] = None, unit: Optional[str] = None) -> dict:
+        """Say what a field means: a description (at most 1,000 characters) and a unit (at most 40), shown in the app
+        and returned with the schema. Needs edit access to the dataset.
+
+        Only the arguments given are changed; pass ``""`` to clear one (a field every dataset has, such as
+        ``created_at``, gets the server's own description back). Returns the field's ``description``, ``unit``,
+        ``values_private`` and ``description_source``. On a mirror, the primary's fields are described on the
+        primary."""
+        return self.client.set_field_description(self._id, field, description=description, unit=unit)
 
     def set_field_classes(self, field_name: str, names, colors=None) -> dict:
         """Name a mask or class-probability field's classes, and optionally colour them.
@@ -1098,7 +1176,15 @@ class Dataset:
         print(f"merge_samples: merged into {n} samples")
         return n
 
-    def add_samples_from(self, source, *, embedding_fields=None, hash_fields=None, batch_size: int = 500) -> dict:
+    def add_samples_from(
+        self,
+        source,
+        *,
+        embedding_fields=None,
+        hash_fields=None,
+        batch_size: int = 500,
+        path_prefixes: Optional[Dict[str, str]] = None,
+    ) -> dict:
         """Copy samples from ``source`` into this dataset, adding the ones that aren't here.
 
         Unlike ``merge_samples`` (which only merges metadata into samples that already exist), this
@@ -1111,23 +1197,56 @@ class Dataset:
         bounded however large the source is. Interrupted? Run it again; samples already copied are
         skipped.
 
+        A sample's path can't be changed once it is added, so this is also how samples get new paths
+        when their media has moved: ``path_prefixes`` replaces the start of each copy's path (see
+        docs/SDK.md, "Paths, and when media moves").
+
+        Objects (``media_type`` ``object``) stay with their images: the images are copied first, and each
+        object's ``metadata.parent_id`` becomes the id, here, of the sample at its image's path (after
+        ``path_prefixes``), or null when this dataset has no image there. Another sample's ``parent_id``, and
+        one that isn't a sample id, are copied as they are.
+
         Args:
-            source: a Dataset (copy everything) or a DatasetView (copy just that selection). The source
-                may live on a different Freedom Ridge instance.
+            source: a Dataset (copy everything), a DatasetView (copy just that selection), or a
+                version's view (``dataset.version(...)``, copy the samples as the version holds them). The
+                source may live on a different Freedom Ridge instance.
             embedding_fields: embedding fields to copy (default: every stored field, patch embeddings
                 included; ``[]`` for none).
             hash_fields: hash fields to copy (default: all; ``[]`` for none).
             batch_size: samples per request.
+            path_prefixes: ``{old: new}``: the copies get new paths. A path that starts with ``old`` at a
+                folder boundary (it is ``old``, or ``old`` then ``/``) has that start replaced by ``new``;
+                the rest of the path is kept exactly. The longest ``old`` that fits wins; a trailing ``/``
+                makes no difference; a path no ``old`` fits is copied unchanged. ``new`` may be a local
+                folder, a path relative to the server's data root (``""`` is the data root itself) or a
+                cloud location such as ``s3://bucket/prefix``. The same replacement is made in every text
+                value of the copy's metadata, at any depth (its other media paths). A sample is matched in
+                this dataset by its new path, so a rerun skips what it already copied. Before anything is
+                written, the copy is refused when the rule would give two samples of the source the same
+                path. ``{}`` is no rule.
 
         Returns:
-            dict: ``{"seen": n, "added": n, "skipped": n}`` (``skipped`` = already in this dataset).
+            dict: ``{"seen": n, "added": n, "skipped": n}`` (``skipped`` = already in this dataset), and
+            with ``path_prefixes``, ``"rewritten"``: how many of the samples added got a new ``filepath``.
+            When the view holds objects, ``"objects_without_image"``: how many objects were added with
+            ``parent_id`` null (0 when every object found its image).
+
+        Raises:
+            ValueError: a bad ``path_prefixes`` (not a dict, an empty ``old``, an ``old`` or ``new`` that
+                isn't text, the same path twice), or a rule that would give two samples the same path.
+            TypeError: a source of another kind, before anything is read.
 
         Example:
             target.add_samples_from(source.filter(split="eval"))
             # select by a metadata key:
             target.add_samples_from(source.filter(source_id__in=source_ids))
+            # the media moved from a USB drive to /data/photos:
+            moved = Dataset("photos (moved)")
+            moved.add_samples_from(Dataset("photos"), path_prefixes={"/media/usb/photos": "/data/photos"})
         """
+        rule = PathRule.parse(path_prefixes)
         view = source.all() if isinstance(source, Dataset) else source
+        refuse_unknown(view)
         src = view._dataset
         if src.client.base_url == self.client.base_url and src.id == self._id:
             raise ValueError("source and target are the same dataset")
@@ -1142,6 +1261,11 @@ class Dataset:
             missing = sorted(set(wanted) - set(stored))
             if missing:
                 raise ValueError(f"source dataset '{src.name}' has no {kind} field(s) {missing}")
+        # A source filters would change (cut, a similarity result, a cut version's view) is listed once: its ids, paths
+        # and media types serve the collision check, the passes and its objects' images (copy_objects.py).
+        listed = listing(view, batch_size)
+        if rule is not None:
+            check_collisions(rule, view, batch_size, None if listed is None else [path for _, path, _ in listed])
 
         # Listing the source's array fields also registers them, so iterating it returns their values.
         array_names = [name for name in src.list_array_fields() if name != 'tags']
@@ -1151,26 +1275,64 @@ class Dataset:
                 if name not in existing:
                     self.create_array_field(name)
 
-        seen = added = skipped = 0
-        samples = view.iter_samples(batch_size=batch_size)
-        while batch := list(islice(samples, batch_size)):
-            ids = [sample.id for sample in batch]
-            vectors = src.client.get_vectors_by_ids(src.id, ids, embeddings) if embeddings else {}
-            hash_values = src.client.get_hashes_by_ids(src.id, ids, hashes) if hashes else {}
-            rows = []
-            for sample in batch:
-                row = sample.to_dict()
-                row["embeddings"] = vectors.get(sample.id)
-                row["hashes"] = hash_values.get(sample.id)
-                rows.append(row)
-            result = self.client.add_samples(self._id, rows, on_duplicate='skip')
-            seen += len(batch)
-            added += len(result.get("ids", []))
-            skipped += result.get("skipped", 0)
+        # Every image before any object, so each object finds the copy of its image (copy_objects.py).
+        has_objects, passes = copy_passes(view, listed, batch_size)
+        images_of = image_paths(view, listed)
+        seen = added = skipped = rewritten = without_image = 0
+        for samples in passes:
+            while batch := list(islice(samples, batch_size)):
+                ids = [sample.id for sample in batch]
+                vectors = src.client.get_vectors_by_ids(src.id, ids, embeddings) if embeddings else {}
+                hash_values = src.client.get_hashes_by_ids(src.id, ids, hashes) if hashes else {}
+                objects = [sample for sample in batch if sample.media_type == OBJECT]
+                parents = parents_in_target(images_of, self, rule, objects) if objects else {}
+                # Written apart by (new path, object without its image), so the server's ids count the added ones.
+                groups: Dict[Tuple[bool, bool], List[Dict[str, Any]]] = {}
+                for sample in batch:
+                    row = sample.to_dict()
+                    row["embeddings"] = vectors.get(sample.id)
+                    row["hashes"] = hash_values.get(sample.id)
+                    moved = orphan = False
+                    if rule is not None:
+                        row["filepath"] = rule.apply(sample.filepath)
+                        row["metadata"] = rule.apply_metadata(row["metadata"])
+                        moved = row["filepath"] != sample.filepath
+                    if sample.media_type == OBJECT:
+                        parent = parent_sample_id(sample.metadata.get("parent_id"))
+                        if parent is not None:
+                            # The target's id of its image, or null: never the source's id.
+                            row["metadata"]["parent_id"] = parents.get(parent)
+                        elif "parent_id" in sample.metadata:
+                            row["metadata"]["parent_id"] = _jsonable(sample.metadata["parent_id"])  # as it is
+                        orphan = parent not in parents
+                    groups.setdefault((moved, orphan), []).append(row)
+                seen += len(batch)
+                if rule is not None:
+                    paths = [row["filepath"] for group in groups.values() for row in group]
+                    if len(set(paths)) != len(paths):
+                        # Checked before the copy started: only a sample added to the source since can do this.
+                        raise ValueError(
+                            "path_prefixes gives two samples of this batch the same path: the source changed during "
+                            f"the copy. {added} samples were added before it stopped; run it again to check it whole.",
+                        )
+                for (moved, orphan), group in groups.items():
+                    result = self.client.add_samples(self._id, group, on_duplicate='skip')
+                    count = len(result.get("ids", []))
+                    added += count
+                    skipped += result.get("skipped", 0)
+                    rewritten += count if moved else 0
+                    without_image += count if orphan else 0
         if added:
             self._dirty = True
-        print(f"add_samples_from: {added} added, {skipped} already present ({seen} read from '{src.name}')")
-        return {"seen": seen, "added": added, "skipped": skipped}
+        note = f", {rewritten} of them with a new path" if rule is not None else ""
+        note += f", {without_image} objects without their image here" if has_objects else ""
+        print(f"add_samples_from: {added} added{note}, {skipped} already present ({seen} read from '{src.name}')")
+        answer = {"seen": seen, "added": added, "skipped": skipped}
+        if rule is not None:
+            answer["rewritten"] = rewritten
+        if has_objects:
+            answer["objects_without_image"] = without_image
+        return answer
 
     def list_views(self) -> list:
         """List all saved views for this dataset."""
@@ -2014,6 +2176,14 @@ class Dataset:
         Cheap: PIL reads dimensions from the image header without decoding pixels.
         Needs only the base install (Pillow). Skips samples that already have 'width'
         unless skip_existing=False.
+
+        Each field the run wrote a value of gets its description and unit
+        (COMPUTED_FIELD_DESCRIPTIONS) where it has none of its own; if the server
+        refuses them, the values stay and a warning says which fields and why.
+        A run that skipped a sample because it already had its values describes
+        nothing: those values may be your own, in another scale. Nor is a field
+        described that a sample the run didn't write it for already holds (an
+        unreadable image's sample, or an s3:// sample's file_size_bytes).
         """
         try:
             from PIL import Image  # noqa: F401 — base dep, but fail with a clear message
@@ -2027,6 +2197,8 @@ class Dataset:
         skipped = 0
         errors = 0
         pending: Dict[int, Dict[str, Any]] = {}
+        written: set = set()  # the fields this run wrote a value of (file_size_bytes only for local files)
+        unvouched: set = set()  # fields a sample the run didn't write them for already holds
 
         def _flush():
             if pending:
@@ -2041,18 +2213,24 @@ class Dataset:
                 img = image_loader(sample.filepath)
                 if img is None:
                     errors += 1
+                    unvouched.update(_held_values(sample.metadata))
                     continue
             except Exception as e:
                 print(f"  Error loading {sample.filepath}: {e}")
                 errors += 1
+                unvouched.update(_held_values(sample.metadata))
                 continue
             pending[sample.id] = _media_metadata(img, sample.filepath)
+            written.update(pending[sample.id])
+            unvouched.update(_held_values(sample.metadata, pending[sample.id]))
             processed += 1
             if len(pending) >= batch_size:
                 _flush()
 
         _flush()
         print(f"Metadata: {processed} computed, {skipped} skipped, {errors} errors")
+        if not skipped:  # values that were already there may be the user's own, in another scale
+            self._describe_computed("compute_metadata", written - unvouched)
         if processed > 0:
             self.refresh_stats()
 
@@ -2061,7 +2239,13 @@ class Dataset:
         salt_and_pepper, saturation, pct_underexposed, pct_overexposed).
 
         Downloads each image, computes metrics, and updates sample metadata.
-        Automatically refreshes field stats when done.
+        Automatically refreshes field stats when done. Each field the run wrote a
+        value of gets its description and unit (COMPUTED_FIELD_DESCRIPTIONS) where it
+        has none of its own; if the server refuses them, the values stay and a
+        warning says which fields and why. A run that skipped a sample because it
+        already had its values describes nothing: those values may be your own, in
+        another scale. Nor is a field described that a sample whose image could not
+        be read already holds.
 
         Args:
             image_loader: Callable(filepath) -> PIL.Image. If None, uses a default
@@ -2084,6 +2268,8 @@ class Dataset:
         skipped = 0
         errors = 0
         pending: Dict[int, Dict[str, Any]] = {}  # sample_id -> metrics; flushed in batches (bulk, not N+1 PATCH)
+        written: set = set()  # the fields this run wrote a value of
+        unvouched: set = set()  # fields a sample the run didn't write them for already holds
 
         def _flush():
             if pending:
@@ -2099,6 +2285,7 @@ class Dataset:
                 img = image_loader(sample.filepath)
                 if img is None:
                     errors += 1
+                    unvouched.update(_held_values(sample.metadata))
                     continue
                 if img.mode != "RGB":
                     from .image_modes import to_rgb
@@ -2107,17 +2294,56 @@ class Dataset:
             except Exception as e:
                 print(f"  Error loading {sample.filepath}: {e}")
                 errors += 1
+                unvouched.update(_held_values(sample.metadata))
                 continue
 
             pending[sample.id] = compute_image_metrics(img)
+            written.update(pending[sample.id])
+            unvouched.update(_held_values(sample.metadata, pending[sample.id]))
             processed += 1
             if len(pending) >= batch_size:
                 _flush()
 
         _flush()
         print(f"Metrics: {processed} computed, {skipped} skipped, {errors} errors")
+        if not skipped:  # values that were already there may be the user's own, in another scale
+            self._describe_computed("compute_metrics", written - unvouched)
         if processed > 0:
             self.refresh_stats()
+
+    def _describe_computed(self, method: str, written: set) -> None:
+        """Give each field in `written` (those `method` wrote a value of in this run) its description and unit from
+        COMPUTED_FIELD_DESCRIPTIONS, each only where the field has none of its own: what someone wrote is never
+        replaced. The schema shows a field's own description and unit only, as the server describes none of these
+        fields by name. Written with set_field_description, as the user running the SDK.
+
+        A request that fails (the server refuses: below edit, a mirror's field, an older server without the route)
+        leaves the values as they are: it warns once, naming the fields not described and why, and stops there, as
+        the next request would fail the same way."""
+        remaining = [name for name in COMPUTED_FIELD_DESCRIPTIONS if name in written]
+        if not remaining:
+            return
+        try:
+            schema = {field["name"]: field for field in self.get_schema()}
+            todo = []
+            for name in remaining:
+                description, unit = COMPUTED_FIELD_DESCRIPTIONS[name]
+                own = schema.get(name, {})
+                changes = {} if own.get("description") else {"description": description}
+                if unit is not None and not own.get("unit"):
+                    changes["unit"] = unit
+                if changes:
+                    todo.append((name, changes))
+            remaining = [name for name, _ in todo]
+            for name, changes in todo:
+                self.set_field_description(name, **changes)
+                remaining.remove(name)
+        except requests.RequestException as error:
+            warnings.warn(
+                f"{method}() stored its values but could not describe {', '.join(remaining)}: {error}. Describe them "
+                "with set_field_description (fridge.COMPUTED_FIELD_DESCRIPTIONS holds the texts).",
+                stacklevel=3,
+            )
 
     def compute_embeddings(
         self,
@@ -3501,7 +3727,9 @@ class Dataset:
         the grid like any other.
 
         For the crops to be servable, put ``patches_dir`` under FRIDGE_DATA_ROOT
-        (local serving) or upload them and rewrite filepaths afterward.
+        (local serving), or upload them and copy the new dataset into another with the
+        uploaded paths: ``other.add_samples_from(patches, path_prefixes={patches_dir: "s3://bucket/patches"})``
+        (a sample's own path can't be changed).
         """
         import os
 

@@ -179,6 +179,9 @@ test.describe('sidebar text combinations', () => {
             await editor.getByRole('button', { name: 'Apply', exact: true }).click();
             await expectTotal(page, excluded ? 4 : 6);
             await expectPersistedFilters(page, datasetId, {}, [convertSimpleFiltersToComplex(upgradeDraftKeys(draft))]);
+            // The address holds the applied filter only once its query text is back from the server, after the history
+            // write: a reload before that reopens the address the page had, which says "no filters".
+            await expect(page).toHaveURL(/[?&](q|f)=[^&]/);
             await page.reload();
             await expectTotal(page, excluded ? 4 : 6);
             await expect(chip).toContainText(excluded ? `not (${label})` : label);

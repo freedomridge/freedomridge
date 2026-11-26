@@ -31,6 +31,7 @@ from .. import follower_search
 from ..api_errors import CodedHTTPException
 from ..crypto import hash_token
 from ..database import db
+from ..field_registry import without_reserved_fields
 from ..models import ViewCreate
 from ..sample_ids import ranges_on_ids
 from . import datasets as datasets_router
@@ -803,17 +804,21 @@ async def follower_coordinates(dataset_id: int, request: BlockRequest, follower:
 
 @router.get('/follower/datasets/{dataset_id}/state')
 async def follower_state(dataset_id: int, follower: dict = Depends(current_follower)):
-    """The dataset's settings, field registry and shared views, for a mirror."""
+    """The dataset's settings, field registry (with each field's description and unit) and shared views, for a
+    mirror. values_private stays here: each instance decides it."""
     await subscription(db, follower, dataset_id)
     dataset = await db.fetchrow(
         """SELECT id, name, description, media_fields, grid_media_field, modal_media_field, segmentation_config,
                   default_view_id FROM datasets WHERE id = $1""",
         dataset_id,
     )
-    fields = await db.fetch(
-        """SELECT field_name, field_type, origin, is_promoted, display_type, overlay_config
-           FROM dataset_fields WHERE dataset_id = $1 ORDER BY field_name""",
-        dataset_id,
+    # A metadata field an older release left under a sample's own field's name goes as migration 0043 leaves it.
+    fields = without_reserved_fields(
+        await db.fetch(
+            """SELECT field_name, field_type, origin, is_promoted, display_type, overlay_config, description, unit
+               FROM dataset_fields WHERE dataset_id = $1 ORDER BY field_name""",
+            dataset_id,
+        ),
     )
     views = await db.fetch(
         'SELECT id, name, slug, content FROM views WHERE dataset_id = $1 AND is_public ORDER BY id',

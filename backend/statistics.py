@@ -6,8 +6,8 @@ from typing import Any
 
 import asyncpg
 
-from . import job_queue, statistics_measure
-from .field_registry import REQUEST_FULL_REFRESH
+from . import field_kinds, job_queue, statistics_measure
+from .field_registry import REQUEST_FULL_REFRESH, leftover_row_sql
 from .job_runner import StepResult
 
 KIND = 'statistics'
@@ -17,6 +17,23 @@ FULL_REFRESH_ACTIVE = f"""SELECT {job_queue.JOB_COLUMNS} FROM {job_queue.JOB_TAB
     WHERE kind='{KIND}' AND dataset_id=$1 AND state IN ('queued','running')
       AND (barrier->>'full')::boolean AND NOT cancel_requested
     ORDER BY created_at,id LIMIT 1"""
+
+
+async def stale_fields(source, dataset_id):
+    """Whether each field's statistics are behind the dataset's samples now, as a test of a field's name: a change the
+    statistics haven't counted yet names the field, or a label list's field (dataset_stats_pending), or names no field,
+    or the dataset's statistics were never counted whole or wait to be published (dataset_stats_state). One query; the
+    pending changes are read as their distinct sets of names, which repeat."""
+    rows = await source.fetch(
+        """SELECT DISTINCT field_names FROM dataset_stats_pending WHERE dataset_id = $1
+           UNION ALL
+           SELECT NULL::text[] FROM dataset_stats_state
+           WHERE dataset_id = $1 AND (NOT initialized OR publish_pending)""",
+        dataset_id,
+    )
+    everything = any(row['field_names'] is None for row in rows)
+    names = {name for row in rows for name in row['field_names'] or ()}
+    return lambda field: everything or field in names or statistics_measure.parent_field(field) in names
 
 
 async def request_refresh(pool, dataset_id, *, created_by=None, force=False, unless_full_active=False):
@@ -232,6 +249,7 @@ async def _publish_field(connection, dataset_id, field):
     token = await connection.fetchval(
         f'SELECT {statistics_measure.DEFINITION_TOKEN} FROM dataset_fields '
         "WHERE dataset_id=$1 AND field_name=ANY($2::text[]) AND origin<>'system' "
+        f'AND NOT {leftover_row_sql()} '  # as the measurement's definitions (statistics_measure)
         'ORDER BY (field_name=$3) DESC LIMIT 1',
         dataset_id,
         [field['field_name'], field.get('parent_field', statistics_measure.parent_field(field['field_name']))],
@@ -331,6 +349,9 @@ def handler(pool):
                              SELECT field_name FROM dataset_block_field_stats WHERE dataset_id=$1
                              UNION SELECT field_name FROM dataset_field_stats WHERE dataset_id=$1
                              UNION SELECT field_name FROM dataset_fields WHERE dataset_id=$1 AND origin<>'system'
+                                 AND NOT """
+                        + leftover_row_sql()
+                        + """
                              UNION SELECT 'tags' UNION SELECT 'media_type'
                              UNION SELECT unnest($2::text[])) names
                            ORDER BY (field_name=ANY($2::text[])) DESC, field_name COLLATE "C"
@@ -454,6 +475,11 @@ def handler(pool):
                 message='Publishing filter statistics',
                 publish=publish_field,
             )
+
+        # Right after the count, the record of which kind of sample has which field (backend/field_kinds.py): its job is
+        # queued to clear a mark no sample of its kind needs any more, when a write that may have taken the last one was
+        # noted. Queued, not run here: the count never fails or waits over the record.
+        await field_kinds.queue_check(pool, dataset_id)
 
         async def finish(connection):
             await _lifecycle(connection, dataset_id)

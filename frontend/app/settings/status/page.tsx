@@ -2,7 +2,7 @@
 
 import { useEffect, useState, type ReactNode } from 'react';
 import Link from 'next/link';
-import { useMutation, useQueryClient } from '@tanstack/react-query';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { AlertCircle, ArrowLeft, Loader2, RefreshCw } from 'lucide-react';
 import { Header } from '@/components/header';
 import { ProtectedRoute } from '@/components/ProtectedRoute';
@@ -11,7 +11,7 @@ import { IndexAdvisor } from '@/components/index-advisor';
 import { formatGB, useSystemStatus } from '@/components/system-status';
 import { useToast } from '@/contexts/ToastContext';
 import { useUser } from '@/contexts/UserContext';
-import { runBackupNow, saveBackupSchedule, type BackupStatus, type BackupVersions } from '@/lib/api';
+import { getJob, getRegionSets, loadRegionSet, runBackupNow, saveBackupSchedule, type BackupStatus, type BackupVersions, type RegionSet } from '@/lib/api';
 
 type Tone = 'ok' | 'warn' | 'bad' | 'none';
 
@@ -261,6 +261,133 @@ function Backups({ backups }: { backups: BackupStatus }) {
     );
 }
 
+const counted = (n: number, one: string, many: string) => `${n.toLocaleString()} ${n === 1 ? one : many}`;
+
+// How a set came to be loaded, after its version and time (docs/REGIONS.md).
+function loadedHow(loaded: NonNullable<RegionSet['loaded']>): string {
+    const by = loaded.loaded_by ? `by ${loaded.loaded_by.username}, ` : '';
+    if (loaded.loaded_from === 'bundled') return `${by || 'automatically, '}from the file that came with this release`;
+    if (loaded.loaded_from === 'download') return `${by}downloaded`;
+    return 'from a file on the server';
+}
+
+// The boundary sets named regions come from (docs/REGIONS.md): what is loaded, and a button that loads a set as a job
+// (from the file that came with this release when the server has it, else downloaded), followed here to its end. A
+// failure is shown as the job gives it: on a server with no internet it says which command loads the file from disk.
+// A load the server lists as under way (`load_job`: the server's own when it starts, another administrator's, or this
+// page's before a reload) is followed the same way, as one this page didn't start.
+function RegionBoundaries() {
+    const queryClient = useQueryClient();
+    const { data: sets, error } = useQuery({
+        queryKey: ['region-sets'], queryFn: getRegionSets, refetchOnWindowFocus: false, meta: { errorHandledLocally: true },
+    });
+    const [load, setLoad] = useState<{ jobId: string; started: boolean } | null>(null);
+    const listed = sets?.find(set => set.load_job)?.load_job?.job_id ?? null;
+    useEffect(() => {
+        // Kept once the listing, read again when the job ends, no longer names it: the card shows how it ended.
+        // eslint-disable-next-line react-hooks/set-state-in-effect -- follow the load the server lists, once per job
+        if (listed) setLoad(current => (current?.jobId === listed ? current : { jobId: listed, started: false }));
+    }, [listed]);
+    const followed = load ?? (listed ? { jobId: listed, started: false } : null);
+    const { data: job } = useQuery({
+        queryKey: ['region-load', followed?.jobId],
+        queryFn: () => getJob(followed!.jobId),
+        enabled: !!followed,
+        refetchInterval: query => (['succeeded', 'failed', 'cancelled'].includes(query.state.data?.state ?? '') ? false : 1500),
+    });
+    const start = useMutation({
+        mutationFn: loadRegionSet,
+        onSuccess: answer => {
+            setLoad({ jobId: answer.job_id, started: answer.started });
+            queryClient.invalidateQueries({ queryKey: ['global-jobs'] });
+        },
+    });
+    const ended = job && ['succeeded', 'failed', 'cancelled'].includes(job.state) ? job.state : null;
+    useEffect(() => {
+        if (!ended) return;
+        queryClient.invalidateQueries({ queryKey: ['region-sets'] });
+        queryClient.invalidateQueries({ queryKey: ['global-jobs'] });
+    }, [ended, queryClient]);
+
+    const loading = start.isPending || (!!followed && !ended);
+    const loadedAll = !!sets?.length && sets.every(set => set.loaded);
+    const [badge, tone]: [string, Tone] = loading ? ['LOADING', 'none'] : ended === 'failed' ? ['FAILED', 'bad']
+        : !sets ? ['UNKNOWN', 'none'] : loadedAll ? ['LOADED', 'ok'] : ['NOT LOADED', 'none'];
+    const failure = (job?.error as { message?: unknown } | null | undefined)?.message;
+    return (
+        <Row testId="status-regions" title="Region boundaries" badge={badge} tone={tone}>
+            <p className="text-zinc-400">
+                Countries, states or provinces, and groups of states, for filters such as <span className="font-mono">location within &quot;US-KS&quot;</span>.
+                A filter naming a region is refused until its boundaries are loaded.
+            </p>
+            {error && <p className="text-red-300">Couldn&apos;t read the region boundaries: {(error as Error).message}</p>}
+            {sets?.map(set => (
+                <div key={set.name} data-testid="status-regions-set" className="mt-3 pt-3 border-t border-zinc-800 space-y-1">
+                    <p className="text-white">{set.title ?? set.name}{set.version && ` ${set.version}`}</p>
+                    {set.loaded ? (
+                        <>
+                            <p data-testid="status-regions-loaded">
+                                Version {set.loaded.version} loaded {new Date(set.loaded.loaded_at).toLocaleString()}{' '}
+                                {loadedHow(set.loaded)}:{' '}
+                                {counted(set.loaded.counts.country, 'country', 'countries')},{' '}
+                                {counted(set.loaded.counts.state, 'state or province', 'states or provinces')} and{' '}
+                                {counted(set.loaded.counts.group, 'group', 'groups')}.
+                            </p>
+                            {set.version && set.loaded.version !== set.version && (
+                                <p className="text-amber-300">This version of Freedom Ridge loads version {set.version}: load it again to update.</p>
+                            )}
+                            {set.loaded.removed_keys.length > 0 && (
+                                <p data-testid="status-regions-removed" className="text-amber-300">
+                                    The last load removed {set.loaded.removed_keys.length.toLocaleString()} region
+                                    {set.loaded.removed_keys.length === 1 ? '' : 's'}:{' '}
+                                    <span className="font-mono break-all">{set.loaded.removed_keys.join(', ')}</span>. Saved views and links
+                                    that name {set.loaded.removed_keys.length === 1 ? 'it' : 'one of them'} are refused until they change.
+                                </p>
+                            )}
+                        </>
+                    ) : (
+                        <p data-testid="status-regions-not-loaded">Not loaded.</p>
+                    )}
+                    {set.url && (
+                        <p className="text-zinc-400">
+                            Source: <span className="font-mono break-all">{set.url}</span>{set.licence && ` · ${set.licence}`}
+                        </p>
+                    )}
+                    <div className="flex flex-wrap items-center gap-3 pt-1">
+                        <button
+                            onClick={() => start.mutate(set.name)}
+                            disabled={loading}
+                            className="px-3 py-1 bg-zinc-800 hover:bg-zinc-700 text-white rounded transition-colors disabled:opacity-50"
+                        >
+                            {set.loaded ? 'Load again' : 'Load'}
+                        </button>
+                    </div>
+                </div>
+            ))}
+            {start.error && <p role="alert" className="text-red-300">{start.error.message}</p>}
+            {followed && (
+                <div data-testid="status-regions-job" role="status" className="mt-2 space-y-1">
+                    {!followed.started && !ended && <p className="text-zinc-400">A load was already running; this is its progress.</p>}
+                    {!job && <p className="text-cyan-300">Loading.</p>}
+                    {(job?.state === 'queued' || job?.state === 'running') && (
+                        <p className="text-cyan-300">
+                            Loading, started {new Date(job.started_at ?? job.created_at).toLocaleTimeString()}
+                            {job.state === 'running' && job.progress.message ? `: ${job.progress.message}` : '.'}
+                        </p>
+                    )}
+                    {job?.state === 'succeeded' && <p className="text-green-400">{job.progress.message ?? 'Loaded'}.</p>}
+                    {job?.state === 'cancelled' && <p className="text-zinc-400">The load was cancelled.</p>}
+                    {failure != null && (
+                        <p data-testid="status-regions-failure" className="text-red-300 whitespace-pre-wrap break-words">
+                            {ended === 'failed' ? 'The load failed: ' : 'The last attempt failed, and it will be tried again: '}{String(failure)}
+                        </p>
+                    )}
+                </div>
+            )}
+        </Row>
+    );
+}
+
 export default function SystemStatusPage() {
     const { user } = useUser();
     const { data, error, isFetching, refetch } = useSystemStatus();
@@ -392,6 +519,8 @@ export default function SystemStatusPage() {
                             </div>
 
                             {data.backups && <Backups backups={data.backups} />}
+
+                            <RegionBoundaries />
 
                             <Row
                                 testId="status-workers"

@@ -1,12 +1,14 @@
 import React, { useState } from 'react';
-import { ViewStage, SchemaField, type ComplexFilter } from '@/lib/api';
+import { useQuery } from '@tanstack/react-query';
+import { ApiError, ViewStage, SchemaField, getRegion, type ComplexFilter } from '@/lib/api';
 import { Cross2Icon, PlusIcon, MagnifyingGlassIcon } from '@radix-ui/react-icons';
 import { FilterStageEditor, FilterModeSwitch } from './filter-stage-editor';
 import { describeFilter, isAutoFilterLabel } from '@/lib/filter-utils';
 import { type DefaultView, defaultViewStages, isDefaultViewStage } from '@/lib/default-view';
-import { EXPIRED_SELECTION_TITLE, type ExpiredSelection, isLassoStage, isReadOnlyStage } from '@/lib/filter-query';
+import { EXPIRED_SELECTION_TITLE, type ExpiredSelection, isConceptScoreStage, isLassoStage, isReadOnlyStage } from '@/lib/filter-query';
 import { STALE_LASSO_WARNING, STALE_LASSO_WARNING_IN_VIEW, staleLasso } from '@/lib/stale-lasso';
 import { SEARCH_LIMIT_CHOICES, SEARCH_LIMIT_TITLE } from './find-similar';
+import { type RegionTest, regionChipLabel, regionTestOf, toggledRegionFilter } from '@/lib/regions';
 import * as Popover from '@radix-ui/react-popover';
 
 interface QueryBuilderBarProps {
@@ -56,6 +58,40 @@ function canExcludeIds(filter: ComplexFilter | undefined): boolean {
     return !!rule && !rule.logic;
 }
 
+// A named region's chip (lib/regions.ts) is this button, which turns the region around (include, exclude), as a map
+// region's chip does. Its words name the region (GET /regions/{key}); the key stands in while the name loads, and for a
+// key this server has no region for, whose refusal (the words the filter itself is refused with, which the grid shows)
+// is its title.
+function RegionToggle({ region, className, onToggle, children }: {
+    region: RegionTest;
+    className: string;
+    onToggle: () => void;
+    children?: React.ReactNode;
+}) {
+    const { data, error } = useQuery({
+        queryKey: ['region', region.key],
+        queryFn: () => getRegion(region.key),
+        staleTime: 10 * 60_000,
+        refetchOnWindowFocus: false,
+        meta: { errorHandledLocally: true },  // the chip shows it
+    });
+    const refusal = error instanceof ApiError && error.status === 404 ? error.message : null;
+    const label = regionChipLabel(region, data);
+    return (
+        <button
+            type="button"
+            onClick={onToggle}
+            aria-label={label}
+            title={refusal ?? 'Click to toggle include/exclude'}
+            className={`${className} cursor-pointer text-left ${refusal ? 'text-amber-300' : ''}`}
+        >
+            <span aria-hidden="true" className="mr-1">{refusal ? '⚠' : '🌍'}</span>
+            {children}
+            {label}
+        </button>
+    );
+}
+
 export function QueryBuilderBar({
     stages,
     expiredSelections = [],
@@ -93,8 +129,9 @@ export function QueryBuilderBar({
     // Some of the default view's filters were removed and none of the viewer's own added: one click back.
     const offersDefaultView = !!defaultView && !hasOwnFilters && defaultCount < defaultViewStages(defaultView).length;
 
-    const handleAddSave = (stage: ViewStage) => {
-        onAddStage({ ...stage, description: describeFilter(stage.filter) });
+    // A concept's chip keeps the Concepts panel's label; a concept in a larger filter is named from `concepts`.
+    const handleAddSave = (stage: ViewStage, concepts?: ReadonlyMap<number, string>) => {
+        onAddStage(isConceptScoreStage(stage) ? stage : { ...stage, description: describeFilter(stage.filter, concepts) });
         setIsAdding(false);
         setAddMode('builder');
         setSelectedFieldForAdd(null);
@@ -263,6 +300,7 @@ export function QueryBuilderBar({
                     const isReadOnly = isReadOnlyStage(stage);
                     // A lasso drawn on an earlier layout of its map: it keeps filtering, and says so.
                     const stale = isLassoStage(stage) && staleLasso(stage.filter, mapLayouts) !== null;
+                    const region = regionTestOf(stage.filter);
 
                     const ChipContent = (
                         <div
@@ -281,7 +319,19 @@ export function QueryBuilderBar({
                                 ${!isReadOnly ? 'cursor-pointer' : 'cursor-default opacity-90'}
                             `}
                         >
-                            <span className={`whitespace-nowrap truncate ${stage.metadata?.search || isLassoStage(stage) ? 'max-w-[360px]' : 'max-w-[200px]'}`} title={stale ? (canUpdateView ? STALE_LASSO_WARNING_IN_VIEW : STALE_LASSO_WARNING) : stage.description}>
+                            {region && (
+                                <RegionToggle
+                                    region={region}
+                                    className="whitespace-nowrap truncate max-w-[360px]"
+                                    onToggle={() => {
+                                        const filter = toggledRegionFilter(stage.filter);
+                                        onUpdateStage(index, { ...stage, description: describeFilter(filter), filter });
+                                    }}
+                                >
+                                    {isDefaultViewStage(stage, defaultView) && <span data-testid="default-view-star" className="mr-1 text-amber-300">★</span>}
+                                </RegionToggle>
+                            )}
+                            {!region && <span className={`whitespace-nowrap truncate ${stage.metadata?.search || isLassoStage(stage) ? 'max-w-[360px]' : 'max-w-[200px]'}`} title={stale ? (canUpdateView ? STALE_LASSO_WARNING_IN_VIEW : STALE_LASSO_WARNING) : stage.description}>
                                 {stage.type === 'map_region' && <span className="mr-1">🌍</span>}
                                 {stale && <span className="mr-1">⚠</span>}
                                 {isLassoStage(stage) && <span className="mr-1">⬡</span>}
@@ -290,18 +340,23 @@ export function QueryBuilderBar({
                                 {stage.metadata?.concept && <span className="mr-1">⊘</span>}
                                 {isDefaultViewStage(stage, defaultView) && <span data-testid="default-view-star" className="mr-1 text-amber-300">★</span>}
                                 {chipLabel(stage)}
-                            </span>
+                            </span>}
                             <button
                                 onClick={(e) => {
                                     e.stopPropagation();
                                     onRemoveStage(index);
                                 }}
+                                aria-label={region ? 'Remove this region filter' : undefined}
                                 className="opacity-0 group-hover:opacity-100 text-zinc-500 hover:text-red-400 p-0.5 rounded-full hover:bg-zinc-950 transition-all"
                             >
                                 <Cross2Icon className="w-3 h-3" />
                             </button>
                         </div>
                     );
+
+                    if (region) {
+                        return <div key={index}>{ChipContent}</div>;
+                    }
 
                     if (stage.type === 'map_region') {
                         // Toggle between geo_polygon (include) and geo_polygon_exclude
@@ -383,10 +438,11 @@ export function QueryBuilderBar({
                                 >
                                     <FilterStageEditor
                                         stage={stage}
-                                        onSave={(newStage) => {
+                                        onSave={(newStage, concepts) => {
                                             // An edited value must show in the chip; a named stage keeps its name.
-                                            onUpdateStage(index, newStage.type === 'filter' && isAutoFilterLabel(stage.description, stage.filter)
-                                                ? { ...newStage, description: describeFilter(newStage.filter) }
+                                            onUpdateStage(index, newStage.type === 'filter' && !isConceptScoreStage(newStage)
+                                                && isAutoFilterLabel(stage.description, stage.filter, concepts)
+                                                ? { ...newStage, description: describeFilter(newStage.filter, concepts) }
                                                 : newStage);
                                             setEditingIndex(null);
                                         }}

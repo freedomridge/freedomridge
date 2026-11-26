@@ -15,14 +15,19 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from starlette.background import BackgroundTask
 
-from . import backups, system_status  # system_status records at import when this process started and its commit
+# system_status records at import when this process started and its commit
+from . import backups, mcp_door, system_status
 from .api_errors import CodedHTTPException
 from .colormaps import COLORMAPS
 from .crypto import assert_secure_encryption_key, warn_insecure_session_cookie
 from .database import lifespan
+from .field_registry import RESERVED_METADATA_KEYS
 from .media_cache import CacheFill, read_cache, write_cache
 from .request_limits import RequestLimitsMiddleware
 from .routers import (
+    assistant_calls,
+    assistant_settings,
+    assistant_views,
     auth,
     backup_settings,
     compute_launcher,
@@ -36,6 +41,7 @@ from .routers import (
     jobs,
     primaries,
     quality,
+    regions,
     sampling,
     schedules,
     search,
@@ -169,6 +175,17 @@ async def csrf_origin_guard(request: Request, call_next):
     return await call_next(request)
 
 
+# --- The MCP server at /mcp (backend/mcp_door.py) -------------------------------
+# Added last, so it is the outermost middleware: /mcp's Origin check (against the same ALLOWED_ORIGINS) comes before
+# anything else, and neither CORS nor the cookie CSRF guard above touches /mcp, which grants a web page nothing and
+# reads no cookie. Its answers still go through the version header and the request limits (guest budgets).
+app.add_middleware(
+    mcp_door.McpDoor,
+    allowed_origins=_ALLOWED_ORIGINS,
+    served=VersionHeaderMiddleware(RequestLimitsMiddleware(mcp_door.endpoint)),
+)
+
+
 @app.exception_handler(RequestValidationError)
 async def validation_error_handler(request: Request, exc: RequestValidationError):
     """Report invalid values without echoing non-JSON inputs such as NaN or Infinity."""
@@ -269,6 +286,10 @@ app.include_router(workers.router, prefix="/api")
 app.include_router(followers.router, prefix="/api")
 app.include_router(primaries.router, prefix="/api")
 app.include_router(compute_launcher.router, prefix="/api")
+app.include_router(assistant_calls.router, prefix="/api")
+app.include_router(regions.router, prefix="/api")
+app.include_router(assistant_settings.router, prefix="/api")
+app.include_router(assistant_views.router, prefix="/api")
 
 
 @app.get("/api/health")
@@ -804,6 +825,10 @@ def _build_media_path_sql(field: str, versioned: bool = False) -> str:
                      WHERE v.version_id = $2 AND d.include_metadata) samples"""
     if field == "filepath":
         return f"SELECT dataset_id, filepath AS path FROM {source} WHERE id = $1"
+    if segments[0] in RESERVED_METADATA_KEYS:
+        # A stored key named as a sample's own field (or a path into one) is no field: no media, as where no sample
+        # has the key, without reading it.
+        return f"SELECT dataset_id, NULL::text AS path FROM {source} WHERE id = $1"
 
     # Nested JSONB: intermediate segments use `->` (returns jsonb), final uses `->>`
     # (returns text). e.g. metadata->'<key>'->>'map_path'
@@ -1119,6 +1144,8 @@ async def _serve_composite(
     # Read the heatmap metadata dict. The field must be a top-level metadata key.
     if not _SAFE_FIELD_RE.match(overlay_field):
         raise HTTPException(status_code=400, detail=f"Invalid overlay field: {overlay_field}")
+    if overlay_field in RESERVED_METADATA_KEYS:  # a stored key named as a sample's own field is no field: as without it
+        raise HTTPException(status_code=404, detail=f"Sample {sample_id} has no heatmap in metadata.{overlay_field}")
     width = _thumbnail_width(width)
 
     if version_id is None:
