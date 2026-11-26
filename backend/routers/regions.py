@@ -47,7 +47,8 @@ class RegionLoad(BaseModel):
 
 @router.post('/admin/regions/load', status_code=202)
 async def load_region_set(body: RegionLoad, user: dict = Depends(require_role('admin'))):
-    """Start downloading and loading a boundary set (a job), or return the region load already running."""
+    """Start loading a boundary set (a job: from the file that came with the install when it is there, else
+    downloaded), or return the region load already queued or running."""
     if body.set not in regions.SETS:
         raise HTTPException(
             status_code=400,

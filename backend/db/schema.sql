@@ -3550,12 +3550,14 @@ CREATE TRIGGER follower_truncate_guard BEFORE TRUNCATE ON embedding_layouts
 -- set (backend/regions.py, docs/REGIONS.md), for the geo_region and geo_region_exclude filters. They belong to
 -- this installation: followers never read them, and loading a set again replaces that set's rows only.
 -- One row per loaded set: which version, from which file, when and by whom, and what the load decided (report).
+-- (0039) loaded_from 'bundled': from the pinned file that came with the install.
 CREATE TABLE IF NOT EXISTS region_sets (
     name TEXT PRIMARY KEY,
     version TEXT NOT NULL,
     sha256 TEXT NOT NULL,
     verified BOOLEAN NOT NULL,  -- the file was the set's pinned one
-    loaded_from TEXT NOT NULL CONSTRAINT region_sets_loaded_from_check CHECK (loaded_from IN ('download', 'file')),
+    loaded_from TEXT NOT NULL CONSTRAINT region_sets_loaded_from_check
+        CHECK (loaded_from IN ('download', 'file', 'bundled')),
     loaded_by INTEGER REFERENCES users(id) ON DELETE SET NULL,  -- NULL from the command line
     loaded_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now(),
     report JSONB NOT NULL DEFAULT '{}'::jsonb
@@ -3717,5 +3719,6 @@ INSERT INTO schema_migrations (filename) VALUES
     ('0035_field_descriptions.sql'),
     ('0036_assistant.sql'),
     ('0037_mcp_tokens_and_assistant_calls.sql'),
-    ('0038_assistant_working_views.sql')
+    ('0038_assistant_working_views.sql'),
+    ('0039_region_sets_bundled.sql')
 ON CONFLICT (filename) DO NOTHING;

@@ -11,7 +11,7 @@ import { IndexAdvisor } from '@/components/index-advisor';
 import { formatGB, useSystemStatus } from '@/components/system-status';
 import { useToast } from '@/contexts/ToastContext';
 import { useUser } from '@/contexts/UserContext';
-import { getJob, getRegionSets, loadRegionSet, runBackupNow, saveBackupSchedule, type BackupStatus, type BackupVersions } from '@/lib/api';
+import { getJob, getRegionSets, loadRegionSet, runBackupNow, saveBackupSchedule, type BackupStatus, type BackupVersions, type RegionSet } from '@/lib/api';
 
 type Tone = 'ok' | 'warn' | 'bad' | 'none';
 
@@ -263,10 +263,19 @@ function Backups({ backups }: { backups: BackupStatus }) {
 
 const counted = (n: number, one: string, many: string) => `${n.toLocaleString()} ${n === 1 ? one : many}`;
 
-// The boundary sets named regions come from (docs/REGIONS.md): what is loaded, and a button that downloads and loads a
-// set as a job, followed here to its end. A failure is shown as the job gives it: on a server with no internet it says
-// which command loads the file from disk. A load the server lists as under way (`load_job`: another administrator's,
-// or this page's before a reload) is followed the same way, as one this page didn't start.
+// How a set came to be loaded, after its version and time (docs/REGIONS.md).
+function loadedHow(loaded: NonNullable<RegionSet['loaded']>): string {
+    const by = loaded.loaded_by ? `by ${loaded.loaded_by.username}, ` : '';
+    if (loaded.loaded_from === 'bundled') return `${by || 'automatically, '}from the file that came with this release`;
+    if (loaded.loaded_from === 'download') return `${by}downloaded`;
+    return 'from a file on the server';
+}
+
+// The boundary sets named regions come from (docs/REGIONS.md): what is loaded, and a button that loads a set as a job
+// (from the file that came with this release when the server has it, else downloaded), followed here to its end. A
+// failure is shown as the job gives it: on a server with no internet it says which command loads the file from disk.
+// A load the server lists as under way (`load_job`: the server's own when it starts, another administrator's, or this
+// page's before a reload) is followed the same way, as one this page didn't start.
 function RegionBoundaries() {
     const queryClient = useQueryClient();
     const { data: sets, error } = useQuery({
@@ -319,13 +328,13 @@ function RegionBoundaries() {
                         <>
                             <p data-testid="status-regions-loaded">
                                 Version {set.loaded.version} loaded {new Date(set.loaded.loaded_at).toLocaleString()}{' '}
-                                {set.loaded.loaded_by ? `by ${set.loaded.loaded_by.username}` : 'from a file on the server'}:{' '}
+                                {loadedHow(set.loaded)}:{' '}
                                 {counted(set.loaded.counts.country, 'country', 'countries')},{' '}
                                 {counted(set.loaded.counts.state, 'state or province', 'states or provinces')} and{' '}
                                 {counted(set.loaded.counts.group, 'group', 'groups')}.
                             </p>
                             {set.version && set.loaded.version !== set.version && (
-                                <p className="text-amber-300">This version of Freedom Ridge loads version {set.version}: download and load it again to update.</p>
+                                <p className="text-amber-300">This version of Freedom Ridge loads version {set.version}: load it again to update.</p>
                             )}
                             {set.loaded.removed_keys.length > 0 && (
                                 <p data-testid="status-regions-removed" className="text-amber-300">
@@ -341,7 +350,7 @@ function RegionBoundaries() {
                     )}
                     {set.url && (
                         <p className="text-zinc-400">
-                            Downloaded from <span className="font-mono break-all">{set.url}</span>{set.licence && ` · ${set.licence}`}
+                            Source: <span className="font-mono break-all">{set.url}</span>{set.licence && ` · ${set.licence}`}
                         </p>
                     )}
                     <div className="flex flex-wrap items-center gap-3 pt-1">
@@ -350,7 +359,7 @@ function RegionBoundaries() {
                             disabled={loading}
                             className="px-3 py-1 bg-zinc-800 hover:bg-zinc-700 text-white rounded transition-colors disabled:opacity-50"
                         >
-                            {set.loaded ? 'Download and load again' : 'Download and load'}
+                            {set.loaded ? 'Load again' : 'Load'}
                         </button>
                     </div>
                 </div>
@@ -359,11 +368,11 @@ function RegionBoundaries() {
             {followed && (
                 <div data-testid="status-regions-job" role="status" className="mt-2 space-y-1">
                     {!followed.started && !ended && <p className="text-zinc-400">A load was already running; this is its progress.</p>}
-                    {(!job || job.state === 'queued') && <p className="text-cyan-300">Waiting to start. It&apos;s listed under Background jobs below.</p>}
-                    {job?.state === 'running' && (
+                    {!job && <p className="text-cyan-300">Loading.</p>}
+                    {(job?.state === 'queued' || job?.state === 'running') && (
                         <p className="text-cyan-300">
-                            Downloading and loading, started {new Date(job.started_at ?? job.created_at).toLocaleTimeString()}
-                            {job.progress.message ? `: ${job.progress.message}` : '.'}
+                            Loading, started {new Date(job.started_at ?? job.created_at).toLocaleTimeString()}
+                            {job.state === 'running' && job.progress.message ? `: ${job.progress.message}` : '.'}
                         </p>
                     )}
                     {job?.state === 'succeeded' && <p className="text-green-400">{job.progress.message ?? 'Loaded'}.</p>}

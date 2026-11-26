@@ -1,12 +1,15 @@
 """Named regions: countries, states or provinces, and named groups of states, loaded from public boundary data
 (docs/REGIONS.md). The `geo_region` filter keeps the samples inside one, `GET /api/regions` finds them by name.
 
-Boundaries are loaded, not shipped: an administrator starts a download (POST /api/admin/regions/load, a job), and a
-server with no internet loads the same file from disk:
+Boundaries come with the install: a set's pinned file sits in the boundaries directory (boundaries_dir: the Docker
+image carries it, a source checkout runs `python -m backend.regions fetch`), and when the job runner starts it
+queues the load of each set this database has never loaded (queue_bundled_loads). An administrator's load
+(POST /api/admin/regions/load, a job) reads the same file, or downloads it when it isn't there, and a server with
+no internet can load a file from anywhere on disk:
 
     python -m backend.regions load ne_10m_admin_1_states_provinces.geojson --set natural-earth-admin1
 
-Either way the file is checked against the set's pinned SHA-256 and size limit, and loading a set again replaces
+Every way the file is checked against the set's pinned SHA-256 and size limit, and loading a set again replaces
 that set's regions and nothing else. PostGIS does the geometry: each region is kept whole, for its outline and
 bounding box, and cut into small pieces (region_parts) that the filter tests a sample's location against.
 """
@@ -15,20 +18,28 @@ import argparse
 import asyncio
 import hashlib
 import json
+import logging
+import os
 import re
 import sys
+import tempfile
 import unicodedata
 from collections import Counter, defaultdict
+from contextlib import suppress
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import asyncpg
+from fastapi import HTTPException
 
-from . import job_queue
+from . import diskspace, job_queue
 from .filter_query import RegionMatch, canonical_region_key
 from .job_queue import JobPolicy
 from .job_runner import StepResult
-from .job_wait import JobInputError
+from .job_wait import JobInputError, JobInsufficientStorage
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -59,9 +70,16 @@ SETS: Dict[str, BoundarySet] = {
 }
 KINDS = ('country', 'state', 'group')
 KIND = 'region_load'
-# One step downloads and loads a set; the unions of the large countries take most of it.
+# Taken by each load of the set $1, in its transaction: one at a time.
+SET_LOCK_SQL = "SELECT pg_advisory_xact_lock(hashtextextended('regions:' || $1, 0))"
+# One step reads (or downloads) a set's file and loads it; the unions of the large countries take most of it.
 POLICY = JobPolicy(max_unit_seconds=1800, max_failures=2, retry_seconds=30, max_retry_seconds=300)
 DOWNLOAD_TIMEOUT_SECONDS = 300
+# What a load asks the free-space gate for, besides the gate's own headroom: 5.1.1's region tables come to 151 MB, and
+# the load's WAL and temporary table about as much again while it runs.
+LOAD_FREE_BYTES = 500 * 1024**2
+# How long queue_bundled_loads waits, in all, while another runner holds the queue's lock.
+CONTENDED_SECONDS = 2.0
 # The pieces the filter tests a location against: at most this many vertices each (ST_Subdivide's default).
 PIECE_VERTICES = 256
 # The cells the per-row test looks a location up in: a quarter of a degree, a power of two so a cell's edges and
@@ -325,10 +343,7 @@ async def load(
         raise RegionLoadError(f'The file is not UTF-8 text: {error}') from None
     async with connection.transaction():
         # One load of a set at a time; readers keep the old regions until this commits.
-        await connection.execute(
-            "SELECT pg_advisory_xact_lock(hashtextextended('regions:' || $1, 0))",
-            boundary_set.name,
-        )
+        await connection.execute(SET_LOCK_SQL, boundary_set.name)
         await connection.execute(
             'CREATE TEMP TABLE region_load_features (index INTEGER PRIMARY KEY, properties JSONB, geometry JSONB) '
             'ON COMMIT DROP',
@@ -734,12 +749,98 @@ def _json(value: Any) -> Any:
     return json.loads(value) if isinstance(value, str) else (value or {})
 
 
+# --- The file that comes with the install --------------------------------------------------------------------------
+
+
+def boundaries_dir() -> Path:
+    """The one directory a server looks in for boundary sets' files: FRIDGE_REGIONS_DIR when it is set, else
+    backend/boundaries/ beside this code (which git ignores). Read at each call."""
+    return Path(os.environ.get('FRIDGE_REGIONS_DIR') or Path(__file__).resolve().parent / 'boundaries')
+
+
+def boundary_file(boundary_set: BoundarySet) -> Path:
+    """Where the set's file is looked for: in boundaries_dir(), named as in the set's URL."""
+    return boundaries_dir() / boundary_set.url.rsplit('/', 1)[-1]
+
+
+def _not_pinned(data: bytes, boundary_set: BoundarySet) -> Optional[str]:
+    """Why `data` isn't the set's pinned file, or None when it is."""
+    if len(data) > boundary_set.max_bytes:
+        return f'it is over the limit of {boundary_set.max_bytes:,} bytes'
+    digest = hashlib.sha256(data).hexdigest()
+    if digest != boundary_set.sha256:
+        return f'its SHA-256 is {digest}, not {boundary_set.sha256}'
+    return None
+
+
+def _read_boundary_file(boundary_set: BoundarySet) -> Tuple[Optional[bytes], Optional[str]]:
+    """(the set's pinned file from boundaries_dir(), None) when it is there; (None, why) for a file there that is
+    anything else; (None, None) when there is none."""
+    try:
+        with open(boundary_file(boundary_set), 'rb') as file:
+            data = file.read(boundary_set.max_bytes + 1)
+    except FileNotFoundError:
+        return None, None
+    except OSError as error:
+        return None, f'it could not be read ({error.strerror or error})'
+    why = _not_pinned(data, boundary_set)
+    return (None, why) if why else (data, None)
+
+
+# The files the log has named as not the pinned one, each with why: each is named once.
+_reported: Set[Tuple[str, str]] = set()
+
+
+def pinned_file(boundary_set: BoundarySet) -> Optional[bytes]:
+    """The set's pinned file from boundaries_dir(), or None when it isn't there. A file there that is anything else
+    counts as none, and the log says so once, naming it: nothing unverified is loaded from this directory."""
+    data, why = _read_boundary_file(boundary_set)
+    if why is not None:
+        path = str(boundary_file(boundary_set))
+        if (path, why) not in _reported:
+            _reported.add((path, why))
+            logger.warning(
+                '%s is not the pinned file of %s %s: %s. It is ignored, as if there were no file '
+                '(python -m backend.regions fetch replaces it)',
+                path,
+                boundary_set.title,
+                boundary_set.version,
+                why,
+            )
+    return data
+
+
+def _write_file(path: Path, data: bytes) -> None:
+    """`data` at `path`, whole or not at all: written beside it, then renamed over it."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle, temporary = tempfile.mkstemp(dir=path.parent, prefix=f'.{path.name}.', suffix='.part')
+    try:
+        with os.fdopen(handle, 'wb') as file:
+            file.write(data)
+            file.flush()
+            os.fsync(file.fileno())
+        os.chmod(temporary, 0o644)  # readable by a job runner running as another user
+        os.replace(temporary, path)
+    except BaseException:
+        with suppress(OSError):
+            os.unlink(temporary)
+        raise
+
+
 # --- Loading as a job ----------------------------------------------------------------------------------------------
 
 
-async def start_load(pool, set_name: str, user_id: Optional[int]) -> Tuple[Dict[str, Any], bool]:
-    """Queue the download and load of a set for an administrator, or return the region load already queued or
-    running: one at a time."""
+async def _queue_load(
+    pool,
+    set_name: str,
+    user_id: Optional[int],
+    *,
+    automatic: bool,
+) -> Tuple[Optional[Dict[str, Any]], bool]:
+    """(the region load queued for the set, True), or (the region load already queued or running, False): one at a
+    time, for the button and the job runner alike. `automatic`: the job runner's own, which reads the file that came
+    with the install and never downloads, and is queued only for a set this database has never loaded ((None, False)
+    otherwise)."""
     async with job_queue._transaction(pool) as connection:
         await connection.execute(f"SELECT pg_advisory_xact_lock(hashtextextended('schedule:{KIND}', 0))")
         active = await connection.fetchrow(
@@ -749,18 +850,70 @@ async def start_load(pool, set_name: str, user_id: Optional[int]) -> Tuple[Dict[
         )
         if active is not None:
             return dict(active), False
+        if automatic and await connection.fetchval(
+            'SELECT EXISTS (SELECT 1 FROM region_sets WHERE name = $1)',
+            set_name,
+        ):
+            return None, False
         job = await job_queue.enqueue_job(
             connection,
             KIND,
             lane='maintenance',
-            args={'set': set_name},
+            args={'set': set_name, 'automatic': True} if automatic else {'set': set_name},
             created_by=user_id,
         )
         return job, True
 
 
+async def start_load(pool, set_name: str, user_id: Optional[int]) -> Tuple[Dict[str, Any], bool]:
+    """Queue the load of a set for an administrator (from the file that came with the install when it is there,
+    else downloaded), or return the region load already queued or running: one at a time."""
+    job, started = await _queue_load(pool, set_name, user_id, automatic=False)
+    assert job is not None  # only an automatic load is ever not queued
+    return job, started
+
+
+async def queue_bundled_loads(pool) -> List[Dict[str, Any]]:
+    """When the job runner starts: queue the region load of each set whose pinned file is in boundaries_dir() and
+    that this database has never loaded (no region_sets row), unless a region load is queued or running. The load
+    is the ordinary job; it reads that file, never downloads, and records loaded_from 'bundled' and no user. A set
+    loaded once, from whatever, is never loaded again by itself. Returns the jobs it queued; safe to call again, and
+    from two runners at once."""
+    queued = []
+    for boundary_set in list(SETS.values()):
+        if not boundary_file(boundary_set).exists():
+            continue  # nothing to decide, and no database to ask
+        if await pool.fetchval('SELECT EXISTS (SELECT 1 FROM region_sets WHERE name = $1)', boundary_set.name):
+            continue
+        if await asyncio.to_thread(pinned_file, boundary_set) is None:
+            continue
+        loop = asyncio.get_running_loop()
+        give_up = loop.time() + CONTENDED_SECONDS
+        while True:
+            try:
+                job, started = await _queue_load(pool, boundary_set.name, None, automatic=True)
+                break
+            except job_queue.QueueContended:
+                # Another runner holds the lock for a moment. Each try waits up to the queue's lock timeout
+                # (100 ms) on its own; past the limit the error goes up, and the job runner tries again later.
+                if loop.time() + 0.2 > give_up:
+                    raise
+                await asyncio.sleep(0.1)
+        if started and job is not None:
+            logger.info(
+                'Queued the load of %s %s from %s (job %s)',
+                boundary_set.title,
+                boundary_set.version,
+                boundary_file(boundary_set),
+                job['id'],
+            )
+            queued.append(job)
+    return queued
+
+
 async def download(boundary_set: BoundarySet) -> bytes:
-    """The set's file from its pinned URL, refused once it passes the size limit."""
+    """The set's file from its pinned URL, refused once it passes the size limit. The only place this module reaches
+    the network: for an administrator's load and for `fetch`, never for a load the server starts by itself."""
     import httpx
 
     chunks, size = [], 0
@@ -800,14 +953,46 @@ def summary(report: Dict[str, Any]) -> str:
 
 def handler(pool):
     async def measure(job):
-        name = (job['args'] or {}).get('set')
+        args = job['args'] or {}
+        name = args.get('set')
         boundary_set = SETS.get(name) if isinstance(name, str) else None
         if boundary_set is None:
             raise JobInputError(f'Unknown boundary set {name!r}')
-        data = await download(boundary_set)
-        digest = check_file(data, boundary_set)
+        automatic = args.get('automatic') is True
+        # Free space first, as for every large write: refused, nothing is read, downloaded or written, and the job
+        # fails with the gate's own words.
+        async with pool.acquire() as connection:
+            try:
+                await diskspace.require_free_space(connection, LOAD_FREE_BYTES, 'loading region boundaries')
+            except HTTPException as error:
+                raise JobInsufficientStorage(str(error.detail)) from None
+        data = await asyncio.to_thread(pinned_file, boundary_set)
+        if data is not None:
+            loaded_from, digest = 'bundled', boundary_set.sha256
+        elif automatic:
+            # The file was there when the job runner queued this; a load it starts by itself never downloads.
+            raise RegionLoadError(
+                f'{boundary_file(boundary_set)} is gone, or is no longer the pinned file of {boundary_set.title} '
+                f'{boundary_set.version}, and a load the server starts by itself never downloads. Load the set from '
+                f'Settings → System status → Region boundaries',
+            )
+        else:
+            data = await download(boundary_set)
+            loaded_from, digest = 'download', check_file(data, boundary_set)
         try:
-            async with pool.acquire() as connection:
+            async with pool.acquire() as connection, connection.transaction():
+                if automatic:
+                    # Loaded meanwhile (from the command line): a loaded set is never loaded again by itself.
+                    await connection.execute(SET_LOCK_SQL, boundary_set.name)
+                    if await connection.fetchval(
+                        'SELECT EXISTS (SELECT 1 FROM region_sets WHERE name = $1)',
+                        boundary_set.name,
+                    ):
+                        return StepResult(
+                            finished=True,
+                            result={'already_loaded': True, 'set': boundary_set.name},
+                            message=f'{boundary_set.title} was loaded meanwhile; it is left as it is',
+                        )
                 report = await load(
                     connection,
                     boundary_set,
@@ -815,7 +1000,7 @@ def handler(pool):
                     version=boundary_set.version,
                     sha256=digest,
                     verified=True,
-                    loaded_from='download',
+                    loaded_from=loaded_from,
                     user_id=job['created_by'],
                 )
         except asyncpg.PostgresError as error:
@@ -858,12 +1043,59 @@ async def _load_file(path: str, boundary_set: BoundarySet, verify: bool, version
         await connection.close()
 
 
+# --- Fetching the file, in a source checkout's install steps -------------------------------------------------------
+
+
+async def _fetch(boundary_sets: Sequence[BoundarySet]) -> int:
+    """`fetch`: each set's pinned file into boundaries_dir(), for the job runner to load. No database."""
+    code = 0
+    for boundary_set in boundary_sets:
+        path = boundary_file(boundary_set)
+        data, why = await asyncio.to_thread(_read_boundary_file, boundary_set)
+        if data is not None:
+            print(f'{boundary_set.name} {boundary_set.version}: {path} is already the pinned file; nothing downloaded')
+            continue
+        if why is not None:
+            print(f'{boundary_set.name}: {path} is not the pinned file ({why}); downloading the pinned one')
+        try:
+            data = await download(boundary_set)
+            why = _not_pinned(data, boundary_set)
+            if why is not None:
+                raise RegionLoadError(
+                    f'{boundary_set.url} gave a file that is not the pinned one of {boundary_set.title} '
+                    f'{boundary_set.version}: {why}',
+                )
+            # Renamed over the old file only once verified: until then the directory is as it was.
+            await asyncio.to_thread(_write_file, path, data)
+        except (OSError, RegionLoadError) as error:
+            print(f'error: {error}', file=sys.stderr)
+            print(
+                'The region boundaries can be loaded later, from Settings → System status → Region boundaries.',
+                file=sys.stderr,
+            )
+            code = 1
+            continue
+        print(f'{boundary_set.name} {boundary_set.version}: downloaded to {path} (SHA-256 checked)')
+    return code
+
+
+# --- The command line ----------------------------------------------------------------------------------------------
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         prog='python -m backend.regions',
-        description='Load a boundary set from a file, on a server that cannot download it (docs/REGIONS.md).',
+        description=(
+            "Fetch boundary sets' pinned files for the job runner to load, or load a boundary set from a file "
+            '(docs/REGIONS.md).'
+        ),
     )
     commands = parser.add_subparsers(dest='command', required=True)
+    fetch_command = commands.add_parser(
+        'fetch',
+        help=f"download each boundary set's pinned file into {boundaries_dir()}, for the job runner to load",
+    )
+    fetch_command.add_argument('--set', choices=sorted(SETS), help='fetch only this set')
     load_command = commands.add_parser('load', help='load a GeoJSON file as a boundary set, replacing its regions')
     load_command.add_argument('file', help="the set's GeoJSON file, as its source publishes it")
     load_command.add_argument('--set', required=True, choices=sorted(SETS), help='the boundary set it is')
@@ -877,6 +1109,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         help='with --no-verify, the version of a file that is not the pinned one',
     )
     args = parser.parse_args(argv)
+    if args.command == 'fetch':
+        return asyncio.run(_fetch([SETS[args.set]] if args.set else list(SETS.values())))
     boundary_set = SETS[args.set]
     try:
         report = asyncio.run(_load_file(args.file, boundary_set, not args.no_verify, args.set_version))

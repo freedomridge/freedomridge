@@ -1340,9 +1340,9 @@ export interface RegionSet {
     loaded: {
         version: string;
         verified: boolean;
-        loaded_from: string;
+        loaded_from: string;  // 'bundled' (the file that came with this release), 'download' or 'file'
         loaded_at: string;
-        loaded_by: { id: number; username: string } | null;  // null: loaded from a file on the server
+        loaded_by: { id: number; username: string } | null;  // null: loaded by the server itself, or from a file on it
         counts: { country: number; state: number; group: number };
         removed_keys: string[];  // the keys the last load took away
     } | null;
@@ -1356,7 +1356,7 @@ export async function getRegionSets(): Promise<RegionSet[]> {
     return (await res.json()).sets;
 }
 
-/** Queues the download and load of a boundary set, or returns the region load already queued or running (`started: false`). */
+/** Queues the load of a boundary set (from the file that came with this release, else downloaded), or returns the region load already queued or running (`started: false`). */
 export async function loadRegionSet(set: string): Promise<{ job_id: string; state: string; started: boolean }> {
     const res = await fetch(`${API_BASE}/admin/regions/load`, {
         method: 'POST',

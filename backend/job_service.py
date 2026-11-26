@@ -282,6 +282,17 @@ async def run_service(dsn=DATABASE_URL):
         nonlocal dispatch_after
         dispatch_after = await concept_jobs.dispatch_changes(pool, after_dataset=dispatch_after)
 
+    bundled_loads_queued = False
+
+    async def queue_bundled_loads():
+        # Once each time the runner starts (tried again until it succeeds): the boundary sets whose pinned file came
+        # with the install and that this database has never loaded (docs/REGIONS.md). Restore recovery leaves region
+        # loads alone, so this doesn't wait for it.
+        nonlocal bundled_loads_queued
+        if not bundled_loads_queued:
+            await regions.queue_bundled_loads(pool)
+            bundled_loads_queued = True
+
     handlers = {
         SELECTION_CLEANUP: handle_cleanup,
         statistics.KIND: handle_statistics,
@@ -408,6 +419,7 @@ async def run_service(dsn=DATABASE_URL):
                 (lambda: map_refit.sweep(pool), 600, 'Map artifact cleanup', False),
                 (lambda: map_refit.heal_unranked_maps(pool), 600, 'Unranked map heal', False),
                 (lambda: map_refit.expire_unclaimed_fits(pool), 600, 'Unclaimed map fit expiry', False),
+                (queue_bundled_loads, 5, 'Region boundaries', False),
             ]
             retries = [FailureBackoff(logger, f'{name} scheduling', period) for _, period, name, _ in schedules]
             next_runs = [0.0] * len(schedules)

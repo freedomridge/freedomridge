@@ -1,4 +1,8 @@
+# syntax=docker/dockerfile:1.27.1@sha256:4edf897a3ffa55b89f906fc8cc78afdb3f1834cc9c7083565e611a8a7d5fe99e
 # Worker Dockerfile - runs background jobs
+# Building it needs BuildKit (`docker compose build`, or `docker build` with the buildx plugin); the legacy builder
+# stops at the ADD of the region boundaries below. The syntax line pins BuildKit's Dockerfile reader, so ADD --checksum
+# works whichever BuildKit version builds it.
 FROM ghcr.io/astral-sh/uv:0.13.6@sha256:af22a52f5eafef3d78e551599d405c02df61919d18028f0cea8eda93bc9986d0 AS uv
 FROM python:3.14-slim@sha256:cd89c30eda26ee911a4611b18680086e0ea42e6f5f8cbe653d07fa7958c9cec8
 
@@ -10,6 +14,16 @@ RUN apt-get update && apt-get install -y \
 
 # Set working directory
 WORKDIR /app
+
+# Region boundaries (docs/REGIONS.md): the pinned file of backend.regions.SETS['natural-earth-admin1'], at the
+# place the job runner looks (backend/boundaries/). The job runner loads it by itself on a database that has never
+# loaded the set. The build checks its SHA-256 and fails on any other file. Before the code, so a code change
+# doesn't download it again; readable by any user (a file added from a URL is otherwise mode 600). The directories
+# come first: ADD --chmod would give the ones it creates the file's mode, which no user but root can enter.
+RUN mkdir -p /app/backend/boundaries
+ADD --checksum=sha256:22d0e3ad85eb3e27f17cabf8ba2d50e554fbc27a87796ff891d958185da62fb5 --chmod=644 \
+    https://raw.githubusercontent.com/nvkelso/natural-earth-vector/v5.1.1/geojson/ne_10m_admin_1_states_provinces.geojson \
+    /app/backend/boundaries/ne_10m_admin_1_states_provinces.geojson
 
 # Locked Python environment (pyproject.toml + uv.lock; see docs/DEPENDENCIES.md) in /opt/venv,
 # using the image's Python rather than a downloaded one.

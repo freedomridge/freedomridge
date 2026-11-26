@@ -5,8 +5,9 @@ filter `location within "US-KS"` keeps the samples located in Kansas, and `locat
 The assistant uses them to answer "all the images in Kansas"; anyone can use them in the filter bar's query text, in
 links, in the SDK and in the API.
 
-Regions belong to the installation that loads them. They aren't part of the install: an administrator loads a
-boundary set once, and loads it again to replace it.
+Regions belong to the installation that loads them, and they come with the install: a Docker server loads the
+boundary set by itself a few minutes after its first start, and a source checkout fetches the file in its install
+steps ([Loading a set](#loading-a-set)). An administrator loads a set again to replace it.
 
 ## The boundary set
 
@@ -74,16 +75,59 @@ a country and a US state.
   administrator knows which saved views and links to update: a filter naming a key that is gone is refused, not
   emptied.
 
-## Loading a set (administrators)
+## Loading a set
 
-**`POST /api/admin/regions/load`** with `{"set": "natural-earth-admin1"}` starts a background job that downloads the
-set's file from its pinned URL over HTTPS, checks its size and SHA-256, and loads it. The answer is a 202:
-`{"job_id": "...", "state": "queued", "started": true}`. While a region load is queued or running, a second request
-returns that job with `"started": false`. The job shows in the Jobs list like other jobs; its result is the load's
-report: the counts of each kind, the decisions above, and `removed_keys`.
+**Where the file is.** A server looks for a set's file in one directory: `FRIDGE_REGIONS_DIR` when that is set,
+otherwise `backend/boundaries/` beside the backend's code (git ignores it). The file is named as in the set's URL
+(`ne_10m_admin_1_states_provinces.geojson`). Only the set's pinned file counts: a file there with another SHA-256,
+or over the size limit, is ignored as if there were none, and the job runner's log says so once, naming it.
 
-**A server with no internet** loads the same file from disk, from the repository root with the backend's
-environment (`DATABASE_URL`):
+- **Docker:** the job runner's image (`Dockerfile.worker`) carries the pinned file. The build downloads it and fails
+  unless its SHA-256 is the pinned one. It adds 40.7 MB to the image.
+- **A source checkout** fetches it once, from the repository root (no database needed):
+
+  ```bash
+  python -m backend.regions fetch
+  ```
+
+  It downloads each set's pinned file (41 MB) into the directory above, checks its size and SHA-256, and prints
+  where it is. A pinned file already there is kept and nothing is downloaded; any other file there is replaced once
+  the download is checked. A download that isn't the pinned file, or that fails, leaves the directory as it was
+  (nothing partial, and a file that was there is untouched) and exits 1: the boundaries can still be loaded later
+  from Settings. `--set natural-earth-admin1` fetches one set. The job runner loads the file when it next starts:
+  if the backend was running during the fetch, restart it (its launcher starts the job runner).
+
+**The server loads it by itself.** Each time the job runner starts, it queues a region load for each set whose
+pinned file is there and that this database has never loaded, unless a region load is already queued or running.
+That is a new install's first start, the first start after an upgrade to a release that carries the file, and a
+database restored from a backup that had no regions. The load is the ordinary region load job (Loading region
+boundaries, in Background jobs), retried like any other; one that fails for good is tried again at the job runner's
+next start. It records `loaded_from` `bundled` and no user. It never downloads: with no file there, the job runner
+queues nothing.
+
+**A set that has been loaded is never loaded again by itself**, whatever version or file it was loaded from (an
+older version, a file an administrator vouched for). Keys can change between versions, so replacing a set stays an
+administrator's act.
+
+**Every load first checks the database volume's free space**, as other large writes do: it asks for 500 MB on top of
+the check's usual 1 GB of headroom. Refused, it writes nothing and the job fails with the check's words, which say how
+much is free; an automatic load is tried again at the job runner's next start.
+
+Loading 5.1.1 took 31 seconds on a desktop computer, with the launcher's PostgreSQL settings. One PostgreSQL process
+does the work, so a slower processor takes longer: allow a few minutes on a small server. It adds 151 MB to the
+database: after the load the region tables, with their indexes, are `regions` 45 MB, `region_parts` 38 MB and
+`region_cells` 68 MB.
+
+**`POST /api/admin/regions/load`** with `{"set": "natural-earth-admin1"}` starts a background job that loads the
+set: from the pinned file in the directory above when it is there (`loaded_from` `bundled`, so a Docker server with
+no internet can load it), else downloaded from its pinned URL over HTTPS (`loaded_from` `download`), its size and
+SHA-256 checked. The answer is a 202: `{"job_id": "...", "state": "queued", "started": true}`. While a region load
+is queued or running, the server's own included, a second request returns that job with `"started": false`. The job
+shows in the Jobs list like other jobs; its result is the load's report: the counts of each kind, the decisions
+above, and `removed_keys`.
+
+**A server with no internet and no file there** loads a file from anywhere on disk, from the repository root with
+the backend's environment (`DATABASE_URL`):
 
 ```bash
 python -m backend.regions load ne_10m_admin_1_states_provinces.geojson --set natural-earth-admin1
@@ -108,9 +152,10 @@ until the new ones are in.
 }]}
 ```
 
-`loaded` is `null` until the set is loaded; `loaded_by` is `null` for a load from the command line. `load_job` is
-the region load queued or running for the set, so a page can follow a load another administrator started; `null`
-when there is none.
+`loaded` is `null` until the set is loaded. `loaded_from` is `bundled` (the file that came with the install),
+`download` or `file` (the command line); `loaded_by` is `null` for a load the server started by itself and for one
+from the command line. `load_job` is the region load queued or running for the set, so a page can follow a load the
+server or another administrator started; `null` when there is none.
 
 ## Finding regions
 
@@ -183,13 +228,16 @@ filter gives.
 - **Datasets with objects.** On a dataset with objects, `not within` is coupled across the grains as a drawn
   region's exclude is: the image grid keeps the images outside the region with no object inside it, the object grid
   the objects outside it whose image isn't inside it.
-- **Loading boundaries.** Administrators load a set on Settings → System status, in the Region boundaries card. It
-  shows each set and what is loaded of it (version, when, by whom, the number of countries, states or provinces and
-  groups), and a button that downloads and loads it. The card follows the job it starts (Loading region boundaries,
-  also in Background jobs) to its result, or to its failure as the job gives it: on a server with no internet, that
-  says which command loads the file from disk. A load already under way when the page opens (`load_job`: started by
-  another administrator, or before a reload) is followed the same way, the button disabled until it ends. After a set
-  is loaded again, the card lists the keys the load removed.
+- **Loading boundaries.** Settings → System status has a Region boundaries card for administrators. It shows each
+  set, its source and licence, and what is loaded of it: the version, when, how ("automatically, from the file that
+  came with this release", "by admin, from the file that came with this release", "by admin, downloaded", or "from a
+  file on the server") and the number of countries, states or provinces and groups. Its button reads **Load** before
+  a set is loaded and **Load again** after. While the job is queued or running the card says "Loading, started" and
+  the time, and it follows the job (Loading region boundaries, also in Background jobs) to its result, or to its
+  failure as the job gives it: on a server with no internet and no file, that says which command loads the file from
+  disk. A load already under way when the page opens (`load_job`: the server's own, another administrator's, or one
+  started before a reload) is followed the same way, the button disabled until it ends. After a set is loaded again,
+  the card lists the keys the load removed.
 
 ## Followers
 

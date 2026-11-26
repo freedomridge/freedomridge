@@ -327,6 +327,8 @@ again on a working site just to renew it.
 
 `pull` fetches the release's images from ghcr.io. For a revision that isn't a release, build
 them from the checkout with `docker compose -f docker-compose.prod.yml build --pull` instead.
+Building needs BuildKit (`docker compose build`, or `docker build` with the buildx plugin); the
+legacy builder stops at the step that adds the region boundaries.
 
 ```bash
 docker compose -f docker-compose.prod.yml pull
@@ -1027,7 +1029,7 @@ metrics are absent. The module does not add a 5xx alarm or demo-login dashboard.
 Review security updates monthly and after relevant advisories. OS unattended
 upgrades do not update containers. Back up first, check out the release that has
 the fixes, pull its images with `docker compose -f docker-compose.prod.yml pull`
-(between releases, rebuild from the checkout with `build --pull`), stop the app
+(between releases, rebuild from the checkout with `build --pull`, which needs BuildKit), stop the app
 (`docker compose -f docker-compose.prod.yml stop backend job-runner worker backup frontend`),
 apply migrations using the explicit production DB container, and recreate with
 `up -d` ([Upgrading](UPGRADING.md), step 4). nginx re-resolves Docker service IPs

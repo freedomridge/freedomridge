@@ -123,6 +123,9 @@ docker compose -f docker-compose.prod.yml up -d
 docker compose -f docker-compose.prod.yml ps
 ```
 
+Building the images yourself (`build --pull`) needs BuildKit (`docker compose build`, or `docker build` with
+the buildx plugin); the legacy builder stops at the step that adds the region boundaries.
+
 Bootstrap runs a challenge-only nginx config with no certificates or upstreams,
 then certbot uses the shared HTTP webroot to obtain the first certificate. The
 normal stack serves HTTPS, redirects HTTP except ACME, rejects unknown Hosts with
@@ -132,6 +135,9 @@ goes through nginx; DB/backend/frontend have no published ports.
 
 Log in as `admin` at the HTTPS domain with the generated `FRIDGE_ADMIN_PASSWORD`
 from `.env`, then follow any password-change prompt. Do not use a default password.
+Named regions (filters such as `location within "US-KS"`, [Regions](REGIONS.md)) are
+ready a few minutes after the first start: the job-runner image carries the boundary
+file and loads it by itself (Settings → System status → Region boundaries).
 Read the AWS guide's public-demo checks: private guest views return 200; admin-only
 writes and demo-account password changes return 403 before
 sharing the URL (`bash ops/smoke/guest_gate.sh https://YOUR_DOMAIN DATASET_ID` checks
@@ -237,7 +243,8 @@ migrations before starting clients. Use the exact commands in the
 docker compose -f docker-compose.prod.yml logs --tail=100 backend nginx backup
 docker compose -f docker-compose.prod.yml exec db pg_isready -U freedomridge
 docker compose -f docker-compose.prod.yml exec nginx nginx -t
-# After backing up and checking out a release (a revision that isn't one: build --pull instead);
+# After backing up and checking out a release (a revision that isn't one: build --pull instead, which needs
+# BuildKit: `docker compose build`, or `docker build` with the buildx plugin);
 # the migrations run with the app stopped (Upgrading, step 4):
 docker compose -f docker-compose.prod.yml pull
 docker compose -f docker-compose.prod.yml stop backend job-runner worker backup frontend

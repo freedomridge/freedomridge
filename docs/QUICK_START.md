@@ -47,6 +47,7 @@ From the repository root:
 curl -LsSf https://astral.sh/uv/install.sh | sh   # once: installs uv (Python package manager)
 uv sync --extra cpu      # with an NVIDIA GPU (driver 560+): uv sync --extra cuda
 source .venv/bin/activate
+python -m backend.regions fetch   # once: the region boundaries, a 41 MB download
 export FRIDGE_DATA_ROOT="$PWD/data"
 mkdir -p "$FRIDGE_DATA_ROOT"
 export DATABASE_URL=postgres://freedomridge:password@127.0.0.1:5432/freedomridge
@@ -59,10 +60,15 @@ Reuse the absolute `FRIDGE_DATA_ROOT` in importer terminals. `--reload-dir backe
 prevents package installs in the repository's venv from repeatedly restarting the
 API. `uv sync` installs the exact versions in `uv.lock` (server, SDK, importers, dev
 tools) into `.venv`; [Updating dependencies](DEPENDENCIES.md) explains how versions change.
+`python -m backend.regions fetch` puts the region boundaries (a 41 MB download, made once) in
+`backend/boundaries/`, and the job runner loads them by itself when it starts, for filters such as
+`location within "US-KS"` ([Regions](REGIONS.md#loading-a-set)).
 
 The launcher starts one job runner. Reload restarts only the API; restart the
 launcher after changing runner/job-handler code. If using the Compose `jobs`
-profile instead, export `FRIDGE_RUNNER_ENABLED=false` for the launcher.
+profile instead, export `FRIDGE_RUNNER_ENABLED=false` for the launcher. That job
+runner mounts the checkout's `backend/` over the image's, so it loads the region
+boundaries the checkout fetched, not the image's file.
 
 ## 4. Start the frontend
 

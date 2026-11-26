@@ -710,6 +710,9 @@ async function jobLike(changes: Record<string, unknown>): Promise<Record<string,
 const DOWNLOAD_FAILED = 'Could not download https://raw.githubusercontent.com/nvkelso/natural-earth-vector/v5.1.1/geojson/'
     + 'ne_10m_admin_1_states_provinces.geojson: All connection attempts failed. On a server with no internet, load the file '
     + 'with python -m backend.regions load <file> --set natural-earth-admin1';
+const SET_URL = 'https://raw.githubusercontent.com/nvkelso/natural-earth-vector/v5.1.1/geojson/ne_10m_admin_1_states_provinces.geojson';
+const COUNTED = '5 countries, 8 states or provinces and 3 groups';
+const escapeRegExp = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
 test('the Region boundaries card shows the loaded set with its counts', async ({ page }) => {
     await page.goto('/settings/status');
@@ -724,9 +727,11 @@ test('the Region boundaries card shows the loaded set with its counts', async ({
     await expect(set.getByTestId('status-regions-loaded')).toHaveText(
         new RegExp(`^Version ${FIXTURE_VERSION} loaded .+ from a file on the server: 5 countries, 8 states or provinces and 3 groups\\.$`),
     );
-    await expect(set).toContainText('This version of Freedom Ridge loads version 5.1.1: download and load it again to update.');
-    await expect(set).toContainText('Downloaded from https://raw.githubusercontent.com/nvkelso/natural-earth-vector/v5.1.1/geojson/ne_10m_admin_1_states_provinces.geojson · Public domain');
-    await expect(set.getByRole('button', { name: 'Download and load again' })).toBeEnabled();
+    await expect(set).toContainText('This version of Freedom Ridge loads version 5.1.1: load it again to update.');
+    await expect(card).not.toContainText(/download and load/i);
+    await expect(set).toContainText(`Source: ${SET_URL} · Public domain`);
+    await expect(set).not.toContainText('Downloaded from');
+    await expect(set.getByRole('button', { name: 'Load again', exact: true })).toBeEnabled();
     await expect(set.getByTestId('status-regions-not-loaded')).toHaveCount(0);
 });
 
@@ -755,14 +760,15 @@ test('the card, not loaded, follows the load its button starts to its failure, w
     const card = page.getByTestId('status-regions');
     await expect(card.getByTestId('status-regions-badge')).toHaveText('NOT LOADED');
     await expect(card.getByTestId('status-regions-not-loaded')).toHaveText('Not loaded.');
-    const button = card.getByRole('button', { name: 'Download and load', exact: true });
+    const button = card.getByRole('button', { name: 'Load', exact: true });
     await button.click();
     await expect(card.getByTestId('status-regions-badge')).toHaveText('LOADING');
     await expect(button).toBeDisabled();
     const status = card.getByTestId('status-regions-job');
     await expect(status).toHaveRole('status');
-    await expect(status).toContainText(/Waiting to start\. It's listed under Background jobs below\.|Downloading and loading, started /);
-    await expect(status).toContainText('Downloading and loading, started ', { timeout: 10_000 });
+    await expect(status).toContainText(/Waiting to start\. It's listed under Background jobs below\.|Loading, started /);
+    await expect(status).toContainText('Loading, started ', { timeout: 10_000 });
+    await expect(status).not.toContainText('Downloading');
     await expect(card.getByTestId('status-regions-failure')).toHaveText(`The load failed: ${DOWNLOAD_FAILED}`, { timeout: 15_000 });
     await expect(card.getByTestId('status-regions-badge')).toHaveText('FAILED');
     await expect(button).toBeEnabled();
@@ -797,7 +803,7 @@ for (const outcome of ['LOADED', 'FAILED'] as const) {
 
         const card = page.getByTestId('status-regions');
         const badge = card.getByTestId('status-regions-badge');
-        const button = card.getByRole('button', { name: 'Download and load', exact: true });
+        const button = card.getByRole('button', { name: 'Load', exact: true });
         const status = card.getByTestId('status-regions-job');
         for (const how of ['opened', 'reloaded']) {
             if (how === 'opened') await page.goto('/settings/status');
@@ -806,7 +812,8 @@ for (const outcome of ['LOADED', 'FAILED'] as const) {
             await expect(button, how).toBeDisabled();
             await expect(status, how).toHaveRole('status');
             await expect(status, how).toContainText('A load was already running; this is its progress.');
-            await expect(status, how).toContainText('Downloading and loading, started ');
+            await expect(status, how).toContainText('Loading, started ');
+            await expect(status, how).not.toContainText('Downloading');
         }
 
         ended = true;
@@ -816,7 +823,7 @@ for (const outcome of ['LOADED', 'FAILED'] as const) {
             await expect(card.getByTestId('status-regions-loaded')).toHaveText(
                 new RegExp(`^Version ${FIXTURE_VERSION} loaded .+ from a file on the server: 5 countries, 8 states or provinces and 3 groups\\.$`),
             );
-            await expect(card.getByRole('button', { name: 'Download and load again', exact: true })).toBeEnabled();
+            await expect(card.getByRole('button', { name: 'Load again', exact: true })).toBeEnabled();
         } else {
             await expect(card.getByTestId('status-regions-failure')).toHaveText(`The load failed: ${DOWNLOAD_FAILED}`, { timeout: 15_000 });
             await expect(badge).toHaveText('FAILED');
@@ -830,6 +837,71 @@ for (const outcome of ['LOADED', 'FAILED'] as const) {
     });
 }
 
+/** The listing as the server gives it, with what is loaded of each set changed as `loaded` says, and no load running. */
+const listingWith = (real: { sets: Array<Record<string, unknown>> }, loaded: Record<string, unknown>) => ({
+    sets: real.sets.map(set => ({ ...set, loaded: { ...(set.loaded as Record<string, unknown>), ...loaded }, load_job: null })),
+});
+
+const ADMIN_NAME = 'e2e-regions-admin';
+// What is loaded, after the version and time, for each way a set is loaded (the regions contract, 4.3).
+const WHAT_IS_LOADED: Array<{ loadedFrom: string; by: string | null; words: string }> = [
+    { loadedFrom: 'bundled', by: null, words: 'automatically, from the file that came with this release' },
+    { loadedFrom: 'bundled', by: ADMIN_NAME, words: `by ${ADMIN_NAME}, from the file that came with this release` },
+    { loadedFrom: 'download', by: ADMIN_NAME, words: `by ${ADMIN_NAME}, downloaded` },
+    { loadedFrom: 'file', by: null, words: 'from a file on the server' },
+];
+
+for (const { loadedFrom, by, words } of WHAT_IS_LOADED) {
+    test(`the card says what is loaded: ${loadedFrom}, ${by ? 'by a user' : 'no user'} (answers faked)`, async ({ page }) => {
+        const real = await apiFetch(cookie, '/admin/regions');
+        const loaded = { version: '5.1.1', verified: true, loaded_from: loadedFrom, loaded_by: by ? { id: 1, username: by } : null };
+        await page.route('**/api/admin/regions', (route: Route) => route.request().method() === 'GET'
+            ? route.fulfill({ json: listingWith(real, loaded) })
+            : route.continue());
+        await page.goto('/settings/status');
+        const set = page.getByTestId('status-regions').getByTestId('status-regions-set');
+        await expect(set.getByTestId('status-regions-loaded')).toHaveText(
+            new RegExp(`^Version 5\\.1\\.1 loaded .+ ${escapeRegExp(words)}: ${COUNTED}\\.$`),
+        );
+        await expect(set).toContainText(`Source: ${SET_URL} · Public domain`);
+        await expect(set.getByRole('button', { name: 'Load again', exact: true })).toBeEnabled();
+    });
+}
+
+test('a load the server started by itself is followed like any other, to what it loaded (answers faked)', async ({ page }) => {
+    const real = await apiFetch(cookie, '/admin/regions');
+    const jobId = '00000000-0000-4000-8000-00000000e2e4';
+    let ended = false;
+    await page.route('**/api/admin/regions', (route: Route) => {
+        if (route.request().method() !== 'GET') return route.continue();
+        if (ended) return route.fulfill({ json: listingWith(real, { version: '5.1.1', verified: true, loaded_from: 'bundled', loaded_by: null }) });
+        const sets = real.sets.map((set: Record<string, unknown>) => ({ ...set, loaded: null, load_job: { job_id: jobId, state: 'running' } }));
+        return route.fulfill({ json: { sets } });
+    });
+    let loads = 0;
+    await page.route('**/api/admin/regions/load', (route: Route) => {
+        loads += 1;
+        return route.fulfill({ status: 500, json: { detail: 'e2e: no load may be started here' } });
+    });
+    const running = await jobLike({ id: jobId, kind: 'region_load', state: 'running', started_at: new Date().toISOString(), finished_at: null, error: null });
+    const message = `${COUNTED} loaded (5.1.1)`;
+    const succeeded = { ...running, state: 'succeeded', finished_at: new Date().toISOString(), progress: { ...(running.progress as object ?? {}), message }, result: { message } };
+    await page.route(`**/api/jobs/${jobId}`, (route: Route) => route.fulfill({ json: ended ? succeeded : running }));
+
+    await page.goto('/settings/status');
+    const card = page.getByTestId('status-regions');
+    await expect(card.getByTestId('status-regions-badge')).toHaveText('LOADING');
+    await expect(card.getByRole('button', { name: 'Load', exact: true })).toBeDisabled();
+    await expect(card.getByTestId('status-regions-job')).toContainText('Loading, started ');
+    ended = true;
+    await expect(card.getByTestId('status-regions-badge')).toHaveText('LOADED', { timeout: 15_000 });
+    await expect(card.getByTestId('status-regions-loaded')).toHaveText(
+        new RegExp(`^Version 5\\.1\\.1 loaded .+ automatically, from the file that came with this release: ${COUNTED}\\.$`),
+    );
+    await expect(card.getByRole('button', { name: 'Load again', exact: true })).toBeEnabled();
+    expect(loads, 'no load request sent').toBe(0);
+});
+
 test('a load the server refuses shows its words; a region load job is "Loading region boundaries" among Background jobs (answers faked)', async ({ page }) => {
     await page.route('**/api/admin/regions/load', (route: Route) => route.fulfill({ status: 409, json: { detail: 'e2e: a load is refused' } }));
     const failedJob = await jobLike({
@@ -839,7 +911,7 @@ test('a load the server refuses shows its words; a region load job is "Loading r
     await page.route('**/api/admin/jobs?*', (route: Route) => route.fulfill({ json: { items: [failedJob], next_cursor: null } }));
     await page.goto('/settings/status');
     const card = page.getByTestId('status-regions');
-    await card.getByRole('button', { name: /^Download and load/ }).click();
+    await card.getByRole('button', { name: /^Load( again)?$/ }).click();
     await expect(card.getByRole('alert')).toHaveText('e2e: a load is refused');
     const job = page.getByTestId('job-history-item').filter({ hasText: 'Loading region boundaries' });
     await expect(job).toHaveCount(1);

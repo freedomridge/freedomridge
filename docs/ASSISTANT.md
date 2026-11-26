@@ -36,8 +36,10 @@ An administrator, once:
    ([Links](#links)).
 2. Open **Settings → Assistant** and switch on **MCP server**. It ships off.
 3. On the same page, say who may use it ([Who may use it](#who-may-use-it)). As shipped, only administrators may.
-4. If people will ask about places ("the images in Kansas"), load region boundaries under **Settings → System status
-   → Region boundaries** ([regions](REGIONS.md)).
+4. Places ("the images in Kansas") need region boundaries. On a Docker install they are ready a few minutes after the
+   first start: the server loads them by itself. A source checkout loads them once `python -m backend.regions fetch`
+   has run ([regions](REGIONS.md#loading-a-set)). **Settings → System status → Region boundaries** shows what is
+   loaded.
 
 Each person who uses it (a power user or an administrator: guests make no tokens):
 
@@ -245,7 +247,7 @@ The tools hand a model what people wrote, as they wrote it:
 - field names, descriptions and units;
 - concept names;
 - saved views' names, descriptions and slugs;
-- region names (those of a boundary set an administrator loads);
+- region names (those of the loaded boundary set);
 - the values of every field not marked private, tags included.
 
 Two things follow:

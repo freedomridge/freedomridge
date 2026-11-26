@@ -9,13 +9,17 @@ it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
 This release adds an AI assistant: Claude Code and other MCP clients answer questions about a server's datasets
 through thirteen read-only tools at `/mcp`, reading as the person using them. It is off until an administrator
 switches it on. Also new: named regions as a filter, a text form for concept filters, and a description and unit for
-each field. Five migrations, none of which touches a sample.
+each field. Six migrations, none of which touches a sample.
 
 ### Upgrade notes
 
-- Five database migrations, `0034_regions.sql` to `0038_assistant_working_views.sql`, and changed database functions,
+- Six database migrations, `0034_regions.sql` to `0039_region_sets_bundled.sql`, and changed database functions,
   applied with `scripts/apply_migrations.sh` (step 4 of [Upgrading](docs/UPGRADING.md)). They add empty tables and
   columns and touch no rows.
+- The job runner loads the region boundaries by itself on its first start after the upgrade: its image now carries
+  the boundary file (40.7 MB more). The load takes about half a minute on a desktop computer, a few minutes on a
+  small server, and adds 151 MB to the database. A development checkout runs `python -m backend.regions fetch` once
+  ([Upgrading](docs/UPGRADING.md#a-development-checkout)).
 - The assistant ships off, and an upgraded server keeps it off; existing datasets stay open to it once it is on.
 - **What switching it on means:** the server calls no AI service and needs no key, but each person you let in can have
   their own AI client read what they can already see in their datasets and send it to that client's AI service
@@ -88,10 +92,15 @@ each field. Five migrations, none of which touches a sample.
     always did for a person. Migrations `0036_assistant.sql` (three small tables and `datasets.assistant_closed`,
     false on every existing dataset), `0037_mcp_tokens_and_assistant_calls.sql` (the token kind and the empty log
     table) and `0038_assistant_working_views.sql` (two tables and `assistant_settings.sample_fields`).
-- **Named regions, and a filter for the samples in one** ([docs/REGIONS.md](docs/REGIONS.md)). An administrator loads
-  Natural Earth's 1:10m states and provinces (version 5.1.1, public domain) on Settings → System status, which shows
-  what is loaded, or with `POST /api/admin/regions/load`, a background download checked against a pinned SHA-256, or
-  on a server with no internet with `python -m backend.regions load <file> --set natural-earth-admin1`. That gives 251
+- **Named regions, and a filter for the samples in one** ([docs/REGIONS.md](docs/REGIONS.md)). They come with the
+  install: the job runner's Docker image carries Natural Earth's 1:10m states and provinces (version 5.1.1, public
+  domain), checked against a pinned SHA-256 when the image is built, and the job runner loads them by itself when it
+  starts on a database that has never loaded them, so they are ready a few minutes after a new server's first start.
+  A source checkout downloads the file once with `python -m backend.regions fetch`. The server never downloads by
+  itself, and never loads a set again once it is loaded. Settings → System status shows what is loaded and how, and
+  its **Load** button (`POST /api/admin/regions/load`) loads the set again: from the file that came with the release
+  when the server has it, else a background download checked against the pinned SHA-256; a server with no internet
+  and no file loads one with `python -m backend.regions load <file> --set natural-earth-admin1`. That gives 251
   countries, 4,596 states or provinces and 313 groups of them, keyed by ISO code (`US-KS`, `US`) or by country and
   group (`US:midwest`). `location within "US-KS"` then keeps the samples located in Kansas and
   `location not within "US-KS"` removes them, in filter text, links, the SDK's `dataset.query()` and the API
@@ -102,7 +111,9 @@ each field. Five migrations, none of which touches a sample.
   names the region ("In Kansas, United States of America"), however it came (typed text, a link, a saved view), and a
   click turns it into "Not in Kansas" and back. While it is applied the map outlines the region, dashed when excluded,
   across the antimeridian too, and applying one moves the map to the samples inside as drawing a polygon does. Views
-  with region chips are written as `?q=` links. Migration `0034_regions.sql` adds the empty region tables.
+  with region chips are written as `?q=` links. Migration `0034_regions.sql` adds the empty region tables, and
+  `0039_region_sets_bundled.sql` records a set loaded from the file that came with the release (`loaded_from`
+  `bundled`).
 - **A concept filter has a text form**, so a view that keeps or hides samples by a concept's score is a readable
   `?q=` link and can be typed in a filter card's Query box or `dataset.query()`: `concept "equipment" > 0.62` keeps
   the samples whose score passes (`>`, `>=`, `<` or `<=`), and `not concept "equipment" > 0.62` hides them, as the
