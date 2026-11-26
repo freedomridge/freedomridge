@@ -86,6 +86,37 @@ function updateNodeSizes(root: PanelNode, id: PanelId, sizes: number[]): PanelNo
 
 const LAYOUT_STORAGE_KEY = 'fridge-panel-layout-v2';
 
+// Every panel type (the compiler checks the list is whole), so a kept layout naming another one opens on the default.
+const PANEL_TYPES: Record<PanelType, true> = {
+    grid: true, filters: true, empty: true, embeddings: true, map: true, histogram: true, duplicates: true, concepts: true,
+    'sparse-sample': true,
+};
+
+// Whether a stored value is a layout this version can show: a panel of a known type, or a group of one or more of
+// them. Anything else (damaged, or another version's shape) opens on the default layout.
+function isPanelNode(value: unknown): value is PanelNode {
+    if (typeof value !== 'object' || value === null) return false;
+    const node = value as { id?: unknown; type?: unknown; size?: unknown; data?: unknown; direction?: unknown; children?: unknown };
+    if (typeof node.id !== 'string' || (node.size !== undefined && typeof node.size !== 'number')) return false;
+    if (node.type === 'leaf') {
+        const panelType = (node.data as { panelType?: unknown } | null | undefined)?.panelType;
+        return typeof panelType === 'string' && Object.hasOwn(PANEL_TYPES, panelType);
+    }
+    return node.type === 'group' && (node.direction === 'horizontal' || node.direction === 'vertical')
+        && Array.isArray(node.children) && node.children.length > 0 && node.children.every(isPanelNode);
+}
+
+function readStoredLayout(): PanelNode | null {
+    try {
+        // A size stored as null (JSON's spelling of a NaN size) reads as no size.
+        const noNullSize = (key: string, value: unknown) => (key === 'size' && value === null ? undefined : value);
+        const parsed: unknown = JSON.parse(localStorage.getItem(LAYOUT_STORAGE_KEY) ?? 'null', noNullSize);
+        return isPanelNode(parsed) ? parsed : null;
+    } catch {
+        return null;  // no storage, or not JSON: the default layout
+    }
+}
+
 export function PanelLayout({ initialLayout, renderPanel, getIsActive }: PanelLayoutProps) {
     // Initialize with default layout matching user preference: Filters -> Grid -> Embeddings
     const defaultLayout: PanelNode = initialLayout || {
@@ -103,41 +134,27 @@ export function PanelLayout({ initialLayout, renderPanel, getIsActive }: PanelLa
     const [, setLayoutVersion] = useState(0);
     const [, setIsLoaded] = useState(false);
 
+    // Use a ref to track the *current* layout including the latest sizes the person resized to.
+    // This avoids re-rendering the entire tree on every resize. Every setLayout below sets it too.
+    const layoutRef = useRef<PanelNode>(layout);
+
     // Load from local storage on mount
     useEffect(() => {
         if (typeof window !== 'undefined') {
-            let saved: string | null = null;
-            try { saved = localStorage.getItem(LAYOUT_STORAGE_KEY); } catch { /* no storage: the default layout */ }
+            const saved = readStoredLayout();
             if (saved) {
-                try {
-                    const parsed = JSON.parse(saved);
-                    // eslint-disable-next-line react-hooks/set-state-in-effect -- synchronize existing per-view UI state after a prop or client-mount change
-                    setLayout(parsed);
-                    setLayoutVersion(v => v + 1); // Force re-render of Group
-                } catch (e) {
-                    console.error('Failed to parse saved layout', e);
-                }
+                layoutRef.current = saved;
+                // eslint-disable-next-line react-hooks/set-state-in-effect -- synchronize existing per-view UI state after a prop or client-mount change
+                setLayout(saved);
+                setLayoutVersion(v => v + 1); // Force re-render of Group
             }
             setIsLoaded(true);
         }
     }, []);
 
-    // Use a ref to track the *current* layout including latest sizes from onLayoutChange events.
-    // This avoids re-rendering the entire tree on every resize frame.
-    const layoutRef = useRef<PanelNode>(layout);
-
-    // Keep ref in sync if layout state changes externally (though mostly we drive from ref -> state)
-    useEffect(() => {
-        layoutRef.current = layout;
-    }, [layout]);
-
-    // Debounced save to local storage
-    const saveTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+    // Written only when the person changes the layout: opening the page never writes over the kept one.
     const saveLayout = useCallback((newLayout: PanelNode) => {
-        if (saveTimeoutRef.current) clearTimeout(saveTimeoutRef.current);
-        saveTimeoutRef.current = setTimeout(() => {
-            try { localStorage.setItem(LAYOUT_STORAGE_KEY, JSON.stringify(newLayout)); } catch { /* ignore */ }
-        }, 500);
+        try { localStorage.setItem(LAYOUT_STORAGE_KEY, JSON.stringify(newLayout)); } catch { /* ignore */ }
     }, []);
 
     const handleSplit = useCallback((id: PanelId, direction: 'horizontal' | 'vertical') => {
@@ -196,7 +213,20 @@ export function PanelLayout({ initialLayout, renderPanel, getIsActive }: PanelLa
         saveLayout(newLayout);
     }, [saveLayout]);
 
-    const handleLayoutChange = useCallback((groupId: string, sizes: number[]) => {
+    // A Group reports its sizes as it mounts too, and again when the kept layout replaces the default one: those
+    // reports repeat the sizes the layout holds and are left alone. A resize the person makes (dragging a separator,
+    // the keyboard, or a double click on a separator, which resets the panel next to it) is recorded and saved.
+    const handleLayoutChanged = useCallback((groupId: string, sizes: (number | undefined)[], isUserInteraction: boolean) => {
+        const group = findNode(layoutRef.current, groupId);
+        // Not a layout of this group: the group is gone, or its panels are changing.
+        if (!group || group.type !== 'group' || group.children.length !== sizes.length) return;
+        if (!sizes.every((size): size is number => typeof size === 'number')) return;
+        const children = group.children;
+        const resized = sizes.some((size, index) => {
+            const held = children[index].size;
+            return held !== undefined && Math.abs(size - held) > 0.01;
+        });
+        if (!resized && !isUserInteraction) return;
         // Update the ref ONLY, do not trigger re-render
         layoutRef.current = updateNodeSizes(layoutRef.current, groupId, sizes);
         saveLayout(layoutRef.current);
@@ -233,7 +263,11 @@ export function PanelLayout({ initialLayout, renderPanel, getIsActive }: PanelLa
                 key={`${node.id}-${node.children.length}`}
                 id={node.id}
                 orientation={node.direction}
-                onLayoutChange={(sizes) => handleLayoutChange(node.id, node.children.map(child => sizes[child.id]))}
+                onLayoutChanged={(sizes, { isUserInteraction }) => handleLayoutChanged(
+                    node.id,
+                    node.children.map(child => sizes[child.id]),
+                    isUserInteraction,
+                )}
             >
                 {node.children.map((child, index) => (
                     <React.Fragment key={child.id}>

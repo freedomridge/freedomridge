@@ -32,6 +32,16 @@ interface UserContextType {
 
 const UserContext = createContext<UserContextType | undefined>(undefined);
 
+// The server's answer to every request of a session whose account an administrator deactivated (backend/routers/auth.py):
+// the session is over, as after a 401. Any other 403 refuses one request and leaves the person signed in.
+async function accountInactive(res: Response): Promise<boolean> {
+    try {
+        return (await res.json())?.detail === 'Account is inactive';
+    } catch {
+        return false;
+    }
+}
+
 export function UserProvider({ children }: { children: React.ReactNode }) {
     const [user, setUser] = useState<User | null>(null);
     const [isLoading, setIsLoading] = useState(true);
@@ -72,7 +82,7 @@ export function UserProvider({ children }: { children: React.ReactNode }) {
                     // reloads its thumbnails).
                     setUser(previous => (previous && JSON.stringify(previous) === JSON.stringify(userData) ? previous : userData));
                     setIsLoading(false);
-                } else if (res.status === 401) {
+                } else if (res.status === 401 || (res.status === 403 && await accountInactive(res))) {
                     if (controller.signal.aborted) return;
                     setUser(null);
                     setIsLoading(false);
@@ -106,7 +116,8 @@ export function UserProvider({ children }: { children: React.ReactNode }) {
     // media `<img>` requests are 401ing (native image loads bypass react-query and
     // ApiError, so nothing else would notice). Checks on tab focus, on a slow
     // interval, and on demand via the `fridge:check-session` event (which the grid
-    // fires from an <img> onError). Debounced so a burst of failures = one check.
+    // fires from an <img> onError, and SessionCheck from a failed request of a page's
+    // own). Debounced so a burst of failures = one check.
     useEffect(() => {
         if (!isAuthenticated) return;
         let inFlight = false;
@@ -116,12 +127,13 @@ export function UserProvider({ children }: { children: React.ReactNode }) {
             // Throttle to once per 30s: the `fridge:check-session` trigger fires on every grid
             // image onError, so a broken/aborted-image burst (or a slow scroll) must not turn into
             // a /api/auth/me storm. 30s still detects an expired session promptly (and tab-focus +
-            // the 60s interval back it up) without the noise.
-            if (inFlight || now - lastCheck < 30000) return;
+            // the 60s interval back it up) without the noise. While the last check's quiet retry is
+            // due (the server busy or out of reach), that retry asks: a check now would only add one.
+            if (inFlight || now - lastCheck < 30000 || authRetry.current !== null) return;
             inFlight = true;
             lastCheck = now;
             try {
-                // Share the 401-only decision and quiet retry with the initial check.
+                // Share the signed-out decision (a 401, or a deactivated account's 403) and quiet retry with the initial check.
                 await checkAuth();
             } finally {
                 inFlight = false;

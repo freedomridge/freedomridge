@@ -51,8 +51,9 @@ export default function TokensPage() {
 
     const queryClient = useQueryClient();
 
-    // Fetch tokens
-    const { data: tokens, isLoading } = useQuery<Token[]>({
+    // Fetch tokens. GET /api/tokens answers revoked ones too (is_active false: revoked here, by an administrator, or by
+    // a password change that revoked them); the page lists the others.
+    const { data: allTokens, isLoading } = useQuery<Token[]>({
         queryKey: ['api-tokens'],
         queryFn: async () => {
             const res = await fetch('/api/tokens', { credentials: 'include' });
@@ -60,6 +61,7 @@ export default function TokensPage() {
             return res.json();
         }
     });
+    const tokens = allTokens?.filter(token => token.is_active);
 
     // Create token
     const createMutation = useMutation({
@@ -91,7 +93,9 @@ export default function TokensPage() {
             });
             if (!res.ok) throw new Error('Failed to revoke token');
         },
-        onSuccess: () => {
+        onSuccess: (_, id) => {
+            // Gone from the list at once; the list read again agrees.
+            queryClient.setQueryData<Token[]>(['api-tokens'], previous => previous?.filter(token => token.id !== id));
             queryClient.invalidateQueries({ queryKey: ['api-tokens'] });
         }
     });
@@ -358,6 +362,9 @@ export default function TokensPage() {
                                             </p>
                                         )}
                                     </div>
+                                    {revokeMutation.isError && revokeMutation.variables === token.id && (
+                                        <p role="alert" className="mt-2 text-sm text-red-400">{revokeMutation.error.message}</p>
+                                    )}
                                 </div>
                                 <button
                                     onClick={() => {

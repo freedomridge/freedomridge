@@ -506,6 +506,28 @@ test('observed (the contract is silent): a w= link after the dataset is closed t
             .toBe(true).catch(() => undefined);
     };
     const statusOf = async (handle: string, session: string) => (await fetch(`${new URL(origin).origin}/api/assistant/views/${encodeURIComponent(handle)}`, { headers: { Cookie: session } })).status;
+    /**
+     * Opens `path` in `target` and waits for the sign-in page there, settled: the address on /login for a second and
+     * its Sign in button shown. The navigation waits only for the server's answer (commit), so the app's own way to the
+     * sign-in page can't abort it, and the next navigation starts only once the app is done.
+     */
+    const reachesSignIn = async (target: Page, path: string, label: string) => {
+        await target.goto(path, { waitUntil: 'commit' });
+        let previous = '';
+        try {
+            await expect.poll(async () => {
+                const now = target.url();
+                const settled = now === previous && new URL(now).pathname === '/login';
+                previous = now;
+                return settled;
+            }, { timeout: 20_000, intervals: [1_000] }).toBe(true);
+        } catch {
+            const text = await target.evaluate(() => document.body.innerText.replace(/\s+/g, ' ').slice(0, 240)).catch(() => '');
+            throw new Error(`${label}: no sign-in page within 20 s; at ${target.url().replace(/^https?:\/\/[^/]+/, '')} the page showed "${text}"`);
+        }
+        await expect(target.getByRole('button', { name: 'Sign in', exact: true }), label).toBeVisible();
+        await target.waitForLoadState('load');
+    };
 
     // The dataset closed to the assistant after the view was made.
     const { view } = await withList(await tool('make_view', { dataset: small, filter: 'split = "train"' }), 'secret_code');
@@ -544,12 +566,20 @@ test('observed (the contract is silent): a w= link after the dataset is closed t
         seen.push(`deactivating her: ${off.status} ${(await off.text()).slice(0, 200)}`);
         expect(off.ok).toBe(true);
         seen.push(`her view's endpoint, deactivated, her old session: ${await statusOf(handle, piaSession)}`);
-        await openLink(hers, piaView.link);
-        await outcome(hers);
+        // Her open browser, required now (the contract "three page fixes" 3.1: a deactivated account's next full page
+        // load reaches the sign-in page): a page of the app reaches it, opening her view's link there reaches it too and
+        // shows nothing of the view, and so does the dataset without a link. One address at a time, each waited for at
+        // the sign-in page, so that no navigation of the test races the app's own way there.
+        await reachesSignIn(hers, '/', 'deactivated, her open browser loads a page of the app');
+        await note('deactivated, her open browser loads a page of the app', hers);
+        const link = new URL(piaView.link);
+        await reachesSignIn(hers, link.pathname + link.search, 'deactivated, her open browser opens her link');
         await note('deactivated, her open browser opens her link', hers);
+        await expect(chips(hers), 'nothing of her view is shown').toHaveCount(0);
+        await expect(hers.getByTestId('total-samples'), 'nothing of her view is shown').toHaveCount(0);
+        await expect(hers.getByTestId('grid-cell'), 'nothing of her view is shown').toHaveCount(0);
         seen.push(`deactivated, her old session's auth/me: ${(await fetch(`${new URL(origin).origin}/api/auth/me`, { headers: { Cookie: piaSession } })).status}`);
-        await hers.goto(`/datasets/${small}`);
-        await outcome(hers);
+        await reachesSignIn(hers, `/datasets/${small}`, 'deactivated, her open browser opens the dataset without a link');
         await note('deactivated, her open browser opens the dataset without a link', hers);
         const on = await fetch(`${new URL(origin).origin}/api/users/${pia.id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json', Cookie: cookie }, body: JSON.stringify({ is_active: true }) });
         seen.push(`reactivating her: ${on.status} ${(await on.text()).slice(0, 200)}`);

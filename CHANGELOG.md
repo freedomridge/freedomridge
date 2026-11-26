@@ -183,6 +183,22 @@ each field. Six migrations, none of which touches a sample.
   answered a statement that ran out of time while it fetched the page's rows with a 500 ("Internal query error"),
   where the same timeout in its count was answered as a timeout (504 under a request's own time limit, a guest's or the
   assistant's). The page now answers as the count does, and the assistant's tools say `too_slow` instead of failing.
+- **A panel layout a person arranged is kept.** A dataset page opened on the layout from the last visit and, under a
+  second later, wrote over it with the default panels, so an arrangement lasted one visit. The layout is now saved
+  only when a person changes it (a split, a close, a panel's type, a divider). A stored layout the page can't read
+  opens the default layout, where every wrong shape but text that isn't JSON crashed the page into "Something went
+  wrong".
+- **A revoked API token is no longer listed.** On Settings → API Tokens a token's card stayed, with its Revoke
+  button, after Revoke succeeded, and tokens revoked elsewhere (an administrator's revoke, a password change or reset
+  with "also revoke") stayed listed. The page now lists the tokens that still work and removes a card at once; a
+  Revoke that fails says so on the card. `GET /api/tokens` is unchanged and still answers revoked tokens, marked
+  inactive.
+- **A tab whose session ended reaches the sign-in page.** After an administrator deactivated an account, that
+  person's open tab showed "Loading..." for good on a reload, or an empty page; a tab left open after signing out in
+  another one showed "No datasets yet". The app now reads the server's "Account is inactive" as the end of the
+  session, and asks who is signed in at each navigation inside the app, so the tab goes to sign in; signing in again
+  lands on the page the person was on. A request that merely fails (the network, a server error, a page the person
+  may not see) sends no one to sign in.
 - **A link whose request fails is kept, not lost.** Opening a `q=`, `view=` or `w=` link, a request the browser
   dropped is asked again (up to three times), and one that still fails (the network, a server error) no longer opens
   the dataset without the link and rewrites the address: the page says so, with **Try again** and **Open the dataset

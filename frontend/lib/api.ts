@@ -743,8 +743,9 @@ export class ApiError extends Error {
         // the single choke point every status-bearing API error flows through — so
         // the app logs out even when the caller swallows this error (e.g. a
         // background grid prefetch that does `.catch(() => {})`). Fires before the
-        // throw propagates; providers.tsx listens and redirects to login.
-        if (status === 401 && typeof window !== 'undefined') {
+        // throw propagates; providers.tsx listens and redirects to login. A deactivated account's session is
+        // refused with a 403 saying so (backend/routers/auth.py): it is over too.
+        if ((status === 401 || (status === 403 && message === 'Account is inactive')) && typeof window !== 'undefined') {
             window.dispatchEvent(new Event('fridge:unauthorized'));
         }
         noticeLevelRefusal(status, message);
