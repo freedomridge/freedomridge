@@ -773,7 +773,7 @@ const DECLARED_TYPES: DeclaredFieldType[] = ['unknown', 'boolean', 'number', 'st
 const REBUILDING_NOTE = 'Its index is being rebuilt in the background (Jobs shows its progress). Until then it filters and sorts correctly, only slower.';
 
 // What a field means, under its name in the Fields tab: its description and unit, saved together with their own
-// Save. A default description (the server's, for the built-in fields and the SDK's metrics) fills the text area and
+// Save. A default description (the server's own, for the built-in fields only) fills the text area and
 // is marked as such until someone saves their own; saving an empty one brings the default back.
 const DEFAULT_DESCRIPTION_NOTE = 'Default description: nobody has written one for this field yet.';
 // The server's refusal of a change to a field the primary owns, on a mirror (guard_mirror_fields): the reason its

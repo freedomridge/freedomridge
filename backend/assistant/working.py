@@ -870,7 +870,7 @@ MAKE_VIEW = Tool(
     name='make_view',
     description=(
         'Make a working view of a dataset from filter text in the filter language, such as '
-        '`state = "Kansas" AND brightness < 40`, `location within "US-KS"` or `not concept "equipment" > 0.62`. '
+        '`state = "Kansas" AND speed < 5`, `location within "US-KS"` or `not concept "equipment" > 0.62`. '
         'Each top-level AND part is a stage. Answers the view\'s handle (wv_...), its exact count, the filter as the '
         'server writes it, its stages and a link that opens it in the app. Pass the handle to the other tools.'
     ),

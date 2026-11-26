@@ -639,7 +639,7 @@ def test_describe_dataset_from_the_schema_and_the_statistics(world):
         assert result['fields_total'] == len(result['fields']) and result['next_offset'] is None
         brightness = fields['brightness']
         assert brightness['type'] == 'number' and brightness['range'] == {'min': 10.5, 'max': 12.5}
-        assert brightness['description_source'] == 'default' and brightness['samples_with_value'] == 3
+        assert brightness['description_source'] is None and brightness['samples_with_value'] == 3  # none by its name
         assert brightness['values'] is None and brightness['complete'] is True
         # The values the statistics keep, in their order, without counts; a boolean's aren't in the schema's answer.
         assert fields['plot']['values'] == {'distinct': 2, 'examples': ['P0', 'P1']} and fields['plot']['complete']

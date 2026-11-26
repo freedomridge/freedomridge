@@ -304,7 +304,8 @@ _DESCRIBE_DATASET = Tool(
         "Describe one dataset and its fields, a page at a time, in the schema's order, from the statistics the "
         'server keeps (quick on any dataset; nothing is counted per value). Each field has its type in the filter '
         'language (number, datetime, text, list, boolean or object), what it means (description and unit, when '
-        'someone wrote one or the server has a default), how many rows have it (object rows included), its smallest '
+        'someone wrote one, or the server\'s own for a field it makes itself such as created_at), how many rows have '
+        'it (object rows included), its smallest '
         'and largest value (number and datetime fields), or, for text and list fields, how many distinct values it '
         'has and up to five examples of them, without counts. `indexed: true` means a filter on the field with =, in '
         'or a narrow range is quick however large the dataset; for a list field it is `in` that is quick (= on a list '

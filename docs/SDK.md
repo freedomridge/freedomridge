@@ -1307,17 +1307,25 @@ for field in dataset.get_schema():
 - A description holds at most 1,000 characters and a unit 40, trimmed; a description may hold line breaks, and
   neither may hold other control characters (422).
 - Every field in `get_schema()` carries `description`, `unit`, `description_source` and `values_private`.
-  `description_source` is `"set"` when someone wrote the description, `"default"` when the server supplies one,
-  and None when there is none.
-- **Defaults.** The server describes the fields every dataset has (`id`, `filepath`, `created_at`,
-  `last_modified_at`, `tags`, `media_type`) and those `compute_metadata()` and `compute_metrics()` write, while
-  nobody has set a description: setting one replaces the default (`"set"`), clearing it brings the default back
-  (`"default"`). The defaults go by name: a field of your own called `brightness` gets the metric's description
-  until you describe it.
-- **Default units.** Where a default description has a unit, the server supplies it too, while nobody has set a
-  unit; a unit you set replaces it, and clearing yours brings the default unit back. Each falls back on its own:
-  `description_source` speaks of the description only, so a field with your description and no unit of yours shows
-  the default unit.
+  `description_source` is `"set"` when someone wrote the description, `"default"` when it is the server's own,
+  and None when there is none. It speaks of the description only.
+- **Defaults.** The server describes by name only the fields it makes itself, the ones every dataset has (`id`,
+  `filepath`, `created_at`, `last_modified_at`, `tags`, `media_type`), while nobody has set a description: setting
+  one replaces the default (`"set"`), clearing it brings the default back (`"default"`). None of them has a unit.
+  Every other field has the description and unit someone wrote for it, or none: nobody describes a field by
+  guessing from its name, so a field of your own called `brightness` has no description until you write one.
+- **Computed fields.** `compute_metadata()` and `compute_metrics()` describe the fields they compute, when they
+  compute them. After writing values, a run gives each field it wrote a value of its description and unit, where the
+  field has none of its own, with `set_field_description`, as you. The description and the unit are each filled on
+  their own, and what someone wrote is never replaced. A field the run wrote no value for is left alone, and a run
+  that skipped any sample because it already had its values (`skip_existing=True`) describes nothing: those values
+  may be your own, in another scale. Nor does a run describe a field that a sample it didn't write that field for
+  already holds: the sample of an image that could not be read, or an `s3://` sample's `file_size_bytes` (written
+  only for local files). So a dataset computed in several runs gets its descriptions from the first, if that run
+  ran to its end: describing is a run's last step, so a run that stops partway describes nothing, and the run that
+  resumes it skips the samples done. Otherwise apply them by hand with the lines below. If the server refuses (you
+  have less than edit, or it is older than field descriptions), the values are stored all the same and the SDK warns
+  once, naming the fields it could not describe and why. The units they give:
 
   | Unit | Fields |
   |---|---|
@@ -1326,7 +1334,19 @@ for field in dataset.get_schema():
   | `bytes` | `file_size_bytes` |
   | `bits` | `entropy` |
   | `%` | `salt_and_pepper`, `pct_underexposed`, `pct_overexposed` |
-  | none | `id`, `filepath`, `created_at`, `last_modified_at`, `tags`, `media_type`, `aspect_ratio`, `brightness`, `blurriness`, `contrast`, `saturation` |
+  | none | `aspect_ratio`, `brightness`, `blurriness`, `contrast`, `saturation` |
+
+  `fridge.COMPUTED_FIELD_DESCRIPTIONS` holds the descriptions and units, field name to `(description, unit)` (`unit`
+  None where there is none). To describe a dataset computed before, apply them to the fields it has. Unlike a run,
+  this replaces the description and the unit someone wrote (`""` clears a unit where the field has none here), and
+  it fits only values these methods computed:
+
+  ```python
+  fields = {field["name"] for field in dataset.get_schema()}
+  for name in fields & fridge.COMPUTED_FIELD_DESCRIPTIONS.keys():
+      description, unit = fridge.COMPUTED_FIELD_DESCRIPTIONS[name]
+      dataset.set_field_description(name, description, unit=unit or "")
+  ```
 
 - **Which fields.** A field the dataset's schema lists takes a description: its own fields, the built-in ones and
   label fields such as `detections.label`. Anything else is a 404, a key that exists only in some samples' metadata
@@ -1540,6 +1560,9 @@ ds.compute_metadata()  # width / height / aspect_ratio / megapixels / file_size_
 ds.compute_metrics()   # brightness / blurriness / contrast / entropy / salt_and_pepper /
                        # saturation / pct_underexposed / pct_overexposed
 ```
+
+Both also describe the fields they write, where nobody has, in a run that skipped no sample
+([field descriptions](#field-descriptions)).
 
 ### Lassos drawn on an earlier map layout
 

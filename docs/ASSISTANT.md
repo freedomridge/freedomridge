@@ -443,7 +443,11 @@ many fields the page has (`GET /api/datasets/{id}`, then its `field-stats`, `sch
   `object`);
 - `indexed`: whether a filter on it with `=`, `in` or a narrow range is quick however large the dataset
   ([What is quick and what is slow](#what-is-quick-and-what-is-slow)), from what the schema already says;
-- `description`, `unit` and `description_source`, as the schema gives them;
+- `description`, `unit` and `description_source`, as the schema gives them: what someone wrote (`"set"`), or the
+  server's own description of a field it makes itself, such as `created_at` (`"default"`). A field nobody described
+  has none, whatever its name: a field called `brightness` may hold 0 to 1 or 0 to 255
+  ([field descriptions](SDK.md#field-descriptions)), so the instructions tell the model that a number field's scale
+  is the dataset's own and to read its `range` (or its `field_summary`) before choosing a cut;
 - `samples_with_value`: rows with the field, as the statistics count them, object rows included;
 - `range`: smallest and largest, for number and datetime fields;
 - `values`, for text and list fields: `distinct`, how many different values, and `examples`, up to five of them in the

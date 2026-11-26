@@ -428,11 +428,32 @@ def test_auth_me_fresh_reads_the_mcp_switch_from_the_database_for_that_request(w
 
 
 def section(text: str, heading: str) -> str:
-    """The text under `heading` (a whole line), up to the next heading of the same or a higher level."""
+    """The text under `heading` (a whole line), up to the next heading of the same or a higher level. A line inside a
+    fenced code block (```) is never a heading: a code comment such as `# {...}` doesn't end the section."""
     level = len(heading) - len(heading.lstrip('#'))
-    found = re.search(rf'^{re.escape(heading)}\s*$(.*?)(?=^#{{1,{level}}} |\Z)', text, re.M | re.S)
-    assert found, heading
-    return found.group(1)
+    lines = text.splitlines()
+    starts = [index for index, line in enumerate(lines) if line.rstrip() == heading]
+    assert starts, heading
+    taken: list[str] = []
+    fenced = False
+    for line in lines[starts[0] + 1 :]:
+        if line.lstrip().startswith('```'):
+            fenced = not fenced
+        elif not fenced and re.match(rf'#{{1,{level}}} ', line):
+            break
+        taken.append(line)
+    return '\n'.join(taken)
+
+
+def test_a_comment_in_a_fenced_code_block_does_not_end_a_section():
+    text = (
+        '## Part\n### Wanted\nbefore the code\n```python\n# a comment, not a heading\ninside = 1\n```\n'
+        'after the code\n#### A lower heading stays in\n### Next\nnot wanted\n'
+    )
+    found = section(text, '### Wanted')
+    for kept in ('before the code', '# a comment, not a heading', 'inside = 1', 'after the code', 'A lower heading'):
+        assert kept in found, (kept, found)
+    assert 'not wanted' not in found and 'Next' not in found, found
 
 
 def test_the_docs_say_a_guest_cant_use_the_mcp_server_as_a_rule_and_keep_the_guests_setting_for_the_chat():

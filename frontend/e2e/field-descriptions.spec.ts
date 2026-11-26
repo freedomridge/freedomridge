@@ -6,9 +6,10 @@ import { REASON, type Level, type TestUser, allSteps, createUser, openDataset, s
 // Field descriptions (docs/DATASET_MANAGEMENT.md, "Describe a field"). Each field can have a description (what it
 // means) and a unit. Everyone who can open the dataset reads them: on a field's name in the filter sidebar (hover and
 // keyboard focus), and in Dataset Settings → Fields, which lists every field the sidebar lists. Edit and up change them
-// there; below edit the controls are disabled and say why. Built-in fields and the SDK's metric fields come with a
-// default, marked as one until someone writes their own; clearing a written one brings the default back. Saving a
-// description changes nothing else about the field.
+// there; below edit the controls are disabled and say why. Built-in fields come with a default, marked as one until
+// someone writes their own; clearing a written one brings the default back. A field of the user's own named as one the
+// SDK computes (brightness, width) has no description or unit until someone writes one, and none again once cleared
+// (m1-contract-computed-field-descriptions). Saving a description changes nothing else about the field.
 test.use({ storageState: AUTH_STATE });
 
 type Field = { name: string; type: string; description: string | null; unit: string | null; description_source: 'set' | 'default' | null };
@@ -31,8 +32,8 @@ async function fixture(name: string): Promise<number> {
         metadata: {
             crop: i % 2 ? 'corn' : 'soy',
             digital_gain: i * 1.5,
-            brightness: i * 10,  // the name of an SDK metric: described by the server
-            width: 640 + i,  // likewise, with a unit
+            brightness: i * 10,  // named as an SDK metric, but the user's own: no description by its name
+            width: 640 + i,  // likewise, and no unit by its name
             detections: [{ label: i % 2 ? 'weed' : 'rock', bbox: [0.1, 0.1, 0.2, 0.2], confidence: 0.9 }],
         },
     }));
@@ -183,45 +184,75 @@ test('Save waits for a change and sends only what changed; the box then shows wh
 
 test('a default is shown as a default, to sight and to assistive reading; writing over it makes it the field\'s own, clearing brings it back', async ({ page }) => {
     const sent = descriptionPatches(page);
-    const original = await fieldOf('width');
-    expect([original.description_source, original.unit]).toEqual(['default', 'px']);
+    const original = await fieldOf('media_type');
+    expect([original.description_source, original.unit]).toEqual(['default', null]);
     const dialog = await openFields(page);
-    const box = descriptionBox(dialog, 'width');
+    const box = descriptionBox(dialog, 'media_type');
     await expect(box).toHaveValue(original.description!);
     await expect(box).toHaveCSS('font-style', 'italic');
     await expect(box).toHaveAccessibleDescription(DEFAULT_LINE);
-    await expect(unitBox(dialog, 'width')).toHaveValue('px');
+    await expect(unitBox(dialog, 'media_type')).toHaveValue('');
     // A field someone described has no such line, nor one with no description at all.
     await expect(descriptionBox(dialog, 'crop')).toHaveAccessibleDescription('');
 
-    await fillStable(box, 'Pixel width of the stored image.');
-    expect((await save(page, dialog, 'width')).status()).toBe(200);
-    expect(sent.at(-1)).toEqual({ description: 'Pixel width of the stored image.' });  // the default unit untouched
-    await expect(box).toHaveValue('Pixel width of the stored image.');
+    await fillStable(box, 'What kind of file the sample is.');
+    expect((await save(page, dialog, 'media_type')).status()).toBe(200);
+    expect(sent.at(-1)).toEqual({ description: 'What kind of file the sample is.' });  // the unit untouched
+    await expect(box).toHaveValue('What kind of file the sample is.');
     await expect(box).toHaveAccessibleDescription('');
     await expect(box).not.toHaveCSS('font-style', 'italic');
-    let stored = await fieldOf('width');
-    expect([stored.description_source, stored.unit]).toEqual(['set', 'px']);
+    let stored = await fieldOf('media_type');
+    expect([stored.description_source, stored.unit]).toEqual(['set', null]);
 
     // Cleared: the default is back, with its line.
     await fillStable(box, '');
-    expect((await save(page, dialog, 'width')).status()).toBe(200);
+    expect((await save(page, dialog, 'media_type')).status()).toBe(200);
     expect(Object.keys(sent.at(-1)!)).toEqual(['description']);
     expect(['', null]).toContain(sent.at(-1)!.description);
     await expect(box).toHaveValue(original.description!);
     await expect(box).toHaveAccessibleDescription(DEFAULT_LINE);
-    stored = await fieldOf('width');
+    stored = await fieldOf('media_type');
     expect([stored.description, stored.description_source]).toEqual([original.description, 'default']);
 
-    // The unit works the same way.
-    const unit = unitBox(dialog, 'width');
+    // A unit is saved the same way; no field has one by its name, so cleared, it is none.
+    const unit = unitBox(dialog, 'media_type');
     await fillStable(unit, 'mm');
-    expect((await save(page, dialog, 'width')).status()).toBe(200);
-    expect((await fieldOf('width')).unit).toBe('mm');
+    expect((await save(page, dialog, 'media_type')).status()).toBe(200);
+    expect((await fieldOf('media_type')).unit).toBe('mm');
     await fillStable(unit, '');
+    expect((await save(page, dialog, 'media_type')).status()).toBe(200);
+    await expect(unit).toHaveValue('');
+    expect((await fieldOf('media_type')).unit).toBeNull();
+});
+
+test('a field of your own named as one the SDK computes shows no description or unit, and none again once a written one is cleared', async ({ page }) => {
+    for (const name of ['brightness', 'width']) {
+        const field = await fieldOf(name);
+        expect([field.description, field.unit, field.description_source], name).toEqual([null, null, null]);
+    }
+    const dialog = await openFields(page);
+    for (const name of ['brightness', 'width']) {
+        await expect(descriptionBox(dialog, name), name).toHaveValue('');
+        await expect(descriptionBox(dialog, name), name).toHaveAccessibleDescription('');
+        await expect(descriptionBox(dialog, name), name).not.toHaveCSS('font-style', 'italic');
+        await expect(unitBox(dialog, name), name).toHaveValue('');
+    }
+    // Written, then cleared: nothing, not a description by its name.
+    const box = descriptionBox(dialog, 'width');
+    await fillStable(box, 'Print width, in centimetres.');
     expect((await save(page, dialog, 'width')).status()).toBe(200);
-    await expect(unit).toHaveValue('px');
-    expect((await fieldOf('width')).unit).toBe('px');
+    expect((await fieldOf('width')).description_source).toBe('set');
+    await fillStable(box, '');
+    expect((await save(page, dialog, 'width')).status()).toBe(200);
+    await expect(box).toHaveValue('');
+    await expect(box).toHaveAccessibleDescription('');
+    const cleared = await fieldOf('width');
+    expect([cleared.description, cleared.unit, cleared.description_source]).toEqual([null, null, null]);
+    // And the filter sidebar says nothing on their names.
+    await page.keyboard.press('Escape');
+    for (const name of ['brightness', 'width']) {
+        await expect(page.getByTestId(`field-toggle-${name}`), name).toHaveAccessibleDescription('');
+    }
 });
 
 test('a unit alone shows nothing in the sidebar; the boxes stop at 1,000 and 40 characters; a refusal is shown in the box', async ({ page }) => {
@@ -299,9 +330,11 @@ test('the sidebar shows a field\'s description on hover and on keyboard focus, w
     await page.mouse.move(0, 0);
     await expect(page.getByRole('tooltip')).toHaveCount(0);
 
-    // A default, with its unit; and the System group's ID, whose name is a tab stop because it is described.
-    const width = await fieldOf('width');
-    await expect(page.getByTestId('field-toggle-width')).toHaveAccessibleDescription(`${width.description} Unit: px`);
+    // A default: the built-in tags, and the System group's ID, whose name is a tab stop because it is described. A
+    // field of your own named as an SDK metric has none.
+    const tags = await fieldOf('tags');
+    await expect(page.getByTestId('field-toggle-tags')).toHaveAccessibleDescription(tags.description!);
+    await expect(page.getByTestId('field-toggle-width')).toHaveAccessibleDescription('');
     const id = await fieldOf('id');
     await expect(page.getByTestId('panel-filters').getByText('ID', { exact: true })).toHaveAccessibleDescription(id.description!);
 
@@ -346,9 +379,9 @@ for (const [who, key, canEdit] of [
     test(`${who} ${canEdit ? 'may change descriptions' : 'sees them, can\'t change them, and is told why'}; the sidebar tip is the same`, async ({ browser }) => {
         const { context, page } = await signIn(browser, key ? users[key] : undefined);
         try {
-            const width = await fieldOf('width');
+            const tags = await fieldOf('tags');
             const dialog = await openFields(page);
-            await expect(descriptionBox(dialog, 'width')).toHaveValue(width.description!);
+            await expect(descriptionBox(dialog, 'tags')).toHaveValue(tags.description!);
             await expect(dialog.getByText(DEFAULT_LINE).first()).toBeVisible();
             for (const field of ['width', 'crop', 'tags']) {
                 for (const control of [descriptionBox(dialog, field), unitBox(dialog, field), saveButton(dialog, field)]) {
@@ -366,13 +399,13 @@ for (const [who, key, canEdit] of [
                     await expect(saveButton(dialog, field)).toBeDisabled();  // until something changes
                 }
             }
-            if (canEdit) await expect(descriptionBox(dialog, 'width')).toHaveAccessibleDescription(DEFAULT_LINE);
+            if (canEdit) await expect(descriptionBox(dialog, 'tags')).toHaveAccessibleDescription(DEFAULT_LINE);
             if (canEdit) await expect(dialog.getByText(VIEW_ONLY)).toHaveCount(0);
             else await expect(dialog.getByText(VIEW_ONLY)).toBeVisible();
             await page.keyboard.press('Escape');
-            await expect(page.getByTestId('field-toggle-width')).toHaveAccessibleDescription(`${width.description} Unit: px`);
-            await page.getByTestId('field-toggle-width').hover();
-            await expect(page.getByTestId('field-description-width')).toContainText(width.description!);
+            await expect(page.getByTestId('field-toggle-tags')).toHaveAccessibleDescription(tags.description!);
+            await page.getByTestId('field-toggle-tags').hover();
+            await expect(page.getByTestId('field-description-tags')).toContainText(tags.description!);
         } finally {
             await context.close();
         }

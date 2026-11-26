@@ -40,32 +40,45 @@ def test_a_unit_takes_no_line_break_tab_or_other_control_character(value):
 
 
 def test_a_field_nobody_described_has_the_default_or_nothing():
-    description, unit = DEFAULTS['width']
-    assert described('width', None) == {
+    description, unit = DEFAULTS['tags']
+    assert described('tags', None) == {
         'description': description,
         'unit': unit,
         'values_private': False,
         'description_source': 'default',
     }
-    assert described('digital_gain', None) == {
-        'description': None,
-        'unit': None,
-        'values_private': False,
-        'description_source': None,
-    }
+    for name in ('digital_gain', 'width', 'brightness'):  # named as computed fields or not: none by name
+        assert described(name, None) == {
+            'description': None,
+            'unit': None,
+            'values_private': False,
+            'description_source': None,
+        }, name
 
 
 def test_what_someone_wrote_replaces_the_default_and_each_falls_back_on_its_own():
     stored = {'description': 'Gain of the sensor', 'unit': None, 'values_private': True}
+    assert described('tags', stored) == {
+        'description': 'Gain of the sensor',
+        'unit': DEFAULTS['tags'][1],
+        'values_private': True,
+        'description_source': 'set',
+    }
     assert described('width', stored) == {
         'description': 'Gain of the sensor',
-        'unit': DEFAULTS['width'][1],
+        'unit': None,
         'values_private': True,
         'description_source': 'set',
     }
     only_unit = {'description': None, 'unit': 'dB', 'values_private': False}
-    assert described('width', only_unit)['description_source'] == 'default'
-    assert described('width', only_unit)['unit'] == 'dB'
+    assert described('tags', only_unit)['description_source'] == 'default'
+    assert described('tags', only_unit)['unit'] == 'dB'
+    assert described('width', only_unit) == {
+        'description': None,
+        'unit': 'dB',
+        'values_private': False,
+        'description_source': None,
+    }
     assert described('digital_gain', only_unit) == {
         'description': None,
         'unit': 'dB',

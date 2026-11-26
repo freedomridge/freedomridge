@@ -145,10 +145,17 @@ each field. Six migrations, none of which touches a sample.
   and its unit under Dataset Settings → Fields, with `dataset.set_field_description(field, description, unit)`, or
   with `PATCH /api/datasets/{id}/fields/{field}/description`. The filter sidebar shows a field's description on its
   name, on hover or keyboard focus, and every field of the schema and field-stats answers carries `description`,
-  `unit`, `description_source` (`"set"`, `"default"` or null) and `values_private`. The server describes the fields
-  every dataset has and those `compute_metadata()` and `compute_metrics()` write (brightness, blurriness, entropy and
-  the rest, each as it is computed), until someone writes their own. A mirror takes its primary's descriptions with
-  its field settings, and a version saves them with the field types. `values_private` marks a field whose values
+  `unit`, `description_source` (`"set"`, `"default"` or null) and `values_private`. The server describes by name only
+  the fields it makes itself, the ones every dataset has (`id`, `filepath`, `created_at`, `last_modified_at`, `tags`,
+  `media_type`), until someone writes their own. The SDK describes the fields it computes, when it computes them:
+  `compute_metadata()` and `compute_metrics()` give each field a run wrote a value of its description and unit
+  (brightness, blurriness, entropy and the rest, each as it is computed), as the user running them, where the field
+  has none of its own, and warn instead when the server refuses. A run that skipped a sample because it already had
+  its values describes nothing, as those values may be the user's own, and neither is a field described that a
+  sample the run didn't write it for already holds. Nobody describes a field by guessing from its name: a field of
+  your own called `brightness` has no description until you write one. `fridge.COMPUTED_FIELD_DESCRIPTIONS` holds
+  the SDK's texts, to describe a dataset computed before. A mirror takes its primary's descriptions with its field
+  settings, and a version saves them with the field types. `values_private` marks a field whose values
   aren't given to the assistant (above). It is each server's own, never versioned or synced, and outlives the field:
   a private field that goes and comes back is still private. Migration `0035_field_descriptions.sql` adds three
   columns to `dataset_fields` and touches no rows. A follower still on 2.13 receives the primary's described built-in

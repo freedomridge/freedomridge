@@ -226,14 +226,14 @@ field = requests.patch(
   field statistics list it) included. Below edit: 403 "This needs edit access to the dataset". A dataset being
   deleted: 409.
 - The answer, and every field of `GET /datasets/{id}/schema` and of the field-stats answers, carries `description`,
-  `unit`, `values_private` and `description_source`: `"set"` when someone wrote the description, `"default"` when the
-  server supplies one, `null` when there is none. The server describes the built-in fields and those the SDK's
-  `compute_metadata()` and `compute_metrics()` write ([list](SDK.md#field-descriptions)), by name: a field of your
-  own called `brightness` gets the metric's description until you describe it. Clearing what someone wrote brings the
-  default back. The server supplies a unit with its default descriptions where there is one (`px` for `width` and
-  `height`, `MP` for `megapixels`, `bytes` for `file_size_bytes`, `bits` for `entropy`, `%` for `salt_and_pepper`,
-  `pct_underexposed` and `pct_overexposed`), while nobody set a unit; clearing a unit someone set brings it back.
-  `description_source` speaks of the description only.
+  `unit`, `values_private` and `description_source`: `"set"` when someone wrote the description, `"default"` when it
+  is the server's own, `null` when there is none. The server describes by name only the fields it makes itself, the
+  built-in ones (with no unit); clearing what someone wrote on one brings the default back. Every other field has the
+  description and unit someone wrote for it, or none: nobody describes a field by guessing from its name, so a field
+  of your own called `brightness` has no description until you write one. The SDK's `compute_metadata()` and
+  `compute_metrics()` describe the fields they compute when they compute them, as the user running them, where a
+  field has none of its own ([details](SDK.md#field-descriptions)). `description_source` speaks of the description
+  only.
 - On a mirror, the primary's fields are described on the primary and arrive with its field settings: changing their
   description or unit here is refused (409), and such a request changes nothing, its `values_private` included.
   `values_private` belongs to each server: a mirror sets it on any field, the built-in ones included, and the sync

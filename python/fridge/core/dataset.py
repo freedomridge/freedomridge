@@ -492,6 +492,61 @@ def compute_image_metrics(img):
     }
 
 
+# What each field Dataset.compute_metadata() and compute_metrics() write means, as (description, unit), unit None
+# where there is none: true of how the code above makes each value (the metrics are compute_image_metrics() on the
+# image as 8-bit RGB, its grey levels Pillow's convert("L"); the metadata is _media_metadata()). A run of either
+# gives them to the fields it wrote a value of, where a field has none of its own (Dataset._describe_computed).
+# Exported as fridge.COMPUTED_FIELD_DESCRIPTIONS, so a dataset computed before can be given them with
+# set_field_description.
+COMPUTED_FIELD_DESCRIPTIONS: Dict[str, tuple[str, Optional[str]]] = {
+    'width': ("The image's width in pixels, as stored in the file (a camera's rotation tag isn't applied).", 'px'),
+    'height': ("The image's height in pixels, as stored in the file (a camera's rotation tag isn't applied).", 'px'),
+    'aspect_ratio': (
+        'Width divided by height, rounded to 4 decimal places: above 1 for a landscape image, below 1 for portrait.',
+        None,
+    ),
+    'megapixels': ('Width times height in millions of pixels, rounded to 3 decimal places.', 'MP'),
+    'file_size_bytes': (
+        "The image file's size, recorded only when the sample's path named a file on the disk of the machine that "
+        'ran compute_metadata() (never for s3:// files).',
+        'bytes',
+    ),
+    'brightness': (
+        "Perceived brightness of the image's average colour, the square root of 0.241·R² + 0.691·G² + 0.068·B² of "
+        'its mean red, green and blue values, from 0 (black) to 255 (white).',
+        None,
+    ),
+    'blurriness': (
+        'Variance of the Laplacian of the grey-level image: low values suggest a blurry image and high values a '
+        'sharp one, despite the name.',
+        None,
+    ),
+    'contrast': ('The highest minus the lowest value over all pixels and all three colour channels, 0 to 255.', None),
+    'entropy': (
+        'Shannon entropy of the red, green and blue values taken as one 768-bin histogram, from about 1.6 for a single '
+        'flat colour to about 9.6 when every value is equally common.',
+        'bits',
+    ),
+    'salt_and_pepper': (
+        'Share of pixels that are lone near-white (grey level 244 or more) or near-black (10 or less) specks, the '
+        'ones a 2×2 morphological opening removes: a sign of salt-and-pepper noise.',
+        '%',
+    ),
+    'saturation': (
+        'Mean colour saturation of the pixels on the HSV scale, from 0 (grey) to 255 (fully saturated colour).',
+        None,
+    ),
+    'pct_underexposed': ('Share of pixels whose grey level is 5 or less (of 255): crushed shadows.', '%'),
+    'pct_overexposed': ('Share of pixels whose grey level is 250 or more (of 255): blown highlights.', '%'),
+}
+
+
+def _held_values(metadata, written=()):
+    """The COMPUTED_FIELD_DESCRIPTIONS fields a sample already holds a value of, less those a run wrote for it
+    (`written`): values the run can't vouch for, which keep their field from its description."""
+    return {name for name in COMPUTED_FIELD_DESCRIPTIONS if name not in written and metadata.get(name) is not None}
+
+
 def _default_s3_image_loader():
     """Returns a callable that downloads images from S3 or local paths.
 
@@ -987,8 +1042,9 @@ class Dataset:
         """Get the field schema for this dataset.
 
         Returns list of field dicts with name, type, min/max, values, etc., and what each field means:
-        ``description``, ``unit``, ``description_source`` (``"set"`` when someone wrote it, ``"default"`` when the
-        server supplies one, None when there is none) and ``values_private``.
+        ``description``, ``unit``, ``description_source`` (``"set"`` when someone wrote it, ``"default"`` for the
+        server's own description of a field every dataset has, such as ``created_at``, None when there is none) and
+        ``values_private``.
         """
         return self.client.get_schema(self._id, filters=filters)
 
@@ -1006,8 +1062,8 @@ class Dataset:
         """Say what a field means: a description (at most 1,000 characters) and a unit (at most 40), shown in the app
         and returned with the schema. Needs edit access to the dataset.
 
-        Only the arguments given are changed; pass ``""`` to clear one (a field the server describes by default, such
-        as ``brightness``, gets that description back). Returns the field's ``description``, ``unit``,
+        Only the arguments given are changed; pass ``""`` to clear one (a field every dataset has, such as
+        ``created_at``, gets the server's own description back). Returns the field's ``description``, ``unit``,
         ``values_private`` and ``description_source``. On a mirror, the primary's fields are described on the
         primary."""
         return self.client.set_field_description(self._id, field, description=description, unit=unit)
@@ -2026,6 +2082,14 @@ class Dataset:
         Cheap: PIL reads dimensions from the image header without decoding pixels.
         Needs only the base install (Pillow). Skips samples that already have 'width'
         unless skip_existing=False.
+
+        Each field the run wrote a value of gets its description and unit
+        (COMPUTED_FIELD_DESCRIPTIONS) where it has none of its own; if the server
+        refuses them, the values stay and a warning says which fields and why.
+        A run that skipped a sample because it already had its values describes
+        nothing: those values may be your own, in another scale. Nor is a field
+        described that a sample the run didn't write it for already holds (an
+        unreadable image's sample, or an s3:// sample's file_size_bytes).
         """
         try:
             from PIL import Image  # noqa: F401 — base dep, but fail with a clear message
@@ -2039,6 +2103,8 @@ class Dataset:
         skipped = 0
         errors = 0
         pending: Dict[int, Dict[str, Any]] = {}
+        written: set = set()  # the fields this run wrote a value of (file_size_bytes only for local files)
+        unvouched: set = set()  # fields a sample the run didn't write them for already holds
 
         def _flush():
             if pending:
@@ -2053,18 +2119,24 @@ class Dataset:
                 img = image_loader(sample.filepath)
                 if img is None:
                     errors += 1
+                    unvouched.update(_held_values(sample.metadata))
                     continue
             except Exception as e:
                 print(f"  Error loading {sample.filepath}: {e}")
                 errors += 1
+                unvouched.update(_held_values(sample.metadata))
                 continue
             pending[sample.id] = _media_metadata(img, sample.filepath)
+            written.update(pending[sample.id])
+            unvouched.update(_held_values(sample.metadata, pending[sample.id]))
             processed += 1
             if len(pending) >= batch_size:
                 _flush()
 
         _flush()
         print(f"Metadata: {processed} computed, {skipped} skipped, {errors} errors")
+        if not skipped:  # values that were already there may be the user's own, in another scale
+            self._describe_computed("compute_metadata", written - unvouched)
         if processed > 0:
             self.refresh_stats()
 
@@ -2073,7 +2145,13 @@ class Dataset:
         salt_and_pepper, saturation, pct_underexposed, pct_overexposed).
 
         Downloads each image, computes metrics, and updates sample metadata.
-        Automatically refreshes field stats when done.
+        Automatically refreshes field stats when done. Each field the run wrote a
+        value of gets its description and unit (COMPUTED_FIELD_DESCRIPTIONS) where it
+        has none of its own; if the server refuses them, the values stay and a
+        warning says which fields and why. A run that skipped a sample because it
+        already had its values describes nothing: those values may be your own, in
+        another scale. Nor is a field described that a sample whose image could not
+        be read already holds.
 
         Args:
             image_loader: Callable(filepath) -> PIL.Image. If None, uses a default
@@ -2096,6 +2174,8 @@ class Dataset:
         skipped = 0
         errors = 0
         pending: Dict[int, Dict[str, Any]] = {}  # sample_id -> metrics; flushed in batches (bulk, not N+1 PATCH)
+        written: set = set()  # the fields this run wrote a value of
+        unvouched: set = set()  # fields a sample the run didn't write them for already holds
 
         def _flush():
             if pending:
@@ -2111,6 +2191,7 @@ class Dataset:
                 img = image_loader(sample.filepath)
                 if img is None:
                     errors += 1
+                    unvouched.update(_held_values(sample.metadata))
                     continue
                 if img.mode != "RGB":
                     from .image_modes import to_rgb
@@ -2119,17 +2200,56 @@ class Dataset:
             except Exception as e:
                 print(f"  Error loading {sample.filepath}: {e}")
                 errors += 1
+                unvouched.update(_held_values(sample.metadata))
                 continue
 
             pending[sample.id] = compute_image_metrics(img)
+            written.update(pending[sample.id])
+            unvouched.update(_held_values(sample.metadata, pending[sample.id]))
             processed += 1
             if len(pending) >= batch_size:
                 _flush()
 
         _flush()
         print(f"Metrics: {processed} computed, {skipped} skipped, {errors} errors")
+        if not skipped:  # values that were already there may be the user's own, in another scale
+            self._describe_computed("compute_metrics", written - unvouched)
         if processed > 0:
             self.refresh_stats()
+
+    def _describe_computed(self, method: str, written: set) -> None:
+        """Give each field in `written` (those `method` wrote a value of in this run) its description and unit from
+        COMPUTED_FIELD_DESCRIPTIONS, each only where the field has none of its own: what someone wrote is never
+        replaced. The schema shows a field's own description and unit only, as the server describes none of these
+        fields by name. Written with set_field_description, as the user running the SDK.
+
+        A request that fails (the server refuses: below edit, a mirror's field, an older server without the route)
+        leaves the values as they are: it warns once, naming the fields not described and why, and stops there, as
+        the next request would fail the same way."""
+        remaining = [name for name in COMPUTED_FIELD_DESCRIPTIONS if name in written]
+        if not remaining:
+            return
+        try:
+            schema = {field["name"]: field for field in self.get_schema()}
+            todo = []
+            for name in remaining:
+                description, unit = COMPUTED_FIELD_DESCRIPTIONS[name]
+                own = schema.get(name, {})
+                changes = {} if own.get("description") else {"description": description}
+                if unit is not None and not own.get("unit"):
+                    changes["unit"] = unit
+                if changes:
+                    todo.append((name, changes))
+            remaining = [name for name, _ in todo]
+            for name, changes in todo:
+                self.set_field_description(name, **changes)
+                remaining.remove(name)
+        except requests.RequestException as error:
+            warnings.warn(
+                f"{method}() stored its values but could not describe {', '.join(remaining)}: {error}. Describe them "
+                "with set_field_description (fridge.COMPUTED_FIELD_DESCRIPTIONS holds the texts).",
+                stacklevel=3,
+            )
 
     def compute_embeddings(
         self,

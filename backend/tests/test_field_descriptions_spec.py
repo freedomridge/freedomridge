@@ -15,10 +15,11 @@ tokens, on the test database. The rule:
 - Every field in GET /api/datasets/{id}/schema and in the field-stats responses carries `description`, `unit`,
   `values_private` and `description_source`: "set" when someone wrote it, "default" when the server supplies it, null
   when there is none.
-- The server supplies a description for the fields every dataset has and for those the SDK's compute_metadata() and
-  compute_metrics() write, while nobody set one: setting one replaces it ("set"), clearing it brings it back
-  ("default"). It also supplies a unit for those with a natural one (DEFAULT_UNITS), while nobody set one: setting a
-  unit replaces it, clearing a set unit brings it back. `description_source` speaks of the description only.
+- The server supplies a description for the fields every dataset has, and for no other field, while nobody set one:
+  setting one replaces it ("set"), clearing it brings it back ("default"). A field named as one the SDK's
+  compute_metadata() or compute_metrics() writes has none by its name (m1-contract-computed-field-descriptions): what
+  someone set, or nothing. The server supplies no unit: a unit someone set is the field's, cleared it is none.
+  `description_source` speaks of the description only.
 - On a mirror, the description and unit of a field the primary owns are refused as a change of that field's type is
   refused there (409); the mirror's own `@local.` fields take them. values_private is this instance's, for any field.
 - One dataset's values never show on another dataset's field of the same name.
@@ -81,9 +82,9 @@ METRIC_FIELDS = (  # compute_metrics()
     'pct_underexposed',
     'pct_overexposed',
 )
-DEFAULTED = SYSTEM_FIELDS + METADATA_FIELDS + METRIC_FIELDS
-# The units the server supplies while nobody set one; the other fields it describes have none.
-DEFAULT_UNITS = {
+COMPUTED_FIELDS = METADATA_FIELDS + METRIC_FIELDS  # no description or unit by their names
+# The units the server gave by name before the computed-field-descriptions contract; it gives no field a unit now.
+UNITS_BEFORE = {
     'width': 'px',
     'height': 'px',
     'megapixels': 'MP',
@@ -548,19 +549,22 @@ def test_a_new_key_written_through_the_api_is_listed_and_takes_a_description(wor
 # --- Defaults ---
 
 
-def test_the_server_describes_the_fields_every_dataset_has_and_the_computed_ones(world):
+def test_the_server_describes_the_fields_every_dataset_has_and_no_other(world):
     async def scenario(w):
         await open_dataset(w)
         entries = await readings(w)
         for where, fields in entries.items():
-            for field in DEFAULTED:
+            for field in SYSTEM_FIELDS:
                 if field not in fields:
                     continue
                 description, unit, values_private, source = four(fields[field], where)
                 assert (source, values_private) == ('default', False), (where, field, fields[field])
                 a_default(description)
-                assert unit == DEFAULT_UNITS.get(field), (where, field, unit)
-        for field in DEFAULTED:
+                assert unit is None, (where, field, unit)
+            for field in COMPUTED_FIELDS:  # named as the SDK's computed fields, but nobody described them
+                if field in fields:
+                    assert four(fields[field], where) == NOTHING, (where, field, fields[field])
+        for field in SYSTEM_FIELDS + COMPUTED_FIELDS:
             assert field in entries['schema'] or field in entries['POST field-stats'], field
         for field in ('label', 'score', 'note'):
             assert await reading(w, field) == NOTHING, field
@@ -571,48 +575,59 @@ def test_the_server_describes_the_fields_every_dataset_has_and_the_computed_ones
 def test_setting_a_description_replaces_the_default_and_clearing_it_brings_the_default_back(world):
     async def scenario(w):
         await open_dataset(w)
-        for field in ('id', 'tags', 'width', 'file_size_bytes', 'brightness', 'pct_overexposed'):
+        for field in SYSTEM_FIELDS:
             default, unit, _, source = await reading(w, field)
-            assert (source, unit) == ('default', DEFAULT_UNITS.get(field)), field
+            assert (source, unit) == ('default', None), field
             a_default(default)
             for cleared in (None, '', '   '):
                 assert (await described(w, field, {'description': 'Ours.'}))['description'] == 'Ours.'
-                assert await reading(w, field) == ('Ours.', unit, False, 'set'), field  # the default unit stays
+                assert await reading(w, field) == ('Ours.', None, False, 'set'), field
                 await described(w, field, {'description': cleared})
-                assert await reading(w, field) == (default, unit, False, 'default'), (field, cleared)
+                assert await reading(w, field) == (default, None, False, 'default'), (field, cleared)
+        # A field named as one the SDK computes has no default: cleared, it has none.
+        for field in ('width', 'file_size_bytes', 'brightness', 'pct_overexposed'):
+            assert await reading(w, field) == NOTHING, field
+            for cleared in (None, '', '   '):
+                assert (await described(w, field, {'description': 'Ours.'}))['description'] == 'Ours.'
+                assert await reading(w, field) == ('Ours.', None, False, 'set'), field
+                await described(w, field, {'description': cleared})
+                assert await reading(w, field) == NOTHING, (field, cleared)
         # A unit or the private flag alone leaves the default description as it is.
-        default = (await reading(w, 'brightness'))[0]
-        await described(w, 'brightness', {'unit': 'level'})
-        assert await reading(w, 'brightness') == (default, 'level', False, 'default')
-        await described(w, 'height', {'values_private': True})
-        height = await reading(w, 'height')
-        assert (height[1], height[2], height[3]) == ('px', True, 'default')
+        default = (await reading(w, 'filepath'))[0]
+        await described(w, 'filepath', {'unit': 'level'})
+        assert await reading(w, 'filepath') == (default, 'level', False, 'default')
+        await described(w, 'created_at', {'values_private': True})
+        created_at = await reading(w, 'created_at')
+        assert (created_at[1], created_at[2], created_at[3]) == (None, True, 'default')
 
     world(scenario)
 
 
-def test_a_set_unit_replaces_the_default_unit_and_clearing_it_brings_the_default_back(world):
+def test_no_field_has_a_unit_by_its_name_and_a_set_unit_cleared_leaves_none(world):
     async def scenario(w):
         await open_dataset(w)
-        for field, unit in DEFAULT_UNITS.items():
-            default = (await reading(w, field))[0]
-            assert await reading(w, field) == (default, unit, False, 'default'), field
+        for field in UNITS_BEFORE:
+            assert await reading(w, field) == NOTHING, field
             for cleared in (None, ''):
                 await described(w, field, {'unit': 'counts'})
-                assert await reading(w, field) == (default, 'counts', False, 'default'), field
+                assert await reading(w, field) == (None, 'counts', False, None), field
                 await described(w, field, {'unit': cleared})
-                assert await reading(w, field) == (default, unit, False, 'default'), (field, cleared)
-        # A description set, no unit set: the default unit shows beside it.
+                assert await reading(w, field) == NOTHING, (field, cleared)
+        # A description set, no unit set: no unit shows beside it.
         await described(w, 'entropy', {'description': 'How much the pixels vary.'})
-        assert await reading(w, 'entropy') == ('How much the pixels vary.', 'bits', False, 'set')
+        assert await reading(w, 'entropy') == ('How much the pixels vary.', None, False, 'set')
         await described(w, 'entropy', {'unit': 'nats'})
         assert await reading(w, 'entropy') == ('How much the pixels vary.', 'nats', False, 'set')
         await described(w, 'entropy', {'description': None, 'unit': None})
-        assert (await reading(w, 'entropy'))[1:] == ('bits', False, 'default')
-        # The other fields the server describes have no unit.
-        for field in DEFAULTED:
-            if field not in DEFAULT_UNITS:
-                assert (await reading(w, field))[1] is None, field
+        assert await reading(w, 'entropy') == NOTHING
+        # The fields the server describes have no unit either; one set beside the default is kept, and cleared, none.
+        for field in SYSTEM_FIELDS + COMPUTED_FIELDS:
+            assert (await reading(w, field))[1] is None, field
+        default = (await reading(w, 'tags'))[0]
+        await described(w, 'tags', {'unit': 'labels'})
+        assert await reading(w, 'tags') == (default, 'labels', False, 'default')
+        await described(w, 'tags', {'unit': None})
+        assert await reading(w, 'tags') == (default, None, False, 'default')
 
     world(scenario)
 
@@ -724,11 +739,13 @@ def test_on_a_mirror_only_its_own_fields_take_a_description_and_any_field_its_pr
         assert (answer['description'], answer['unit']) == ('Weeds counted here.', 'plants')
         assert await reading(w, '@local.weeds') == ('Weeds counted here.', 'plants', False, 'set')
         # The private flag, on any field.
-        for field in ('score', 'brightness', '@local.weeds', 'id'):
+        created_at = await reading(w, 'created_at')
+        for field in ('score', 'brightness', '@local.weeds', 'id', 'created_at'):
             assert (await described(w, field, {'values_private': True}))['values_private'] is True, field
             assert (await reading(w, field))[2] is True, field
         assert await reading(w, 'score') == (None, None, True, None)
-        assert await reading(w, 'brightness') == (brightness[0], brightness[1], True, 'default')
+        assert await reading(w, 'brightness') == (None, None, True, None)  # no description by its name
+        assert await reading(w, 'created_at') == (created_at[0], created_at[1], True, 'default')  # the default stays
 
     world(scenario)
 
@@ -741,7 +758,7 @@ def test_one_datasets_values_never_show_on_anothers_field_of_the_same_name(world
         await open_dataset(w)
         await open_dataset(w, E)
         others = {field: await reading(w, field, E) for field in ('brightness', 'id')}
-        assert {source for _, _, _, source in others.values()} == {'default'}
+        assert {field: values[3] for field, values in others.items()} == {'brightness': None, 'id': 'default'}
         for field in ('note', 'brightness', 'id'):
             await described(
                 w,
@@ -1159,12 +1176,14 @@ def test_0035_leaves_every_field_undescribed_and_otherwise_as_it_was(database, m
                             _, unit, values_private, source = four(entry, where)
                             assert values_private is False, (dataset_id, where, field)
                             assert source in (None, 'default'), (dataset_id, where, field)
-                            assert unit == DEFAULT_UNITS.get(field), (dataset_id, where, field)  # only a default
+                            assert unit is None, (dataset_id, where, field)  # no field has a unit by its name
                         if dataset_id == 1:
-                            for field in ('width', 'brightness', 'id', 'filepath'):
+                            for field in ('id', 'filepath'):
                                 description, _, _, source = four(entries[field], where)
                                 assert source == 'default', (where, field)
                                 a_default(description)
+                            for field in ('width', 'brightness'):  # named as computed fields: none by their names
+                                assert four(entries[field], where) == NOTHING, (where, field)
         finally:
             await pool.close()
 

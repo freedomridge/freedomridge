@@ -1,5 +1,5 @@
 from .core.client import IncompatibleServerError, StaleLassoWarning, connect, get_client
-from .core.dataset import Dataset, compute_image_metrics
+from .core.dataset import COMPUTED_FIELD_DESCRIPTIONS, Dataset, compute_image_metrics
 from .core.geometry3d import Calibration
 from .core.job import Job, JobCancelled, JobError, JobFailed, JobTimeout
 from .core.labels import (
@@ -60,6 +60,7 @@ __all__ = [
     'JobTimeout',
     # Image metrics
     'compute_image_metrics',
+    'COMPUTED_FIELD_DESCRIPTIONS',
     'compute_image_patch_vectors',
     'load_patch_model',
     'PATCH_MODEL_ID',
