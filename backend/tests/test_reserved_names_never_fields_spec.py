@@ -119,6 +119,7 @@ from backend import follower_sync, main
 from backend.routers import datasets, followers
 from backend.tests import test_field_registry_postgres as registry_helpers
 from backend.tests import test_follower_sync, test_regions_spec, test_upgrade_paths
+from backend.tests.changelog_helpers import release_heading
 from backend.tests.test_access_rule_spec import ADMIN, World
 from backend.tests.test_assistant_conversation_spec import count_statistics
 from backend.tests.test_assistant_core_spec import open_door
@@ -1861,7 +1862,7 @@ def test_the_docs_say_a_stored_one_is_no_field_and_the_upgrade_notes_name_the_mi
     assert re.search(r'\buntil\b[^.]*\bremoved\b', flat), flat
     assert re.search(r'\bnot (a|listed as a) field\b', flat), flat
     changelog = (ROOT / 'CHANGELOG.md').read_text()
-    unreleased = changelog.split('\n## Unreleased', 1)[1].split('\n## ', 1)[0]
+    unreleased = changelog.split('\n' + release_heading('2.14.0', changelog), 1)[1].split('\n## ', 1)[0]
     notes = unreleased.split('### Upgrade notes', 1)[-1].split('\n### ', 1)[0]
     flat_notes = ' '.join(notes.split())
     numbers = [int(number) for number in re.findall(r'`?(\d{4})_\w+\.sql`?', flat_notes)]

@@ -48,6 +48,7 @@ import pytest
 from backend import assistant
 from backend.crypto import hash_token
 from backend.tests import test_access_rule_spec, test_field_registry_postgres
+from backend.tests.changelog_helpers import release_heading
 from backend.tests.test_access_rule_spec import ADMIN, GUEST, OTHER_GUEST, OTHER_POWER, POWER, World
 from backend.tests.test_assistant_core_spec import (
     MCP_OFF,
@@ -464,5 +465,5 @@ def test_the_docs_say_a_guest_cant_use_the_mcp_server_as_a_rule_and_keep_the_gue
     rule = [s for s in sentences if re.search(r"\bguests?\b.*\b(never|can't|can’t|cannot|may not)\b", s, re.I)]
     assert rule, f'no sentence of "Who may use it" says a guest never may: {who}'
     assert 'chat' in who.lower(), who
-    unreleased = section((ROOT / 'CHANGELOG.md').read_text(), '## Unreleased')
+    unreleased = section((ROOT / 'CHANGELOG.md').read_text(), release_heading('2.14.0'))
     assert re.search(r'\bguests?\b', unreleased, re.I), 'the Unreleased entry says nothing of guests'

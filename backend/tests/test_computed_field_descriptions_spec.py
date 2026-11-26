@@ -48,6 +48,7 @@ import pytest
 
 from backend import assistant
 from backend.tests import test_access_rule_spec, test_field_registry_postgres
+from backend.tests.changelog_helpers import release_heading
 from backend.tests.test_access_rule_spec import ADMIN, World
 from backend.tests.test_assistant_core_spec import open_door, result
 from backend.tests.test_assistant_guests_spec import section
@@ -277,7 +278,7 @@ def test_the_docs_no_longer_describe_a_field_by_its_name_and_show_how_to_apply_t
         f'nothing says applying them replaces what was written: {around}'
     )
     assert 'or ""' in around, f'the lines do not clear a unit with `unit or ""`: {around}'
-    unreleased = ' '.join(section((ROOT / 'CHANGELOG.md').read_text(), '## Unreleased').split())
+    unreleased = ' '.join(section((ROOT / 'CHANGELOG.md').read_text(), release_heading('2.14.0')).split())
     old = r'server describes the fields every dataset has and those `compute_metadata\(\)` and `compute_metrics\(\)`'
     assert not re.search(old, unreleased), 'CHANGELOG.md still says the server describes the computed fields'
 

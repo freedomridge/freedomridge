@@ -4,14 +4,15 @@ Freedom Ridge has one version for the server, the web app and the Python SDK (th
 file), following [Semantic Versioning](https://semver.org). A release lists **upgrade notes** when
 it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
 
-## Unreleased
+## 2.14.0 (2026-11-25)
 
 This release adds an AI assistant: Claude Code and other MCP clients answer questions about a server's datasets
 through thirteen read-only tools at `/mcp`, reading as the person using them, and an administrator's client can read
 the server's status, background jobs, backups and index advice through four more. It is off until an administrator
 switches it on. Also new: named regions as a filter, a text form for concept filters, and a description and unit for
-each field. Eleven migrations: one removes the metadata keys named `tags` or `media_type`, which are refused from now
-on; the others touch no sample.
+each field. On a dataset with objects the page now reads a filter on an image together with its objects, which
+changes what some filters find (Changed). Eleven migrations: one removes the metadata keys named `tags` or
+`media_type`, which are refused from now on; the others touch no sample.
 
 ### Upgrade notes
 
@@ -93,7 +94,9 @@ on; the others touch no sample.
 - Before switching it on, set `FRIDGE_PUBLIC_URL` in `.env` to the server's public address (`.env.example`; the
   production Compose file passes it on): the assistant's links start with it. Without it they start with the first
   `ALLOWED_ORIGINS` entry, which must then be the public HTTPS origin.
-- The bundled nginx routes `/mcp` to the backend, unbuffered. If you keep your own web server in front, route it too
+- The bundled nginx routes `/mcp` to the backend, unbuffered. nginx reads its configuration when its container
+  starts, so after step 4 recreate it: `docker compose -f docker-compose.prod.yml up -d --force-recreate nginx` (the
+  site is away for a second or two). If you keep your own web server in front, route it too
   ([Docker deployment](docs/DOCKER_DEPLOYMENT.md#your-own-web-server-in-front)).
 - The server has a new dependency, the official MCP SDK (`mcp` 2.3), in the images.
 

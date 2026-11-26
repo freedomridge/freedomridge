@@ -126,6 +126,7 @@ from backend.crypto import hash_token
 from backend.database import init_connection
 from backend.routers import datasets
 from backend.tests import job_helpers, test_access_rule_spec, test_field_registry_postgres, test_upgrade_paths
+from backend.tests.changelog_helpers import release_heading
 from backend.tests.test_access_enforcement_spec import app_routes
 from backend.tests.test_access_rule_spec import ADMIN, GUEST, OTHER_ADMIN, POWER, World
 from backend.tests.test_assistant_core import _raw
@@ -3871,7 +3872,7 @@ def test_the_docs_describe_the_administration_tools():
     assert 'private' in lowered or 'kept from' in lowered, part[:500]
     developers = docs_section(text, '## How a tool reads (for developers)').lower()
     assert 'administration tool' in developers, 'the fence paragraph does not say which tools may read those routes'
-    unreleased = docs_section((ROOT / 'CHANGELOG.md').read_text(), '## Unreleased').lower()
+    unreleased = docs_section((ROOT / 'CHANGELOG.md').read_text(), release_heading('2.14.0')).lower()
     assert 'administration tool' in unreleased, 'CHANGELOG.md Unreleased says nothing of the administration tools'
 
 

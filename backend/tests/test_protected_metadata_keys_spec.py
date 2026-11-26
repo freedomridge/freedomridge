@@ -112,6 +112,7 @@ from backend import main
 from backend.database import PLANNING, Database, init_connection
 from backend.routers import datasets, versions
 from backend.tests import test_regions_spec, test_upgrade_paths
+from backend.tests.changelog_helpers import release_heading
 from backend.tests.test_access_rule_spec import ADMIN, ROLES, World
 from backend.tests.test_assistant_conversation_spec import count_statistics
 from backend.tests.test_assistant_core_spec import open_door
@@ -1717,7 +1718,7 @@ def test_the_docs_list_the_seven_names_and_the_upgrade_notes_say_what_the_migrat
     listing = [block for block in blocks if all(re.search(rf'`{name}`', block) for name in SEVEN)]
     assert listing, f'no paragraph or list of {", ".join(UPLOADER_DOCS)} names all seven protected keys'
     changelog = (ROOT / 'CHANGELOG.md').read_text()
-    unreleased = changelog.split('\n## Unreleased', 1)[1].split('\n## ', 1)[0]
+    unreleased = changelog.split('\n' + release_heading('2.14.0', changelog), 1)[1].split('\n## ', 1)[0]
     notes = unreleased.split('### Upgrade notes', 1)
     assert len(notes) == 2, 'the Unreleased section has no Upgrade notes'
     upgrade_notes = notes[1].split('\n### ', 1)[0]
@@ -1737,7 +1738,7 @@ def test_the_docs_say_the_seven_are_refused_wherever_metadata_is_written_and_a_s
     assert not re.search(r'`tags` and `media_type` are refused wherever', flat), flat  # all seven now, not two
     assert re.search(r'\buntil\b[^.]*\bremoved\b', flat), flat
     changelog = (ROOT / 'CHANGELOG.md').read_text()
-    unreleased = changelog.split('\n## Unreleased', 1)[1].split('\n## ', 1)[0]
+    unreleased = changelog.split('\n' + release_heading('2.14.0', changelog), 1)[1].split('\n## ', 1)[0]
     notes = unreleased.split('### Upgrade notes', 1)[-1].split('\n### ', 1)[0]
     sentences = re.split(r'(?<=[.;:])\s+', ' '.join(notes.split()))
     five = r'`(id|dataset_id|filepath|created_at|last_modified_at)`'
@@ -1748,7 +1749,7 @@ def test_the_upgrade_notes_say_cleaned_samples_show_as_modified_and_the_keep_sta
     """Contract 3.2's added words, lightly: a sentence of the upgrade notes says a cleaned sample shows as modified
     against a version, and the notes speak of mirrors."""
     changelog = (ROOT / 'CHANGELOG.md').read_text()
-    unreleased = changelog.split('\n## Unreleased', 1)[1].split('\n## ', 1)[0]
+    unreleased = changelog.split('\n' + release_heading('2.14.0', changelog), 1)[1].split('\n## ', 1)[0]
     notes = unreleased.split('### Upgrade notes', 1)[-1].split('\n### ', 1)[0]
     sentences = re.split(r'(?<=[.;:])\s+', ' '.join(notes.split()))
     assert any(re.search(r'modified', each, re.I) and re.search(r'version', each, re.I) for each in sentences), notes

@@ -33,6 +33,8 @@ from pathlib import Path
 
 from fridge.core.dataset import Dataset
 
+from backend.tests.changelog_helpers import release_heading
+
 ROOT = Path(__file__).resolve().parents[2]
 UPLOADER_DOCS = ('docs/SDK.md', 'docs/DATASET_MANAGEMENT.md')
 CANT_CHANGE = r"can(?:no|'|’)t be changed|cannot change|can(?:'|’)t change"
@@ -182,7 +184,7 @@ def test_the_sdk_reference_documents_path_prefixes_and_rewritten():
 
 def unreleased_items(heading: str) -> list[str]:
     """The list items under `### <heading>` in CHANGELOG.md's Unreleased section."""
-    unreleased = dict(sections(read('CHANGELOG.md')))['Unreleased']
+    unreleased = dict(sections(read('CHANGELOG.md')))[release_heading('2.14.0')[3:]]
     items = []
     for title, body in sections(unreleased):
         if title == heading:
@@ -232,7 +234,7 @@ def test_the_changelog_has_the_object_fix_and_what_to_do_with_earlier_copies():
     """5.6 and 5.3."""
     fixed = [item for item in unreleased_items('Fixed') if says_all(item, (r'\bobjects?\b', COPY))]
     assert fixed, 'no Fixed entry names objects and the copy'
-    unreleased = dict(sections(read('CHANGELOG.md')))['Unreleased']
+    unreleased = dict(sections(read('CHANGELOG.md')))[release_heading('2.14.0')[3:]]
     items = [item for item in re.split(r'\n(?=- )', unreleased) if item.startswith('- ')]
     assert any(says_all(item, EARLIER_OBJECTS) for item in items), 'no Unreleased entry says what to do with them'
 
