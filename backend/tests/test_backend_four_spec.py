@@ -38,10 +38,9 @@ Where the contract is unclear, or main is not as it says, these tests read it th
   the bulk tag job's `updated_count`, beside the rows it tagged. The sidebar's facet is checked by its min and max
   when some sample is kept (main answers its cached numbers for a filter that keeps none). The same checks run on the
   same ids listed with `in`, which pass today, so a failure of the `contains` tests is the filter's, not the checks'.
-- Section 2 (now the protected-keys contract): main refuses five keys, not four, and only where samples are added
-  (POST /samples): PATCH /samples/{id} and POST /samples/bulk-set (each of its three modes) store a `created_at` key
-  in metadata today. So "refused exactly as before" is pinned where samples are added only; what the edit routes do
-  with those keys is not tested either way.
+- Section 2 (now the protected-keys and reserved-keys-on-edits contracts): main refused five keys, not four, and
+  then only where samples were added; "refused exactly as before" is pinned here where samples are added, and the
+  edit routes are tested in test_protected_metadata_keys_spec.py.
 - Section 3: "the image grid's query" is the filter itself on a dataset without objects, and on one with objects the
   filter the dataset page wraps it in (test_assistant_views_spec.image_grain). Objects here carry none of their
   images' fields or scores. The docs test is light: no sentence of docs/FILTER_QUERY.md keeps "the samples the concept

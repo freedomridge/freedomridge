@@ -6,10 +6,14 @@ other, and the key can be removed."""
 import json
 import os
 
+import httpx
 import pytest
 
+from backend import database as database_module
+from backend import main
 from backend.routers import datasets, versions
 from backend.tests import test_field_registry_postgres
+from backend.tests.test_access_rule_spec import ADMIN, World
 from backend.tests.test_bulk_jobs import claim, finish, step, submitted
 from backend.tests.test_field_registry_postgres import USER, ingest
 
@@ -91,7 +95,12 @@ def test_a_rename_queued_onto_a_protected_name_fails_and_writes_nothing(registry
     registry_database(scenario)
 
 
-def test_a_sample_still_carrying_a_key_is_edited_with_other_keys_and_the_key_removed(registry_database):
+def test_a_sample_still_carrying_a_key_is_edited_with_other_keys_and_the_key_removed(registry_database, monkeypatch):
+    """A sample still carrying the keys is edited with other keys and the keys can be removed. An edit that sets `tags`
+    to a new value is refused by the route (422, the sentence, nothing written): whether an edit of one sample is
+    refused depends on what the sample already stores (f6-contract-reserved-keys-on-edits, section 2), so the refusal
+    is the route's, not the request model's."""
+
     async def scenario(database):
         ids = (await ingest([{'n': 0}]))['ids']
         await database.execute(f"UPDATE samples SET metadata = metadata || '{OLD}'::jsonb WHERE id = $1", ids[0])
@@ -104,8 +113,20 @@ def test_a_sample_still_carrying_a_key_is_edited_with_other_keys_and_the_key_rem
             USER,
         )
         assert await metadata(database, ids) == [{'n': 5}]
-        with pytest.raises(ValueError, match='name sample columns'):
-            datasets.SampleUpdate(metadata={'tags': 'new'})
+        monkeypatch.setattr(database_module.db, 'pool', database.pool)
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=main.app), base_url='http://test') as client:
+            w = World(database, client)
+            await w.user(ADMIN, 'admin')
+            refused = await w.call(
+                ADMIN,
+                'PATCH',
+                f'/api/datasets/1/samples/{ids[0]}',
+                json={'metadata': {'tags': 'new'}},
+            )
+        assert refused.status_code == 422, refused.text
+        sentence = "metadata key(s) ['tags'] name sample columns — set them on the sample itself"
+        assert sentence in json.dumps(refused.json()['detail'], ensure_ascii=False), refused.text
+        assert await metadata(database, ids) == [{'n': 5}]
 
     registry_database(scenario)
 

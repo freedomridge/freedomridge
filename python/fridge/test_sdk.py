@@ -324,6 +324,23 @@ def run_tests():
 
     _()
 
+    @test("save() and set_values with a metadata key named like one of the five older sample columns are refused")
+    def _():
+        for key in ('id', 'dataset_id', 'filepath', 'created_at', 'last_modified_at'):
+            s = ds['s3://test/img_6.jpg']
+            before = dict(s.metadata)
+
+            def undo():
+                ds.client.update_sample(ds._id, s.id, remove_metadata_keys=[key])
+
+            s.metadata[key] = 'x'
+            refused_with_the_servers_sentence(key, s.save, undo)
+            assert ds['s3://test/img_6.jpg'].metadata == before, "a refused save changed the sample"
+            refused_with_the_servers_sentence(key, lambda: ds.set_values([s.id], key, 'x'), undo)
+            assert ds['s3://test/img_6.jpg'].metadata == before, "a refused set_values changed the sample"
+
+    _()
+
     # --- TAGS ---
     print("\n--- Health ---")
 

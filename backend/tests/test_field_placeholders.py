@@ -41,19 +41,33 @@ async def row(w, field: str):
     return tuple(found) if found else None
 
 
-def test_a_metadata_key_named_as_a_described_built_in_registers_and_keeps_the_description(world):
+def test_a_metadata_key_named_as_a_described_built_in_is_refused_and_the_description_stays(world):
     async def scenario(w):
         ids = await a_dataset(w)
         await patch(w, 'created_at', {'description': 'When it arrived.', 'unit': 'UTC'})
         assert await row(w, 'created_at') == ('system', 'When it arrived.', 'UTC', False)
-        # A sample PATCH (or bulk-set) may write such a key; it registers as on a dataset that described nothing.
+        # A sample PATCH (or bulk-set) writing such a key is refused now (the reserved-keys-on-edits contract): the
+        # built-in keeps its row and its description.
         written = await w.call(
             ADMIN,
             'PATCH',
             f'/api/datasets/{D}/samples/{ids[0]}',
             json={'metadata': {'created_at': 'x'}},
         )
-        assert written.is_success, written.text
+        assert written.status_code == 422, written.text
+        assert await row(w, 'created_at') == ('system', 'When it arrived.', 'UTC', False)
+        assert (await listed(w))['created_at']['description'] == 'When it arrived.'
+        # A sample that already carries one (written into `samples` directly, registered as such a write registered
+        # it before the refusal) keeps the description on the registered row.
+        await w.database.execute(
+            "UPDATE samples SET metadata = metadata || jsonb_build_object('created_at', 'x') WHERE id = $1",
+            ids[0],
+        )
+        await w.database.execute(
+            "UPDATE dataset_fields SET field_type = 'string', origin = 'metadata' "
+            "WHERE dataset_id = $1 AND field_name = 'created_at'",
+            D,
+        )
         assert await row(w, 'created_at') == ('metadata', 'When it arrived.', 'UTC', False)
         assert (await listed(w))['created_at']['description'] == 'When it arrived.'
         # Cleared, the key goes and the built-in keeps its description.
@@ -61,6 +75,8 @@ def test_a_metadata_key_named_as_a_described_built_in_registers_and_keeps_the_de
         assert cleared.is_success, cleared.text
         assert await row(w, 'created_at') == ('system', 'When it arrived.', 'UTC', False)
         assert (await listed(w))['created_at']['description'] == 'When it arrived.'
+        carried = "SELECT count(*) FROM samples WHERE dataset_id = $1 AND metadata ? 'created_at'"
+        assert await w.database.fetchval(carried, D) == 0
 
     world(scenario)
 
@@ -134,7 +150,7 @@ def test_a_field_a_revert_removes_keeps_its_flag_for_when_it_comes_back(world):
 
 def test_a_rename_or_a_clone_onto_a_placeholder_keeps_what_it_held(world):
     async def scenario(w):
-        await a_dataset(w)
+        ids = await a_dataset(w)
         await patch(w, 'note', {'values_private': True})
         assert (await w.call(ADMIN, 'POST', f'/api/datasets/{D}/fields/note/clear')).is_success
         await patch(w, 'other', {'description': 'Another number.'})
@@ -143,11 +159,31 @@ def test_a_rename_or_a_clone_onto_a_placeholder_keeps_what_it_held(world):
         # The field brings its description; the name's flag stays: either one's makes it private.
         assert await row(w, 'note') == ('metadata', 'Another number.', None, True)
         assert await row(w, 'other') is None  # a rename takes the definition along
+        # A clone onto a built-in's placeholder is refused now (the reserved-keys-on-edits contract): both rows stay.
         await patch(w, 'filepath', {'unit': 'path'})
         cloned = await w.call(ADMIN, 'POST', f'/api/datasets/{D}/fields/note/clone', json={'new_name': 'filepath'})
+        assert cloned.status_code == 400, cloned.text
+        assert await row(w, 'filepath') == ('system', None, 'path', False)
+        assert await row(w, 'note') == ('metadata', 'Another number.', None, True)
+        # A clone onto an ordinary name's placeholder lands. Only the flag outlives a clear (the description and unit
+        # go with the field), so the landing brings the clone's values and description and keeps the name's flag.
+        written = await w.call(
+            ADMIN,
+            'POST',
+            f'/api/datasets/{D}/samples/bulk-set',
+            json={'sample_ids': ids, 'metadata': {'note2': 'x', 'spare': 7}},
+        )
+        assert written.is_success, written.text
+        await patch(w, 'note2', {'values_private': True, 'description': 'A second note.', 'unit': 'u'})
+        assert (await w.call(ADMIN, 'POST', f'/api/datasets/{D}/fields/note2/clear')).is_success
+        assert await row(w, 'note2') == ('system', None, None, True)
+        await patch(w, 'spare', {'description': 'A spare number.'})
+        cloned = await w.call(ADMIN, 'POST', f'/api/datasets/{D}/fields/spare/clone', json={'new_name': 'note2'})
         assert cloned.is_success, cloned.text
-        assert await row(w, 'filepath') == ('metadata', 'Another number.', 'path', True)
-        assert await row(w, 'note') == ('metadata', 'Another number.', None, True)  # a clone leaves the source
+        assert await row(w, 'note2') == ('metadata', 'A spare number.', None, True)
+        assert await row(w, 'spare') == ('metadata', 'A spare number.', None, False)  # a clone leaves the source
+        values = "SELECT metadata->'note2', metadata->'spare' FROM samples WHERE dataset_id = $1 ORDER BY id"
+        assert [tuple(found) for found in await w.database.fetch(values, D)] == [(7, 7)] * 3
 
     world(scenario)
 

@@ -11,7 +11,7 @@ from .api_errors import CodedHTTPException
 from .diskspace import INGEST_ROW_BYTES, require_free_space
 from .field_registry import (
     LOCAL_PREFIX,
-    PROTECTED_METADATA_KEYS,
+    RESERVED_METADATA_KEYS,
     forget_definitions,
     invalidate_values,
     lock_field_lifecycle,
@@ -505,9 +505,10 @@ async def _mutate(connection, job, ids, removed_fields, targeted=None):
             )
         await invalidate_values(connection, dataset_id, [request['field_name']])
         return int(status.split()[-1])
-    # A job queued before `tags` and `media_type` were refused (field_registry.PROTECTED_METADATA_KEYS) leaves them out.
-    protected = sorted(PROTECTED_METADATA_KEYS)
-    setting = {k: v for k, v in request.get('metadata', {}).items() if k not in PROTECTED_METADATA_KEYS}
+    # A job queued before keys named as a sample's own fields were refused (field_registry.RESERVED_METADATA_KEYS)
+    # leaves them out.
+    protected = sorted(RESERVED_METADATA_KEYS)
+    setting = {k: v for k, v in request.get('metadata', {}).items() if k not in RESERVED_METADATA_KEYS}
     names = set(setting) | set(request.get('remove_metadata_keys', []))
     if operation == 'set':
         if request.get('per_sample'):
@@ -550,7 +551,7 @@ async def _mutate(connection, job, ids, removed_fields, targeted=None):
         )
         values = [dataset_id, ids, field]
         if operation != 'clear':
-            refuse_column_keys([request['new_name']], PROTECTED_METADATA_KEYS)  # a rename queued before the refusal
+            refuse_column_keys([request['new_name']])  # a rename queued before the refusal
             values.append(request['new_name'])
             names.add(request['new_name'])
         status = await connection.execute(

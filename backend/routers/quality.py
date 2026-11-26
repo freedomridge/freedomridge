@@ -25,7 +25,6 @@ from .. import job_queue, job_wait
 from ..access import require_dataset_access, require_level
 from ..database import db
 from ..field_registry import (
-    PROTECTED_METADATA_KEYS,
     REQUEST_FULL_REFRESH,
     invalidate_values,
     lock_field_lifecycle,
@@ -37,8 +36,8 @@ from ..index_jobs import submit_ann_index, valid_hnsw_index
 
 
 def _written_key(name: str) -> str:
-    """The metadata key a score or a group id is written under: not `tags` or `media_type` (field_registry)."""
-    refuse_column_keys([name], PROTECTED_METADATA_KEYS)
+    """The metadata key a score or a group id is written under: not a sample's own field's name (field_registry)."""
+    refuse_column_keys([name])
     return name
 
 

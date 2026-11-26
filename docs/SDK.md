@@ -558,11 +558,12 @@ else is not served. Use `s3://bucket/key` for objects in S3.
 
 **Names a metadata key can't have.** Seven names are a sample's own fields, set on the `Sample` itself: `id`,
 `dataset_id`, `filepath`, `created_at`, `last_modified_at`, `tags` and `media_type`. The server refuses a metadata
-key named like any of them when samples are added, with an error that names it (`metadata key(s) ['tags'] name sample
-columns`), and nothing of the request is written. `tags` and `media_type` are refused wherever metadata is
-written: also by `sample.save()`, `set_values` and other bulk edits, and as a field's new name in a rename or clone.
-Removing such a key is allowed. A name that only contains one (`source_tags`, `media_type_guess`) is an ordinary key,
-and so is `heading`.
+key named like any of them wherever metadata is written, with an error that names it (`metadata key(s) ['tags'] name
+sample columns`), and nothing of the request is written: when samples are added, by `sample.save()`, `set_values` and
+other bulk edits, and as a field's new name in a rename or clone. A sample that already carries one (an older release
+stored them) keeps it until it is removed: `sample.save()` may send it back with the value it has, while a changed
+value is refused. Removing such a key is allowed. A name that only contains one (`source_tags`, `created_at_source`)
+is an ordinary key, and so is `heading`.
 
 #### Sample Properties
 

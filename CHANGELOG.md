@@ -57,6 +57,12 @@ on; the others touch no sample.
   A dataset version saved before the upgrade counts the samples the migration cleaned as modified when compared with
   the dataset, also after a revert to it: a version keeps a fingerprint of each sample's metadata, the removed key
   included. Save a version after upgrading: the dataset then shows as at that version.
+- **Metadata keys named `id`, `dataset_id`, `filepath`, `created_at` or `last_modified_at` are refused on edits too.**
+  They were refused only when samples were added. A script that sets one in an edit of a sample, a bulk edit or a
+  quality score's field, or as a field's new name in a rename or clone, is now refused with the same error, and nothing
+  is written. Stored ones stay, with no migration (a stored `created_at` can be the only copy of an original date), and
+  a sample that carries one stays editable: `sample.save()` may send the key back with the value it has, and the key
+  can be removed.
 - The job runner loads the region boundaries by itself on its first start after the upgrade: its image now carries
   the boundary file (40.7 MB more). The load takes about half a minute on a desktop computer, a few minutes on a
   small server, and adds 151 MB to the database. A development checkout runs `python -m backend.regions fetch` once
@@ -223,6 +229,11 @@ on; the others touch no sample.
 
 ### Fixed
 
+- **A metadata key named `id`, `dataset_id`, `filepath`, `created_at` or `last_modified_at` is refused on edits, not
+  only when samples are added.** An edit stored it, and it was registered as a field: its values went into the real
+  field's statistics (a `created_at` of `1999-…` beside the real dates), or showed as a second `dataset_id` field. The
+  seven names now have one rule on every route that writes metadata; an edit of one sample may send a stored one back
+  with the value it has.
 - **A metadata key named `tags` or `media_type` is refused instead of kept out of sight**, as `id`, `dataset_id`,
   `filepath`, `created_at` and `last_modified_at` already were when samples are added. The two are refused wherever
   metadata is written: adding samples (every `on_duplicate` mode), `PATCH`, both kinds of bulk-set, a field's new

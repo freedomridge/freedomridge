@@ -46,7 +46,6 @@ from backend.field_descriptions import (
 )
 from backend.field_registry import (
     LOCAL_PREFIX,
-    PROTECTED_METADATA_KEYS,
     REQUEST_FULL_REFRESH,
     cached_distinct_values,
     field_stats,
@@ -57,6 +56,7 @@ from backend.field_registry import (
     prune_fields,
     refuse_column_keys,
     register_fields,
+    unchanged_column_keys,
     validate_metadata,
 )
 from backend.filter_query import canonical_region_key
@@ -7917,10 +7917,10 @@ class SampleUpdate(BaseModel):
     @field_validator('metadata')
     @classmethod
     def _metadata(cls, metadata: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-        # `@local.` keys are a mirror's own fields: update_sample routes them (local_writes).
+        # `@local.` keys are a mirror's own fields: update_sample routes them (local_writes). A key named as a sample's
+        # own field is checked there too, against what the sample stores (unchanged_column_keys).
         if metadata is None:
             return None
-        refuse_column_keys(metadata, PROTECTED_METADATA_KEYS)
         return validate_metadata(metadata, allow_local=True)
 
     tags: Optional[List[str]] = None
@@ -8016,6 +8016,20 @@ async def update_sample(
             )
             if not existing:
                 raise HTTPException(status_code=404, detail="Sample not found")
+            # A key named as a sample's own field (field_registry.RESERVED_METADATA_KEYS) is refused, before anything is
+            # written, unless it comes back with exactly the value the sample stores (Sample.save() sends the whole
+            # metadata): such a key is left out of the edit, so a stored one stays as it is.
+            metadata = request.metadata
+            if metadata:
+                kept = unchanged_column_keys(metadata, existing['metadata'])
+                try:
+                    refuse_column_keys(set(metadata) - kept)
+                except ValueError as error:
+                    raise HTTPException(
+                        status_code=422,
+                        detail=[{'type': 'value_error', 'loc': ['body', 'metadata'], 'msg': f'Value error, {error}'}],
+                    ) from None
+                metadata = {key: value for key, value in metadata.items() if key not in kept}
 
             # Build update query dynamically
             updates = []
@@ -8030,8 +8044,8 @@ async def update_sample(
             # Metadata merge + key removal share the same UPDATE slot since they both
             # rewrite the whole JSONB blob. Read-modify-write: fold in new keys, drop
             # any in remove_metadata_keys, then write the result.
-            if request.metadata is not None or request.remove_metadata_keys:
-                merged_metadata = {**(existing['metadata'] or {}), **(request.metadata or {})}
+            if metadata is not None or request.remove_metadata_keys:
+                merged_metadata = {**(existing['metadata'] or {}), **(metadata or {})}
                 for key in request.remove_metadata_keys or []:
                     merged_metadata.pop(key, None)
                 updates.append(f"metadata = ${arg_idx}")
@@ -8073,24 +8087,24 @@ async def update_sample(
             args.extend([sample_id, id])
 
             await conn.execute(query, *args)
-            if request.metadata:
+            if metadata:
                 await register_fields(
                     conn,
                     id,
                     [
                         {
                             key: value
-                            for key, value in request.metadata.items()
+                            for key, value in metadata.items()
                             if key not in (request.remove_metadata_keys or [])
                         },
                     ],
                 )
-            if request.metadata is not None or request.remove_metadata_keys:
+            if metadata is not None or request.remove_metadata_keys:
                 await append_discovery(conn, id, [merged_metadata])
             await invalidate_values(
                 conn,
                 id,
-                set(request.metadata or {})
+                set(metadata or {})
                 | set(request.remove_metadata_keys or [])
                 | set(request.array_fields or {})
                 | ({'tags'} if request.tags is not None else set()),
@@ -8521,7 +8535,7 @@ async def tag_samples(id: int, request: BulkTagRequest, user: dict, made_by: str
 
 def _metadata_with_local(metadata: Dict[str, Any]) -> Dict[str, Any]:
     """`@local.` keys are a mirror's own fields: bulk_set_metadata routes them (local_writes)."""
-    refuse_column_keys(metadata, PROTECTED_METADATA_KEYS)
+    refuse_column_keys(metadata)
     return validate_metadata(metadata, allow_local=True)
 
 
@@ -8852,7 +8866,7 @@ async def _check_field_target(
     _validate_field_name(field_name)
     _validate_field_name(new_name)
     try:
-        refuse_column_keys([new_name], PROTECTED_METADATA_KEYS)  # its values would be stored under that key
+        refuse_column_keys([new_name])  # its values would be stored under that key
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from None
     if new_name == field_name:

@@ -54,10 +54,13 @@ def canonical_type(field_type: str) -> str:
 # The names a metadata key can't have: a sample's own fields, which every filter, list and statistic by that name
 # reads. Stored in metadata, `id`, `dataset_id`, `filepath`, `created_at` and `last_modified_at` were registered as
 # fields beside the real ones; `tags` and `media_type` were never listed, filtered or shown, but for a field renamed or
-# cloned onto one, which stood in the field list in place of the sample's own. The five are refused when samples are
-# added; `tags` and `media_type` (PROTECTED_METADATA_KEYS) wherever metadata is written: added, edited, set in bulk, a
-# field's new name in a rename or clone, a quality score's field. Migration 0042 removed stored keys and such fields.
-# `heading` stays allowed: no filter or list names its column, so a metadata key of that name is a field like any other.
+# cloned onto one, which stood in the field list in place of the sample's own. All seven are refused wherever metadata
+# is written: added, edited, set in bulk, a field's new name in a rename or clone, a quality score's field. An edit of
+# one sample may send one back with exactly the value the sample stores (unchanged_column_keys): a stored `created_at`
+# can be the only copy of an original date, so the five stay where they are stored, until removed. `tags` and
+# `media_type` (PROTECTED_METADATA_KEYS) are also taken out of what is kept: migration 0042 removed stored ones and such
+# fields, and a version revert leaves them out. `heading` stays allowed: no filter or list names its column, so a
+# metadata key of that name is a field like any other.
 RESERVED_METADATA_KEYS = frozenset(
     {'id', 'dataset_id', 'filepath', 'created_at', 'last_modified_at', 'tags', 'media_type'},
 )
@@ -70,6 +73,33 @@ def refuse_column_keys(names: Iterable[str], refused: frozenset[str] = RESERVED_
     reserved = sorted(refused.intersection(names))
     if reserved:
         raise ValueError(f"metadata key(s) {reserved} name sample columns — set them on the sample itself")
+
+
+def _same_json(a: Any, b: Any) -> bool:
+    """Whether two decoded JSON values are the same JSON value: numbers of the same value (1 and 1.0) are, true and
+    false are no numbers, null is only null, and objects and lists are the same item by item."""
+    if isinstance(a, bool) or isinstance(b, bool):
+        return isinstance(a, bool) and isinstance(b, bool) and a == b
+    if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+        return a == b
+    if isinstance(a, dict) and isinstance(b, dict):
+        return a.keys() == b.keys() and all(_same_json(a[key], b[key]) for key in a)
+    if isinstance(a, list) and isinstance(b, list):
+        return len(a) == len(b) and all(_same_json(x, y) for x, y in zip(a, b))
+    return type(a) is type(b) and a == b
+
+
+def unchanged_column_keys(metadata: Mapping[str, Any], stored: Any) -> set[str]:
+    """The keys among RESERVED_METADATA_KEYS that `metadata` (an edit's, as decoded from its request) sends with exactly
+    the value `stored` (the sample's metadata as read) holds for them: sending one back is no setting of it. Both sides
+    are compared as the server decodes JSON, so a value read and sent back unchanged is the same."""
+    if not isinstance(stored, Mapping):
+        return set()
+    return {
+        key
+        for key in RESERVED_METADATA_KEYS.intersection(metadata)
+        if key in stored and _same_json(metadata[key], stored[key])
+    }
 
 
 def validate_metadata(metadata: dict[str, Any], *, allow_local: bool = False) -> dict[str, Any]:
