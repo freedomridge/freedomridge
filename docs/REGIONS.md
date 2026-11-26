@@ -227,7 +227,9 @@ filter gives.
   Forward.
 - **Datasets with objects.** On a dataset with objects, `not within` is coupled across the grains as a drawn
   region's exclude is: the image grid keeps the images outside the region with no object inside it, the object grid
-  the objects outside it whose image isn't inside it.
+  the objects outside it whose image isn't inside it. That holds for a chip of its own. Sharing a filter card with
+  another test, inside an `OR`, or as `NOT (location within …)`, it also keeps the images inside the region that have
+  an object with no location ([FILTER_QUERY.md](FILTER_QUERY.md#on-a-dataset-with-objects)).
 - **Loading boundaries.** Settings → System status has a Region boundaries card for administrators. It shows each
   set, its source and licence, and what is loaded of it: the version, when, how ("automatically, from the file that
   came with this release", "by admin, from the file that came with this release", "by admin, downloaded", or "from a

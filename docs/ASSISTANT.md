@@ -435,7 +435,8 @@ One dataset and its fields, a page at a time, in the schema's order. Arguments: 
 It reads only what the server already keeps about the dataset, its statistics, and never counts through the samples
 field by field: a call costs about what opening the dataset's sidebar costs, and makes the same six requests however
 many fields the page has (`GET /api/datasets/{id}`, then its `field-stats`, `schema`, `coverage`, `concepts` and
-`views`, all as the person). Counts per value belong to the tools asked about one field.
+`views`, all as the person). One statement counts the samples, for the numbers no statistic keeps: the rows, the
+object rows and the rows with a location. Counts per value belong to the tools asked about one field.
 
 `dataset` has `samples`, the number a view of the whole dataset counts (what its page shows with no filter), and
 `objects`, how many object rows it has besides. Each field has:
@@ -457,9 +458,11 @@ many fields the page has (`GET /api/datasets/{id}`, then its `field-stats`, `sch
 With the fields come `fields_total`, `next_offset`, `undescribed_fields` (fields with no description at all, over the
 whole dataset), `samples_with_location`, `embedding_fields`, `concepts`, and `saved_views` (those the person can see).
 
-`values` comes from the list of a field's values the statistics keep (the built-in `tags` and `media_type` are read
-whole). A field with more different values than the statistics keep a list of (serial numbers, file names) has
-`"many": true`, `distinct` null and whatever examples the server holds, possibly none: no fault of the statistics. A
+`values` comes from the list of a field's values the statistics keep, for an indexed field and the built-in `tags`
+and `media_type` too: nothing is read from the samples for it, so until the dataset's statistics are first counted
+`tags` and `media_type` may have none, and say `complete: false`. A field with more different values than the
+statistics keep a list of (serial numbers, file names) has `"many": true`, `distinct` null and whatever examples the
+server holds, possibly none: no fault of the statistics. A
 boolean's `values` is null (its values are true and false), as is that of a field holding JSON lists, a media field
 and a drawing itself (detections, polygons, masks). A drawing's label list (`detections.label`) has its labels.
 

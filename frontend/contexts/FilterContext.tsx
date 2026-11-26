@@ -6,7 +6,7 @@ import { ComplexFilter, ViewStage } from '@/lib/api';
 import { convertSimpleFiltersToComplex, describeFilter, upgradeDraftKeys } from '@/lib/filter-utils';
 import { type DefaultView, defaultViewSaved, defaultViewStages, isDefaultViewStage, opensOnDefaultView } from '@/lib/default-view';
 import { type DatasetLink, type LinkSort, linkSetsFilters, openingOf, withSample, withSort } from '@/lib/links';
-import { type ExpiredSelection, expiredSelection, filterHasInSelection } from '@/lib/filter-query';
+import { type ExpiredSelection, expiredSelection, filterHasInSelection, soleRule } from '@/lib/filter-query';
 import { lassoFilter } from '@/lib/stale-lasso';
 import { type SourceView, sourceOf } from '@/lib/source-view';
 
@@ -376,12 +376,17 @@ export function withGrain(
     // point on its map. Coupled like the other leaves, such a row on the partner grain (an object with no point on an
     // image map) would vacuously let its partner through. So it is coupled as NOT (the row or its partner is inside the
     // region).
-    const isRegionExclude = (f: ComplexFilter): boolean =>
-        f.operator === 'geo_polygon_exclude' || f.operator === 'geo_region_exclude' || f.operator === 'embedding_polygon_exclude';
+    // A filter card saved from its Builder tab wraps the exclusion in an AND group of one rule: it is the same filter and
+    // the same chip, so it is coupled as the bare one is (soleRule).
+    const isRegionExclude = (f: ComplexFilter): boolean => {
+        const rule = soleRule(f);
+        return rule?.operator === 'geo_polygon_exclude' || rule?.operator === 'geo_region_exclude'
+            || rule?.operator === 'embedding_polygon_exclude';
+    };
     // A polygon with fewer than 3 points is no polygon and excludes nothing, as the server's own exclude does. A named
     // region's value is its key.
-    const excluded = baseFilters.filter((f) => isRegionExclude(f)
-        && (f.operator === 'geo_region_exclude' || (Array.isArray(f.value) && f.value.length >= 3)));
+    const excluded = baseFilters.filter(isRegionExclude).map((f) => soleRule(f) as ComplexFilter)
+        .filter((f) => f.operator === 'geo_region_exclude' || (Array.isArray(f.value) && f.value.length >= 3));
     const offGrainEmb = baseFilters.filter((f) => !isRegionExclude(f) && isOffGrainEmb(f));
     const rest = baseFilters.filter((f) => !isRegionExclude(f) && !isOffGrainEmb(f));
     const parts: ComplexFilter[] = [...grainPredicate(grain, pivot)];

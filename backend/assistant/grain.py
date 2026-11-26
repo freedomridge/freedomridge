@@ -22,6 +22,15 @@ _REGION_EXCLUDES = {
 _CROSS = 'has_matching_object'
 
 
+def _sole_rule(node: dict[str, Any]) -> dict[str, Any]:
+    """The rule a stage comes down to: itself, or the one rule of an AND group around it, however deeply wrapped (a
+    filter card saved from its Builder tab wraps a lone rule in an AND group), as the app's soleRule
+    (frontend/lib/filter-query.ts). An OR or a NOT is never seen through."""
+    while node.get('logic') == 'AND' and len(node.get('filters') or []) == 1:
+        node = node['filters'][0]
+    return node
+
+
 def _coupled(node: dict[str, Any], field: str = '_crossgrain') -> list[dict[str, Any]]:
     return [
         {'field': '_cgself', 'operator': 'cg_self', 'value': node},
@@ -36,21 +45,18 @@ def image_grain(stages: list[dict[str, Any]], has_objects: bool) -> dict[str, An
     if not has_objects:
         return {'logic': 'AND', 'filters': [dict(_IMAGES), *stages]}
 
-    def region_exclude(node: dict[str, Any]) -> bool:
-        return node.get('operator') in _REGION_EXCLUDES
+    def region_exclude(node: dict[str, Any]) -> bool:  # wrapped or not: the same filter and the same chip
+        return _sole_rule(node).get('operator') in _REGION_EXCLUDES
 
     def off_grain_lasso(node: dict[str, Any]) -> bool:  # a lasso on the objects' map (clip_obj)
         return node.get('operator') == 'embedding_polygon' and node.get('field') == 'clip_obj'
 
     # A polygon of fewer than 3 points is no polygon and excludes nothing; a named region's value is its key.
     excluded = [
-        node
-        for node in stages
-        if region_exclude(node)
-        and (
-            node.get('operator') == 'geo_region_exclude'
-            or (isinstance(node.get('value'), list) and len(node['value']) >= 3)
-        )
+        rule
+        for rule in (_sole_rule(node) for node in stages if region_exclude(node))
+        if rule.get('operator') == 'geo_region_exclude'
+        or (isinstance(rule.get('value'), list) and len(rule['value']) >= 3)
     ]
     lassos = [node for node in stages if not region_exclude(node) and off_grain_lasso(node)]
     rest = [node for node in stages if not region_exclude(node) and not off_grain_lasso(node)]

@@ -54,14 +54,22 @@ A query is an AND of parts. In the SDK and the API, each top-level `AND` part be
 | `>` `>=` `<` `<=` | compare | numbers, dates |
 | `in (...)`, `not in (...)` | one of the listed values, or none of them | numbers, dates, text, lists |
 | `between A and B` | `>= A` and `<= B`, as one part | numbers, dates |
-| `contains "x"` (also `like "%x%"`) | case-insensitive substring | text, lists |
+| `contains "x"` (also `like "%x%"`) | case-insensitive substring | text, lists, `id` |
 | `exists`, `not exists` | the field is present, or absent | all |
 | `is null`, `is not null` | no value (absent or null), or a value | all |
+
+`id contains "12"` keeps the samples whose id, written in decimal, contains `12` (12, 112, 1203, ...), and
+`NOT (id contains "12")` every other sample. Text that isn't digits matches no sample.
 
 Logic: `AND`, `OR` and `NOT`, with brackets. Keywords aren't case sensitive. `concept` is a keyword only where it
 starts a [concept part](#concept-scores): followed by a name (quoted, or a plain word) it is a concept's score,
 followed by an operator it is a field named concept. `within` counts as an operator there, so `concept within "US-KS"`
 is the [region form](#regions)'s mistake (`within` applies only to `location`).
+
+A negation of a field (`!=`, `not in`, or a `NOT` around one field's tests) keeps the samples with another value. On
+a dataset without objects it keeps the samples without the field too: `split != "train"` keeps the samples that have
+no `split`. On a dataset with objects it keeps only the samples that have the field, and a `NOT` around tests of two
+or more fields works differently ([below](#on-a-dataset-with-objects)).
 
 ## Concept scores
 
@@ -70,9 +78,11 @@ samples by that score, as the Concepts panel's **show only** and **exclude** do:
 
 - `concept "equipment" > 0.62` keeps the samples whose score for the dataset's concept named `equipment` passes the
   comparison: `>`, `>=`, `<` or `<=`.
-- `not concept "equipment" > 0.62` hides them and keeps the rest, the samples the concept has no score for included,
-  as the panel's exclude does. `NOT (concept "equipment" > 0.62)` is the same filter. A `NOT` around more than the
-  one concept part, such as `NOT (concept "equipment" > 0.62 AND split = "train")`, is a `NOT` of its parts.
+- `not concept "equipment" > 0.62` hides them and keeps the rest, as the panel's exclude does. On a dataset without
+  objects the rest includes the samples the concept has no score for; on a dataset with objects it is only the
+  samples that have a score, here those at or below 0.62 ([below](#on-a-dataset-with-objects)).
+  `NOT (concept "equipment" > 0.62)` is the same filter. A `NOT` around more than the one concept part, such as
+  `NOT (concept "equipment" > 0.62 AND split = "train")`, is a `NOT` of its parts.
 - `concept "equipment"`, with no comparison, takes the concept's saved threshold with `>`, as it is when the text is
   read. The text the app and `format` write always has the comparison, so a link keeps its meaning when the saved
   threshold changes.
@@ -112,7 +122,8 @@ location within Kansas AND split = train
 ```
 
 - **`location within R`** keeps the samples located inside R; **`location not within R`** keeps every other sample,
-  samples with no location included. They are the filters `geo_region` and `geo_region_exclude`.
+  samples with no location included (on a dataset with objects, see [below](#on-a-dataset-with-objects)). They are the
+  filters `geo_region` and `geo_region_exclude`.
 - **R is a key or a name, in any case,** quoted or not: `"US-KS"`, `us-ks`, `Kansas`, `"New South Wales"` (a name
   with spaces needs quotes). The text is always written back with the key: `location within "US-KS"`.
 - **A name that several regions have is a mistake** whose suggestions are their keys, with their kinds and countries
@@ -125,6 +136,36 @@ location within Kansas AND split = train
   dataset's own field named `location`,** as it was before regions: `location = "north field"` filters that field. On a
   dataset with no such field, `location = ...` is a mistake that points to `within`. `within` applies only to
   `location`.
+
+## On a dataset with objects
+
+On a dataset with object rows (each naming its image in `parent_id`), the dataset's page reads every filter across
+the images and their objects: an image is kept when it matches the filter or one of its objects does, and on the
+objects' grid an object is kept when it or its image does. The assistant reads filters the same way. An image and its
+objects hold different fields, so there a negation of one field, or of a concept's score, is true only of a row that
+has that field or score at all. Otherwise every object, which has none of its image's fields, would pass every
+negation of them and bring its image back.
+
+- `split != "train"`, `split not in (train val)` and `NOT (split contains "tr")` keep only the samples that have a
+  `split`. On a dataset without objects they keep the samples with no `split` too.
+- `not concept "equipment" > 0.62` keeps only the samples the concept scores at or below 0.62. On a dataset without
+  objects it keeps the samples it has no score for too. The assistant's `concept_preview` says how many images have
+  no score (`unscored`) before the filter is applied.
+- A `NOT` around a condition on two or more fields isn't held to this: it is also true of a row that has none of those
+  fields. So the images of such objects are kept too, and on the objects' grid the objects of such images. Where the
+  objects have neither `colour` nor `n`, `NOT (colour = "red" AND n = 0)` keeps every image that has an object, the red
+  images with `n` 0 among them.
+- `location not within "US-KS"` keeps the same samples on both kinds of dataset, those outside the place and those
+  with no location, when it is a filter of its own: one chip in the app, made from a filter card's Query or Builder
+  tab, or a part joined by `AND` at the top of a query. It isn't guarded so, and is also true of an object with
+  no location, so the images inside the place that have such objects are kept too, when a `NOT` is written around a
+  place test (`NOT (location within "US-KS")`), when it sits inside an `OR` group, or, in the app, when it shares one
+  filter card with another test (the card is one filter, linked to the objects as a whole). These cases concern
+  objects with no location: an object with a location of its own is tested like any sample. To leave a place out on a
+  dataset with objects, give `location not within` a filter card of its own.
+- Every row has the built-in fields (`id`, `filepath`, `media_type`, `created_at`, `last_modified_at`), so nothing
+  changes for them. A list (`tags`, or a list field kept in a column of its own) keeps the samples with no value on
+  either kind of dataset: `tags not in (rejected)` keeps the samples without tags.
 
 ## Values
 

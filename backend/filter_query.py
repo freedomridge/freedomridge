@@ -40,6 +40,8 @@ OPERATORS_BY_KIND: Dict[str, List[str]] = {
     BOOLEAN: ['=', '!=', *_PRESENCE],
     OBJECT: list(_PRESENCE),
 }
+# A sample's id is a number that also takes contains: its digits, written in decimal, contain the text.
+_ID_TEXT = ['contains', 'like']
 # Query-language operator -> ComplexFilter operator.
 _TO_FILTER = {'exists': 'exists', 'not exists': 'not_exists', 'is null': 'is_null', 'is not null': 'is_not_null'}
 # ComplexFilter operator -> query-language operator, for every spelling the server accepts.
@@ -322,12 +324,15 @@ class _Parser:
             raise self.fail(f'unknown field {field!r}{hint}', token, _close_names(field, self.fields))
         operator_token = self.peek()
         operator = self.operator(field)
-        if operator not in OPERATORS_BY_KIND[kind]:
-            allowed = ', '.join(OPERATORS_BY_KIND[kind])
+        operators = OPERATORS_BY_KIND[kind] + (_ID_TEXT if field == 'id' else [])
+        if operator not in operators:
+            allowed = ', '.join(operators)
             raise self.fail(
                 f'{operator!r} does not apply to the {kind} field {field!r}; use one of: {allowed}',
                 operator_token,
             )
+        if field == 'id' and operator in _ID_TEXT:
+            kind = TEXT  # `id contains "12"`: the id written in decimal, a text test
         if operator in _VALUELESS:
             return {'field': field, 'operator': _TO_FILTER[operator], 'value': None}
         if operator in ('in', 'not in'):

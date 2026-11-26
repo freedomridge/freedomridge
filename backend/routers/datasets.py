@@ -403,7 +403,10 @@ async def list_datasets(request: Request):
 
 
 @router.get("/datasets/{id}", response_model=Dataset)
-async def get_dataset(id: int, request: Request):
+async def get_dataset(id: int, request: Request, brief: bool = False):
+    """The dataset as the caller sees it. With `brief`, its row and the caller's level only: no sidebar_expand_all
+    (which counts up to 100,001 of its samples), default_view or map_layouts, for a caller that uses none of them (the
+    assistant's describe_dataset)."""
     user = await get_optional_user(request)
     # Raises 404 if missing, 403 if no access. Returns the row but only with
     # the access-check fields, so we still need the full SELECT below.
@@ -416,6 +419,8 @@ async def get_dataset(id: int, request: Request):
     )
     if not row:
         raise HTTPException(status_code=404, detail="Dataset not found")
+    if brief:
+        return _parse_dataset_row(row)
     return {
         **_parse_dataset_row(row),
         'sidebar_expand_all': await _sidebar_expands_all(id),
@@ -856,12 +861,21 @@ from fastapi import APIRouter, Depends  # noqa: E402
 
 @router.get("/datasets/{id}/field-stats", dependencies=[Depends(require_dataset_access)])
 @guest_heavy
-async def get_dataset_field_stats(id: int, filters: Optional[str] = None, lightning_mode: bool = True):
+async def get_dataset_field_stats(
+    id: int,
+    filters: Optional[str] = None,
+    lightning_mode: bool = True,
+    brief: bool = False,
+):
     """
     Get dataset field statistics from cached dataset_field_stats table.
     For PROMOTED fields: computes filtered min/max based on current filters (fast with index).
     lightning_mode=True (default): Use cached values for performance.
     lightning_mode=False: Compute filtered values dynamically.
+    brief=True: each field's counts and the lists of values the statistics keep, as they are, and nothing read from the
+    samples or an index for them: no `null_count` (a count of the samples), no list of an indexed field's values, and
+    no media_type's or list field's values while the statistics keep none. For a caller that offers no filter, as the
+    assistant's describe_dataset.
     """
 
     # Check dataset exists
@@ -871,7 +885,7 @@ async def get_dataset_field_stats(id: int, filters: Optional[str] = None, lightn
 
     # Parse filters if provided
     filter_obj = json.loads(filters) if filters else None
-    return await _get_dataset_field_stats_impl(id, filter_obj, lightning_mode)
+    return await _get_dataset_field_stats_impl(id, filter_obj, lightning_mode, brief=brief)
 
 
 class FieldStatsRequest(BaseModel):
@@ -1689,6 +1703,7 @@ async def _get_dataset_field_stats_impl(
     known_broad: Optional[bool] = None,
     emit: Optional[Callable[[Dict[str, Any]], None]] = None,
     report: Optional[Dict[str, Any]] = None,
+    brief: bool = False,
 ):
     """Sidebar field schema with per-field facet provenance (see _LIGHTNING_SIDEBAR_BUDGET_S).
 
@@ -1978,6 +1993,8 @@ async def _get_dataset_field_stats_impl(
     media_type_stat = get_cached_stat('media_type')
     if media_type_stat and media_type_stat['values_complete'] and media_type_stat['unique_values'] is not None:
         media_values, media_complete = media_type_stat['unique_values'], True
+    elif brief:  # the statistics' list as it is, read from nothing
+        media_values, media_complete = (media_type_stat or {}).get('unique_values') or [], False
     else:
         media_values, media_complete = await cached_distinct_values(
             db.pool,
@@ -2091,7 +2108,7 @@ async def _get_dataset_field_stats_impl(
                 complete = len(filtered) <= 200
             # else: filter raised; keep cached `values`
 
-        if values is None:
+        if values is None and not brief:
             values, complete = await cached_distinct_values(
                 db.pool,
                 id,
@@ -2333,7 +2350,9 @@ async def _get_dataset_field_stats_impl(
 
     # Dataset total (global; indexed count) → per-field null_count, so the sidebar only
     # offers a "(no value)" filter for fields that actually have missing samples.
-    total_count = await db.fetchval("SELECT count(*) FROM samples WHERE dataset_id = $1", id) or 0
+    total_count = 0
+    if not brief:
+        total_count = await db.fetchval("SELECT count(*) FROM samples WHERE dataset_id = $1", id) or 0
 
     async def fill_cached(field_schema: Dict[str, Any], stat, kind: str) -> None:
         """A field's facet the gate does not recompute: the dataset's values."""
@@ -2344,7 +2363,7 @@ async def _get_dataset_field_stats_impl(
             if stat['unique_values'] and len(stat['unique_values']) >= 2:
                 field_schema['min'] = stat['unique_values'][0]
                 field_schema['max'] = stat['unique_values'][1]
-        elif stat['is_promoted'] and _is_safe_field_name(stat['field_name']):
+        elif stat['is_promoted'] and _is_safe_field_name(stat['field_name']) and not brief:
             # Indexed field → serve the COMPLETE distinct set from the index, not the
             # stale bounded cache. Falls back to the cache only if the skip-scan errors.
             _is_num = stat['field_type'] in ('number', 'float', 'int', 'integer')
@@ -2358,7 +2377,7 @@ async def _get_dataset_field_stats_impl(
                 field_schema['values'] = stat['unique_values']
         elif stat['unique_values']:
             field_schema['values'] = stat['unique_values']
-        elif stat['display_type'] == 'enum' and _is_safe_field_name(stat['field_name']):
+        elif stat['display_type'] == 'enum' and _is_safe_field_name(stat['field_name']) and not brief:
             # Number field overridden to enum but unique_values not cached — compute inline
             vals = await db.fetch(
                 f"""
@@ -3499,6 +3518,31 @@ def _remove_field_from_filter(filter_obj: dict, field_name: str) -> Optional[dic
     return filter_obj
 
 
+async def _kept_value_lists(id: int, is_stale: Optional[Callable[[str], bool]]) -> Dict[str, Dict[str, Any]]:
+    """The lists of values the statistics keep (dataset_field_stats) for media_type, tags and the indexed fields that
+    aren't numbers, each in the order the schema's read of the samples or of the index gives it (by value; tags by
+    lower case), with whether the list is whole and, given `is_stale`, whether changes wait to be counted. media_type
+    or tags without a kept list is `stats_pending`: nothing counted yet."""
+    rows = await db.fetch(
+        """SELECT s.field_name, s.values_complete,
+                  ARRAY(SELECT v FROM unnest(s.unique_values) v
+                        ORDER BY CASE WHEN s.field_name = 'tags' THEN lower(v) END, v) AS kept
+           FROM dataset_field_stats s
+           WHERE s.dataset_id = $1 AND s.unique_values IS NOT NULL
+             AND (s.field_name IN ('media_type', 'tags') OR EXISTS (
+                 SELECT 1 FROM dataset_fields f WHERE f.dataset_id = $1 AND f.field_name = s.field_name
+                   AND f.is_promoted AND f.field_type <> 'number'))""",
+        id,
+    )
+    lists: Dict[str, Dict[str, Any]] = {name: {'stats_pending': True} for name in ('media_type', 'tags')}
+    for row in rows:
+        entry: Dict[str, Any] = {'values': list(row['kept']), 'values_complete': bool(row['values_complete'])}
+        if is_stale is not None:
+            entry['stats_stale'] = is_stale(row['field_name'])
+        lists[row['field_name']] = entry
+    return lists
+
+
 @router.get("/datasets/{id}/schema", dependencies=[Depends(require_dataset_access)])
 @guest_heavy
 async def get_dataset_schema(
@@ -3507,6 +3551,7 @@ async def get_dataset_schema(
     lightning_mode: bool = True,
     stale: bool = False,
     values: bool = True,
+    kept_values: bool = False,
 ):
     """
     Get schema with stats.
@@ -3517,6 +3562,11 @@ async def get_dataset_schema(
     With `values=false`, the fields come without the lists of values read from the samples (media_type's, tags', an
     indexed field's: each reads every sample or its index): for a caller that needs the fields only, as the
     assistant's field tools do.
+    With `kept_values`, every list of values is the one the statistics keep, media_type's and tags' too, with its
+    `values_complete` (and `stats_stale`, with `stale`), and nothing is read from the samples or an index for them:
+    media_type and tags are `stats_pending` while the statistics keep no list of them, and an indexed field's list is
+    the kept one in the index's order. For a caller that reads only what the server keeps and passes no filter, as the
+    assistant's describe_dataset.
     """
     schema: List[Dict[str, Any]] = []
 
@@ -3529,8 +3579,12 @@ async def get_dataset_schema(
         except (json.JSONDecodeError, TypeError) as e:
             raise HTTPException(status_code=400, detail=f"Invalid filter JSON: {e}")
 
+    is_stale = await statistics.stale_fields(db, id) if stale else None
+    kept = await _kept_value_lists(id, is_stale) if kept_values else {}
+    read_values = values and not kept_values  # the lists read from the samples or an index
+
     # 1. media_type (enum)
-    if not values:
+    if not read_values:
         media_types = None
     elif filter_obj and has_active_filters(filter_obj):
         f_args = [id]
@@ -3551,13 +3605,15 @@ async def get_dataset_schema(
     else:
         media_types = await db.fetch("SELECT DISTINCT media_type FROM samples WHERE dataset_id = $1", *args)
 
-    if media_types is None:
+    if kept_values:
+        schema.append({"name": "media_type", "type": "enum", **kept['media_type']})
+    elif media_types is None:
         schema.append({"name": "media_type", "type": "enum"})
     else:
         schema.append({"name": "media_type", "type": "enum", "values": [r['media_type'] for r in media_types]})
 
     # 2. Tags
-    if not values:
+    if not read_values:
         tags_rows = None
     elif filter_obj and has_active_filters(filter_obj):
         # Tags are an array, so unnest them under the same filter SQL compute_filtered_values builds.
@@ -3595,7 +3651,9 @@ async def get_dataset_schema(
             *args,
         )
 
-    if tags_rows is None:
+    if kept_values:
+        schema.append({"name": "tags", "type": "array", **kept['tags']})
+    elif tags_rows is None:
         schema.append({"name": "tags", "type": "array"})
     else:
         schema.append({"name": "tags", "type": "array", "values": [r['tag'] for r in tags_rows]})
@@ -3669,7 +3727,6 @@ async def get_dataset_schema(
 
     # --- Metadata Fields ---
     cached_stats = await field_stats(db, id)
-    is_stale = await statistics.stale_fields(db, id) if stale else None
     vector_types = {}
     for cache in ('__polyline_fields__', '__keypoint_fields__', '__detection_fields__', '__cuboid_fields__'):
         for stat in cached_stats:
@@ -3730,7 +3787,7 @@ async def get_dataset_schema(
 
         elif field_info['type'] == 'enum':
             field_info['values'] = stat['unique_values']
-            if values and stat['field_type'] == 'number' and not stat['unique_values']:
+            if read_values and stat['field_type'] == 'number' and not stat['unique_values']:
                 _validate_field_name(stat['field_name'])
                 rows = await db.fetch(
                     f"SELECT DISTINCT metadata->>'{stat['field_name']}' AS val FROM samples "
@@ -3754,7 +3811,9 @@ async def get_dataset_schema(
                 except Exception as e:
                     print(f"Error computing filtered values for {stat['field_name']}: {e}")
                     pass
-            elif values and stat['is_promoted']:
+            elif kept_values and stat['is_promoted'] and field_info['values'] and stat['field_name'] in kept:
+                field_info['values'] = kept[stat['field_name']]['values']  # the same list, in the index's order
+            elif read_values and stat['is_promoted']:
                 # Unfiltered indexed field → complete distinct set from the index, not the
                 # stale bounded cache (same fix as the field-stats sidebar path).
                 _is_num = stat['field_type'] in ('number', 'float', 'int', 'integer')
@@ -3824,35 +3883,48 @@ async def _embedding_coverage(dataset_id: int) -> list[tuple[str, int]]:
 
 @router.get("/datasets/{id}/coverage", dependencies=[Depends(require_dataset_access)])
 @guest_heavy
-async def dataset_coverage(id: int):
+async def dataset_coverage(id: int, brief: bool = False):
     """Derived-artifact coverage: how many samples have each embedding field, each hash
     field, and a location, vs the dataset total. Powers the "N of M embedded/hashed/
     located" signal and tells an uploader what still needs filling. Occasional/dashboard
     call (counts scan the artifact tables) — not a hot path.
+    With `brief`, for a caller that wants the counts and the embedding fields only (the assistant's describe_dataset):
+    the samples are counted in one statement (its two index scans one after the other, where the app's request runs
+    them side by side), and `hashes` is an empty list: the hash table, joined to every hash's sample, isn't read.
     """
-    # Each count is a full scan of its artifact table on large datasets; run them
-    # concurrently so wall-clock ≈ the slowest, not the sum. Still an occasional/
-    # dashboard call (seconds on multi-million-row datasets) — not for hot polling.
-    counts, emb, hsh, loc_present = await asyncio.gather(
-        # Object rows counted in the same scan: the map's empty state quotes the image grain the
-        # header shows (not "0 of 12,000 samples" next to "2,000 images").
-        db.fetchrow(
-            "SELECT count(*) AS total, count(*) FILTER (WHERE media_type = 'object') AS objects "
-            "FROM samples WHERE dataset_id = $1",
-            id,
-        ),
-        _embedding_coverage(id),
-        db.fetch(
-            """
+    # Object rows counted in the same scan: the map's empty state quotes the image grain the
+    # header shows (not "0 of 12,000 samples" next to "2,000 images").
+    totals = (
+        "count(*) AS total, count(*) FILTER (WHERE media_type = 'object') AS objects FROM samples WHERE dataset_id = $1"
+    )
+    located = "SELECT count(*) FROM samples WHERE dataset_id = $1 AND location IS NOT NULL"
+    if brief:
+        # The located count stays its own index-only scan, of the located samples' index: one count of all three reads
+        # every row (1.1M samples: 54 ms, against 34 and 25 ms for the two scans).
+        counts, emb = await asyncio.gather(
+            db.fetchrow(f"SELECT ({located}) AS located, {totals}", id),
+            _embedding_coverage(id),
+        )
+        hsh: list = []
+        loc_present = counts['located']
+    else:
+        # Each count is a full scan of its artifact table on large datasets; run them
+        # concurrently so wall-clock ≈ the slowest, not the sum. Still an occasional/
+        # dashboard call (seconds on multi-million-row datasets) — not for hot polling.
+        counts, emb, hsh, loc_present = await asyncio.gather(
+            db.fetchrow(f"SELECT {totals}", id),
+            _embedding_coverage(id),
+            db.fetch(
+                """
             SELECT h.field_name, count(*) AS present
             FROM sample_hashes h JOIN samples s ON h.sample_id = s.id
             WHERE s.dataset_id = $1
             GROUP BY h.field_name ORDER BY h.field_name
         """,
-            id,
-        ),
-        db.fetchval("SELECT count(*) FROM samples WHERE dataset_id = $1 AND location IS NOT NULL", id),
-    )
+                id,
+            ),
+            db.fetchval(located, id),
+        )
     total = counts['total'] or 0
     objects = counts['objects'] or 0
     loc_present = loc_present or 0
@@ -4596,6 +4668,20 @@ def _collect_top_meta_fields(node: Dict[str, Any], array_columns: Optional[set] 
     return fields
 
 
+def _id_text_test(node: Any) -> bool:
+    """`id contains ...`, or an AND / OR of such tests only (the sidebar's several typed terms)."""
+    if not isinstance(node, dict):
+        return False
+    if 'filters' in node or 'logic' in node:
+        children = node.get('filters') or []
+        return (
+            str(node.get('logic', 'AND')).upper() in ('AND', 'OR')
+            and bool(children)
+            and all(map(_id_text_test, children))
+        )
+    return node.get('field') == 'id' and str(node.get('operator', '=')).lower() == 'contains'
+
+
 def _strictify_negations(node: Any, partner: bool = False, array_columns: Optional[set] = None) -> Any:
     """Transform `node` for use inside the cross-grain link so a NULL-tolerant negation can't
     vacuously match a row that lacks the field. PER-LEAF (correct even inside an OR — unlike a
@@ -4622,6 +4708,9 @@ def _strictify_negations(node: Any, partner: bool = False, array_columns: Option
             # too; if it concerns exactly one metadata field, require that field present.
             real = [k for k in kids if not isinstance(k, bool)]
             if not real:
+                return None
+            if partner and all(_id_text_test(k) for k in real):
+                # "id does not contain": a row-identity exclusion like `id != 5`, dropped for the partner (above).
                 return None
             rebuilt = {'logic': 'NOT', 'filters': real}
             fields = _collect_top_meta_fields(node, array_columns)
@@ -5507,6 +5596,11 @@ def _compile_filter_node(
             if is_array:
                 args.append(val)
                 return f"${arg_idx} = ANY({arr})", arg_idx + 1
+            elif field == 'id':
+                # The id written in decimal contains the text. An integer has no ILIKE (a 500), so its text is
+                # compared; text that isn't digits matches nothing.
+                args.append(f"%{_escape_like(val)}%")
+                return f"{col}::text LIKE ${arg_idx} ESCAPE '\\'", arg_idx + 1
             else:
                 args.append(f"%{_escape_like(val)}%")
                 return f"{col} ILIKE ${arg_idx} ESCAPE '\\'", arg_idx + 1

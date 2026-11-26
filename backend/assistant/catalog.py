@@ -192,13 +192,21 @@ async def describe_dataset(api: Api, arguments: dict[str, Any]) -> dict[str, Any
     """Reads only what the server keeps about the dataset: six requests, however many fields the page has."""
     dataset_id = arguments['dataset']
     search, limit, offset = arguments.get('search'), arguments.get('limit', 50), arguments.get('offset', 0)
-    dataset = await api.get(DATASET, id=dataset_id, missing=f'Dataset not found: id {dataset_id}')
+    # Each read asks only for what is used here (`brief`, `kept_values`), so one statement counts the dataset's samples
+    # (/coverage's), and the lists of values are the statistics' own: no sidebar count, no total for null counts, no
+    # list read from the samples or an index, no hashes.
+    dataset = await api.get(
+        DATASET,
+        id=dataset_id,
+        missing=f'Dataset not found: id {dataset_id}',
+        query={'brief': 'true'},
+    )
     if dataset.get('deleting'):
         raise ToolError('not_found', f"Dataset '{dataset['name']}' (id {dataset_id}) is being deleted")
     # The field statistics first: they find a drawing field's labels (`detections.label`), which the schema lists after.
-    stats = {field['name']: field for field in await api.get(FIELD_STATS, id=dataset_id)}
-    schema = await api.get(SCHEMA, id=dataset_id, query={'stale': 'true'})
-    coverage = await api.get(COVERAGE, id=dataset_id)
+    stats = {field['name']: field for field in await api.get(FIELD_STATS, id=dataset_id, query={'brief': 'true'})}
+    schema = await api.get(SCHEMA, id=dataset_id, query={'stale': 'true', 'kept_values': 'true'})
+    coverage = await api.get(COVERAGE, id=dataset_id, query={'brief': 'true'})
     concepts = await api.get(CONCEPTS, id=dataset_id)
     views = await api.get(VIEWS, id=dataset_id)
 

@@ -263,6 +263,41 @@ def run_tests():
 
     _()
 
+    def refused_with_the_servers_sentence(key, write, undo):
+        """`write` raises the server's refusal of a metadata key named like a sample's own column. A server that
+        takes it gets `undo` first, so the samples the later tests count stay as they were."""
+        sentence = f"metadata key(s) ['{key}'] name sample columns — set them on the sample itself"
+        try:
+            write()
+        except requests.HTTPError as error:
+            assert error.response is not None and error.response.status_code == 422, error
+            assert sentence in str(error), error
+        else:
+            undo()
+            raise AssertionError(f"a metadata key named {key!r} was accepted")
+
+    def delete_if_stored(fp):
+        try:
+            ds.delete_sample(ds[fp].id)
+        except KeyError:
+            pass
+
+    @test("add_samples refuses a metadata key named created_at with the server's sentence, storing nothing")
+    def _():
+        fp = 's3://test/reserved_created_at.jpg'
+        refused_with_the_servers_sentence(
+            'created_at',
+            lambda: ds.add_samples([Sample(filepath=fp, metadata={'created_at': 'x', 'kept': 1})]),
+            lambda: delete_if_stored(fp),
+        )
+        try:
+            ds[fp]
+            assert False, "the refused sample was stored"
+        except KeyError:
+            pass
+
+    _()
+
     # --- TAGS ---
     print("\n--- Health ---")
 

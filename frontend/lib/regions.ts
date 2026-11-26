@@ -6,13 +6,11 @@ import { type RegionTest, regionTestOf } from './filter-query';
 
 export { type RegionTest, regionTestOf };
 
-/** A region test's filter (regionTestOf) turned around: included becomes excluded, and back. */
+/** A region test's filter (regionTestOf) turned around, in the AND groups it is wrapped in: included becomes excluded,
+ * and back. */
 export function toggledRegionFilter(filter: ComplexFilter): ComplexFilter {
-    const flip = (node: ComplexFilter): ComplexFilter => ({
-        ...node,
-        operator: node.operator === 'geo_region_exclude' ? 'geo_region' : 'geo_region_exclude',
-    });
-    return filter.logic ? { ...filter, filters: (filter.filters ?? []).map(flip) } : flip(filter);
+    if (filter.logic) return { ...filter, filters: (filter.filters ?? []).map(toggledRegionFilter) };
+    return { ...filter, operator: filter.operator === 'geo_region_exclude' ? 'geo_region' : 'geo_region_exclude' };
 }
 
 /** The region tests among the stages' filters, in their order. */

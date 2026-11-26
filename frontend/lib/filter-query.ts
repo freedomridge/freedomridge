@@ -41,9 +41,19 @@ export interface RegionTest {
     exclude: boolean;
 }
 
-/** The region test a stage's filter is when it is one on its own, or the one rule of an AND group; else null. */
+/**
+ * The rule a filter comes down to: itself, or the one rule of an AND group around it, however deeply wrapped (a filter
+ * card saved from its Builder tab wraps a lone rule in an AND group). An OR or a NOT is never seen through.
+ */
+export function soleRule(filter: ComplexFilter | undefined): ComplexFilter | undefined {
+    let node = filter;
+    while (node?.logic === 'AND' && node.filters?.length === 1) node = node.filters[0];
+    return node;
+}
+
+/** The region test a stage's filter is when it is one on its own, or the one rule of AND groups around it; else null. */
 export function regionTestOf(filter: ComplexFilter | undefined): RegionTest | null {
-    const node = filter?.logic === 'AND' && filter.filters?.length === 1 ? filter.filters[0] : filter;
+    const node = soleRule(filter);
     if (!node || node.logic || node.field !== 'location' || typeof node.value !== 'string') return null;
     if (node.operator !== 'geo_region' && node.operator !== 'geo_region_exclude') return null;
     return { key: node.value, exclude: node.operator === 'geo_region_exclude' };

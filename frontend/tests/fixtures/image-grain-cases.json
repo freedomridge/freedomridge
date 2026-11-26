@@ -342,6 +342,496 @@
     }
   },
   {
+    "name": "a region exclude alone, as a filter card's Builder tab saves it: the one rule of an AND group",
+    "has_objects": true,
+    "stages": [
+      {
+        "logic": "AND",
+        "filters": [
+          {
+            "field": "location",
+            "operator": "geo_region_exclude",
+            "value": "US-KS"
+          }
+        ]
+      }
+    ],
+    "filter": {
+      "logic": "AND",
+      "filters": [
+        {
+          "field": "media_type",
+          "operator": "!=",
+          "value": "object"
+        },
+        {
+          "logic": "NOT",
+          "filters": [
+            {
+              "logic": "OR",
+              "filters": [
+                {
+                  "field": "_cgself",
+                  "operator": "cg_self",
+                  "value": {
+                    "logic": "AND",
+                    "filters": [
+                      {
+                        "field": "location",
+                        "operator": "geo_region",
+                        "value": "US-KS"
+                      }
+                    ]
+                  }
+                },
+                {
+                  "field": "_crossgrain",
+                  "operator": "has_matching_object",
+                  "value": {
+                    "logic": "AND",
+                    "filters": [
+                      {
+                        "field": "location",
+                        "operator": "geo_region",
+                        "value": "US-KS"
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "name": "a region exclude in two AND groups of one rule",
+    "has_objects": true,
+    "stages": [
+      {
+        "logic": "AND",
+        "filters": [
+          {
+            "logic": "AND",
+            "filters": [
+              {
+                "field": "location",
+                "operator": "geo_region_exclude",
+                "value": "US-KS"
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "filter": {
+      "logic": "AND",
+      "filters": [
+        {
+          "field": "media_type",
+          "operator": "!=",
+          "value": "object"
+        },
+        {
+          "logic": "NOT",
+          "filters": [
+            {
+              "logic": "OR",
+              "filters": [
+                {
+                  "field": "_cgself",
+                  "operator": "cg_self",
+                  "value": {
+                    "logic": "AND",
+                    "filters": [
+                      {
+                        "field": "location",
+                        "operator": "geo_region",
+                        "value": "US-KS"
+                      }
+                    ]
+                  }
+                },
+                {
+                  "field": "_crossgrain",
+                  "operator": "has_matching_object",
+                  "value": {
+                    "logic": "AND",
+                    "filters": [
+                      {
+                        "field": "location",
+                        "operator": "geo_region",
+                        "value": "US-KS"
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "name": "a map polygon exclude as the one rule of an AND group, beside a plain filter",
+    "has_objects": true,
+    "stages": [
+      {
+        "field": "crop",
+        "operator": "exists"
+      },
+      {
+        "logic": "AND",
+        "filters": [
+          {
+            "field": "location",
+            "operator": "geo_polygon_exclude",
+            "value": [
+              [
+                0,
+                0
+              ],
+              [
+                1,
+                0
+              ],
+              [
+                1,
+                1
+              ]
+            ]
+          }
+        ]
+      }
+    ],
+    "filter": {
+      "logic": "AND",
+      "filters": [
+        {
+          "field": "media_type",
+          "operator": "!=",
+          "value": "object"
+        },
+        {
+          "logic": "OR",
+          "filters": [
+            {
+              "field": "_cgself",
+              "operator": "cg_self",
+              "value": {
+                "logic": "AND",
+                "filters": [
+                  {
+                    "field": "crop",
+                    "operator": "exists"
+                  }
+                ]
+              }
+            },
+            {
+              "field": "_crossgrain",
+              "operator": "has_matching_object",
+              "value": {
+                "logic": "AND",
+                "filters": [
+                  {
+                    "field": "crop",
+                    "operator": "exists"
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "logic": "NOT",
+          "filters": [
+            {
+              "logic": "OR",
+              "filters": [
+                {
+                  "field": "_cgself",
+                  "operator": "cg_self",
+                  "value": {
+                    "logic": "AND",
+                    "filters": [
+                      {
+                        "field": "location",
+                        "operator": "geo_polygon",
+                        "value": [
+                          [
+                            0,
+                            0
+                          ],
+                          [
+                            1,
+                            0
+                          ],
+                          [
+                            1,
+                            1
+                          ]
+                        ]
+                      }
+                    ]
+                  }
+                },
+                {
+                  "field": "_crossgrain",
+                  "operator": "has_matching_object",
+                  "value": {
+                    "logic": "AND",
+                    "filters": [
+                      {
+                        "field": "location",
+                        "operator": "geo_polygon",
+                        "value": [
+                          [
+                            0,
+                            0
+                          ],
+                          [
+                            1,
+                            0
+                          ],
+                          [
+                            1,
+                            1
+                          ]
+                        ]
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "name": "a region exclude sharing an AND group with another rule is a filter like the others",
+    "has_objects": true,
+    "stages": [
+      {
+        "logic": "AND",
+        "filters": [
+          {
+            "field": "location",
+            "operator": "geo_region_exclude",
+            "value": "US-KS"
+          },
+          {
+            "field": "crop",
+            "operator": "exists"
+          }
+        ]
+      }
+    ],
+    "filter": {
+      "logic": "AND",
+      "filters": [
+        {
+          "field": "media_type",
+          "operator": "!=",
+          "value": "object"
+        },
+        {
+          "logic": "OR",
+          "filters": [
+            {
+              "field": "_cgself",
+              "operator": "cg_self",
+              "value": {
+                "logic": "AND",
+                "filters": [
+                  {
+                    "logic": "AND",
+                    "filters": [
+                      {
+                        "field": "location",
+                        "operator": "geo_region_exclude",
+                        "value": "US-KS"
+                      },
+                      {
+                        "field": "crop",
+                        "operator": "exists"
+                      }
+                    ]
+                  }
+                ]
+              }
+            },
+            {
+              "field": "_crossgrain",
+              "operator": "has_matching_object",
+              "value": {
+                "logic": "AND",
+                "filters": [
+                  {
+                    "logic": "AND",
+                    "filters": [
+                      {
+                        "field": "location",
+                        "operator": "geo_region_exclude",
+                        "value": "US-KS"
+                      },
+                      {
+                        "field": "crop",
+                        "operator": "exists"
+                      }
+                    ]
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "name": "a region exclude as the one rule of an OR group is a filter like the others",
+    "has_objects": true,
+    "stages": [
+      {
+        "logic": "OR",
+        "filters": [
+          {
+            "field": "location",
+            "operator": "geo_region_exclude",
+            "value": "US-KS"
+          }
+        ]
+      }
+    ],
+    "filter": {
+      "logic": "AND",
+      "filters": [
+        {
+          "field": "media_type",
+          "operator": "!=",
+          "value": "object"
+        },
+        {
+          "logic": "OR",
+          "filters": [
+            {
+              "field": "_cgself",
+              "operator": "cg_self",
+              "value": {
+                "logic": "AND",
+                "filters": [
+                  {
+                    "logic": "OR",
+                    "filters": [
+                      {
+                        "field": "location",
+                        "operator": "geo_region_exclude",
+                        "value": "US-KS"
+                      }
+                    ]
+                  }
+                ]
+              }
+            },
+            {
+              "field": "_crossgrain",
+              "operator": "has_matching_object",
+              "value": {
+                "logic": "AND",
+                "filters": [
+                  {
+                    "logic": "OR",
+                    "filters": [
+                      {
+                        "field": "location",
+                        "operator": "geo_region_exclude",
+                        "value": "US-KS"
+                      }
+                    ]
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "name": "a NOT around a region include is a filter like the others",
+    "has_objects": true,
+    "stages": [
+      {
+        "logic": "NOT",
+        "filters": [
+          {
+            "field": "location",
+            "operator": "geo_region",
+            "value": "US-KS"
+          }
+        ]
+      }
+    ],
+    "filter": {
+      "logic": "AND",
+      "filters": [
+        {
+          "field": "media_type",
+          "operator": "!=",
+          "value": "object"
+        },
+        {
+          "logic": "OR",
+          "filters": [
+            {
+              "field": "_cgself",
+              "operator": "cg_self",
+              "value": {
+                "logic": "AND",
+                "filters": [
+                  {
+                    "logic": "NOT",
+                    "filters": [
+                      {
+                        "field": "location",
+                        "operator": "geo_region",
+                        "value": "US-KS"
+                      }
+                    ]
+                  }
+                ]
+              }
+            },
+            {
+              "field": "_crossgrain",
+              "operator": "has_matching_object",
+              "value": {
+                "logic": "AND",
+                "filters": [
+                  {
+                    "logic": "NOT",
+                    "filters": [
+                      {
+                        "field": "location",
+                        "operator": "geo_region",
+                        "value": "US-KS"
+                      }
+                    ]
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
     "name": "a region exclude, no objects",
     "has_objects": false,
     "stages": [
@@ -957,6 +1447,323 @@
                     "value": [
                       4410,
                       9213
+                    ]
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "name": "a region exclude alone, as the only rule of an AND group (the Builder tab's shape): as the bare exclude",
+    "has_objects": true,
+    "stages": [
+      {
+        "logic": "AND",
+        "filters": [
+          {
+            "field": "location",
+            "operator": "geo_region_exclude",
+            "value": "US-KS"
+          }
+        ]
+      }
+    ],
+    "filter": {
+      "logic": "AND",
+      "filters": [
+        {
+          "field": "media_type",
+          "operator": "!=",
+          "value": "object"
+        },
+        {
+          "logic": "NOT",
+          "filters": [
+            {
+              "logic": "OR",
+              "filters": [
+                {
+                  "field": "_cgself",
+                  "operator": "cg_self",
+                  "value": {
+                    "logic": "AND",
+                    "filters": [
+                      {
+                        "field": "location",
+                        "operator": "geo_region",
+                        "value": "US-KS"
+                      }
+                    ]
+                  }
+                },
+                {
+                  "field": "_crossgrain",
+                  "operator": "has_matching_object",
+                  "value": {
+                    "logic": "AND",
+                    "filters": [
+                      {
+                        "field": "location",
+                        "operator": "geo_region",
+                        "value": "US-KS"
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "name": "a region exclude in a one-rule group in a one-rule group: as the bare exclude",
+    "has_objects": true,
+    "stages": [
+      {
+        "logic": "AND",
+        "filters": [
+          {
+            "logic": "AND",
+            "filters": [
+              {
+                "field": "location",
+                "operator": "geo_region_exclude",
+                "value": "US-KS"
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "filter": {
+      "logic": "AND",
+      "filters": [
+        {
+          "field": "media_type",
+          "operator": "!=",
+          "value": "object"
+        },
+        {
+          "logic": "NOT",
+          "filters": [
+            {
+              "logic": "OR",
+              "filters": [
+                {
+                  "field": "_cgself",
+                  "operator": "cg_self",
+                  "value": {
+                    "logic": "AND",
+                    "filters": [
+                      {
+                        "field": "location",
+                        "operator": "geo_region",
+                        "value": "US-KS"
+                      }
+                    ]
+                  }
+                },
+                {
+                  "field": "_crossgrain",
+                  "operator": "has_matching_object",
+                  "value": {
+                    "logic": "AND",
+                    "filters": [
+                      {
+                        "field": "location",
+                        "operator": "geo_region",
+                        "value": "US-KS"
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "name": "a map polygon exclude as the only rule of an AND group: as the bare exclude",
+    "has_objects": true,
+    "stages": [
+      {
+        "logic": "AND",
+        "filters": [
+          {
+            "field": "location",
+            "operator": "geo_polygon_exclude",
+            "value": [
+              [
+                0,
+                0
+              ],
+              [
+                1,
+                0
+              ],
+              [
+                1,
+                1
+              ]
+            ]
+          }
+        ]
+      }
+    ],
+    "filter": {
+      "logic": "AND",
+      "filters": [
+        {
+          "field": "media_type",
+          "operator": "!=",
+          "value": "object"
+        },
+        {
+          "logic": "NOT",
+          "filters": [
+            {
+              "logic": "OR",
+              "filters": [
+                {
+                  "field": "_cgself",
+                  "operator": "cg_self",
+                  "value": {
+                    "logic": "AND",
+                    "filters": [
+                      {
+                        "field": "location",
+                        "operator": "geo_polygon",
+                        "value": [
+                          [
+                            0,
+                            0
+                          ],
+                          [
+                            1,
+                            0
+                          ],
+                          [
+                            1,
+                            1
+                          ]
+                        ]
+                      }
+                    ]
+                  }
+                },
+                {
+                  "field": "_crossgrain",
+                  "operator": "has_matching_object",
+                  "value": {
+                    "logic": "AND",
+                    "filters": [
+                      {
+                        "field": "location",
+                        "operator": "geo_polygon",
+                        "value": [
+                          [
+                            0,
+                            0
+                          ],
+                          [
+                            1,
+                            0
+                          ],
+                          [
+                            1,
+                            1
+                          ]
+                        ]
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "name": "a region exclude and another rule in one group: coupled as the group (not lifted)",
+    "has_objects": true,
+    "stages": [
+      {
+        "logic": "AND",
+        "filters": [
+          {
+            "field": "crop",
+            "operator": "exists"
+          },
+          {
+            "field": "location",
+            "operator": "geo_region_exclude",
+            "value": "US-KS"
+          }
+        ]
+      }
+    ],
+    "filter": {
+      "logic": "AND",
+      "filters": [
+        {
+          "field": "media_type",
+          "operator": "!=",
+          "value": "object"
+        },
+        {
+          "logic": "OR",
+          "filters": [
+            {
+              "field": "_cgself",
+              "operator": "cg_self",
+              "value": {
+                "logic": "AND",
+                "filters": [
+                  {
+                    "logic": "AND",
+                    "filters": [
+                      {
+                        "field": "crop",
+                        "operator": "exists"
+                      },
+                      {
+                        "field": "location",
+                        "operator": "geo_region_exclude",
+                        "value": "US-KS"
+                      }
+                    ]
+                  }
+                ]
+              }
+            },
+            {
+              "field": "_crossgrain",
+              "operator": "has_matching_object",
+              "value": {
+                "logic": "AND",
+                "filters": [
+                  {
+                    "logic": "AND",
+                    "filters": [
+                      {
+                        "field": "crop",
+                        "operator": "exists"
+                      },
+                      {
+                        "field": "location",
+                        "operator": "geo_region_exclude",
+                        "value": "US-KS"
+                      }
                     ]
                   }
                 ]

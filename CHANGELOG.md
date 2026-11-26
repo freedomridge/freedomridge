@@ -175,6 +175,10 @@ each field. Six migrations, none of which touches a sample.
   now in double quotes, and a number is written bare: a spreadsheet that reads the file with `;` takes a line with no
   `;` for one cell, with the comma as its decimal mark, so a number followed by an unquoted text could read as one
   formula ([DATASET_MANAGEMENT.md](docs/DATASET_MANAGEMENT.md#export-samples-as-csv)).
+- **A place excluded from a filter card's Builder tab is kept out on a dataset with objects**, as one excluded from
+  the Query tab is. The Builder tab saves `location not within "US-KS"` as the one rule of a group: the same filter
+  and the same "Not in Kansas" chip, which the page and the assistant now link to the objects as they link the bare
+  one, so the images inside the place no longer come back through objects that have no location.
 - **Text that reads as a number but is too large for one is text.** A value such as the hex id `0347677e05719710`
   matched the aggregate route's number pattern and overflowed when cast, so `count_values` (which orders ties by
   number) and every number operation failed with a 500 on a field holding one. It is now counted and listed as the
@@ -228,6 +232,19 @@ each field. Six migrations, none of which touches a sample.
   holding such a stage opens without it and says so (the default view once in each browser, until its filters
   change), and a saved view that lost one offers **Update this view**. Filters the browser kept from an earlier visit
   still hold such a stage, and the grid then shows the server's message until its chip is removed.
+- **`id contains` is a filter, not a server error.** `{"field": "id", "operator": "contains", "value": "12"}` failed
+  with a 500 wherever a filter is read (samples, counts, the map, selections), a bulk edit using it was accepted and
+  failed later as a job, and the filter text refused the `id contains "12"` its own formatter writes. It now keeps
+  the samples whose id, written in decimal, contains the text; text that isn't digits matches nothing.
+- **The assistant's `describe_dataset` reads the samples once.** One call counted or scanned the dataset's samples
+  seven times; it now sends one statement that counts, and takes the values of `tags` and `media_type` from the kept
+  field statistics. Its answer is the same; while changes wait to be counted those two lists are the kept ones,
+  marked `complete: false`.
+- **The filter docs say what `not` keeps on a dataset with objects.** [FILTER_QUERY.md](docs/FILTER_QUERY.md) said a
+  negated concept keeps the samples the concept has no score for. That holds on a dataset without objects; on one
+  with objects a negation of one field or score keeps only the rows that have it, and the docs now say so, with the
+  cases that aren't guarded (a `NOT` around several fields or around a place, a place exclusion inside an `OR` or
+  sharing a filter card with another test). The server is unchanged.
 - **A search by words that can't load the text model says so (501), not 500.** On a server with no internet for
   the model's first download, the app's search by words, a text concept, and the assistant's `search_similar` answer
   that the text model could not be loaded and that a search by samples still works; the details go to the log. A
