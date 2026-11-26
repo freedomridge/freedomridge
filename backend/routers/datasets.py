@@ -1,6 +1,7 @@
 import asyncio
 import collections
 import datetime
+import functools
 import hashlib
 import json
 import logging
@@ -13,7 +14,7 @@ import uuid
 from contextlib import asynccontextmanager, suppress
 from fractions import Fraction
 from functools import partial
-from typing import Any, Callable, Collection, Deque, Dict, List, Literal, NamedTuple, Optional, cast
+from typing import Any, Awaitable, Callable, Collection, Deque, Dict, List, Literal, NamedTuple, Optional, cast
 
 import anyio
 import asyncpg
@@ -78,6 +79,7 @@ from backend.sample_ingest import insert_samples
 from .. import (
     class_rules,
     dataset_deletion,
+    field_kinds,
     field_usage,
     grain_reading,
     job_queue,
@@ -1054,6 +1056,12 @@ async def _cancel_on_disconnect(request: Request, coro) -> Any:
         await asyncio.gather(listener, task, return_exceptions=True)
 
 
+# Errors a filtered read never falls back from (to cached values, an empty list): a refusal, 409 for a concept being
+# rescored and 400 for one that isn't the dataset's, and a statement refused by require_field_kinds (40001), which the
+# reading around it reads again (field_kinds.reading).
+_REFUSED = (asyncpg.ObjectNotInPrerequisiteStateError, asyncpg.InvalidParameterValueError, asyncpg.SerializationError)
+
+
 # Best-effort budget for a single filtered field-stats sub-query when
 # lightning_mode is on. The filter sidebar is interactive — under that
 # budget, falling back to cached unfiltered values is a better answer
@@ -1497,7 +1505,7 @@ async def _facet_query(coro, budget_s: Optional[float]) -> tuple[str, Any]:
         return 'exact', await (coro if budget_s is None else asyncio.wait_for(coro, timeout=budget_s))
     except asyncio.TimeoutError:
         return 'out_of_budget', None
-    except (asyncpg.ObjectNotInPrerequisiteStateError, asyncpg.InvalidParameterValueError):
+    except _REFUSED:
         raise  # a refusal (a concept being rescored: 409; one that isn't the dataset's: 400)
     except asyncpg.PostgresError:
         return 'cached', None
@@ -1521,7 +1529,7 @@ async def _safe_filter_query(coro, *, budget_s: Optional[float] = None):
         if budget_s is None:
             return await coro
         return await asyncio.wait_for(coro, timeout=budget_s)
-    except (asyncpg.ObjectNotInPrerequisiteStateError, asyncpg.InvalidParameterValueError):
+    except _REFUSED:
         raise  # a refusal (a concept being rescored, or not the dataset's), not a slow query to fall back from
     except (asyncpg.PostgresError, asyncio.TimeoutError):
         return None
@@ -1548,6 +1556,21 @@ _AUTOCOMPLETE_BUDGET_S = 2.0
 
 
 async def _filtered_set_is_broad(
+    dataset_id: int,
+    filter_obj: Dict[str, Any],
+    threshold: int,
+    budget_s: Optional[float] = None,
+) -> Optional[bool]:
+    """_filtered_set_is_broad_now, with the record of which kind of row has which field (field_kinds.reading)."""
+    return await field_kinds.reading(
+        db,
+        dataset_id,
+        filter_obj,
+        lambda: _filtered_set_is_broad_now(dataset_id, filter_obj, threshold, budget_s),
+    )
+
+
+async def _filtered_set_is_broad_now(
     dataset_id: int,
     filter_obj: Dict[str, Any],
     threshold: int,
@@ -1727,6 +1750,18 @@ async def _get_dataset_field_stats_impl(
     loop = asyncio.get_running_loop()
     wanted = None if fields is None else set(fields)
     filter_active = bool(filter_obj and has_active_filters(filter_obj))
+
+    def with_record(read: Callable[..., Awaitable[Any]]) -> Callable[..., Awaitable[Any]]:
+        """One of the units below that compiles the request's filter and reads with it, run with the record of which
+        kind of row has which field (field_kinds.reading): a refused statement is read again there, before the unit's
+        own fallback to cached values could see it. Its first attempt takes the record the request read below."""
+
+        @functools.wraps(read)
+        async def unit(*args: Any, **kwargs: Any) -> Any:
+            return await field_kinds.reading(db, id, filter_obj, lambda: read(*args, **kwargs), record=kinds_record)
+
+        return unit
+
     # The default view (the grain predicate alone) keeps computing its eligible facets in the sidebar
     # request: on a dataset with objects they are the image grain's, not the dataset's.
     default_view = filter_active and _grain_predicate_only(cast('Dict[str, Any]', filter_obj))
@@ -1757,6 +1792,8 @@ async def _get_dataset_field_stats_impl(
 
     stats = await field_stats(db, id)
     descriptions: Dict[str, Any] = {}  # what was written about each field, read with the overlay configs below
+    # Which kinds of sample (images, objects) each field has been seen on, beside its sample_count (field_kinds).
+    kinds_record, kinds_arrays = await field_kinds.load(db, id), await get_dataset_array_columns(id)
 
     # Selectivity gate (lightning_mode only). Decide ONCE whether the active filter is selective
     # enough that a per-field faceted recompute (one filtered scan PER field, fanned out across the
@@ -1913,6 +1950,7 @@ async def _get_dataset_field_stats_impl(
             print(f"[field-stats] Failed to fetch segmentation.labels for dataset {dataset_id}: {error}")
             return []
 
+    @with_record
     async def compute_filtered_annotation_labels(json_field: str) -> List[str]:
         """
         Compute unique annotation labels (detections/polygons) with filter constraints applied.
@@ -1949,7 +1987,7 @@ async def _get_dataset_field_stats_impl(
                 *args,
             )
             return [r['label'] for r in rows if r['label']]
-        except (asyncpg.ObjectNotInPrerequisiteStateError, asyncpg.InvalidParameterValueError):
+        except _REFUSED:
             raise  # a refusal (a concept being rescored, or not the dataset's) is a 409 or 400, not an empty label list
         except Exception as e:
             print(f"[field-stats] Error computing filtered {json_field} labels: {e}")
@@ -1958,6 +1996,7 @@ async def _get_dataset_field_stats_impl(
     async def get_or_cache_discovery(cache: str) -> List[str]:
         return await discover_fields(db.pool, id, cache, get_cached_stat(cache))
 
+    @with_record
     async def compute_filtered_segmentation_labels() -> List[str]:
         """
         Compute unique segmentation labels with filter constraints applied.
@@ -1990,7 +2029,7 @@ async def _get_dataset_field_stats_impl(
                 *args,
             )
             return [r['label'] for r in rows if r['label']]
-        except (asyncpg.ObjectNotInPrerequisiteStateError, asyncpg.InvalidParameterValueError):
+        except _REFUSED:
             raise  # a refusal (a concept being rescored, or not the dataset's) is a 409 or 400, not an empty label list
         except Exception as e:
             print(f"[field-stats] Error computing filtered segmentation labels: {e}")
@@ -2029,6 +2068,7 @@ async def _get_dataset_field_stats_impl(
 
     # Override the created_at slider bounds with the FILTERED range when the set is small enough, so
     # the slider reflects the active global filter (fall back to the global bounds on timeout/empty).
+    @with_record
     async def filter_created_at() -> None:
         ca_args: List[Any] = [id]
         ca_sql, _ = parse_filter_node(
@@ -2069,6 +2109,7 @@ async def _get_dataset_field_stats_impl(
     # into this dataset's schema.
     array_cols = await get_dataset_array_columns(id)
 
+    @with_record
     async def fill_array(col_name: str, array_entry: Dict[str, Any], recompute: bool) -> None:
         cached = get_cached_stat(col_name)
         values = (
@@ -2419,6 +2460,7 @@ async def _get_dataset_field_stats_impl(
             )
         return (field_name, 'enum', state, result, stat)
 
+    @with_record
     async def filter_datetime_field(field_name, stat):
         if not _queryable_field(field_name):
             return (field_name, 'datetime', 'cached', None, stat)
@@ -2571,6 +2613,7 @@ async def _get_dataset_field_stats_impl(
             "type": field_type,
             "original_type": original_type,
             "sample_count": stat["sample_count"],
+            **field_kinds.members(kinds_record, _record_name(stat['field_name'], kinds_arrays)),
             "is_promoted": stat['is_promoted'] or False,
             "display_type": display_type,
             "declared_type": original_type,
@@ -2735,6 +2778,20 @@ async def compute_filtered_minmax(
     field_name: str,
     filters: Dict[str, Any],
 ) -> Optional[Dict[str, float]]:
+    """compute_filtered_minmax_now, with the record of which kind of row has which field (field_kinds.reading)."""
+    return await field_kinds.reading(
+        db,
+        dataset_id,
+        filters,
+        lambda: compute_filtered_minmax_now(dataset_id, field_name, filters),
+    )
+
+
+async def compute_filtered_minmax_now(
+    dataset_id: int,
+    field_name: str,
+    filters: Dict[str, Any],
+) -> Optional[Dict[str, float]]:
     """
     Compute min/max for a specific field given filter constraints.
     Uses the B-Tree index on the promoted field for performance.
@@ -2781,6 +2838,16 @@ async def compute_filtered_minmax(
 
 
 async def compute_filtered_values(dataset_id: int, field_name: str, filters: Dict[str, Any]) -> List[str]:
+    """compute_filtered_values_now, with the record of which kind of row has which field (field_kinds.reading)."""
+    return await field_kinds.reading(
+        db,
+        dataset_id,
+        filters,
+        lambda: compute_filtered_values_now(dataset_id, field_name, filters),
+    )
+
+
+async def compute_filtered_values_now(dataset_id: int, field_name: str, filters: Dict[str, Any]) -> List[str]:
     """
     Compute unique values for a specific field given filter constraints.
     Uses the B-Tree index on the promoted field for performance.
@@ -3388,7 +3455,12 @@ async def autocomplete_field_post(id: int, field_name: str, request: Autocomplet
     the bounded scan timed out and ``values`` is only the cached preview.
     """
     with field_usage.measure(id, {'facet': [field_name]}):
-        return await _autocomplete_impl(id, field_name, request.q, request.limit, request.filters)
+        return await field_kinds.reading(
+            db,
+            id,
+            request.filters,
+            lambda: _autocomplete_impl(id, field_name, request.q, request.limit, request.filters),
+        )
 
 
 @router.get("/datasets/{id}/fields/{field_name}/autocomplete", dependencies=[Depends(require_dataset_access)])
@@ -3396,7 +3468,12 @@ async def autocomplete_field_post(id: int, field_name: str, request: Autocomplet
 async def autocomplete_field(id: int, field_name: str, q: str = "", limit: int = 100, filters: Optional[str] = None):
     filter_obj = json.loads(filters) if filters else None
     with field_usage.measure(id, {'facet': [field_name]}):
-        return await _autocomplete_impl(id, field_name, q, limit, filter_obj)
+        return await field_kinds.reading(
+            db,
+            id,
+            filter_obj,
+            lambda: _autocomplete_impl(id, field_name, q, limit, filter_obj),
+        )
 
 
 async def _autocomplete_impl(id: int, field_name: str, q: str, limit: int, filter_obj=None):
@@ -4809,14 +4886,74 @@ def _strictify_negations(node: Any, partner: bool = False, array_columns: Option
     return node
 
 
+def _record_name(field: Any, arrays: Any) -> Optional[str]:
+    """The name the record of which kind of row has which field (backend/field_kinds.py) gives a field: its metadata
+    key (a label path's is its list's key), a mirror's own field's `@local.` name, or `location` (the location, or a
+    metadata key of that name). None for a field the record doesn't cover: a column, a list (`arrays`: the dataset's
+    array columns, `@local.tags`), an embedding's or a hash's presence, a name no metadata key can have."""
+    if not isinstance(field, str):
+        return None
+    if field == 'location':
+        return field
+    if field.startswith(LOCAL_PREFIX):
+        try:
+            local = local_field(field)
+        except ValueError:
+            return None
+        return field if local is not None and not local.array else None
+    if (
+        not _is_safe_field_name(field)
+        or field in RESERVED_METADATA_KEYS
+        or field in _CROSSGRAIN_NATIVE_FIELDS
+        or field == LOCAL_TAGS
+        or field in arrays
+        or _derived_field(field) is not None
+    ):
+        return None
+    if field == 'segmentation.labels':
+        return 'segmentation'
+    path = label_path(field, arrays)
+    return path[0] if path is not None else field
+
+
 class _GrainRow(NamedTuple):
     """A row a filter on a dataset with objects is asked of (backend/grain_reading.py): the field mapping its tests
-    compile with, its id column, the name its table goes by, and the dataset id its tests compile with."""
+    compile with, its id column, the name its table goes by, the dataset id its tests compile with, and its kind
+    ('image' or 'object') when it is known: always for a partner, for the grid's own row when its filter says it."""
 
     mapping: Optional[Dict[str, str]]
     id_col: str
     table: str
     dataset_id: Optional[int]
+    kind: Optional[str] = None
+
+
+# The kind of row a filter's AND is about when it holds the page's kind predicate (withGrain's grainPredicate, the
+# assistant's image_grain): every row it keeps is of that kind.
+_GRID_KINDS = {('=', 'object'): 'object', ('!=', 'object'): 'image'}
+# Comparisons that hold only where the field has a value (a row without the key reads NULL or FALSE), except a range
+# whose value is missing or blank, which filters nothing (TRUE for every row).
+_HOLD_WITH_VALUE = {'=', 'in', 'contains', 'is_not_null', 'exists', 'match_elements', 'elem_match'}
+_RANGE_OPS = {'<', '<=', '>', '>='}
+
+
+def _grid_kind(filters: Any) -> Optional[str]:
+    """The kind an AND's parts restrict its rows to: 'object' for media_type = 'object', 'image' for != 'object'."""
+    if not isinstance(filters, list):
+        return None
+    kinds = set()
+    for node in filters:
+        if (
+            isinstance(node, dict)
+            and node.get('field') == 'media_type'
+            and 'logic' not in node
+            and 'filters' not in node
+        ):
+            value = node.get('value')
+            kind = _GRID_KINDS.get((str(node.get('operator', '=')).lower(), value)) if isinstance(value, str) else None
+            if kind is not None:
+                kinds.add(kind)
+    return kinds.pop() if len(kinds) == 1 else None
 
 
 class _GrainRows:
@@ -4833,25 +4970,82 @@ class _GrainRows:
         dataset_id: Optional[int],
         array_columns: Optional[set],
         concepts: set,
+        outer_kind: Optional[str] = None,
     ):
         self.args, self.arg_idx = args, arg_idx
         self.field_mapping, self.numeric_indexed_fields = field_mapping, numeric_indexed_fields
         self.dataset_id, self.array_columns, self.concepts = dataset_id, array_columns, concepts
         self.ds = dataset_id if dataset_id is not None else (args[0] if args and isinstance(args[0], int) else None)
         self.arrays = array_columns if array_columns is not None else _get_array_columns_sync()
+        self.outer_kind = outer_kind
+        # The record of which kind of row has which field (backend/field_kinds.py), when this compile reads with it.
+        self.kinds, self.skipped = field_kinds.compile_state()
+        if self.kinds is not None and self.kinds.dataset_id != dataset_id:
+            self.kinds = None
 
     def outer(self) -> _GrainRow:
         id_col = (self.field_mapping or {}).get('id', 'samples.id')
         table = id_col.rsplit('.', 1)[0] if '.' in id_col else 'samples'
-        return _GrainRow(self.field_mapping, id_col, table, self.dataset_id)
+        return _GrainRow(self.field_mapping, id_col, table, self.dataset_id, self.outer_kind)
 
     def _inner(self, alias: str) -> _GrainRow:
         """A partner row's subquery, named as the lone operators name theirs (`o` an image's object, `s2` an object's
         image), at any depth: a subquery refers only to the row it is nested in, the nearest of that name, and an
         unqualified column to its own row."""
-        return _GrainRow({**_realiased(self.field_mapping, alias), 'id': f'{alias}.id'}, f'{alias}.id', alias, self.ds)
+        mapping = {**_realiased(self.field_mapping, alias), 'id': f'{alias}.id'}
+        return _GrainRow(mapping, f'{alias}.id', alias, self.ds, 'object' if alias == 'o' else 'image')
 
-    def test(self, node: Any, row: _GrainRow) -> str:
+    def mark(self) -> tuple[int, int]:
+        return len(self.args), self.arg_idx
+
+    def rollback(self, mark: tuple[int, int]) -> None:
+        """Forgets the parameters added since `mark`: their SQL was left out (grain_reading folds a constant)."""
+        del self.args[mark[0] :]
+        self.arg_idx = mark[1]
+
+    def _skip(self, name: Optional[str], row: _GrainRow) -> bool:
+        """Whether the row's kind is skipped for the field the record calls `name`: the row's kind is known, the dataset
+        is examined and no row of that kind has been seen with the field. Each skip is noted for the statement's guard
+        (field_kinds.guarded), which refuses the statement if the field is seen on that kind in its snapshot."""
+        if self.kinds is None or self.skipped is None or name is None or row.kind is None:
+            return False
+        if self.kinds.seen(name, row.kind):
+            return False
+        self.skipped.add((name, row.kind))
+        return True
+
+    def record_name(self, field: Any) -> Optional[str]:
+        return _record_name(field, self.arrays)
+
+    def _held_name(self, node: Any) -> Optional[str]:
+        """The record's name for the field a test never holds without (a row with no such key or location reads NULL
+        or FALSE: a comparison, a presence test, a place), else None: a range with no value and a polygon that is
+        none filter nothing, and an exclusion keeps the rows without a location."""
+        if isinstance(node, dict) and 'field' not in node and str(node.get('logic', 'AND')).upper() == 'AND':
+            children = node.get('filters')
+            if not isinstance(children, list) or not children:
+                return None
+            names = {self._held_name(child) for child in children}
+            return names.pop() if len(names) == 1 else None
+        if not isinstance(node, dict) or 'logic' in node or 'filters' in node:
+            return None
+        field, operator, value = node.get('field'), str(node.get('operator', '=')).lower(), node.get('value')
+        name = self.record_name(field)
+        if name is None:
+            return None
+        if operator in _RANGE_OPS:
+            return name if value is not None and not (isinstance(value, str) and not value.strip()) else None
+        if field == 'location' and operator == 'geo_polygon':
+            return name if _polygon_points(operator, value) is not None else None
+        if field == 'location' and operator == 'geo_near':
+            point = value.get('point') if isinstance(value, dict) else None
+            return name if isinstance(point, (list, tuple)) and len(point) >= 2 else None
+        if field == 'location' and operator == 'geo_region':
+            return name
+        return name if operator in _HOLD_WITH_VALUE else None
+
+    def _compiled(self, node: Any, row: _GrainRow) -> str:
+        mark = self.mark()
         sql, self.arg_idx = _compile_filter_node(
             node,
             self.args,
@@ -4862,13 +5056,37 @@ class _GrainRows:
             array_columns=self.array_columns,
             concepts=self.concepts,
         )
+        if sql in ('TRUE', 'FALSE'):
+            self.rollback(mark)
         return sql
+
+    def _skipped(self, node: Any, row: _GrainRow) -> str:
+        """A test skipped for the row's kind: FALSE. It is compiled all the same, into nothing, so a malformed test is
+        refused as it is when read."""
+        _compile_filter_node(
+            node,
+            list(self.args),
+            self.arg_idx,
+            row.mapping,
+            self.numeric_indexed_fields,
+            row.dataset_id,
+            array_columns=self.array_columns,
+            concepts=set(),
+        )
+        return 'FALSE'
+
+    def test(self, node: Any, row: _GrainRow) -> str:
+        if self._skip(self._held_name(node), row):
+            return self._skipped(node, row)
+        return self._compiled(node, row)
 
     def has(self, field: str, row: _GrainRow, presence: bool = False) -> str:
         """The row has a value for the field: there, and not a JSON null. `presence`: for `is null`, where `location` is
         the sample's own location; otherwise it is a field compared with an operator other than a place's, the
         metadata field named location. A metadata key's test (`?`) goes first: the same rows, found through the
         metadata index where few rows have the key."""
+        if self._skip(self.record_name(field), row):
+            return 'FALSE'
         if field == 'location' and not presence:
             return f"({_metadata_source(field)}->>'location' IS NOT NULL)"
         if field == 'segmentation.labels':
@@ -4887,8 +5105,10 @@ class _GrainRows:
         """A test asked of a partner row (an image's object, an object's image), with its metadata key's test first: the
         same rows, as a comparison holds only where the key is, but found through the metadata index. A field one kind
         has is never a key of the other kind's rows, so the partners' subquery reads none of them."""
-        sql = self.test(node, row)
         key = self._compared_key(node)
+        if self._skip(key if key is not None else self._held_name(node), row):
+            return self._skipped(node, row)
+        sql = self.test(node, row)
         return f"({self.test({'field': key, 'operator': 'exists'}, row)} AND {sql})" if key else sql
 
     def _compared_key(self, node: Any) -> Optional[str]:
@@ -4911,17 +5131,19 @@ class _GrainRows:
         by a list of ids (has_matching_object's array, below)."""
         sub = self._inner('o')
         sub_sql = inner(sub)
+        if sub_sql == 'FALSE':  # no object can meet it (it holds no parameter: grain_reading)
+            return sub_sql
         alias, scope = sub.table, int(self.ds) if self.ds is not None else f"{row.table}.dataset_id"
         ids = _id_list_bound(plain) if plain is not None else None
         if self.ds is None or ids is None or len(ids) > _IMAGES_OF_LISTED_OBJECTS_MAX:
-            return (
+            return grain_reading.Lookup(
                 f"EXISTS (SELECT 1 FROM samples {alias} WHERE {alias}.dataset_id = {scope} "
-                f"AND {alias}.parent_id = {row.id_col} AND {alias}.media_type = 'object' AND ({sub_sql}))"
+                f"AND {alias}.parent_id = {row.id_col} AND {alias}.media_type = 'object' AND ({sub_sql}))",
             )
-        return (
+        return grain_reading.Lookup(
             f"{row.id_col} = ANY(ARRAY(SELECT {alias}.parent_id FROM samples {alias} "
             f"WHERE {alias}.dataset_id = {scope} AND {alias}.parent_id IS NOT NULL AND {alias}.media_type = 'object' "
-            f"AND ({sub_sql})))"
+            f"AND ({sub_sql})))",
         )
 
     def parent(self, row: _GrainRow, inner: Callable[[_GrainRow], str], plain: Any = None) -> str:
@@ -4929,6 +5151,8 @@ class _GrainRows:
         bound the object's parent_id by a list of ids (parent_matches', below)."""
         sub = self._inner('s2')
         sub_sql = inner(sub)
+        if sub_sql == 'FALSE':  # no image can meet it (it holds no parameter: grain_reading)
+            return sub_sql
         alias = sub.table
         scope = f"{alias}.dataset_id = {int(self.ds)} AND " if self.ds is not None else ""
         link = (
@@ -4937,10 +5161,11 @@ class _GrainRows:
         )
         ids = _id_list_bound(plain) if plain is not None else None
         if ids is None:
-            return link
+            return grain_reading.Lookup(link)
         self.args.append(ids)
         self.arg_idx += 1
-        return f"({row.table}.parent_id = ANY(${self.arg_idx - 1}) AND {link})"
+        # Never NULL: an object with no image has a NULL parent_id, whose FALSE EXISTS makes the AND FALSE.
+        return grain_reading.Lookup(f"({row.table}.parent_id = ANY(${self.arg_idx - 1}) AND {link})")
 
     def row_field(self, field: Any) -> Optional[str]:
         """'builtin' for a column every row has, 'list' for a list kept in a column of its own (`tags`,
@@ -5329,16 +5554,22 @@ def parse_filter_node(
     joined: list = []
     if region_keys and region_joins:
         node, joined = _top_region_excludes(node)
-    sql, arg_idx = _compile_filter_node(
-        node,
-        args,
-        arg_idx,
-        field_mapping,
-        numeric_indexed_fields,
-        dataset_id,
-        array_columns=array_columns,
-        concepts=concept_ids,
-    )
+    # On a dataset with objects, a reading with the record of which kind of row has which field (field_kinds.reading)
+    # skips the other kind's rows for a field only one kind has; a statement with skips starts with their guard.
+    record, skipped = field_kinds.current(dataset_id), set[tuple[str, str]]()
+    with field_kinds.compiling(record, skipped):
+        sql, arg_idx = _compile_filter_node(
+            node,
+            args,
+            arg_idx,
+            field_mapping,
+            numeric_indexed_fields,
+            dataset_id,
+            array_columns=array_columns,
+            concepts=concept_ids,
+        )
+    if skipped and dataset_id is not None:
+        sql, arg_idx = field_kinds.guarded(sql, args, arg_idx, dataset_id, skipped)
     for leaf in joined:
         region_sql, arg_idx = _region_leaf(
             leaf,
@@ -5372,9 +5603,12 @@ def _compile_filter_node(
     array_columns: Optional[set] = None,
     *,
     concepts: set,
+    outer_kind: Optional[str] = None,
 ) -> tuple[str, int]:
     """Recursively compiles a filter node. Every concept id whose scores it reads goes into `concepts`,
-    for the statement's one guard (parse_filter_node)."""
+    for the statement's one guard (parse_filter_node). `outer_kind`: the kind of row ('image', 'object') the node is
+    asked of, when an AND around it holds the page's kind predicate (_grid_kind); the reader of a dataset with objects
+    may then skip the row for a field its kind has never been seen with (backend/field_kinds.py)."""
     # Logic Node (AND/OR/NOT). A node with `filters` but no explicit `logic` is
     # treated as an implicit AND rather than silently dropped.
     if 'logic' in node or 'filters' in node:
@@ -5382,6 +5616,8 @@ def _compile_filter_node(
         if logic not in ('AND', 'OR', 'NOT'):
             raise HTTPException(status_code=400, detail=f"Invalid logic operator: {node['logic']!r}")
         sub_filters = node.get('filters', [])
+        if logic == 'AND':
+            outer_kind = _grid_kind(sub_filters) or outer_kind
 
         if logic == 'NOT':
             if not sub_filters:
@@ -5398,6 +5634,7 @@ def _compile_filter_node(
                     dataset_id,
                     array_columns=array_columns,
                     concepts=concepts,
+                    outer_kind=outer_kind,
                 )
                 child_sqls.append(sql)
 
@@ -5432,6 +5669,7 @@ def _compile_filter_node(
                         dataset_id,
                         array_columns,
                         concepts,
+                        outer_kind,
                     )
                     child_sqls.append(grain_reading.read(base, grid, rows))
                     arg_idx = rows.arg_idx
@@ -5445,6 +5683,7 @@ def _compile_filter_node(
                     dataset_id,
                     array_columns=array_columns,
                     concepts=concepts,
+                    outer_kind=outer_kind,
                 )
                 child_sqls.append(sql)
 
@@ -6282,7 +6521,12 @@ async def get_dataset_map_points_post(id: int, request: MapPointsRequest):
     located sample at once has no bound."""
     if request.zoom is None and not request.points:
         raise HTTPException(status_code=422, detail='map_points needs the map\'s zoom, or "points": true')
-    return await _get_dataset_map_points_impl(id, request.filters, request.zoom, request.bbox, request.points)
+    return await field_kinds.reading(
+        db,
+        id,
+        request.filters,
+        lambda: _get_dataset_map_points_impl(id, request.filters, request.zoom, request.bbox, request.points),
+    )
 
 
 class MapExtentRequest(BaseModel):
@@ -6306,6 +6550,10 @@ async def get_dataset_map_extent(id: int, request: MapExtentRequest):
     Fast: one read, min/max over the stored lon/lat columns (covering index), in every case. A stretch with no sample
     at least 180 degrees wide that avoids longitude 180 holds longitude 0, so the same read also takes the largest
     longitude below 0 and the smallest from 0 on, the two ends such a stretch would have."""
+    return await field_kinds.reading(db, id, request.filters, lambda: _map_extent(id, request))
+
+
+async def _map_extent(id: int, request: MapExtentRequest) -> Dict[str, Any]:
     conditions = ["dataset_id = $1", "location IS NOT NULL"]
     args: list = [id]
     if request.filters:
@@ -6358,7 +6606,12 @@ async def create_selection_token(
     large 'select all' / filtered selection can be APPLIED and operated on via the indexed
     in_selection filter WITHOUT a giant id array crossing the wire or sitting in the
     browser. Returns {token, count}. Mirrors the embeddings select-region / version-diff
-    token pattern; tokens TTL-prune after 2h."""
+    token pattern; tokens TTL-prune after 2h. A statement refused by require_field_kinds is inserted again
+    (field_kinds.reading): its transaction rolled back, nothing of it was kept."""
+    return await field_kinds.reading(db, id, request.filters, lambda: _selection_token(id, request))
+
+
+async def _selection_token(id: int, request: SelectionTokenRequest) -> Dict[str, Any]:
     conditions = ["dataset_id = $1"]
     args: list = [id]
     if request.filters:
@@ -6808,7 +7061,8 @@ async def list_samples_post(id: int, request: SamplesRequest):
     assistant_guard.sort(request.sort_by)
     # Index advisor telemetry (backend/field_usage.py): an in-memory count, never a failure or a wait.
     with field_usage.measure(id, _grid_usage(request.filters, request.sort_by)):
-        answer = await _list_samples_post(id, request)
+        # On a dataset with objects, with the record of which kind of row has which field (backend/field_kinds.py).
+        answer = await field_kinds.reading(db, id, request.filters, lambda: _list_samples_post(id, request))
     stale = await stale_lassos.stale_maps(db, id, request.filters)
     if stale and isinstance(answer, dict):
         answer['stale_lassos'] = stale
@@ -6826,13 +7080,16 @@ def _slim_metadata_select(keys_param: int, source: str = 'metadata') -> str:
 
 # Errors of a page's statement that answer as they do for its count, not as "Internal query error" (500): 409 (the
 # app's handler) for a deleting dataset, a concept being rescored or a lasso on a re-fitted map; 400 for bad input,
-# such as a concept that isn't the dataset's; and a statement that ran out of time, which a guest or the assistant is
-# answered as 504 (request_limits, assistant/inner.py) and anyone else as the server's error.
+# such as a concept that isn't the dataset's; a statement that ran out of time, which a guest or the assistant is
+# answered as 504 (request_limits, assistant/inner.py) and anyone else as the server's error; and the record of which
+# kind of row has which field changing under the statement (require_field_kinds), which field_kinds.reading reads
+# again.
 _PAGE_ERRORS_ANSWERED = (
     asyncpg.ObjectNotInPrerequisiteStateError,
     asyncpg.DataError,
     asyncpg.QueryCanceledError,
     asyncio.TimeoutError,
+    asyncpg.SerializationError,
 )
 
 
@@ -7387,7 +7644,7 @@ async def get_histogram(
     numbers still falls back to categories).
     """
     with field_usage.measure(id, {'histogram': [field]}):
-        return await _histogram(id, field, bins, filters, top, as_number)
+        return await field_kinds.reading(db, id, filters, lambda: _histogram(id, field, bins, filters, top, as_number))
 
 
 class HistogramRequest(BaseModel):
@@ -7409,13 +7666,18 @@ async def get_histogram_post(id: int, request: HistogramRequest):
     """POST version of get_histogram, for a filter too large for a URL: a selection of a few thousand sample
     ids already passes the server's 64 KB request-line limit (HTTP 400)."""
     with field_usage.measure(id, {'histogram': [request.field]}):
-        return await _histogram(
+        return await field_kinds.reading(
+            db,
             id,
-            request.field,
-            request.bins,
-            request.filters_json(),
-            request.top,
-            request.as_number,
+            request.filters,
+            lambda: _histogram(
+                id,
+                request.field,
+                request.bins,
+                request.filters_json(),
+                request.top,
+                request.as_number,
+            ),
         )
 
 
@@ -7762,20 +8024,30 @@ async def get_histogram_preview(
     returned only when `preview.status` is `ok`; otherwise (`not_broad`, `insufficient_sample`,
     `timeout`, `failed`) the caller waits for /histogram, which is always the exact answer.
     """
-    return await _histogram_preview(id, field, bins, filters, top, as_number)
+    return await field_kinds.reading(
+        db,
+        id,
+        filters,
+        lambda: _histogram_preview(id, field, bins, filters, top, as_number),
+    )
 
 
 @router.post("/datasets/{id}/histogram/preview", dependencies=[Depends(require_dataset_access)])
 @guest_heavy
 async def get_histogram_preview_post(id: int, request: HistogramRequest):
     """POST version of get_histogram_preview, for a filter too large for a URL (see get_histogram_post)."""
-    return await _histogram_preview(
+    return await field_kinds.reading(
+        db,
         id,
-        request.field,
-        request.bins,
-        request.filters_json(),
-        request.top,
-        request.as_number,
+        request.filters,
+        lambda: _histogram_preview(
+            id,
+            request.field,
+            request.bins,
+            request.filters_json(),
+            request.top,
+            request.as_number,
+        ),
     )
 
 
@@ -7839,6 +8111,8 @@ async def _histogram_preview(
         return await asyncio.wait_for(measure(), timeout=_HISTOGRAM_PREVIEW_BUDGET_S)
     except asyncio.TimeoutError:
         return unavailable("timeout")
+    except asyncpg.SerializationError:
+        raise  # refused by require_field_kinds: the reading around the preview reads it again (field_kinds.reading)
     except asyncpg.PostgresError:
         # The exact request reports the error; a preview only ever adds to it.
         return unavailable("failed")
@@ -9804,13 +10078,17 @@ async def aggregate(id: int, request: AggregateRequest):
     for spec in request.aggregations:
         assistant_guard.aggregation(spec.field, spec.op)
     filters_json = json.dumps(request.filters) if request.filters else None
-    where_clause, base_args, _ = build_sample_query_parts(
-        id,
-        filters=filters_json,
-        array_columns=await get_dataset_array_columns(id),
-        numeric_indexed_fields=await get_promoted_numeric_fields(id) if filters_json else None,
-    )
-    return await run_aggregations(id, request.aggregations, where_clause, base_args)
+
+    async def aggregated() -> Dict[str, Any]:
+        where_clause, base_args, _ = build_sample_query_parts(
+            id,
+            filters=filters_json,
+            array_columns=await get_dataset_array_columns(id),
+            numeric_indexed_fields=await get_promoted_numeric_fields(id) if filters_json else None,
+        )
+        return await run_aggregations(id, request.aggregations, where_clause, base_args)
+
+    return await field_kinds.reading(db, id, request.filters, aggregated)
 
 
 async def run_aggregations(

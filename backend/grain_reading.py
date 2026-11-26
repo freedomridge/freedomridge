@@ -23,13 +23,17 @@ its objects, or for an object together with its image. A row is never asked abou
   are answered by the grid's own row, as before. A NOT around tests of built-in fields only keeps the reading it had:
   each row on its own (`NOT (id contains ...)`: the grid's row).
 
-Nothing is stored about which kind of row has which field: every rule reads the values. The SQL is built through the
-`Rows` the compiler passes (`test` compiles a plain filter node against a row, `keyed` the same for a partner row with
-the metadata key's test first; `objects` and `parent` reach a row's objects and an object's image, each as one EXISTS
-the planner can run as a hashed set).
+Every rule reads the values. For speed only, the compiler's `Rows` may skip a kind of row for a field that kind has
+never been seen with (backend/field_kinds.py): its `test`, `keyed` and `has` then answer FALSE without reading the row,
+and a partner whose test is FALSE is not looked up. The parts below fold such constants as SQL's three-valued logic
+does (x OR FALSE is x, x AND FALSE is FALSE, NOT FALSE is TRUE), building the parts in order, so the answer is the one
+the full statement gives. The SQL is built through the `Rows` the compiler passes (`test` compiles a plain filter node
+against a row, `keyed` the same for a partner row with the metadata key's test first; `objects` and `parent` reach a
+row's objects and an object's image, each as one EXISTS the planner can run as a hashed set).
 """
 
-from typing import Any, Callable, Optional, Protocol
+from functools import partial
+from typing import Any, Callable, Iterable, Optional, Protocol
 
 # A filter node's place in the reading: ('test', node), ('not', unit, fields, concepts), ('absent', what it is the
 # absence of: a test, or ('has', field) for a value), ('exclude', node), ('own', node), ('and', units), ('or', units).
@@ -90,6 +94,10 @@ class Rows(Protocol):
 
     def id_list(self, node: Any) -> Optional[list]: ...
 
+    def mark(self) -> Any: ...
+
+    def rollback(self, mark: Any) -> None: ...
+
 
 def read(base: Any, grid: str, rows: Rows) -> str:
     """SQL for the grid's row (rows.outer()): `grid` 'image' for has_matching_object's pair, 'object' for
@@ -100,19 +108,49 @@ def read(base: Any, grid: str, rows: Rows) -> str:
     return reader.image(unit, row) if grid == 'image' else reader.object(unit, row)
 
 
+_CONSTANTS = ('TRUE', 'FALSE')
+
+
+class Lookup(str):
+    """The SQL of a partner lookup (Rows.objects, Rows.parent): never NULL, so its NOT needs no COALESCE, and written as
+    NOT EXISTS the planner can read it as an anti-join (a count of the images' grid's `label != "car"` on a million
+    images with four million objects: 1.0 s, against 7.1 s as a test of each image)."""
+
+
 def _and(parts: list[str]) -> str:
+    """AND of SQL already built: FALSE if one part is, TRUE parts left out. The caller makes sure a part left out holds
+    no parameter (a constant never does: _Reader.all_of, _Reader.any_of)."""
+    if 'FALSE' in parts:
+        return 'FALSE'
+    parts = [part for part in parts if part != 'TRUE']
     if not parts:
         return 'TRUE'
     return parts[0] if len(parts) == 1 else '(' + ' AND '.join(parts) + ')'
 
 
 def _or(parts: list[str]) -> str:
+    if 'TRUE' in parts:
+        return 'TRUE'
+    parts = [part for part in parts if part != 'FALSE']
+    if not parts:
+        return 'FALSE'
     return parts[0] if len(parts) == 1 else '(' + ' OR '.join(parts) + ')'
 
 
 def _not(sql: str) -> str:
     """NOT, with a test that is NULL for a row (no value) counted as not holding."""
+    if sql in _CONSTANTS:
+        return 'TRUE' if sql == 'FALSE' else 'FALSE'
+    if isinstance(sql, Lookup):
+        return f'NOT {sql}'
     return f'NOT COALESCE({sql}, FALSE)'
+
+
+def _neg(sql: str) -> str:
+    """NOT of a test that is never NULL (an EXISTS)."""
+    if sql in _CONSTANTS:
+        return 'TRUE' if sql == 'FALSE' else 'FALSE'
+    return f'NOT {sql}'
 
 
 def _is_group(node: Any) -> bool:
@@ -151,6 +189,29 @@ def _tests(unit: Unit) -> list:
 class _Reader:
     def __init__(self, rows: Rows):
         self.rows = rows
+
+    def all_of(self, parts: Iterable[Callable[[], str]]) -> str:
+        """The AND of the parts, built in order. A FALSE one makes it FALSE and nothing built for it stays among the
+        statement's parameters, so a part that comes out a constant never holds one."""
+        mark, built = self.rows.mark(), []
+        for part in parts:
+            sql = part()
+            if sql == 'FALSE':
+                self.rows.rollback(mark)
+                return 'FALSE'
+            built.append(sql)
+        return _and(built)
+
+    def any_of(self, parts: Iterable[Callable[[], str]]) -> str:
+        """The OR of the parts, built in order: TRUE as soon as one is (all_of)."""
+        mark, built = self.rows.mark(), []
+        for part in parts:
+            sql = part()
+            if sql == 'TRUE':
+                self.rows.rollback(mark)
+                return 'TRUE'
+            built.append(sql)
+        return _or(built)
 
     # --- What each node of the filter is ---
 
@@ -257,16 +318,17 @@ class _Reader:
         if kind == 'and':
             return self.image_and(unit[1], row)
         if kind == 'or':
-            return _or([self.image(child, row) for child in unit[1]])
+            return self.any_of(partial(self.image, child, row) for child in unit[1])
         if kind == 'test':
             test = unit[1]
-            cross = rows.objects(row, lambda o: rows.keyed(test, o), test)
-            return f'({rows.test(test, row)} OR {cross})'
+            return self.any_of(
+                [partial(rows.test, test, row), lambda: rows.objects(row, lambda o: rows.keyed(test, o), test)],
+            )
         if kind == 'not':
             _, inner, fields, concepts = unit
-            having = [self.image_has(field, row) for field in fields]
-            having += [self.image_scored(concept, row) for concept in concepts]
-            return _and([*having, _not(self.image(inner, row))])
+            having = [partial(self.image_has, field, row) for field in fields]
+            having += [partial(self.image_scored, concept, row) for concept in concepts]
+            return self.all_of([*having, lambda: _not(self.image(inner, row))])
         if kind == 'absent':
             return self.image_absent(unit[1], row)
         if kind == 'has':
@@ -284,29 +346,39 @@ class _Reader:
         rows = self.rows
         if unit[0] == 'has':
             field = unit[1]
-            own, cross = _not(rows.has(field, row, True)), rows.objects(row, lambda o: rows.has(field, o, True))
-        else:
-            test = unit[1]
-            own, cross = _not(rows.test(test, row)), rows.objects(row, lambda o: rows.keyed(test, o))
-        return f'({own} AND NOT {cross})'
+            return self.all_of(
+                [
+                    lambda: _not(rows.has(field, row, True)),
+                    lambda: _neg(rows.objects(row, lambda o: rows.has(field, o, True))),
+                ],
+            )
+        test = unit[1]
+        return self.all_of(
+            [lambda: _not(rows.test(test, row)), lambda: _neg(rows.objects(row, lambda o: rows.keyed(test, o)))],
+        )
 
     def image_has(self, field: str, row: Any, presence: bool = False) -> str:
         rows = self.rows
-        return f'({rows.has(field, row, presence)} OR {rows.objects(row, lambda o: rows.has(field, o, presence))})'
+        return self.any_of(
+            [
+                partial(rows.has, field, row, presence),
+                lambda: rows.objects(row, lambda o: rows.has(field, o, presence)),
+            ],
+        )
 
     def image_scored(self, concept: Any, row: Any) -> str:
         rows, node = self.rows, _scored(concept)
-        return f'({rows.test(node, row)} OR {rows.objects(row, lambda o: rows.test(node, o))})'
+        return self.any_of([partial(rows.test, node, row), lambda: rows.objects(row, lambda o: rows.test(node, o))])
 
     def image_and(self, units: list, row: Any) -> str:
         """The row-level parts each for the image; the tests together, with the same object."""
-        parts = [self.image(child, row) for child in units if not _depends(child)]
+        parts = [partial(self.image, child, row) for child in units if not _depends(child)]
         paired = [child for child in units if _depends(child)]
         if len(paired) == 1:
-            parts.append(self.image(paired[0], row))
+            parts.append(partial(self.image, paired[0], row))
         elif paired:
-            parts.append(self.image_pair(paired, row))
-        return _and(parts)
+            parts.append(partial(self.image_pair, paired, row))
+        return self.all_of(parts)
 
     def image_pair(self, units: list, row: Any) -> str:
         """Two or more parts with tests, ANDed: met by the image alone, or by the image with one of its objects."""
@@ -316,26 +388,40 @@ class _Reader:
             # A list of ids (a selection, a search's results) among them: (the image is listed AND the rest holds for
             # it) OR (a listed object of it meets the rest with it), so each side is found through the list.
             test, rest = listed[1], [unit for unit in units if unit is not listed]
-            own = f'({rows.test(test, row)} AND {self.image_and(rest, row)})'
-            cross = rows.objects(row, lambda o: _and([rows.keyed(test, o), self.paired(('and', rest), o)]), test)
-            return f'({own} OR {cross})'
+            return self.any_of(
+                [
+                    lambda: self.all_of([partial(rows.test, test, row), partial(self.image_and, rest, row)]),
+                    lambda: rows.objects(
+                        row,
+                        lambda o: self.all_of([partial(rows.keyed, test, o), partial(self.paired, ('and', rest), o)]),
+                        test,
+                    ),
+                ],
+            )
         whole: Unit = ('and', units)
         # An object that meets none of the tests adds nothing to the image alone, so only those that meet one are read:
         # a condition on the object alone, which the planner applies where it reads the objects.
-        cross = rows.objects(row, lambda o: _and([self.some(whole, o), self.paired(whole, o)]))
-        return f'({self.alone(whole, row)} OR {cross})'
+        return self.any_of(
+            [
+                partial(self.alone, whole, row),
+                lambda: rows.objects(
+                    row,
+                    lambda o: self.all_of([partial(self.some, whole, o), partial(self.paired, whole, o)]),
+                ),
+            ],
+        )
 
     def some(self, unit: Unit, o: Any) -> str:
         """The object meets one of the unit's tests on its own."""
-        return _or([self.rows.keyed(test, o) for test in _tests(unit)])
+        return self.any_of(partial(self.rows.keyed, test, o) for test in _tests(unit))
 
     def alone(self, unit: Unit, row: Any) -> str:
         """The unit met by the image's own values (its row-level parts read for the image as a whole)."""
         kind = unit[0]
         if kind == 'and':
-            return _and([self.alone(child, row) for child in unit[1]])
+            return self.all_of(partial(self.alone, child, row) for child in unit[1])
         if kind == 'or':
-            return _or([self.alone(child, row) for child in unit[1]])
+            return self.any_of(partial(self.alone, child, row) for child in unit[1])
         if kind == 'test':
             return self.rows.test(unit[1], row)
         return self.image(unit, row)
@@ -346,12 +432,14 @@ class _Reader:
         planner can run as a hashed set."""
         rows, kind = self.rows, unit[0]
         if kind == 'and':
-            return _and([self.paired(child, o) for child in unit[1]])
+            return self.all_of(partial(self.paired, child, o) for child in unit[1])
         if kind == 'or':
-            return _or([self.paired(child, o) for child in unit[1]])
+            return self.any_of(partial(self.paired, child, o) for child in unit[1])
         if kind == 'test':
             test = unit[1]
-            return f'({rows.test(test, o)} OR {rows.parent(o, lambda p: rows.keyed(test, p), test)})'
+            return self.any_of(
+                [partial(rows.test, test, o), lambda: rows.parent(o, lambda p: rows.keyed(test, p), test)],
+            )
         return rows.parent(o, lambda p: self.image(unit, p))
 
     # --- The objects' grid: an object with its image ---
@@ -359,17 +447,19 @@ class _Reader:
     def object(self, unit: Unit, row: Any) -> str:
         rows, kind = self.rows, unit[0]
         if kind == 'and':
-            return _and([self.object(child, row) for child in unit[1]])
+            return self.all_of(partial(self.object, child, row) for child in unit[1])
         if kind == 'or':
-            return _or([self.object(child, row) for child in unit[1]])
+            return self.any_of(partial(self.object, child, row) for child in unit[1])
         if kind == 'test':
             test = unit[1]
-            return f'({rows.test(test, row)} OR {rows.parent(row, lambda p: rows.keyed(test, p), test)})'
+            return self.any_of(
+                [partial(rows.test, test, row), lambda: rows.parent(row, lambda p: rows.keyed(test, p), test)],
+            )
         if kind == 'not':
             _, inner, fields, concepts = unit
-            having = [self.object_has(field, row) for field in fields]
-            having += [self.object_scored(concept, row) for concept in concepts]
-            return _and([*having, _not(self.object(inner, row))])
+            having = [partial(self.object_has, field, row) for field in fields]
+            having += [partial(self.object_scored, concept, row) for concept in concepts]
+            return self.all_of([*having, lambda: _not(self.object(inner, row))])
         if kind == 'absent':
             return self.object_absent(unit[1], row)
         if kind == 'has':
@@ -383,19 +473,29 @@ class _Reader:
         rows = self.rows
         if unit[0] == 'has':
             field = unit[1]
-            own, cross = _not(rows.has(field, row, True)), rows.parent(row, lambda p: rows.has(field, p, True))
-        else:
-            test = unit[1]
-            own, cross = _not(rows.test(test, row)), rows.parent(row, lambda p: rows.keyed(test, p))
-        return f'({own} AND NOT {cross})'
+            return self.all_of(
+                [
+                    lambda: _not(rows.has(field, row, True)),
+                    lambda: _neg(rows.parent(row, lambda p: rows.has(field, p, True))),
+                ],
+            )
+        test = unit[1]
+        return self.all_of(
+            [lambda: _not(rows.test(test, row)), lambda: _neg(rows.parent(row, lambda p: rows.keyed(test, p)))],
+        )
 
     def object_has(self, field: str, row: Any, presence: bool = False) -> str:
         rows = self.rows
-        return f'({rows.has(field, row, presence)} OR {rows.parent(row, lambda p: rows.has(field, p, presence))})'
+        return self.any_of(
+            [
+                partial(rows.has, field, row, presence),
+                lambda: rows.parent(row, lambda p: rows.has(field, p, presence)),
+            ],
+        )
 
     def object_scored(self, concept: Any, row: Any) -> str:
         rows, node = self.rows, _scored(concept)
-        return f'({rows.test(node, row)} OR {rows.parent(row, lambda p: rows.test(node, p))})'
+        return self.any_of([partial(rows.test, node, row), lambda: rows.parent(row, lambda p: rows.test(node, p))])
 
     # --- Both ---
 
@@ -406,7 +506,9 @@ class _Reader:
         if own == 'TRUE':
             return own
         inside = {**node, 'operator': _EXCLUDES[_operator(node)]}
-        return f'({own} AND NOT {partners(row, lambda r: self.rows.test(inside, r))})'
+        # Neither part comes out FALSE (an exclusion keeps the rows with no location; a partner's EXISTS is never TRUE
+        # alone), so nothing built is left out but a constant.
+        return _and([own, _neg(partners(row, lambda r: self.rows.test(inside, r)))])
 
 
 def _scored(concept: Any) -> dict:

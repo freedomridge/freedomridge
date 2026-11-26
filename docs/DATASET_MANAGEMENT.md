@@ -248,6 +248,20 @@ field = requests.patch(
   404, as for a name the dataset never had), so its mark can only be taken off once the field exists again
   ([details](SDK.md#field-descriptions)).
 
+## Which kinds of sample have a field
+
+On a dataset with objects, images (every sample that isn't an object) and objects hold different fields. Each field the
+field-stats answers (`GET` and `POST /datasets/{id}/field-stats`) list with its `sample_count` also carries `on_images`
+and `on_objects`: whether a sample of that kind has been seen with the field, its key on the sample (a `null` under the
+key counts). `false` means no sample of that kind has the field. `true` means one has it, or had it: a kind's mark is
+cleared by a check the job runner runs after the dataset's statistics are next counted, once the last such sample lost
+the field or went. The check reads the samples without holding writes back (they wait only for two one-row changes to
+the record) and finishes on a dataset of any size; one a write in progress holds off is tried again after 20 seconds,
+then 40, doubling up to 5 minutes, and a write noted while a check runs is checked by the next one. Both are
+`true` for a field the server doesn't follow this way (lists such as `tags`, a mirror's `@local.tags`), and for every
+field of a dataset it hasn't examined yet after the upgrade that added them. `sample_count` counts both kinds together.
+The filter reader uses the same record to skip a kind's rows ([Filter query](FILTER_QUERY.md#what-the-server-skips)).
+
 ## Embeddings and the map
 
 Upload vectors you computed yourself (a list of `{sample_id, vector, field_name}`):

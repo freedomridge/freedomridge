@@ -6,7 +6,7 @@ from datetime import datetime
 
 from fastapi import HTTPException
 
-from . import job_queue, local_writes, stale_lassos
+from . import field_kinds, job_queue, local_writes, stale_lassos
 from .api_errors import CodedHTTPException
 from .diskspace import INGEST_ROW_BYTES, require_free_space
 from .field_registry import (
@@ -158,6 +158,30 @@ async def submit(pool, dataset_id, user_id, operation, payload):
         else ('TRUE', 1)
     )
     predicate = predicate.replace("AND rs.created_at > statement_timestamp() - interval '2 hours'", '')
+    # The same filter compiled with the record of which kind of row has which field (field_kinds), read now, when it is
+    # compiled: on a dataset with objects it skips a kind's rows for a field the kind has never had. It starts with
+    # require_field_kinds, which refuses it in a unit whose snapshot has seen a first value of a field it skips; the
+    # unit then runs the predicate above, which skips nothing (_unit_variants).
+    kinds_args: list = []
+    kinds_predicate = None
+
+    async def with_record():
+        nonlocal kinds_predicate
+        compiled, _ = datasets.parse_filter_node(
+            payload['filters'],
+            kinds_args,
+            1,
+            None,
+            None,
+            dataset_id,
+            array_columns=await datasets.get_dataset_array_columns(dataset_id),
+            region_joins=False,
+        )
+        if field_kinds.guarded_sql(compiled):
+            kinds_predicate = compiled.replace("AND rs.created_at > statement_timestamp() - interval '2 hours'", '')
+
+    if payload.get('filters'):
+        await field_kinds.reading(pool, dataset_id, payload['filters'], with_record)
     if operation == 'delete_embeddings' and payload.get('filters') and _matches_every_sample(predicate):
         # Only filters == {} deletes a whole field (delete_embedding_field); a filter is never a silent everything.
         raise HTTPException(
@@ -268,6 +292,11 @@ async def submit(pool, dataset_id, user_id, operation, payload):
                     ),
                     'predicate': predicate,
                     'typed_predicate_args': _freeze_value(args),
+                    **(
+                        {'kinds_predicate': kinds_predicate, 'typed_kinds_predicate_args': _freeze_value(kinds_args)}
+                        if kinds_predicate is not None
+                        else {}
+                    ),
                     # Every vector of the field (Dataset.delete_embedding_field): each unit gives its map a new
                     # layout id with the delete, so a lasso drawn on it warns, whatever lays it out again after.
                     'stale_lassos': stale,
@@ -578,6 +607,27 @@ async def _mutate(connection, job, ids, removed_fields, targeted=None):
     return count
 
 
+def _unit_variants(request):
+    """The predicates a unit tries in turn (field_kinds.retrying): the one compiled with the record of which kind of row
+    has which field, if the job has one, then the one that skips nothing, which nothing refuses. Each as (SQL, its
+    parameters, a fresh list). Older jobs used JSON-only parameters; preserve their resumability.
+
+    The first one's guard (require_field_kinds, an InitPlan) runs once, in the statement's snapshot. A row the unit's
+    SELECT ... FOR NO KEY UPDATE waits for is rechecked against the predicate after the wait, where a skipped test is
+    the constant FALSE and the guard isn't evaluated again: a row given its first value of a skipped field by a
+    transaction in flight when the unit started is left out, as it would be had that write committed just after the
+    unit (READ COMMITTED). A later unit's guard sees the committed mark and runs the second predicate."""
+    full = (
+        request['predicate'],
+        _restore_value(request['typed_predicate_args'])
+        if 'typed_predicate_args' in request
+        else list(request['predicate_args']),
+    )
+    if 'kinds_predicate' not in request:
+        return [full]
+    return [(request['kinds_predicate'], _restore_value(request['typed_kinds_predicate_args'])), full]
+
+
 def handler(pool):
     async def measure(job):
         if job['kind'] != KIND or job['lane'] != 'user':
@@ -748,43 +798,50 @@ def handler(pool):
             # Long ID lists (exclusions, `in` filters) bind as parameters. A generic plan scans
             # them linearly per row; a custom plan hashes them.
             await connection.execute('SET LOCAL plan_cache_mode = force_custom_plan')
-            # Older jobs used JSON-only parameters; preserve their resumability.
-            args = (
-                _restore_value(request['typed_predicate_args'])
-                if 'typed_predicate_args' in request
-                else list(request['predicate_args'])
+
+            async def attempt(variant):
+                """The unit with one of the job's predicates (_unit_variants); a refused one (require_field_kinds) left
+                nothing behind (its savepoint), and the next is run."""
+                where, args = variant
+                args.extend([job['dataset_id'], ids, request.get('excluded_ids', [])])
+                n = len(args)
+                where += f' AND dataset_id=${n - 2} AND id=ANY(${n - 1}::int[]) AND NOT(id=ANY(${n}::int[]))'
+                if request.get('selection_token'):
+                    args.append(request['selection_token'])
+                    where += f' AND id IN (SELECT sample_id FROM region_selections WHERE token=${len(args)})'
+                # PostgreSQL rechecks row predicates after waiting for a concurrent updater.
+                # Nonmatches never get row locks (and never dirty their heap pages). Only delete changes
+                # a key: edits leave FK writers (embeddings, hashes, scores) for matching rows unblocked.
+                lock = 'FOR UPDATE' if request['operation'] == 'delete' else 'FOR NO KEY UPDATE'  # vectors keep keys
+                selected = await connection.fetch(f'SELECT id FROM samples WHERE {where} ORDER BY id {lock}', *args)
+                # Re-evaluate subqueries in a fresh snapshot too, retaining only locked rows.
+                args[n - 2] = [row['id'] for row in selected]
+                selected = await connection.fetch(f'SELECT id FROM samples WHERE {where}', *args) if selected else []
+                removed = set(checkpoint.get('removed_fields', []))
+
+                async def targeted(candidates):
+                    """Those of these samples the job deletes itself, in this unit or a later one."""
+                    test = list(args)
+                    test[n - 2] = candidates
+                    extra = f" AND id <= {int(job['barrier']['max_id'])}"
+                    if request['explicit']:
+                        test.append(job['id'])
+                        extra += f' AND id IN (SELECT sample_id FROM bulk_job_targets WHERE job_id=${len(test)})'
+                    rows = await connection.fetch(f'SELECT id FROM samples WHERE {where}{extra}', *test)
+                    return {row['id'] for row in rows}
+
+                if not selected:
+                    return None, removed
+                return await _mutate(connection, job, [row['id'] for row in selected], removed, targeted), removed
+
+            variants = _unit_variants(request)
+            outcome, removed_fields = await field_kinds.retrying(
+                variants,
+                attempt,
+                savepoint=connection if len(variants) > 1 else None,
             )
-            where = request['predicate']
-            args.extend([job['dataset_id'], ids, request.get('excluded_ids', [])])
-            n = len(args)
-            where += f' AND dataset_id=${n - 2} AND id=ANY(${n - 1}::int[]) AND NOT(id=ANY(${n}::int[]))'
-            if request.get('selection_token'):
-                args.append(request['selection_token'])
-                where += f' AND id IN (SELECT sample_id FROM region_selections WHERE token=${len(args)})'
-            # PostgreSQL rechecks row predicates after waiting for a concurrent updater.
-            # Nonmatches never get row locks (and never dirty their heap pages). Only delete changes
-            # a key: edits leave FK writers (embeddings, hashes, scores) for matching rows unblocked.
-            lock = 'FOR UPDATE' if request['operation'] == 'delete' else 'FOR NO KEY UPDATE'  # vectors keep sample keys
-            selected = await connection.fetch(f'SELECT id FROM samples WHERE {where} ORDER BY id {lock}', *args)
-            # Re-evaluate subqueries in a fresh snapshot too, retaining only locked rows.
-            args[n - 2] = [row['id'] for row in selected]
-            selected = await connection.fetch(f'SELECT id FROM samples WHERE {where}', *args) if selected else []
-            removed_fields = set(checkpoint.get('removed_fields', []))
-
-            async def targeted(candidates):
-                """Those of these samples the job deletes itself, in this unit or a later one."""
-                test = list(args)
-                test[n - 2] = candidates
-                extra = f" AND id <= {int(job['barrier']['max_id'])}"
-                if request['explicit']:
-                    test.append(job['id'])
-                    extra += f' AND id IN (SELECT sample_id FROM bulk_job_targets WHERE job_id=${len(test)})'
-                rows = await connection.fetch(f'SELECT id FROM samples WHERE {where}{extra}', *test)
-                return {row['id'] for row in rows}
-
             affected = 0
-            if selected:
-                outcome = await _mutate(connection, job, [row['id'] for row in selected], removed_fields, targeted)
+            if outcome is not None:
                 if request['operation'] == 'delete':
                     affected, objects = outcome
                     checkpoint['objects'] = checkpoint.get('objects', 0) + objects

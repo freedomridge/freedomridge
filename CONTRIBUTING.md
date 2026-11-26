@@ -243,6 +243,10 @@ To change the schema:
    ids again. When the rows mean the same afterwards (a column filled in, a table
    rebuilt), keep the triggers from firing, for example with `ALTER TABLE ... DISABLE TRIGGER USER` around the
    statement or by creating the triggers after the rows are copied, and say in the file that it is on purpose.
+   The record of which kind of sample has which field (0044, `dataset_field_kinds`) is kept by triggers on `samples`
+   too: a statement run without them that gives samples a metadata key or a location they lacked, takes one away, or
+   moves samples to the other kind, also deletes those datasets' rows from `dataset_field_kinds_state` in the same
+   transaction, so the job runner examines them again.
 5. Run sections 4 and 5.
 
 To apply pending migrations to an existing database, run `scripts/apply_migrations.sh` from the

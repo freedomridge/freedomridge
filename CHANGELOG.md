@@ -10,15 +10,26 @@ This release adds an AI assistant: Claude Code and other MCP clients answer ques
 through thirteen read-only tools at `/mcp`, reading as the person using them, and an administrator's client can read
 the server's status, background jobs, backups and index advice through four more. It is off until an administrator
 switches it on. Also new: named regions as a filter, a text form for concept filters, and a description and unit for
-each field. Ten migrations: one removes the metadata keys named `tags` or `media_type`, which are refused from now
+each field. Eleven migrations: one removes the metadata keys named `tags` or `media_type`, which are refused from now
 on; the others touch no sample.
 
 ### Upgrade notes
 
-- Ten database migrations, `0034_regions.sql` to `0043_reserved_names_never_fields.sql`, and changed database
-  functions, applied with `scripts/apply_migrations.sh` (step 4 of [Upgrading](docs/UPGRADING.md)). The first eight add
-  empty tables and columns and touch no rows. `0041` builds two indexes on the jobs table, about a second per million
-  jobs, while job writes wait. `0042` is the next item; `0043` changes only the field list (the item after it).
+- Eleven database migrations, `0034_regions.sql` to `0044_field_kinds.sql`, and changed database functions, applied
+  with `scripts/apply_migrations.sh` (step 4 of [Upgrading](docs/UPGRADING.md)). The first eight add empty tables and
+  columns and touch no rows. `0041` builds two indexes on the jobs table, about a second per million jobs, while job
+  writes wait. `0042` is the next item; `0043` changes only the field list (the item after it). `0044` adds three empty
+  tables and the triggers that fill them (the item on which kinds of sample have a field), and restore recovery covers
+  them too.
+- **Each dataset is examined once after the upgrade, in the background.** The job runner reads every sample of each
+  dataset once to note which fields images and objects have (job `field_kinds`, "Updating which kinds of sample have
+  each field", one dataset at a time per lane): about 13 seconds for a dataset of a million images and four million
+  objects, 2 seconds for a million images. Nothing waits for it, and until a dataset's turn every field counts as seen
+  on both kinds (its filters read as before, its fields answer `on_images` and `on_objects` true). A dataset made after
+  the upgrade is followed from its first sample. A statement that writes samples with the triggers disabled (`ALTER
+  TABLE samples DISABLE TRIGGER USER`, `session_replication_role = replica`, as some import recipes suggest) and adds or
+  removes metadata keys must also run `DELETE FROM dataset_field_kinds_state WHERE dataset_id = ...` for the datasets it
+  wrote, in the same transaction, so that they are examined again.
 - **Metadata keys named `tags` or `media_type` are refused, and the stored ones are removed for good.** Such a key
   names a sample's own field, so it was stored but never listed, filtered or shown. A script that writes one (an
   upload, an edit, a bulk edit, a rename or clone onto the name) is now refused with an error that names the key
@@ -273,6 +284,23 @@ on; the others touch no sample.
   A dataset without objects, and a filter sent without the page's wrapping (the SDK), read as before. A patch search
   relayed to a follower ([FOLLOWERS.md](docs/FOLLOWERS.md)) is filtered by the follower's own server, which takes the
   page's wrapped filter: a follower on an older version reads it the old way until it is upgraded.
+- **On a dataset with objects, every reader of the filter skips a kind of row for a field that kind has never had**
+  ([FILTER_QUERY.md](docs/FILTER_QUERY.md#what-the-server-skips)). The server notes which fields images and objects have
+  been seen with, in the same transaction as every write that adds one, and clears a note in a check the job runner runs
+  after the statistics are next counted, once a kind's last value is gone; the check reads samples without holding
+  writes back (they wait only for two one-row changes to the record) and finishes on a dataset of any size. The grids'
+  pages and counts, the top bar's count, the sidebar, the histogram, the aggregates, autocomplete, the map, Select all,
+  sparse sampling, the export, bulk edits by filter and the assistant then ask no row about a field its kind lacks (the
+  map's clusters for an image field on the images' grid 1.0 s to 0.1 s, its extent 0.7 s to 0.1 s; the histogram for
+  `label != "car"` there 6.7 s to 2.4 s). On a million images with four million objects, against the reading above: the
+  objects' grid's `label != "car"` first page 1.5 s to 0.3 s and count 1.3 s to 0.3 s; the images' grid's `NOT (colour =
+  "red" AND label = "car")` first page 3.2 s to 0.01 s and count 4.1 s to 1.3 s; a place on the objects' grid 0.7 s to
+  0.05 s; an image field on the images' grid 0.18 s to 0.01 s. The images' grid's count of an object field is slower
+  (0.95 s to 1.3 s; its first page 0.27 s to 0.03 s): the database now joins the objects to their images where it looked
+  each image up in a hashed list. No answer changes. Writes cost a little more: a bulk update of 10,000 samples with 5
+  KB of metadata each takes about 10% longer when it changes values only and about 23% longer when it adds or removes a
+  key; with 50 KB each, about 2.5% and 7%. The field-stats answers say for each field which kinds have it (`on_images`,
+  `on_objects`, [Dataset management](docs/DATASET_MANAGEMENT.md#which-kinds-of-sample-have-a-field)).
 
 ### Fixed
 

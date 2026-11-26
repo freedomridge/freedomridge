@@ -1175,6 +1175,7 @@ CREATE TRIGGER trigger_mark_stats_stale
 --   20261065 = exclusive job resources (one started job per resource, e.g. map fits), keyed by hashtext(resource)
 --   20261066 = ANN (HNSW) index builds, keyed by hashtext(embedding field name); session lock held by the build
 --   20261067 = every concurrent index build or drop on one table (try-only, never waited for), keyed by hashtext(table name)
+--   20261125 = the record of which kind of sample has which field (shared: a write marking a kind, field_kinds_mark; exclusive, try-only, for one statement on one mark: the job writing a check's token on a mark and clearing it, backend/field_kinds.py), keyed by dataset id
 --   (single 64-bit keys are a separate space: job_queue.enqueue_job hashes its dedupe identity into one)
 CREATE OR REPLACE FUNCTION refresh_stale_datasets_stats()
 RETURNS TABLE(dataset_id INTEGER, fields_updated INTEGER, error TEXT) AS $$
@@ -2653,7 +2654,7 @@ BEGIN
     IF restored THEN
         -- Block queue writers while merging keys. No samples or embeddings are scanned.
         LOCK TABLE dataset_stats_pending,concept_embedding_pending,concept_score_pending,
-            concept_score_count_deltas,duplicate_pending,embedding_concepts
+            concept_score_count_deltas,duplicate_pending,embedding_concepts,dataset_field_kinds_pending
             IN SHARE ROW EXCLUSIVE MODE;
         WITH removed AS (
             -- A dataset being deleted is left alone: its guard refuses these writes, schedulers
@@ -2696,6 +2697,12 @@ BEGIN
         SELECT DISTINCT dataset_id,block_id,3 FROM removed;
         GET DIAGNOSTICS merged_rows = ROW_COUNT;
         RAISE LOG 'Restore recovery: duplicate_pending merged to % rows', merged_rows;
+        -- The record of which kind of sample has which field (0044): a note's writing transaction becomes 3, visible in
+        -- every snapshot, so the next clearing pass forgets it (and checks every mark first). A check's token left on a
+        -- mark stays: it costs the next writer of that field one write of the mark.
+        UPDATE dataset_field_kinds_pending SET xact='3';
+        GET DIAGNOSTICS merged_rows = ROW_COUNT;
+        RAISE LOG 'Restore recovery: dataset_field_kinds_pending normalized % rows', merged_rows;
 
         UPDATE embedding_concepts SET score_definition_transaction=3,
             score_manual_snapshot=NULL,score_manual_transaction=NULL
@@ -2734,10 +2741,12 @@ BEGIN
             lease_token=NULL,lease_expires_at=NULL,worker_id=NULL,heartbeat_at=NULL,
             available_at=clock_timestamp(),updated_at=clock_timestamp(),
             message='Restarted after database restore'
-        WHERE kind IN ('statistics','concept_scoring','duplicate_maintenance') AND state IN ('queued','running');
+        WHERE kind IN ('statistics','concept_scoring','duplicate_maintenance','field_kinds')
+            AND state IN ('queued','running');
         -- Failed/cancelled work can be resumed by a later explicit request too.
         UPDATE jobs SET barrier='{}',checkpoint='{}'
-        WHERE kind IN ('statistics','concept_scoring','duplicate_maintenance') AND state IN ('failed','cancelled');
+        WHERE kind IN ('statistics','concept_scoring','duplicate_maintenance','field_kinds')
+            AND state IN ('failed','cancelled');
     END IF;
     INSERT INTO transaction_high_water(singleton,transaction_id,system_identifier)
     VALUES(TRUE,current_transaction,current_system)
@@ -3679,6 +3688,286 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql STABLE PARALLEL SAFE;
 
+-- (0044) Which kind of sample has been seen with which field, for speed only (docs/FILTER_QUERY.md, "What the server
+-- skips"): images (every sample that isn't an object) and objects. On a dataset with objects the filter reader skips a
+-- kind's rows for a field that kind has never been seen with. One rule holds the record: it never says a kind lacks a
+-- field while a committed sample of that kind has it. It may say "seen" of a field no sample of the kind has any more,
+-- which costs speed, never an answer. A field is a top-level metadata key as stored (the key: a JSON null under it
+-- counts), a mirror's own field (`@local.<key>`, a key of local_metadata), or `location`: the location column or a
+-- metadata key of that name. The triggers below mark a kind in the transaction of
+-- every write that puts a field on a sample of that kind (an insert, any update, whatever the path); only the job in
+-- backend/field_kinds.py clears a mark, when no sample of the kind has the field. Every marking write holds the lock
+-- 20261125 shared from before it reads the mark to its end; the job takes it exclusive (trying only) just for the
+-- one-row statements that write a check's token on a mark and then clear it, and reads samples without it in between
+-- (checking_images, checking_objects; backend/field_kinds.py says why that holds). A write with the user triggers
+-- disabled (ALTER TABLE samples DISABLE TRIGGER USER, session_replication_role = replica) that adds or removes a field
+-- must delete the dataset's dataset_field_kinds_state row in the same transaction, so that it is examined again (the
+-- examination ends with a note, so a pass then checks every mark).
+-- checking_images / checking_objects: the token of the check of that kind that is running, NULL when none (set under
+-- the exclusive lock before the check, which reads samples without the lock). A writer treats a mark being checked as
+-- not set and writes it again (mark on, token NULL); the check clears the mark only if its own token is still there,
+-- so nothing touched the mark since it set the token, whatever other check of the mark runs beside it. Readers read
+-- only on_images and on_objects: a mark being checked is a mark.
+CREATE TABLE IF NOT EXISTS dataset_field_kinds (
+    dataset_id INTEGER NOT NULL REFERENCES datasets(id) ON DELETE CASCADE,
+    field_name TEXT NOT NULL,
+    on_images BOOLEAN NOT NULL DEFAULT FALSE,
+    on_objects BOOLEAN NOT NULL DEFAULT FALSE,
+    checking_images UUID,
+    checking_objects UUID,
+    PRIMARY KEY (dataset_id, field_name)
+);
+
+-- A dataset whose record is complete, a field it doesn't name being seen on neither kind: one created since 0044 from
+-- its creation (trg_datasets_field_kinds), one from before once the job examined its samples. Without a row every
+-- field counts as seen on both kinds, and nothing is skipped. held_passes and retry_after: a clearing pass a write held
+-- off (it couldn't take the lock) waits until retry_after, longer after each held pass in a row (backend/field_kinds.py).
+CREATE TABLE IF NOT EXISTS dataset_field_kinds_state (
+    dataset_id INTEGER PRIMARY KEY REFERENCES datasets(id) ON DELETE CASCADE,
+    examined_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT clock_timestamp(),
+    held_passes INTEGER NOT NULL DEFAULT 0,
+    retry_after TIMESTAMP WITH TIME ZONE
+);
+
+-- A write that may have taken a kind's last sample with a field: a delete, or an update that removed a key or a
+-- location, or moved a sample to another kind or dataset. The job checks the dataset's marks again, then removes the
+-- notes whose writing transaction (xact) had committed when its pass began, so a note is forgotten only by a pass
+-- whose checks all began after its write. One row per writing transaction (field_kinds_note), so writers never wait on
+-- each other here.
+CREATE TABLE IF NOT EXISTS dataset_field_kinds_pending (
+    dataset_id INTEGER NOT NULL REFERENCES datasets(id) ON DELETE CASCADE,
+    id BIGSERIAL,
+    noted_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT clock_timestamp(),
+    xact XID8 NOT NULL DEFAULT pg_current_xact_id(),
+    PRIMARY KEY (dataset_id, id)
+);
+
+-- Marks fields as seen on images (image_names) and on objects (object_names) of a dataset, in the caller's
+-- transaction. The shared lock keeps the job from checking or clearing a mark until the transaction ends. Under READ
+-- COMMITTED the marks are read after the lock is held and the ones missing or being checked are written (mark on,
+-- token NULL), both kinds in one statement in name order, so two writers never take two marks in opposite orders within a
+-- statement (a field already marked costs a read and no write). Under REPEATABLE READ or SERIALIZABLE (a version
+-- revert) every name goes through ON CONFLICT, which locks the mark and refuses the write (could not serialize) when
+-- the job checked or cleared it after the transaction's snapshot was taken: a value is never committed with its mark
+-- cleared. That ON CONFLICT locks each
+-- mark row it names until the revert commits, one already set included, so a first mark of the other kind for one of
+-- those fields waits for the revert.
+CREATE OR REPLACE FUNCTION field_kinds_mark(target_dataset INTEGER, image_names TEXT[], object_names TEXT[])
+RETURNS VOID AS $$
+BEGIN
+    image_names := COALESCE(image_names, '{}');
+    object_names := COALESCE(object_names, '{}');
+    IF target_dataset IS NULL OR cardinality(image_names) + cardinality(object_names) = 0 THEN
+        RETURN;
+    END IF;
+    PERFORM pg_advisory_xact_lock_shared(20261125, target_dataset);
+    IF current_setting('transaction_isolation') = 'read committed' THEN
+        image_names := ARRAY(
+            SELECT DISTINCT wanted.key FROM unnest(image_names) AS wanted(key)
+            WHERE NOT EXISTS (
+                SELECT 1 FROM dataset_field_kinds k
+                WHERE k.dataset_id = target_dataset AND k.field_name = wanted.key
+                  AND k.on_images AND k.checking_images IS NULL));
+        object_names := ARRAY(
+            SELECT DISTINCT wanted.key FROM unnest(object_names) AS wanted(key)
+            WHERE NOT EXISTS (
+                SELECT 1 FROM dataset_field_kinds k
+                WHERE k.dataset_id = target_dataset AND k.field_name = wanted.key
+                  AND k.on_objects AND k.checking_objects IS NULL));
+        IF cardinality(image_names) + cardinality(object_names) = 0 THEN
+            RETURN;
+        END IF;
+    END IF;
+    INSERT INTO dataset_field_kinds AS k (dataset_id, field_name, on_images, on_objects)
+    SELECT target_dataset, wanted.key, wanted.key = ANY(image_names), wanted.key = ANY(object_names)
+    FROM (SELECT DISTINCT unnest(image_names || object_names) AS key) wanted ORDER BY wanted.key
+    ON CONFLICT (dataset_id, field_name) DO UPDATE
+    SET on_images = k.on_images OR EXCLUDED.on_images, on_objects = k.on_objects OR EXCLUDED.on_objects,
+        checking_images = CASE WHEN EXCLUDED.on_images THEN NULL ELSE k.checking_images END,
+        checking_objects = CASE WHEN EXCLUDED.on_objects THEN NULL ELSE k.checking_objects END
+    WHERE (EXCLUDED.on_images AND (NOT k.on_images OR k.checking_images IS NOT NULL))
+       OR (EXCLUDED.on_objects AND (NOT k.on_objects OR k.checking_objects IS NOT NULL));
+END;
+$$ LANGUAGE plpgsql;
+
+-- Notes a write that may have taken a kind's last sample with a field (dataset_field_kinds_pending), once a
+-- transaction. Nothing for a dataset being deleted, or gone (a delete cascading from its row).
+CREATE OR REPLACE FUNCTION field_kinds_note(target_dataset INTEGER)
+RETURNS VOID AS $$
+BEGIN
+    IF target_dataset IS NULL OR current_setting('fridge.deletion_dataset', TRUE) = target_dataset::text
+       OR current_setting('fridge.field_kinds_noted_' || target_dataset, TRUE) = 'on' THEN
+        RETURN;
+    END IF;
+    INSERT INTO dataset_field_kinds_pending (dataset_id)
+    SELECT target_dataset WHERE EXISTS (SELECT 1 FROM datasets WHERE id = target_dataset);
+    PERFORM set_config('fridge.field_kinds_noted_' || target_dataset, 'on', TRUE);
+END;
+$$ LANGUAGE plpgsql;
+
+-- An insert's fields, read once for the whole statement from its new rows (the transition table the parent and
+-- deletion triggers already capture).
+CREATE OR REPLACE FUNCTION field_kinds_inserted() RETURNS trigger AS $$
+DECLARE
+    target RECORD;
+BEGIN
+    FOR target IN
+        SELECT seen.dataset_id,
+               COALESCE(array_agg(seen.key ORDER BY seen.key) FILTER (WHERE NOT seen.is_object), '{}') AS images,
+               COALESCE(array_agg(seen.key ORDER BY seen.key) FILTER (WHERE seen.is_object), '{}') AS objects
+        FROM (
+            SELECT r.dataset_id, r.media_type = 'object' AS is_object, k.key
+            FROM field_kinds_new r CROSS JOIN LATERAL jsonb_object_keys(
+                CASE WHEN jsonb_typeof(r.metadata) = 'object' THEN r.metadata ELSE '{}'::jsonb END) AS k(key)
+            UNION
+            SELECT r.dataset_id, r.media_type = 'object', '@local.' || k.key
+            FROM field_kinds_new r CROSS JOIN LATERAL jsonb_object_keys(
+                CASE WHEN jsonb_typeof(r.local_metadata) = 'object' THEN r.local_metadata ELSE '{}'::jsonb END) AS k(key)
+            UNION
+            SELECT r.dataset_id, r.media_type = 'object', 'location' FROM field_kinds_new r WHERE r.location IS NOT NULL
+        ) seen
+        GROUP BY seen.dataset_id
+        ORDER BY seen.dataset_id
+    LOOP
+        PERFORM field_kinds_mark(target.dataset_id, target.images, target.objects);
+    END LOOP;
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+-- A document's top-level keys (an empty list for NULL or anything but an object), in jsonb's own order, so two
+-- documents have the same keys exactly when their lists are equal: field_kinds_same_keys, the UPDATE trigger's
+-- test. jsonb_object_keys steps over the values without copying them, where concatenating two documents copies both:
+-- on 50 KB documents the test costs about a tenth of the concatenations it replaced, on 5 KB ones about a third.
+CREATE OR REPLACE FUNCTION field_kinds_keys(document JSONB) RETURNS TEXT[] AS $$
+    SELECT CASE WHEN jsonb_typeof(document) = 'object' THEN ARRAY(SELECT jsonb_object_keys(document))
+                ELSE '{}'::text[] END
+$$ LANGUAGE sql IMMUTABLE PARALLEL SAFE;
+
+CREATE OR REPLACE FUNCTION field_kinds_same_keys(a JSONB, b JSONB) RETURNS BOOLEAN AS $$
+    SELECT CASE WHEN jsonb_typeof(a) = 'object' THEN ARRAY(SELECT jsonb_object_keys(a)) ELSE '{}'::text[] END
+         = CASE WHEN jsonb_typeof(b) = 'object' THEN ARRAY(SELECT jsonb_object_keys(b)) ELSE '{}'::text[] END
+$$ LANGUAGE sql IMMUTABLE PARALLEL SAFE;
+
+-- An update that added a key or a location, removed one, or moved the sample to another kind or dataset (the
+-- trigger's WHEN compares the key lists; a change of values alone never comes here). A row trigger: a transition table
+-- would copy every row of a whole-dataset update. What the transaction already marked for the dataset and kind is
+-- kept transaction-local (set_config), so an update adding one key to a million samples marks it once and then
+-- compares two key lists a row.
+CREATE OR REPLACE FUNCTION field_kinds_updated() RETURNS trigger AS $$
+DECLARE
+    is_object BOOLEAN := NEW.media_type = 'object';
+    moved BOOLEAN := OLD.dataset_id IS DISTINCT FROM NEW.dataset_id
+        OR (OLD.media_type = 'object') IS DISTINCT FROM (NEW.media_type = 'object');
+    old_keys TEXT[] := field_kinds_keys(OLD.metadata);
+    new_keys TEXT[] := field_kinds_keys(NEW.metadata);
+    local_changed BOOLEAN := moved OR OLD.local_metadata IS DISTINCT FROM NEW.local_metadata;
+    old_local TEXT[] := CASE WHEN local_changed THEN field_kinds_keys(OLD.local_metadata) ELSE '{}' END;
+    new_local TEXT[] := CASE WHEN local_changed THEN field_kinds_keys(NEW.local_metadata) ELSE '{}' END;
+    located BOOLEAN := NEW.location IS NOT NULL AND (moved OR OLD.location IS NULL);
+    note TEXT := 'fridge.field_kinds_' || NEW.dataset_id || CASE WHEN is_object THEN '_objects' ELSE '_images' END;
+    marked TEXT[];
+    marked_local TEXT[];
+    names TEXT[];
+    local_names TEXT[];
+BEGIN
+    IF moved OR NOT (old_keys <@ new_keys) OR NOT (old_local <@ new_local)
+       OR (OLD.location IS NOT NULL AND NEW.location IS NULL) THEN
+        IF current_setting('fridge.field_kinds_noted_' || OLD.dataset_id, TRUE) IS DISTINCT FROM 'on' THEN
+            PERFORM field_kinds_note(OLD.dataset_id);
+        END IF;
+    END IF;
+    IF NEW.dataset_id IS NULL THEN
+        RETURN NULL;  -- a sample in no dataset: nothing to mark (its old dataset was noted above)
+    END IF;
+    IF moved THEN
+        old_keys := '{}';
+        old_local := '{}';
+    END IF;
+    marked := COALESCE(NULLIF(current_setting(note, TRUE), ''), '{}')::text[];
+    marked_local := COALESCE(NULLIF(current_setting(note || '_local', TRUE), ''), '{}')::text[];
+    IF new_keys <@ (old_keys || marked) AND new_local <@ (old_local || marked_local)
+       AND (NOT located OR 'location' = ANY(marked)) THEN
+        RETURN NULL;
+    END IF;
+    names := ARRAY(SELECT key FROM unnest(new_keys) AS k(key) WHERE key <> ALL(old_keys) AND key <> ALL(marked));
+    IF located AND NOT 'location' = ANY(marked) THEN
+        names := names || 'location'::text;
+    END IF;
+    local_names := ARRAY(SELECT key FROM unnest(new_local) AS k(key) WHERE key <> ALL(old_local) AND key <> ALL(marked_local));
+    IF cardinality(names) = 0 AND cardinality(local_names) = 0 THEN
+        RETURN NULL;
+    END IF;
+    marked := marked || names;
+    names := names || ARRAY(SELECT '@local.' || key FROM unnest(local_names) AS k(key));
+    PERFORM field_kinds_mark(
+        NEW.dataset_id, CASE WHEN is_object THEN '{}' ELSE names END, CASE WHEN is_object THEN names END);
+    PERFORM set_config(note, marked::text, TRUE);
+    PERFORM set_config(note || '_local', (marked_local || local_names)::text, TRUE);
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION field_kinds_deleted() RETURNS trigger AS $$
+BEGIN
+    PERFORM field_kinds_note(gone.dataset_id)
+    FROM (SELECT DISTINCT dataset_id FROM field_kinds_old) gone ORDER BY gone.dataset_id;
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION field_kinds_truncated() RETURNS trigger AS $$
+BEGIN
+    INSERT INTO dataset_field_kinds_pending (dataset_id) SELECT id FROM datasets ORDER BY id;
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION field_kinds_dataset_created() RETURNS trigger AS $$
+BEGIN
+    INSERT INTO dataset_field_kinds_state (dataset_id) VALUES (NEW.id) ON CONFLICT DO NOTHING;
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+-- The guard in front of a filter statement compiled with kinds skipped (parse_filter_node): in the statement's own
+-- snapshot (a STABLE function reads with it), the dataset is still examined and no field skipped for a kind has been
+-- seen on it since the record was read. Otherwise SQLSTATE 40001, and the reader reads the record again: a statement
+-- never sees a sample with a field while skipping that sample's kind for it.
+CREATE OR REPLACE FUNCTION require_field_kinds(target_dataset INTEGER, image_names TEXT[], object_names TEXT[])
+RETURNS BOOLEAN AS $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM dataset_field_kinds_state WHERE dataset_id = target_dataset)
+       OR EXISTS (SELECT 1 FROM dataset_field_kinds
+                  WHERE dataset_id = target_dataset AND ((on_images AND field_name = ANY(image_names))
+                                                         OR (on_objects AND field_name = ANY(object_names)))) THEN
+        RAISE EXCEPTION 'The fields seen on each kind of sample changed while the filter was read'
+            USING ERRCODE = '40001';
+    END IF;
+    RETURN TRUE;
+END;
+$$ LANGUAGE plpgsql STABLE PARALLEL SAFE;
+
+CREATE OR REPLACE TRIGGER trg_samples_field_kinds_insert
+    AFTER INSERT ON samples REFERENCING NEW TABLE AS field_kinds_new
+    FOR EACH STATEMENT EXECUTE FUNCTION field_kinds_inserted();
+CREATE OR REPLACE TRIGGER trg_samples_field_kinds_update
+    AFTER UPDATE OF metadata, local_metadata, media_type, dataset_id, location ON samples FOR EACH ROW
+    WHEN (OLD.dataset_id IS DISTINCT FROM NEW.dataset_id
+          OR (OLD.media_type = 'object') IS DISTINCT FROM (NEW.media_type = 'object')
+          OR (OLD.location IS NULL) IS DISTINCT FROM (NEW.location IS NULL)
+          OR NOT field_kinds_same_keys(OLD.metadata, NEW.metadata)
+          OR (OLD.local_metadata IS DISTINCT FROM NEW.local_metadata
+              AND NOT field_kinds_same_keys(OLD.local_metadata, NEW.local_metadata)))
+    EXECUTE FUNCTION field_kinds_updated();
+CREATE OR REPLACE TRIGGER trg_samples_field_kinds_delete
+    AFTER DELETE ON samples REFERENCING OLD TABLE AS field_kinds_old
+    FOR EACH STATEMENT EXECUTE FUNCTION field_kinds_deleted();
+CREATE OR REPLACE TRIGGER trg_samples_field_kinds_truncate
+    AFTER TRUNCATE ON samples FOR EACH STATEMENT EXECUTE FUNCTION field_kinds_truncated();
+CREATE OR REPLACE TRIGGER trg_datasets_field_kinds
+    AFTER INSERT ON datasets FOR EACH ROW EXECUTE FUNCTION field_kinds_dataset_created();
+
 -- Ledger of applied migrations: the 1.0.0 baseline, then the files in backend/db/migrations/
 -- (0001_..., 0002_...) that scripts/apply_migrations.sh applies to existing databases. A fresh install
 -- from this file IS current: when you add a migration, make the same change here and ADD ITS
@@ -3731,5 +4020,6 @@ INSERT INTO schema_migrations (filename) VALUES
     ('0040_assistant_admin_tools.sql'),
     ('0041_jobs_across_datasets.sql'),
     ('0042_protected_metadata_keys.sql'),
-    ('0043_reserved_names_never_fields.sql')
+    ('0043_reserved_names_never_fields.sql'),
+    ('0044_field_kinds.sql')
 ON CONFLICT (filename) DO NOTHING;

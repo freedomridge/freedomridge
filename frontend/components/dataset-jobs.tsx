@@ -16,6 +16,7 @@ const NAMES: Record<string, string> = {
     statistics: 'Updating statistics',
     concept_scoring: 'Scoring concepts',
     duplicate_maintenance: 'Updating duplicate groups',
+    field_kinds: 'Updating which kinds of sample have each field',
     refresh_stats: 'Updating statistics',
     statistics_refresh: 'Updating statistics',
     create_version: 'Creating version',

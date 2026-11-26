@@ -12,6 +12,7 @@ import numpy as np
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field, model_validator
 
+from .. import field_kinds
 from ..access import require_dataset_access
 from ..database import db
 from ..field_registry import RESERVED_METADATA_KEYS
@@ -314,7 +315,13 @@ async def sparse_sample(
         except asyncio.TimeoutError:
             raise HTTPException(503, "Sparse sampling is busy, retry shortly", headers={"Retry-After": "5"})
         try:
-            return await _sparse_sample(dataset_id, request, stop)
+            # With the record of which kind of row has which field (field_kinds.reading).
+            return await field_kinds.reading(
+                db,
+                dataset_id,
+                request.filters,
+                lambda: _sparse_sample(dataset_id, request, stop),
+            )
         finally:
             _SAMPLING_SLOTS.release()
 

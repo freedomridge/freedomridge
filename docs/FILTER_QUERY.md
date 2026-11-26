@@ -202,6 +202,24 @@ red with no objects.
   built-in fields alone reads each row on its own: on the images' grid `NOT (filepath contains "x")` also shows an
   image whose path holds `x` when one of its objects' paths doesn't.
 
+### What the server skips
+
+The server notes, for each field of a dataset, whether images and whether objects have been seen with it: its key on a
+sample of that kind (a `null` under the key counts), a mirror's own `@local.` field included, and for `location` the
+sample's location too (the field list's `on_images` and `on_objects`,
+[Dataset management](DATASET_MANAGEMENT.md#which-kinds-of-sample-have-a-field)). Every reader of the page's filter
+asks no row of a kind about a field that kind has never been seen with: no test of that row, no lookup of its partner.
+That is the grids' pages and counts (the top bar's included), the sidebar's values and ranges, the histogram, the
+aggregates, autocomplete, the map's points and extent, Select all, sparse sampling, the export, bulk edits by filter and
+the assistant's tools. A bulk edit reads the note when it is submitted; a part of it that runs after a kind got its
+first value of a field it skips runs without the note.
+So a field that only one kind has costs about what it costs on a dataset without objects, give or take the join to the
+partner the reading needs (an image field asked on the objects' grid). An answer never depends on it: a row with no
+value for a field never meets a test of it (above), the note never says a kind lacks a field one of its samples has,
+and a filter read while a kind gets its first value of a field is read again. A concept's scores, a lasso's points and
+the built-in fields and lists are always asked. A dataset from before this was added is examined once by the job runner
+after the upgrade; until then nothing is skipped.
+
 ## Values
 
 - **Text:** `"double"` or `'single'` quotes, with `\"`, `\\`, `\n` and `\t` escapes. A plain word needs no quotes: `split = train`. `and`, `or`, `not`, `in`, `contains`, `exists`, `is`, `null`, `between` and `like` always need quotes. `within` is a keyword only after `location`: a field or a value named within needs none. `concept`, a keyword only before a concept's name, doesn't need them either.

@@ -1,6 +1,7 @@
 """Persistent infrastructure failures change state instead of flooding the shared log."""
 
 import asyncio
+import importlib
 import logging
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
@@ -172,6 +173,13 @@ def test_service_logs_migration_and_outage_transitions_only(monkeypatch, caplog)
         monkeypatch.setattr(compute_launcher, 'schedule', schedule_statistics)
         monkeypatch.setattr(auth_cleanup, 'scheduled_cleanup', schedule_statistics)
         monkeypatch.setattr(assistant_calls, 'prune', schedule_statistics)
+        try:  # the clearing's scheduler (backend.field_kinds), where the checkout has it
+            field_kinds = importlib.import_module('backend.field_kinds')
+        except ModuleNotFoundError as error:
+            if error.name != 'backend.field_kinds':
+                raise
+        else:
+            monkeypatch.setattr(field_kinds, 'schedule', schedule_statistics)
         monkeypatch.setenv('JOB_STATISTICS_SECONDS', '1000000')
         monkeypatch.setenv('JOB_CONCEPT_SECONDS', '1000000')
         monkeypatch.setattr(loop, 'time', lambda: original_time() + elapsed)

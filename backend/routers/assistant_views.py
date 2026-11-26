@@ -14,8 +14,10 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import Response
 
+from .. import field_kinds
 from ..access import check_dataset_access
 from ..assistant import private, store
+from ..database import db
 from ..filter_query import format_filter
 from .auth import get_current_user
 
@@ -101,13 +103,18 @@ async def download_value_list(handle: str, user: dict = Depends(get_current_user
         from .datasets import AggregationSpec, build_sample_query_parts, run_aggregations
 
         filters = private.open_filters((kept['source'] or {}).get('filters'), seal)
-        where, args, _ = build_sample_query_parts(kept['dataset_id'], filters_json(filters))
-        counted = await run_aggregations(
-            kept['dataset_id'],
-            [AggregationSpec(field=kept['field_name'], op='count_values')],
-            where,
-            args,
-        )
+
+        async def count() -> Any:
+            where, args, _ = build_sample_query_parts(kept['dataset_id'], filters_json(filters))
+            return await run_aggregations(
+                kept['dataset_id'],
+                [AggregationSpec(field=kept['field_name'], op='count_values')],
+                where,
+                args,
+            )
+
+        # With the record of which kind of row has which field, as the aggregate route reads it (field_kinds.reading).
+        counted = await field_kinds.reading(db, kept['dataset_id'], filters, count)
         entries = [[item['value'], item['count']] for item in counted['results'][0]['value']]
     # Written row by row as the csv module writes them (`\r\n` after each), each cell by _cell: every text in quotes, a
     # number bare, an empty value as an empty cell, the same as the Export dialog writes them.

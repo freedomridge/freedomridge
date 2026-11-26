@@ -17,6 +17,7 @@ from . import (
     dataset_deletion,
     dataset_schedules,
     duplicate_jobs,
+    field_kinds,
     follower_search,
     follower_sync,
     index_actions,
@@ -153,7 +154,8 @@ async def _cleanup_statistics_history(pool, job):
     async with pool.acquire(timeout=1) as connection:
         expired = await connection.fetch(
             """SELECT id FROM jobs
-               WHERE kind IN ('statistics','concept_scoring','duplicate_maintenance','map_place','follower_sync')
+               WHERE kind IN ('statistics','concept_scoring','duplicate_maintenance','map_place','follower_sync',
+                              'field_kinds')
                  AND dedupe_owner='system' AND state='succeeded'
                  AND NOT barrier @> '{"full":true}' AND finished_at<$1
                ORDER BY finished_at,id LIMIT $2""",
@@ -174,7 +176,8 @@ async def _cleanup_statistics_history(pool, job):
     async def publish(connection):
         await connection.execute(
             """DELETE FROM jobs WHERE id=ANY($1::uuid[])
-               AND kind IN ('statistics','concept_scoring','duplicate_maintenance','map_place','follower_sync')
+               AND kind IN ('statistics','concept_scoring','duplicate_maintenance','map_place','follower_sync',
+                            'field_kinds')
                  AND dedupe_owner='system' AND state='succeeded'
                AND NOT barrier @> '{"full":true}' AND finished_at<$2""",
             [row['id'] for row in expired],
@@ -242,6 +245,9 @@ async def run_service(dsn=DATABASE_URL):
     async def handle_duplicates(job):
         return await duplicate_jobs.handler(pool)(job)
 
+    async def handle_field_kinds(job):
+        return await field_kinds.handler(pool)(job)
+
     async def handle_explicit_concepts(job):
         return await concept_jobs.explicit_handler(pool)(job)
 
@@ -298,6 +304,7 @@ async def run_service(dsn=DATABASE_URL):
         statistics.KIND: handle_statistics,
         concept_jobs.KIND: handle_concepts,
         duplicate_jobs.KIND: handle_duplicates,
+        field_kinds.KIND: handle_field_kinds,
         backups.KIND: backups.handler(),
         dataset_deletion.KIND: handle_deletion,
         bulk_jobs.KIND: handle_bulk,
@@ -323,6 +330,7 @@ async def run_service(dsn=DATABASE_URL):
                 statistics.KIND: statistics.POLICY,
                 concept_jobs.KIND: concept_jobs.POLICY,
                 duplicate_jobs.KIND: duplicate_jobs.POLICY,
+                field_kinds.KIND: field_kinds.POLICY,
                 backups.KIND: backups.POLICY,
                 dataset_deletion.KIND: dataset_deletion.POLICY,
                 bulk_jobs.KIND: bulk_jobs.POLICY,
@@ -403,6 +411,7 @@ async def run_service(dsn=DATABASE_URL):
                 (lambda: concept_jobs.schedule_concepts(pool), concept_interval, 'Concepts', True),
                 (lambda: backups.schedule_backups(pool), 60, 'Backups', False),
                 (lambda: duplicate_jobs.schedule_duplicates(pool), 5, 'Duplicates', True),
+                (lambda: field_kinds.schedule(pool), field_kinds.SCHEDULE_SECONDS, 'Field kinds', True),
                 (lambda: map_placement.schedule_placements(pool), 5, 'Map placement', True),
                 (lambda: follower_sync.schedule_sync(pool), follower_interval, 'Follower sync', True),
                 (

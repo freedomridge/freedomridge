@@ -6,7 +6,7 @@ from typing import Any
 
 import asyncpg
 
-from . import job_queue, statistics_measure
+from . import field_kinds, job_queue, statistics_measure
 from .field_registry import REQUEST_FULL_REFRESH, leftover_row_sql
 from .job_runner import StepResult
 
@@ -475,6 +475,11 @@ def handler(pool):
                 message='Publishing filter statistics',
                 publish=publish_field,
             )
+
+        # Right after the count, the record of which kind of sample has which field (backend/field_kinds.py): its job is
+        # queued to clear a mark no sample of its kind needs any more, when a write that may have taken the last one was
+        # noted. Queued, not run here: the count never fails or waits over the record.
+        await field_kinds.queue_check(pool, dataset_id)
 
         async def finish(connection):
             await _lifecycle(connection, dataset_id)
