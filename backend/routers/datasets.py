@@ -3501,13 +3501,22 @@ def _remove_field_from_filter(filter_obj: dict, field_name: str) -> Optional[dic
 
 @router.get("/datasets/{id}/schema", dependencies=[Depends(require_dataset_access)])
 @guest_heavy
-async def get_dataset_schema(id: int, filters: Optional[str] = None, lightning_mode: bool = True, stale: bool = False):
+async def get_dataset_schema(
+    id: int,
+    filters: Optional[str] = None,
+    lightning_mode: bool = True,
+    stale: bool = False,
+    values: bool = True,
+):
     """
     Get schema with stats.
     Optimization: Use cached stats for global min/max.
     Only re-calculate if absolutely necessary (which is rarely for schema).
     With `stale`, each measured field also says whether changes to the samples wait to be counted for it
     (`stats_stale`, statistics.stale_fields): asked by the assistant, not by the app's page loads.
+    With `values=false`, the fields come without the lists of values read from the samples (media_type's, tags', an
+    indexed field's: each reads every sample or its index): for a caller that needs the fields only, as the
+    assistant's field tools do.
     """
     schema: List[Dict[str, Any]] = []
 
@@ -3521,7 +3530,9 @@ async def get_dataset_schema(id: int, filters: Optional[str] = None, lightning_m
             raise HTTPException(status_code=400, detail=f"Invalid filter JSON: {e}")
 
     # 1. media_type (enum)
-    if filter_obj and has_active_filters(filter_obj):
+    if not values:
+        media_types = None
+    elif filter_obj and has_active_filters(filter_obj):
         f_args = [id]
         f_idx = 2
         f_sql, _ = parse_filter_node(
@@ -3540,10 +3551,15 @@ async def get_dataset_schema(id: int, filters: Optional[str] = None, lightning_m
     else:
         media_types = await db.fetch("SELECT DISTINCT media_type FROM samples WHERE dataset_id = $1", *args)
 
-    schema.append({"name": "media_type", "type": "enum", "values": [r['media_type'] for r in media_types]})
+    if media_types is None:
+        schema.append({"name": "media_type", "type": "enum"})
+    else:
+        schema.append({"name": "media_type", "type": "enum", "values": [r['media_type'] for r in media_types]})
 
     # 2. Tags
-    if filter_obj and has_active_filters(filter_obj):
+    if not values:
+        tags_rows = None
+    elif filter_obj and has_active_filters(filter_obj):
         # Tags are an array, so unnest them under the same filter SQL compute_filtered_values builds.
         f_args = [id]
         f_idx = 2
@@ -3579,7 +3595,10 @@ async def get_dataset_schema(id: int, filters: Optional[str] = None, lightning_m
             *args,
         )
 
-    schema.append({"name": "tags", "type": "array", "values": [r['tag'] for r in tags_rows]})
+    if tags_rows is None:
+        schema.append({"name": "tags", "type": "array"})
+    else:
+        schema.append({"name": "tags", "type": "array", "values": [r['tag'] for r in tags_rows]})
 
     # Detection, polygon and segmentation fields keep their cached values: filtering them per request
     # would be slow.
@@ -3711,7 +3730,7 @@ async def get_dataset_schema(id: int, filters: Optional[str] = None, lightning_m
 
         elif field_info['type'] == 'enum':
             field_info['values'] = stat['unique_values']
-            if stat['field_type'] == 'number' and not stat['unique_values']:
+            if values and stat['field_type'] == 'number' and not stat['unique_values']:
                 _validate_field_name(stat['field_name'])
                 rows = await db.fetch(
                     f"SELECT DISTINCT metadata->>'{stat['field_name']}' AS val FROM samples "
@@ -3735,7 +3754,7 @@ async def get_dataset_schema(id: int, filters: Optional[str] = None, lightning_m
                 except Exception as e:
                     print(f"Error computing filtered values for {stat['field_name']}: {e}")
                     pass
-            elif stat['is_promoted']:
+            elif values and stat['is_promoted']:
                 # Unfiltered indexed field → complete distinct set from the index, not the
                 # stale bounded cache (same fix as the field-stats sidebar path).
                 _is_num = stat['field_type'] in ('number', 'float', 'int', 'integer')
@@ -4275,6 +4294,13 @@ async def _instant_histogram(field, data_cte, args, minmax, total_rows, bin_coun
         *args,
     )
     counts = {row['bucket']: row['count'] for row in rows}
+    buckets = _instant_buckets(lowest, highest, width, bin_count, counts)
+    missing = max(total_rows - total, 0)
+    return {"field": field, "total": total_rows, "missing": missing, "buckets": buckets, "bins": bin_count}
+
+
+def _instant_buckets(lowest: int, highest: int, width: int, bin_count: int, counts: Dict[int, int]) -> List[dict]:
+    """A datetime histogram's bars (_instant_histogram), from its microseconds and each bar's count."""
     buckets = []
     for key in range(1, bin_count + 1):
         first = lowest + (key - 1) * width
@@ -4288,8 +4314,7 @@ async def _instant_histogram(field, data_cte, args, minmax, total_rows, bin_coun
                 "range": {"min": first / 1e6, "max": last / 1e6, "min_label": min_label, "max_label": max_label},
             },
         )
-    missing = max(total_rows - total, 0)
-    return {"field": field, "total": total_rows, "missing": missing, "buckets": buckets, "bins": bin_count}
+    return buckets
 
 
 def _utc_micros_label(micros: int) -> str:
@@ -6277,6 +6302,18 @@ def _slim_metadata_select(keys_param: int, source: str = 'metadata') -> str:
     )
 
 
+# Errors of a page's statement that answer as they do for its count, not as "Internal query error" (500): 409 (the
+# app's handler) for a deleting dataset, a concept being rescored or a lasso on a re-fitted map; 400 for bad input,
+# such as a concept that isn't the dataset's; and a statement that ran out of time, which a guest or the assistant is
+# answered as 504 (request_limits, assistant/inner.py) and anyone else as the server's error.
+_PAGE_ERRORS_ANSWERED = (
+    asyncpg.ObjectNotInPrerequisiteStateError,
+    asyncpg.DataError,
+    asyncpg.QueryCanceledError,
+    asyncio.TimeoutError,
+)
+
+
 async def _list_samples_post(id: int, request: SamplesRequest):
     # Check dataset exists
     dataset = await db.fetchrow("SELECT id FROM datasets WHERE id = $1", id)
@@ -6507,9 +6544,7 @@ async def _list_samples_post(id: int, request: SamplesRequest):
             query_params = args + select_args + [request.limit, request.offset]
         try:
             rows = await db.fetch(query, *query_params)
-        except (asyncpg.ObjectNotInPrerequisiteStateError, asyncpg.DataError):
-            # 409 (app handler): a deleting dataset, a concept being rescored, or a lasso on a re-fitted map; 400: bad
-            # input, such as a concept that isn't the dataset's.
+        except _PAGE_ERRORS_ANSWERED:
             raise
         except Exception as e:
             # Log the SQL/error server-side; never return them to the client
@@ -6553,9 +6588,7 @@ async def _list_samples_post(id: int, request: SamplesRequest):
 
     try:
         rows = await db.fetch(query, *query_args)
-    except (asyncpg.ObjectNotInPrerequisiteStateError, asyncpg.DataError):
-        # 409 (app handler): a deleting dataset, a concept being rescored, or a lasso on a re-fitted map; 400: bad
-        # input, such as a concept that isn't the dataset's.
+    except _PAGE_ERRORS_ANSWERED:
         raise
     except Exception:
         import traceback
@@ -7051,10 +7084,7 @@ async def _histogram(
             total = int(minmax['total'] or 0)
             missing = max(total_rows - total, 0)
 
-            # width_bucket excludes the upper bound; nudge max slightly so max values are included
-            span = max_val - min_val
-            epsilon = max(abs(max_val), abs(min_val), 1.0) * 1e-12 if span == 0 else span * 1e-9
-            adjusted_max = max_val + epsilon
+            adjusted_max = _adjusted_max(min_val, max_val)
 
             # Choose bin count if not provided: round up sqrt(n) capped between 8 and 30 to avoid overdraw
             bin_count = 1 if degenerate else (bin_count or max(8, min(30, int(math.sqrt(total)) or 8)))
@@ -7079,27 +7109,7 @@ async def _histogram(
 
             # Fill all bins (include zero-count buckets)
             count_map = {row['bucket']: row['count'] for row in rows}
-
-            # Compute bucket edges for labels
-            edges = [min_val + (adjusted_max - min_val) * i / bin_count for i in range(bin_count + 1)]
-            buckets = []
-            for i in range(1, bin_count + 1):
-                start = edges[i - 1]
-                end = edges[i]
-                count = count_map.get(i, 0)
-                is_last = i == bin_count
-                # Use the true max for the upper label to avoid showing the epsilon bump
-                if is_last:
-                    end = max_val
-                buckets.append(
-                    {
-                        "key": i,
-                        "count": count,
-                        "label": f"{start:.2f} - {end:.2f}",
-                        "range": {"min": start, "max": end},
-                    },
-                )
-
+            buckets = _number_buckets(min_val, max_val, adjusted_max, bin_count, count_map)
             return {"field": field, "total": total_rows, "missing": missing, "buckets": buckets, "bins": bin_count}
 
     # Categorical histogram (default or fallback). ONE scan: GROUP BY value once (materialized),
@@ -7156,6 +7166,43 @@ async def _histogram(
         "distinct_total": distinct_total,
         "other_count": other_count,
     }
+
+
+def _adjusted_max(min_val: float, max_val: float) -> float:
+    """A number histogram's upper edge: width_bucket excludes it, so the largest value is nudged in. The aggregate
+    route's histogram computes the same in SQL (_ADJUSTED_MAX_SQL)."""
+    span = max_val - min_val
+    epsilon = max(abs(max_val), abs(min_val), 1.0) * 1e-12 if span == 0 else span * 1e-9
+    return max_val + epsilon
+
+
+def _number_buckets(
+    min_val: float,
+    max_val: float,
+    adjusted_max: float,
+    bin_count: int,
+    count_map: Dict[int, int],
+) -> List[dict]:
+    """A number histogram's bars, every bin with its count (zero included), labelled by its edges."""
+    edges = [min_val + (adjusted_max - min_val) * i / bin_count for i in range(bin_count + 1)]
+    buckets = []
+    for i in range(1, bin_count + 1):
+        start = edges[i - 1]
+        end = edges[i]
+        count = count_map.get(i, 0)
+        is_last = i == bin_count
+        # Use the true max for the upper label to avoid showing the epsilon bump
+        if is_last:
+            end = max_val
+        buckets.append(
+            {
+                "key": i,
+                "count": count,
+                "label": f"{start:.2f} - {end:.2f}",
+                "range": {"min": start, "max": end},
+            },
+        )
+    return buckets
 
 
 # Approximate histogram preview. The panel shows this labelled preview while the exact
@@ -9040,9 +9087,11 @@ async def clear_field(
 
 class AggregationSpec(BaseModel):
     field: str
-    op: str  # count|sum|mean|std|min|max|bounds|quantiles|count_values|distinct|distinct_count|values
+    # count|with_value|sum|mean|std|min|max|bounds|quantiles|histogram|count_values|distinct|distinct_count|values
+    op: str
     quantiles: Optional[List[float]] = None  # for op="quantiles" (default [.25,.5,.75])
     limit: Optional[int] = None  # cap for count_values/distinct/values; None = uncapped
+    bins: Optional[int] = Field(None, ge=1, le=200)  # for op="histogram", as POST /histogram takes it
 
 
 class AggregateRequest(BaseModel):
@@ -9052,7 +9101,23 @@ class AggregateRequest(BaseModel):
 
 # count_values' ties: a value that reads as a number in its number's order (2 before 10), then the rest by text.
 _NUMBER_TEXT = r"'^\s*[-+]?([0-9]+\.?[0-9]*|\.[0-9]+)([eE][-+]?[0-9]+)?\s*$'"
-_TIE_ORDER = f"CASE WHEN v ~ {_NUMBER_TEXT} THEN v::numeric END NULLS LAST, v"
+# Text that reads as a number but is too large for one (a hex id such as 0347677e05719710) is text: never cast.
+_TIE_ORDER = f"CASE WHEN v ~ {_NUMBER_TEXT} AND pg_input_is_valid(v, 'numeric') THEN v::numeric END NULLS LAST, v"
+
+# The aggregations by what they read. The operations of one request on one field are answered from one read of the
+# filtered samples wherever one read can give them (_field_statements):
+_ROW_OPS = frozenset({'count', 'with_value'})  # how many samples (have the field)
+_NUMBER_OPS = frozenset({'sum', 'mean', 'std', 'min', 'max', 'bounds'})  # the field's numbers, in any order
+_RANK_OPS = frozenset({'quantiles', 'histogram'})  # its numbers in order, or binned between its smallest and largest
+_VALUE_OPS = frozenset({'count_values', 'distinct', 'distinct_count', 'values'})  # its values, each with its count
+_AGGREGATION_OPS = _ROW_OPS | _NUMBER_OPS | _RANK_OPS | _VALUE_OPS
+# _adjusted_max in SQL, over `mn` and `mx`: the same double precision arithmetic, so the same edge.
+_ADJUSTED_MAX_SQL = (
+    "mx + CASE WHEN mx - mn = 0 THEN GREATEST(abs(mx), abs(mn), 1::double precision) * 1e-12::double precision "
+    "ELSE (mx - mn) * 1e-9::double precision END"
+)
+# The histogram route's number of bins when none is asked for, over `total`: sqrt(total) between 8 and 30.
+_AUTO_BINS_SQL = "GREATEST(8, LEAST(30, floor(sqrt(total::double precision))::int))"
 
 
 def _agg_value_expr(field: str, array_columns: Optional[set] = None) -> str:
@@ -9087,24 +9152,74 @@ def _agg_value_expr(field: str, array_columns: Optional[set] = None) -> str:
     return f"metadata->>'{field}'"
 
 
-def _agg_numeric_expr(field: str, datetime_fields: Collection[str] = ()) -> str:
-    """SQL expression yielding a float for numeric aggregations.
+def _unnested(field: str, array_columns: set) -> bool:
+    """Whether _agg_value_expr gives a sample's field as several values (a list's elements, a drawing's labels)."""
+    if field in ('media_type', 'filepath', 'id'):
+        return False
+    return field in array_columns or bool(label_path(field, array_columns)) or field == 'segmentation.labels'
 
-    Non-numeric / unparseable metadata values become NULL (skipped by the
-    aggregates), so a single bad value can't 500 the whole query — same
-    regex guard get_histogram uses. A datetime field (`datetime_fields`, and the
-    native created_at and last_modified_at) gives its instant as seconds since
-    1970 UTC, by the rule in backend/datetimes.py: text that isn't a datetime is NULL.
-    """
+
+def _number_of(text: str, datetime_field: bool) -> str:
+    """The number the aggregations read from a field's text. Non-numeric / unparseable values become NULL (skipped by
+    the aggregates), so a single bad value can't 500 the whole query: the same regex guard get_histogram uses. A
+    datetime field gives its instant as seconds since 1970 UTC, by the rule in backend/datetimes.py: text that isn't a
+    datetime is NULL."""
+    if datetime_field:
+        return _seconds_of(instant_sql(text))
+    # Text that reads as a number but is too large for a double (a hex id such as 0347677e05719710) isn't one: the
+    # histogram route's guard.
+    return (
+        f"CASE WHEN ({text}) ~ '^[-+]?\\d+(\\.\\d+)?([eE][+-]?\\d+)?$' "
+        f"AND pg_input_is_valid(({text}), 'double precision') THEN ({text})::double precision ELSE NULL END"
+    )
+
+
+def _seconds_of(instant: str) -> str:
+    """An instant (timestamptz) as the number the aggregations read: seconds since 1970 UTC."""
+    return f"EXTRACT(EPOCH FROM {instant})::double precision"
+
+
+def _micros_of(instant: str) -> str:
+    """An instant as the histogram route's bars read it: whole microseconds since 1970 UTC."""
+    return f"(EXTRACT(EPOCH FROM {instant}) * 1000000)::int8"
+
+
+class _NumberSource(NamedTuple):
+    """Where a field's numbers come from: the column or text each sample gives (`sql`), the number from it, and for a
+    datetime its instant in whole microseconds (the histogram route's bars), else None."""
+
+    sql: str
+    number: Callable[[str], str]
+    micros: Optional[Callable[[str], str]]
+
+
+def _number_source(field: str, datetime_fields: Collection[str]) -> _NumberSource:
+    """The numbers of the number aggregations, quantiles and histogram (the native created_at and last_modified_at,
+    and a field in `datetime_fields`, as instants)."""
     if field == 'id':
-        return "id::double precision"
+        return _NumberSource('id', lambda column: f"{column}::double precision", None)
     if field in _NATIVE_TIMESTAMPS:
-        return f"EXTRACT(EPOCH FROM {field})::double precision"
+        return _NumberSource(
+            field,
+            _seconds_of,
+            lambda column: f"CASE WHEN isfinite({column}) THEN {_micros_of(column)} END",
+        )
     _validate_field_name(field)
-    col = f"metadata->>'{field}'"
-    if field in datetime_fields:
-        return f"EXTRACT(EPOCH FROM {instant_sql(col)})::double precision"
-    return f"CASE WHEN ({col}) ~ '^[-+]?\\d+(\\.\\d+)?([eE][+-]?\\d+)?$' THEN ({col})::double precision ELSE NULL END"
+    datetime_field = field in datetime_fields
+
+    def micros(text: str) -> str:
+        return _micros_of(instant_sql(text))
+
+    return _NumberSource(
+        f"metadata->>'{field}'",
+        lambda text: _number_of(text, datetime_field),
+        micros if datetime_field else None,
+    )
+
+
+def _jsonb(value: Any) -> Any:
+    """A jsonb column as Python: decoded by the pool's codec, or still text without one."""
+    return json.loads(value) if isinstance(value, str) else value
 
 
 @router.post("/datasets/{id}/aggregate", dependencies=[Depends(require_dataset_access)])
@@ -9112,11 +9227,13 @@ def _agg_numeric_expr(field: str, datetime_fields: Collection[str] = ()) -> str:
 async def aggregate(id: int, request: AggregateRequest):
     """Run one or more aggregations over the (optionally filtered) dataset in one request.
 
-    Each entry is {field, op, ...}. Numeric ops: count, sum, mean, std, min, max,
-    bounds, quantiles; on a datetime field, its instants as seconds since 1970 UTC.
-    Categorical/any ops: count_values (commonest first, ties by value), distinct,
-    distinct_count (how many distinct values), values (exact and uncapped unless
-    `limit` is given). Returns {"results": [...]}, one per aggregation, in order.
+    Each entry is {field, op, ...}. Counts: count (the samples), with_value (the samples that have the field, as the
+    filter `{"field", "operator": "exists"}` counts them). Numeric ops: sum, mean, std, min, max, bounds, quantiles,
+    histogram (`bins`: the buckets POST /histogram gives, over the values bounds counts); on a datetime field, its
+    instants as seconds since 1970 UTC. Categorical/any ops: count_values (commonest first, ties by value), distinct,
+    distinct_count (how many distinct values), values (exact and uncapped unless `limit` is given). The operations on
+    one field are answered from one read of the filtered samples where one read can give them. Returns
+    {"results": [...]}, one per aggregation, in order.
     """
     for spec in request.aggregations:
         assistant_guard.aggregation(spec.field, spec.op)
@@ -9143,106 +9260,430 @@ async def run_aggregations(
     `with_clause` is a leading ``WITH samples AS (...)`` that stands in for the table, which is how
     a version's stored rows are aggregated with the live dataset's SQL. `array_columns` is the field
     context for those rows (a version's own fields); by default the dataset's current one.
+
+    The aggregations are run field by field, each field's in as few statements as can answer them (one, but for a
+    list or a drawing's labels asked for counts or numbers too). Every statement is read with fetch: a one-row portal
+    (fetchval, fetchrow) turns PostgreSQL's parallel workers off.
     """
-    results = []
-    columns = array_columns if array_columns is not None else await get_dataset_array_columns(id)
-    datetime_fields = getattr(columns, 'datetime_fields', ())
     for spec in aggregations:
-        op, field = spec.op, spec.field
-
-        if op == "count":
-            n = await db.fetchval(f"{with_clause}SELECT count(*) FROM samples {where_clause}", *base_args)
-            results.append({"op": op, "field": field, "value": int(n or 0)})
-
-        elif op in ("sum", "mean", "std", "min", "max", "bounds"):
-            # The numeric expr already NULLs non-numeric values, so no null guard
-            # is needed (aggregates skip NULL).
-            expr = _agg_numeric_expr(field, datetime_fields)
-            if op == "bounds":
-                r = await db.fetchrow(
-                    f"{with_clause}SELECT min({expr}) AS mn, max({expr}) AS mx FROM samples {where_clause}",
-                    *base_args,
-                )
-                lo = float(r['mn']) if r and r['mn'] is not None else None
-                hi = float(r['mx']) if r and r['mx'] is not None else None
-                results.append({"op": op, "field": field, "value": [lo, hi]})
-            else:
-                fn = {"sum": "sum", "mean": "avg", "std": "stddev_samp", "min": "min", "max": "max"}[op]
-                v = await db.fetchval(
-                    f"{with_clause}SELECT {fn}({expr}) FROM samples {where_clause}",
-                    *base_args,
-                )
-                results.append({"op": op, "field": field, "value": float(v) if v is not None else None})
-
-        elif op == "quantiles":
-            qs = spec.quantiles or [0.25, 0.5, 0.75]
-            expr = _agg_numeric_expr(field, datetime_fields)
-            args = list(base_args) + [qs]
-            r = await db.fetchval(
-                f"{with_clause}SELECT percentile_cont(${len(args)}::double precision[]) "
-                f"WITHIN GROUP (ORDER BY {expr}) FROM samples {where_clause}",
-                *args,
-            )
-            results.append({"op": op, "field": field, "quantiles": qs, "value": [float(x) for x in r] if r else []})
-
-        elif op in ("count_values", "distinct", "distinct_count", "values"):
-            value_expr = _agg_value_expr(field, array_columns=columns)
-            # A datetime field's values in instant order (backend/datetimes.py), those without one last, then by text.
-            datetime_field = field in getattr(columns, 'datetime_fields', ())
-
-            def order(column):
-                return f"{instant_sql(column)} NULLS LAST, {column}" if datetime_field else column
-
-            # A datetime's text read once a sample: values sort on each one's instant, which would name it a dozen
-            # times (read_once); distinct reads it for its key and its filter (fenced: a join there costs more).
-            values = (
-                f"v FROM samples {read_once(value_expr, 'v')}" if datetime_field else f"{value_expr} AS v FROM samples"
-            )
-            fence = " OFFSET 0" if datetime_field else ""
-
-            args = list(base_args)
-            limit_sql = ""
-            if spec.limit is not None:
-                args.append(spec.limit)
-                limit_sql = f" LIMIT ${len(args)}"
-            if op == "count_values":
-                rows = await db.fetch(
-                    f"{with_clause}SELECT v AS value, count(*) AS count FROM "
-                    f"(SELECT {value_expr} AS v FROM samples {where_clause}) sub "
-                    f"WHERE v IS NOT NULL GROUP BY v ORDER BY count DESC, {_TIE_ORDER}{limit_sql}",
-                    *args,
-                )
-                results.append(
-                    {"op": op, "field": field, "value": [{"value": r['value'], "count": r['count']} for r in rows]},
-                )
-            elif op == "distinct_count":  # how many distinct values, without listing them
-                n = await db.fetchval(
-                    f"{with_clause}SELECT count(DISTINCT v) FROM "
-                    f"(SELECT {value_expr} AS v FROM samples {where_clause}{fence}) sub WHERE v IS NOT NULL",
-                    *base_args,
-                )
-                results.append({"op": op, "field": field, "value": int(n or 0)})
-            elif op == "distinct":
-                rows = await db.fetch(
-                    f"{with_clause}SELECT value FROM (SELECT DISTINCT v AS value FROM "
-                    f"(SELECT {value_expr} AS v FROM samples {where_clause}{fence}) sub "
-                    f"WHERE v IS NOT NULL) found ORDER BY {order('value')}{limit_sql}",
-                    *args,
-                )
-                results.append({"op": op, "field": field, "value": [r['value'] for r in rows]})
-            else:  # values — every value, not deduped (unlike distinct)
-                rows = await db.fetch(
-                    f"{with_clause}SELECT v AS value FROM "
-                    f"(SELECT {values} {where_clause}) sub "
-                    f"WHERE v IS NOT NULL ORDER BY {order('v')}{limit_sql}",
-                    *args,
-                )
-                results.append({"op": op, "field": field, "value": [r['value'] for r in rows]})
-
-        else:
-            raise HTTPException(status_code=400, detail=f"Unknown aggregation op: {op!r}")
-
+        if spec.op not in _AGGREGATION_OPS:
+            raise HTTPException(status_code=400, detail=f"Unknown aggregation op: {spec.op!r}")
+    columns = array_columns if array_columns is not None else await get_dataset_array_columns(id)
+    by_field: Dict[str, List[int]] = {}
+    for index, spec in enumerate(aggregations):
+        by_field.setdefault(spec.field, []).append(index)
+    results: List[Any] = [None] * len(aggregations)
+    for field, indexes in by_field.items():
+        specs = [(index, aggregations[index]) for index in indexes]
+        for statement in _field_statements(id, field, specs, where_clause, base_args, with_clause, columns):
+            row = statement.read(await db.fetch(statement.sql(), *statement.args))
+            for index, finish in statement.finish:
+                results[index] = finish(row)
     return {"results": results}
+
+
+class _Statement:
+    """One statement over the filtered samples for some aggregations of one field: its CTEs, the columns of its row of
+    single values (an aggregation can take several), the lists it gives as rows of their own, and how each
+    aggregation's result is read from them.
+
+    A list (count_values, distinct, values) comes back as rows, one an item, never as one JSON value: PostgreSQL
+    refuses a jsonb value past 256 MB, and a list asked without a limit has no ceiling of its own (the value list's
+    download, the SDK). The statement is then the row of single values UNION ALL each list's rows, tagged with the
+    list's number and the item's place; a column a branch doesn't fill is NULL there, and takes its type from the
+    branch that does."""
+
+    def __init__(self, base_args: list, with_clause: str):
+        self.args = list(base_args)
+        self.with_clause = with_clause
+        self.ctes: List[str] = []
+        self.columns: List[str] = []
+        self.lists: List[str] = []  # each a select of (_agg_pos, v, c): an item's place, its value, its count or NULL
+        self.source = ""  # the FROM of a statement without CTEs: the samples and what is read from each
+        self.finish: List[tuple[int, Callable[[Any], dict]]] = []
+
+    def param(self, value: Any) -> str:
+        self.args.append(value)
+        return f"${len(self.args)}"
+
+    def column(self, sql: str) -> str:
+        name = f"r{len(self.columns)}"
+        self.columns.append(f"({sql}) AS {name}")
+        return name
+
+    def list(self, sql: str) -> str:
+        """A list's select, by the name its items are read under: [(value, count or None)], in their places."""
+        self.lists.append(sql)
+        return f"_agg_list{len(self.lists) - 1}"
+
+    def read(self, rows: List[Any]) -> Dict[str, Any]:
+        """The statement's answer by name: the row of single values' columns, and each list's items in order."""
+        if not self.lists:
+            return dict(rows[0])
+        single = next(row for row in rows if row['_agg_list'] is None)
+        found: Dict[str, Any] = {name: value for name, value in single.items() if not name.startswith('_agg_')}
+        items: Dict[int, List[Any]] = {number: [] for number in range(len(self.lists))}
+        for row in rows:
+            if row['_agg_list'] is not None:
+                items[row['_agg_list']].append((row['_agg_pos'], row['_agg_v'], row['_agg_c']))
+        for number, listed in items.items():
+            found[f"_agg_list{number}"] = [
+                (value, count) for _, value, count in sorted(listed, key=lambda item: item[0])
+            ]
+        return found
+
+    def answer(self, index: int, spec: AggregationSpec, read: Callable[[Any], Any], **extra: Any) -> None:
+        """The aggregation at `index` is its result with `read(row)` as its value."""
+        self.finish.append((index, lambda row: _result(spec, read(row), **extra)))
+
+    def sql(self) -> str:
+        if not self.ctes:
+            return f"{self.with_clause}SELECT {', '.join(self.columns)} FROM {self.source}"
+        # A version's rows are a CTE named samples already: one WITH holds it and these.
+        lead = f"{self.with_clause.rstrip()}, " if self.with_clause else "WITH "
+        if not self.lists:
+            return f"{lead}{', '.join(self.ctes)} SELECT {', '.join(self.columns)}"
+        tagged = ['NULL AS _agg_list', 'NULL AS _agg_pos', 'NULL AS _agg_v', 'NULL AS _agg_c']
+        single = f"SELECT {', '.join(self.columns + tagged)}"
+        blanks = ''.join('NULL, ' for _ in self.columns)
+        rows = [
+            f"SELECT {blanks}{number}, _agg_pos, v, c FROM ({sql}) _agg_items{number}"
+            for number, sql in enumerate(self.lists)
+        ]
+        return f"{lead}{', '.join(self.ctes)} {' UNION ALL '.join([single, *rows])}"
+
+
+def _exists_sql(id: int, field: str, statement: _Statement, columns: set) -> str:
+    """The filter `{"field": field, "operator": "exists"}`, compiled as every filter is: with_value counts exactly what
+    a count with it added counts."""
+    sql, _ = parse_filter_node(
+        {'field': field, 'operator': 'exists'},
+        statement.args,
+        len(statement.args) + 1,
+        None,
+        None,
+        id,
+        array_columns=columns,
+    )
+    return sql
+
+
+def _result(spec: AggregationSpec, value: Any, **extra: Any) -> dict:
+    return {"op": spec.op, "field": spec.field, **extra, "value": value}
+
+
+def _number(value: Any) -> Optional[float]:
+    return float(value) if value is not None else None
+
+
+# How a result's value is read from its statement's row, by its column names.
+def _count_read(name: str) -> Callable[[Any], Any]:
+    return lambda row: int(row[name] or 0)
+
+
+def _number_read(name: str) -> Callable[[Any], Any]:
+    return lambda row: _number(row[name])
+
+
+def _bounds_read(low: str, high: str) -> Callable[[Any], Any]:
+    return lambda row: [_number(row[low]), _number(row[high])]
+
+
+def _list_read(name: str) -> Callable[[Any], Any]:
+    return lambda row: [value for value, _ in row[name]]
+
+
+def _count_values_read(name: str) -> Callable[[Any], Any]:
+    return lambda row: [{"value": value, "count": count} for value, count in row[name]]
+
+
+def _quantiles_read(name: str) -> Callable[[Any], Any]:
+    return lambda row: [float(x) for x in row[name]] if row[name] else []
+
+
+def _field_statements(
+    id: int,
+    field: str,
+    specs: List[tuple[int, AggregationSpec]],
+    where_clause: str,
+    base_args: list,
+    with_clause: str,
+    columns: set,
+) -> List[_Statement]:
+    """The statements that answer one field's aggregations. Counts and numbers alone are one pass with plain
+    aggregates. Anything that needs each value's count (count_values, distinct, distinct_count, values) or the numbers
+    in order (quantiles, histogram) is one grouped read: the samples' values, each with how many samples have it,
+    from which every one of the field's aggregations is answered. A list's elements or a drawing's labels are grouped
+    on their own, and their field's counts and numbers (which are per sample) read in a second statement."""
+    values = [(index, spec) for index, spec in specs if spec.op in _VALUE_OPS]
+    ranked = [(index, spec) for index, spec in specs if spec.op in _RANK_OPS]
+    others = [(index, spec) for index, spec in specs if spec.op in _ROW_OPS | _NUMBER_OPS]
+    common = (id, field, where_clause, base_args, with_clause, columns)
+    if not values and not ranked:
+        return [_plain_statement(*common, others)]
+    if not _unnested(field, columns):
+        return [_grouped_statement(*common, specs, by_value=bool(values))]
+    statements = [_grouped_statement(*common, values, by_value=True)] if values else []
+    if ranked:
+        statements.append(_grouped_statement(*common, ranked + others, by_value=False))
+    elif others:
+        statements.append(_plain_statement(*common, others))
+    return statements
+
+
+def _plain_statement(
+    id: int,
+    field: str,
+    where_clause: str,
+    base_args: list,
+    with_clause: str,
+    columns: set,
+    specs: List[tuple[int, AggregationSpec]],
+) -> _Statement:
+    """Counts and the numbers' sum, mean, spread, smallest and largest: one pass of plain aggregates, which parallel
+    workers share. A metadata field's text is read once a sample (a function scan, as the histogram route reads it),
+    and its number from that."""
+    statement = _Statement(base_args, with_clause)
+    statement.source = "samples"
+    number = None
+    if any(spec.op in _NUMBER_OPS for _, spec in specs):
+        source = _number_source(field, getattr(columns, 'datetime_fields', ()))
+        if source.sql.startswith('metadata'):
+            statement.source += (
+                f" CROSS JOIN LATERAL unnest(ARRAY[{source.sql}]) AS _agg_text(_agg_t)"
+                f" CROSS JOIN LATERAL unnest(ARRAY[{source.number('_agg_t')}]) AS _agg_number(_agg_n)"
+            )
+            number = "_agg_n"
+        else:
+            number = source.number(source.sql)
+    statement.source += f" {where_clause}"
+    for index, spec in specs:
+        if spec.op == 'count':
+            statement.answer(index, spec, _count_read(statement.column("count(*)")))
+        elif spec.op == 'with_value':
+            exists = _exists_sql(id, field, statement, columns)
+            statement.answer(index, spec, _count_read(statement.column(f"count(*) FILTER (WHERE {exists})")))
+        elif spec.op == 'bounds':
+            statement.answer(
+                index,
+                spec,
+                _bounds_read(statement.column(f"min({number})"), statement.column(f"max({number})")),
+            )
+        else:
+            function = {"sum": "sum", "mean": "avg", "std": "stddev_samp", "min": "min", "max": "max"}[spec.op]
+            statement.answer(index, spec, _number_read(statement.column(f"{function}({number})")))
+    return statement
+
+
+def _grouped_statement(
+    id: int,
+    field: str,
+    where_clause: str,
+    base_args: list,
+    with_clause: str,
+    columns: set,
+    specs: List[tuple[int, AggregationSpec]],
+    *,
+    by_value: bool,
+) -> _Statement:
+    """One read of the filtered samples, grouped: `_agg_grouped` holds each value (`v`, by_value), or each number's
+    source (`s`), or both when the field's numbers aren't read from its value (created_at, media_type), with how many
+    samples have it (`c`) and how many of them have the field (`w`, for with_value). Every aggregation is answered from
+    those rows, not the samples: counts are sums of `c`, the values' order is theirs, and the numbers are taken each as
+    often as its samples (generate_series), so a sum, mean, spread or quantile is the same aggregate over the same
+    numbers. The value is read once a sample (a function scan), which keeps the planner from using a field's index
+    for its order, lets it hash the values in parallel workers, and keeps anything grouped or spilled to disk as narrow
+    as the value: never the sample's metadata. A metadata field's number (`n`), or a datetime's instant (`i`), is read
+    from that value in the same pass, by the parallel workers: a key beside the value that never splits its group."""
+    statement = _Statement(base_args, with_clause)
+    datetime_fields = getattr(columns, 'datetime_fields', ())
+    datetime_field = field in datetime_fields
+    numbers_wanted = any(spec.op in _NUMBER_OPS | _RANK_OPS for _, spec in specs)
+    presence = any(spec.op == 'with_value' for _, spec in specs)
+    value_sql = _agg_value_expr(field, array_columns=columns) if by_value else None
+    source = _number_source(field, datetime_fields) if numbers_wanted else None
+    together = source is not None and source.sql == value_sql  # a metadata field's numbers are read from its value
+    keys: List[tuple[str, str]] = []  # (the group's column, what each sample gives for it)
+    if value_sql is not None:
+        keys.append(('v', value_sql))
+    if source is not None and not together:
+        keys.append(('s', source.sql))
+    counted = "count(*) AS c"
+    if presence:
+        keys.append(('p', _exists_sql(id, field, statement, columns)))
+        counted += ", count(*) FILTER (WHERE _agg_p) AS w"
+    grouped_by = [name for name, _ in keys if name != 'p']
+    if by_value and _unnested(field, columns):
+        assert not presence and source is None  # _field_statements gives such a field's other operations their own
+        # A list's elements or a drawing's labels: several values a sample, so a set-returning expression in a
+        # subquery's select list, as count_values has always read them. Only value operations reach here.
+        grouped = f"SELECT v, {counted} FROM (SELECT {value_sql} AS v FROM samples {where_clause}) _agg_rows GROUP BY v"
+    else:
+        arrays = ', '.join(f"ARRAY[{sql}]" for _, sql in keys)
+        names = ', '.join(f"_agg_{name}" for name, _ in keys)
+        read = f"samples CROSS JOIN LATERAL unnest({arrays}) AS _agg({names})"
+        if source is not None and together:
+            number = ('i', instant_sql('_agg_v')) if source.micros is not None else ('n', source.number('_agg_v'))
+            read += f" CROSS JOIN LATERAL unnest(ARRAY[{number[1]}]) AS _agg_number(_agg_{number[0]})"
+            grouped_by.append(number[0])
+        # The value is grouped by its bytes (equal text is equal bytes in a deterministic collation, so the groups are
+        # the same): sorting a worker's groups for the merge by the locale's rules took longer than reading them. It
+        # comes back in the database's own collation, which every order below is in.
+        group_keys = [f'_agg_{name} COLLATE "C"' if name == 'v' else f'_agg_{name}' for name in grouped_by]
+        selected = ', '.join(
+            f'({key}) COLLATE "default" AS {name}' if name == 'v' else f'{key} AS {name}'
+            for key, name in zip(group_keys, grouped_by)
+        )
+        grouped = f"SELECT {selected}, {counted} FROM {read} {where_clause} GROUP BY {', '.join(group_keys)}"
+    statement.ctes.append(f"_agg_grouped AS MATERIALIZED ({grouped})")
+    # One row per value: grouped already, unless the numbers' source is grouped beside it.
+    texts = "_agg_grouped"
+    if by_value and 's' in grouped_by:
+        texts = "_agg_texts"
+        statement.ctes.append("_agg_texts AS (SELECT v, sum(c)::int8 AS c FROM _agg_grouped GROUP BY v)")
+    # A metadata number's text beside it (`t`), for the histogram of a field whose numbers are all one.
+    worded = source is not None and source.sql.startswith('metadata') and source.micros is None
+    if source is not None:
+        if 'i' in grouped_by:
+            numbers = f"{_seconds_of('i')} AS n, {_micros_of('i')} AS m"
+        elif 'n' in grouped_by:
+            numbers = "n, v AS t"
+        else:
+            micros = f", {source.micros('s')} AS m" if source.micros is not None else ""
+            numbers = f"{source.number('s')} AS n{micros}{', s AS t' if worded else ''}"
+        statement.ctes.append(f"_agg_numbers AS (SELECT {numbers}, c FROM _agg_grouped)")
+    # Each number as often as its samples have it (a number one sample has needs no series: most, on a field whose
+    # values are nearly all different).
+    expanded = (
+        "(SELECT n FROM _agg_numbers WHERE n IS NOT NULL AND c = 1 UNION ALL "
+        "SELECT n FROM _agg_numbers CROSS JOIN LATERAL generate_series(1, c) WHERE n IS NOT NULL AND c > 1) _agg_e"
+    )
+
+    def order(column: str) -> str:
+        """The values' order: a datetime's by its instant (computed once a value, as _agg_o), those without one last,
+        then by text."""
+        return f"_agg_o NULLS LAST, {column}" if datetime_field else column
+
+    ordered = (
+        f"SELECT v, c, {instant_sql('v')} AS _agg_o FROM {texts}" if datetime_field else f"SELECT v, c FROM {texts}"
+    )
+    for position, (index, spec) in enumerate(specs):
+        op = spec.op
+        if op in ('count', 'with_value', 'distinct_count'):
+            sql = {
+                'count': "SELECT sum(c) FROM _agg_grouped",
+                'with_value': "SELECT sum(w) FROM _agg_grouped",
+                'distinct_count': f"SELECT count(v) FROM {texts}",
+            }[op]
+            statement.answer(index, spec, _count_read(statement.column(sql)))
+        elif op == 'count_values':
+            # Commonest first, ties by value; with a limit, the first that many (a top-N sort), placed in that order.
+            ranked = f"c DESC, {_TIE_ORDER}"
+            items = f"SELECT v, c FROM {texts} WHERE v IS NOT NULL"
+            if spec.limit is not None:
+                items += f" ORDER BY {ranked} LIMIT {statement.param(spec.limit)}"
+            name = statement.list(
+                f"SELECT row_number() OVER (ORDER BY {ranked}) AS _agg_pos, v, c FROM ({items}) _agg_cv",
+            )
+            statement.answer(index, spec, _count_values_read(name))
+        elif op in ('distinct', 'values'):
+            each = " CROSS JOIN LATERAL generate_series(1, _agg_d.c)" if op == 'values' else ""
+            items = f"SELECT v{', _agg_o' if datetime_field else ''} FROM ({ordered}) _agg_d{each} WHERE v IS NOT NULL"
+            if spec.limit is not None:
+                items += f" ORDER BY {order('v')} LIMIT {statement.param(spec.limit)}"
+            name = statement.list(
+                f"SELECT row_number() OVER (ORDER BY {order('v')}) AS _agg_pos, v, NULL::int8 AS c "
+                f"FROM ({items}) _agg_dv",
+            )
+            statement.answer(index, spec, _list_read(name))
+        elif op in ('min', 'max'):
+            statement.answer(index, spec, _number_read(statement.column(f"SELECT {op}(n) FROM _agg_numbers")))
+        elif op == 'bounds':
+            low, high = (
+                statement.column("SELECT min(n) FROM _agg_numbers"),
+                statement.column("SELECT max(n) FROM _agg_numbers"),
+            )
+            statement.answer(index, spec, _bounds_read(low, high))
+        elif op in ('sum', 'mean', 'std'):
+            function = {"sum": "sum", "mean": "avg", "std": "stddev_samp"}[op]
+            statement.answer(index, spec, _number_read(statement.column(f"SELECT {function}(n) FROM {expanded}")))
+        elif op == 'quantiles':
+            qs = spec.quantiles or [0.25, 0.5, 0.75]
+            name = statement.column(
+                f"SELECT percentile_cont({statement.param(qs)}::double precision[]) WITHIN GROUP (ORDER BY n) "
+                f"FROM {expanded}",
+            )
+            statement.answer(index, spec, _quantiles_read(name), quantiles=qs)
+        else:  # histogram
+            assert source is not None
+            cte = f"_agg_hist{position}"
+            statement.finish.append(
+                (index, _histogram_columns(statement, spec, cte, source.micros is not None, worded)),
+            )
+    return statement
+
+
+def _histogram_columns(
+    statement: _Statement,
+    spec: AggregationSpec,
+    cte: str,
+    instants: bool,
+    worded: bool,
+) -> Callable[[Any], dict]:
+    """The histogram operation: the buckets POST /histogram gives for the field, filter and bins (its number or its
+    datetime bars, _number_buckets and _instant_buckets), over the numbers bounds reads. Its bins are computed in SQL
+    as the route computes them in Python, from the numbers' smallest, largest and count; no numbers, no buckets. A
+    metadata field (`worded`) whose numbers are all one is the route's categorical bucket of that value instead: the
+    text it is written as, with its count (the commonest 50, the route's default `top`)."""
+    bins = statement.param(spec.bins)
+    if instants:
+        # Whole microseconds: `width` a bar, as _instant_histogram divides them.
+        statement.ctes.append(
+            f"{cte} AS (SELECT lo, hi, width, (hi - lo + width) / width AS bars FROM ("
+            f"SELECT lo, hi, (hi - lo + wanted) / wanted AS width FROM ("
+            f"SELECT lo, hi, CASE WHEN lo = hi THEN 1 ELSE COALESCE({bins}::int, {_AUTO_BINS_SQL}) END AS wanted "
+            f"FROM (SELECT min(m) AS lo, max(m) AS hi, sum(c) AS total FROM _agg_numbers WHERE m IS NOT NULL) _agg_t "
+            f"WHERE lo IS NOT NULL) _agg_w) _agg_b)",
+        )
+        bucket = f"(m - (SELECT lo FROM {cte})) / (SELECT width FROM {cte}) + 1"
+        present = "m IS NOT NULL"
+        names = [statement.column(f"SELECT {name} FROM {cte}") for name in ('lo', 'hi', 'width', 'bars')]
+    else:
+        statement.ctes.append(
+            f"{cte} AS (SELECT mn, mx, {_ADJUSTED_MAX_SQL} AS adjusted, bars FROM ("
+            f"SELECT mn, mx, CASE WHEN mn = mx THEN 1 ELSE COALESCE({bins}::int, {_AUTO_BINS_SQL}) END AS bars "
+            f"FROM (SELECT min(n) AS mn, max(n) AS mx, sum(c) AS total FROM _agg_numbers WHERE n IS NOT NULL) _agg_t "
+            f"WHERE mn IS NOT NULL) _agg_b)",
+        )
+        bucket = f"width_bucket(n, (SELECT mn FROM {cte}), (SELECT adjusted FROM {cte}), (SELECT bars FROM {cte}))"
+        present = "n IS NOT NULL"
+        names = [statement.column(f"SELECT {name} FROM {cte}") for name in ('mn', 'mx', 'adjusted', 'bars')]
+    counts = statement.column(
+        # The bars' edges are each read once (an InitPlan), not joined to every number.
+        f"SELECT jsonb_object_agg(bucket, count) FROM (SELECT {bucket} AS bucket, sum(c)::int8 AS count "
+        f"FROM _agg_numbers WHERE {present} GROUP BY 1) _agg_h WHERE bucket BETWEEN 1 AND (SELECT bars FROM {cte})",
+    )
+
+    one = None
+    if worded:
+        one = statement.column(
+            "SELECT jsonb_agg(jsonb_build_array(t, count) ORDER BY count DESC, t) FROM "
+            "(SELECT t, sum(c)::int8 AS count FROM _agg_numbers "
+            f"WHERE n IS NOT NULL AND (SELECT mn = mx FROM {cte}) GROUP BY t ORDER BY count DESC, t LIMIT 50) _agg_one",
+        )
+
+    def finish(row: Any) -> dict:
+        if row[names[0]] is None:
+            return _result(spec, [])
+        counted = {int(bucket): count for bucket, count in (_jsonb(row[counts]) or {}).items()}
+        first, last, step, bars = (row[name] for name in names)
+        if one is not None and first == last:
+            return _result(spec, [{"key": t, "count": c, "label": str(t)} for t, c in _jsonb(row[one]) or []])
+        if instants:
+            return _result(spec, _instant_buckets(int(first), int(last), int(step), int(bars), counted))
+        return _result(spec, _number_buckets(float(first), float(last), float(step), int(bars), counted))
+
+    return finish
 
 
 class TagCountsRequest(BaseModel):

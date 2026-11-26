@@ -885,6 +885,7 @@ FIELD_KEYS = {
     'values',
     'values_private',
     'complete',
+    'indexed',  # m1-contract-assistant-cost 1.1
 }
 TYPES = {
     'id': 'number',

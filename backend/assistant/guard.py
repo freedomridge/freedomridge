@@ -35,8 +35,10 @@ PRESENCE = frozenset({'exists', 'not_exists', 'is_null', 'is_not_null'})
 BY_TOKEN = frozenset({'=', '==', '!=', '<>', 'in', 'not in', 'not_in', 'nin'})
 # Operators whose value is itself a filter tree, compiled by the same compiler.
 SUB_FILTERS = frozenset({'cg_self', 'parent_matches', 'has_matching_object'})
-# Aggregations that count or list a field's values (which the answer's sealing turns into tokens) without ranking them.
-COUNTING = frozenset({'count', 'count_values', 'distinct_count', 'distinct', 'values'})
+# Aggregations that count or list a field's values (which the answer's sealing turns into tokens) without ranking them,
+# or count the samples that have it (with_value). Any other (bounds, quantiles, mean, histogram, ...) orders or bins
+# the values: refused.
+COUNTING = frozenset({'count', 'with_value', 'count_values', 'distinct_count', 'distinct', 'values'})
 # The operator a test whose token didn't open becomes: it matches nothing (routers/datasets._compile_filter_node).
 NOTHING = 'assistant_unreadable'
 

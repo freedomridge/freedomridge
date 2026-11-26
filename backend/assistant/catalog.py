@@ -122,6 +122,38 @@ def _kind(field: Mapping[str, Any]) -> str:
     return _KINDS.get(canonical_type(field.get('declared_type') or 'string'), TEXT)
 
 
+# The built-in fields an index of the samples table serves a filter on within a dataset (backend/db/schema.sql):
+# equality and ranges on (dataset_id, id), (dataset_id, filepath) unique, (dataset_id, created_at) and
+# (dataset_id, media_type), and `in` (has any of these values, an overlap) on tags' GIN index, which doesn't serve `=`
+# (a test of each sample's list). last_modified_at has no index: one would make every edit's update slower.
+INDEXED_BUILT_IN = {
+    'id': True,
+    'filepath': True,
+    'created_at': True,
+    'media_type': True,
+    'last_modified_at': False,
+    'tags': True,
+}
+
+
+def list_column(field: Mapping[str, Any]) -> bool:
+    """Whether the field is a list the samples table keeps in a column of its own (tags, a registered array field),
+    whose index serves `in` but not `=`."""
+    return field.get('type') == 'array' or field.get('origin') == 'native_array'
+
+
+def indexed(field: Mapping[str, Any]) -> bool:
+    """Whether a filter on the field with =, in or a narrow range (`in`, for a list_column) is served by an index, from
+    what the schema already says (no read of the samples): a built-in field by INDEXED_BUILT_IN, a registered array
+    field always (its column gets its GIN index with it), and any other field when the dataset has an index on it
+    (is_promoted, what the app shows as indexed)."""
+    if field['name'] in INDEXED_BUILT_IN:
+        return INDEXED_BUILT_IN[field['name']]
+    if field.get('origin') == 'native_array':
+        return True
+    return bool(field.get('is_promoted'))
+
+
 def _private_names(schema: list[dict[str, Any]]) -> set[str]:
     """Fields whose values are kept from the assistant: those marked, and the label lists of a marked field
     (`detections.label` holds values of `detections`)."""
@@ -189,6 +221,7 @@ async def describe_dataset(api: Api, arguments: dict[str, Any]) -> dict[str, Any
             {
                 'name': name,
                 'type': kind,
+                'indexed': indexed(field),
                 'description': field.get('description'),
                 'unit': field.get('unit'),
                 'description_source': field.get('description_source'),
@@ -273,7 +306,9 @@ _DESCRIBE_DATASET = Tool(
         'language (number, datetime, text, list, boolean or object), what it means (description and unit, when '
         'someone wrote one or the server has a default), how many rows have it (object rows included), its smallest '
         'and largest value (number and datetime fields), or, for text and list fields, how many distinct values it '
-        'has and up to five examples of them, without counts. `many: true` means more different values than the '
+        'has and up to five examples of them, without counts. `indexed: true` means a filter on the field with =, in '
+        'or a narrow range is quick however large the dataset; for a list field it is `in` that is quick (= on a list '
+        'is not served by its index). `many: true` means more different values than the '
         'server keeps a list of (serial numbers, file names): `distinct` is null and the examples are a few of them. '
         '`complete: false` on a field means its statistics are not up to date (samples changed since they were '
         'counted, or they are being counted): its numbers are what the server has now, not the whole, and `distinct` '

@@ -78,6 +78,15 @@ each field. Six migrations, none of which touches a sample.
     for a tool has a 45-second limit, so a slow count answers `too_slow`. One person keeps at most 2,000 views and
     500 lists, one view at most 50 stages and 50,000 list values. Filter text is at most 20,000 characters, and an
     error's message is cut to 2,000, so every answer stays small whatever its arguments.
+  - **What is quick and what is slow.** `describe_dataset` marks each field `indexed`, and the instructions tell the
+    model that a filter on an indexed field with `=`, `in` or a narrow range is quick at any size, while
+    `field_values` and `field_summary` read every sample of the view whatever the field, so it narrows a large view
+    first. Those two now count the view and then read its samples once (twice for a number's or a datetime's summary)
+    instead of three and eight times, and look the field up without reading the samples: on 4 million samples
+    `field_values` takes about 2 s instead of 10 to 26, a number's summary 5 to 9 s instead of 37 to 49. A summary
+    whose second read runs out of time still answers its first read's numbers, each exact, with a `note`; `too_slow`
+    says what ran out and what to do, names the fields of a filter that are not indexed, and no longer advises an index
+    where one would not help ([docs/ASSISTANT.md](docs/ASSISTANT.md#what-is-quick-and-what-is-slow)).
   - **The call log.** Every tool call is logged (who, tool, dataset, when, how long, the outcome; never the arguments
     or the result) for 30 days: administrators read it under Settings → Assistant, **Recent calls**, and at
     `GET /api/admin/assistant/calls`.
@@ -88,8 +97,14 @@ each field. Six migrations, none of which touches a sample.
     `w=`. Anyone else, an expired or unknown handle, or a view of another dataset is told why, and the dataset opens
     without those filters ([DATASET_MANAGEMENT.md](docs/DATASET_MANAGEMENT.md#links-to-a-filter-a-view-or-a-sample)).
   - **Along the way:** asked with `?stale=true`, each field of `GET /api/datasets/{id}/schema` that the statistics
-    measure carries `stats_stale` (changes to the samples wait to be counted for it). The aggregate route takes
-    `distinct_count`, orders ties by value, and reads a datetime as seconds since 1970 in its numeric aggregations.
+    measure carries `stats_stale` (changes to the samples wait to be counted for it), and asked with `?values=false`
+    it reads no samples (media_type's, tags' and an indexed field's lists of values are left out). The aggregate route
+    takes `distinct_count`, orders ties by value, and reads a datetime as seconds since 1970 in its numeric
+    aggregations. It answers the operations on one field from one read of the filtered samples, in parallel workers
+    and without sorting whole sample rows to disk, a list of any length still coming back whole (the SDK's `aggregate`
+    too), and takes two more: `with_value`, the samples that have the field, and `histogram` (`bins`), the buckets
+    `POST .../histogram` gives over the values `bounds` counts (a number field's numeric text included, which the
+    histogram route leaves out).
     `GET /api/views/{slug}` answers a private view its caller may not see as missing before anything else, as it
     always did for a person. Migrations `0036_assistant.sql` (three small tables and `datasets.assistant_closed`,
     false on every existing dataset), `0037_mcp_tokens_and_assistant_calls.sql` (the token kind and the empty log
@@ -141,6 +156,14 @@ each field. Six migrations, none of which touches a sample.
 
 ### Fixed
 
+- **Text that reads as a number but is too large for one is text.** A value such as the hex id `0347677e05719710`
+  matched the aggregate route's number pattern and overflowed when cast, so `count_values` (which orders ties by
+  number) and every number operation failed with a 500 on a field holding one. It is now counted and listed as the
+  text it is, and the number operations pass over it, as the histogram route already did.
+- **A page of samples that runs out of time answers as its count does.** `POST /api/datasets/{id}/samples/query`
+  answered a statement that ran out of time while it fetched the page's rows with a 500 ("Internal query error"),
+  where the same timeout in its count was answered as a timeout (504 under a request's own time limit, a guest's or the
+  assistant's). The page now answers as the count does, and the assistant's tools say `too_slow` instead of failing.
 - **A link whose request fails is kept, not lost.** Opening a `q=`, `view=` or `w=` link, a request the browser
   dropped is asked again (up to three times), and one that still fails (the network, a server error) no longer opens
   the dataset without the link and rewrites the address: the page says so, with **Try again** and **Open the dataset

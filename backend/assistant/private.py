@@ -83,7 +83,7 @@ COUNT_KEYS = frozenset(
     },
 )
 # Aggregations whose `value` is a count.
-COUNT_OPS = frozenset({'count', 'distinct_count'})
+COUNT_OPS = frozenset({'count', 'with_value', 'distinct_count'})
 NAME_KEYS = ('field', 'name', 'field_name')
 # Every route a tool may list, with the shape of its answer that the walk below covers (inner.request refuses any
 # other, and a test plants values for each and reads its answer). A new route is added here with that test.

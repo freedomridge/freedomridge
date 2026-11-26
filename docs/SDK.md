@@ -915,11 +915,15 @@ results = dataset.filter(scene="highway").aggregate([
 # results is a list, one entry per aggregation (each {"op", "field", "value"})
 ```
 
-Supported ops: `count`, `sum`, `mean`, `std`, `min`, `max`, `bounds`,
-`quantiles` (numeric; a datetime field's instants as seconds since 1970 UTC);
-`count_values` (commonest first, ties by value), `distinct`, `values`
+Supported ops: `count`, `with_value` (how many samples have the field, as an
+`exists` filter counts them), `sum`, `mean`, `std`, `min`, `max`, `bounds`,
+`quantiles`, `histogram` (with `bins`: the buckets `histogram_values` gives, over
+the values `bounds` counts) (numeric; a datetime field's instants as seconds since
+1970 UTC); `count_values` (commonest first, ties by value), `distinct`, `values`
 (categorical/any, with optional `limit`) and `distinct_count` (how many distinct
-values). `view.schema()` returns the dataset field schema.
+values). The operations on one field are answered from one read of the samples
+where one read can give them, so batching them costs about what one does.
+`view.schema()` returns the dataset field schema.
 
 ---
 

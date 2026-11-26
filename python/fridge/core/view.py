@@ -727,10 +727,14 @@ class DatasetView:
     def aggregate(self, aggregations: List[Dict]) -> List[Dict]:
         """Run one or more aggregations server-side in a single request.
 
-        Each entry is ``{"field": str, "op": str, ...}``. Numeric ops: count,
-        sum, mean, std, min, max, bounds, quantiles (+ ``"quantiles": [..]``).
-        Categorical ops: count_values, distinct, values (+ optional ``"limit"``;
-        uncapped by default). Scoped by this view's filters. Returns the list of
+        Each entry is ``{"field": str, "op": str, ...}``. Counts: count,
+        with_value (the samples that have the field). Numeric ops: sum, mean,
+        std, min, max, bounds, quantiles (+ ``"quantiles": [..]``), histogram
+        (+ optional ``"bins"``: the buckets ``histogram_values`` gives, over the
+        values bounds counts). Categorical ops: count_values, distinct,
+        distinct_count, values (+ optional ``"limit"``; uncapped by default).
+        The operations on one field are answered from one read of the samples
+        where one read can. Scoped by this view's filters. Returns the list of
         result dicts, one per aggregation, in order.
 
         Example:

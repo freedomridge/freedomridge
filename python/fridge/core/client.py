@@ -1559,10 +1559,13 @@ class Client:
 
         Args:
             dataset_id: Dataset ID
-            aggregations: list of {"field": str, "op": str, ...}. Numeric ops:
-                count, sum, mean, std, min, max, bounds, quantiles (+ optional
-                "quantiles": [..]). Categorical ops: count_values, distinct,
-                values (+ optional "limit"; uncapped by default).
+            aggregations: list of {"field": str, "op": str, ...}. Counts:
+                count, with_value (the samples that have the field). Numeric
+                ops: sum, mean, std, min, max, bounds, quantiles (+ optional
+                "quantiles": [..]), histogram (+ optional "bins"). Categorical
+                ops: count_values, distinct, distinct_count, values (+ optional
+                "limit"; uncapped by default). The operations on one field are
+                answered from one read of the samples where one read can.
             filters: optional filter dict to scope the aggregation.
 
         Returns:

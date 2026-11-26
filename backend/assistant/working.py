@@ -9,8 +9,8 @@ from dataclasses import dataclass
 from typing import Any, Iterable, Optional
 
 from . import links, private, rule, store
-from .api import Api, ToolError, cut
-from .catalog import _NO_VALUES, DATASET, SCHEMA, Tool, _kind
+from .api import TOO_SLOW, Api, ToolError, cut
+from .catalog import _NO_VALUES, DATASET, SCHEMA, Tool, _kind, indexed, list_column
 from .catalog import _private_names as catalog_private_names
 from .grain import image_grain
 
@@ -18,7 +18,6 @@ PARSE = '/api/datasets/{id}/filter_query/parse'
 FORMAT = '/api/datasets/{id}/filter_query/format'
 QUERY = '/api/datasets/{id}/samples/query'
 AGGREGATE = '/api/datasets/{id}/aggregate'
-HISTOGRAM = '/api/datasets/{id}/histogram'
 
 _VIEW_OR_DATASET = {
     'view': {'type': 'string', 'maxLength': 100, 'description': 'A working view\'s handle (wv_...), from make_view.'},
@@ -280,7 +279,12 @@ async def _view_answer(
     `labelled`: a stage shown by its label comes as `"text": null` and its `label` (open_saved_view)."""
     if grows:
         await _check_size(stages)
-    count = await _count(api, dataset_id, await _images(api, dataset_id, await _nodes(stages)))
+    try:
+        count = await _count(api, dataset_id, await _images(api, dataset_id, await _nodes(stages)))
+    except ToolError as error:
+        if error.code != 'too_slow':
+            raise
+        raise await _too_slow_filter(api, dataset_id, stages, None, 'Counting this view') from None
     formless: set[int] = set()
     shown, full = await _texts(api, dataset_id, stages, formless)
     handle = await store.save_view(_user(api), dataset_id, stages, from_handle)
@@ -443,18 +447,139 @@ class Field:
     private: bool
 
 
+async def _fields(api: Api, dataset_id: int) -> list[dict[str, Any]]:
+    """The dataset's fields, without the lists of values the schema would read from the samples: no read of them."""
+    fields: list[dict[str, Any]] = await api.get(SCHEMA, id=dataset_id, query={'values': 'false'})
+    return fields
+
+
 async def _field(api: Api, dataset_id: int, name: str) -> Field:
-    schema = await api.get(SCHEMA, id=dataset_id)
+    schema = await _fields(api, dataset_id)
     entry = next((field for field in schema if field['name'] == name), None)
     if entry is None:
         raise ToolError('not_found', f"Field '{name}' is not a field of this dataset")
     return Field(name, _kind(entry), entry, private.covered(name, _private_names(schema)))
 
 
-def _presence(name: str) -> dict[str, Any]:
-    """Samples that have the field: a drawing's label list counts the samples with the drawing."""
-    top = name.rsplit('.', 1)[0] if name.endswith('.label') or name == 'segmentation.labels' else name
-    return {'field': top, 'operator': 'exists'}
+def _presence(name: str) -> str:
+    """The field whose samples have the field: a drawing's label list counts the samples with the drawing."""
+    return name.rsplit('.', 1)[0] if name.endswith('.label') or name == 'segmentation.labels' else name
+
+
+def _about(target: Target) -> str:
+    return 'this view' if target.view else 'this dataset'
+
+
+async def _counted_view(api: Api, target: Target, tool: str) -> tuple[dict[str, Any], int]:
+    """The view's filter at the image grain, and its exact count, made before field_values' and field_summary's reads
+    (a samples query that counts, not a read of the field), so a read that runs out of time can say how many samples
+    it had to read."""
+    try:
+        base = await _images(api, target.dataset_id, await _nodes(target.stages))
+        return base, await _count(api, target.dataset_id, base)
+    except ToolError as error:
+        if error.code != 'too_slow':
+            raise
+        raise _too_slow_reads(target, None, tool) from None
+
+
+def _too_slow_reads(target: Target, total: Optional[int], tool: str) -> ToolError:
+    """too_slow from field_values or field_summary: the tool reads every sample of the view whatever the field, so the
+    message gives their number (none when counting them is what ran out) and says to narrow the view, never to index
+    the field."""
+    what = f'every one of the {total:,} samples of' if total is not None else 'every sample of'
+    ran_out = 'that' if total is not None else 'even counting them'
+    return ToolError(
+        'too_slow',
+        f'{tool} reads {what} {_about(target)}, whether or not the field is indexed, and {ran_out} took longer than '
+        'the server allows for one statement, so there is no answer, not even a partial one. Narrow the view first '
+        '(make_view or refine_view), then ask again.',
+    )
+
+
+def _tests_of(node: Any) -> Iterable[tuple[str, str]]:
+    """Each test of a filter tree, as (its field, its operator)."""
+    if isinstance(node, dict):
+        if isinstance(node.get('field'), str):
+            yield node['field'], str(node.get('operator', '=')).lower()
+        for value in node.values():
+            yield from _tests_of(value)
+    elif isinstance(node, list):
+        for value in node:
+            yield from _tests_of(value)
+
+
+def _quoted(names: list[str]) -> str:
+    return ', '.join(f"'{name}'" for name in names)
+
+
+# The tests an index on the field serves (and a sort): only for a field tested so is an index worth asking for.
+# contains (ILIKE '%...%'), exists and not_exists read every sample whether or not the field has one.
+_INDEX_SERVES = frozenset({'=', '==', 'in', '<', '<=', '>', '>='})
+
+
+async def _too_slow_filter(
+    api: Api,
+    dataset_id: int,
+    stages: list[dict[str, Any]],
+    sort_by: Optional[str],
+    doing: str,
+) -> ToolError:
+    """too_slow from a count over a view's filter, or a page of it sorted or filtered: names what it uses that no index
+    serves, for which every sample of the dataset was read: a field that is not indexed, and a list field (tags, a
+    registered array field: its index serves `in`) tested otherwise or sorted by. It advises asking for an index only
+    for a field tested in a way one would serve (=, in, a range) or sorted by. When it uses none, it says to narrow the
+    view without advising an index. A private field's name may be given; never a value."""
+    tests = [test for node in await _nodes(stages) for test in _tests_of(node)]
+    try:
+        schema = {field['name']: field for field in await _fields(api, dataset_id)}
+    except ToolError as error:
+        if error.code != 'too_slow':
+            raise
+        return ToolError('too_slow', TOO_SLOW)
+    sorted_by = schema.get(sort_by) if sort_by else None
+    plain_filter = [name for name, _ in tests if name in schema and not indexed(schema[name])]
+    plain_sort = [sort_by] if sort_by and sorted_by is not None and not indexed(sorted_by) else []
+    plain = list(dict.fromkeys(plain_filter + plain_sort))
+    lists = [name for name, operator in tests if name in schema and list_column(schema[name]) and operator != 'in'] + (
+        [sort_by] if sort_by and sorted_by is not None and list_column(sorted_by) else []
+    )
+    lists = [name for name in dict.fromkeys(lists) if name not in plain]
+    ran_out = (
+        f'{doing} took longer than the server allows for one statement, so there is no answer, not even a partial one.'
+    )
+    if not plain and not lists:
+        return ToolError(
+            'too_slow',
+            f'{ran_out} Narrow the view: a filter on an indexed field with =, in or a narrow range (on a list field, '
+            'in) is quick, but a contains or a range that keeps a large share of the samples reads every sample all '
+            'the same.',
+        )
+    said = []
+    if plain:
+        if plain_filter and plain_sort:
+            subject = 'Its filter and its sort use'
+        else:
+            subject = 'Its sort uses' if plain_sort else 'Its filter uses'
+        said.append(f'{subject} {_quoted(plain)}, which {"is" if len(plain) == 1 else "are"} not indexed')
+    if lists:
+        whose = 'its' if len(lists) == 1 else 'their'
+        said.append(
+            f'{"it also" if plain else "It"} uses the list field{"" if len(lists) == 1 else "s"} {_quoted(lists)} '
+            f'otherwise than with in (with =, say, or to sort), which {whose} index doesn\'t serve',
+        )
+    advice = 'Narrow the view by an indexed field first (describe_dataset marks them indexed: true)'
+    servable = {name for name, operator in tests if operator in _INDEX_SERVES} | set(plain_sort)
+    to_index = [name for name in plain if name in servable]
+    if to_index:
+        advice += f', or ask an administrator to index {_quoted(to_index)}'
+    if lists:
+        advice += '; test a list field with in'
+    read_for = 'it' if len(plain) + len(lists) == 1 else 'them'
+    return ToolError(
+        'too_slow',
+        f'{ran_out} {", and ".join(said)}: every sample of the dataset was read for {read_for}. {advice}.',
+    )
 
 
 def _typed(value: Any, kind: str) -> Any:
@@ -501,27 +626,40 @@ async def field_values(api: Api, arguments: dict[str, Any]) -> dict[str, Any]:
             f"The values of '{field.name}' are kept from the assistant: they can't be searched. Its value list (by "
             'its handle) filters the field, and exists or not_exists test it',
         )
-    base = await _images(api, target.dataset_id, await _nodes(target.stages))
+    base, total = await _counted_view(api, target, 'field_values')
     # Text a value must contain: the server matches it on a text field (any letter case); on a list, a number or a
     # boolean, among the values counted.
-    counted = (
-        _and(base, {'field': field.name, 'operator': 'contains', 'value': search})
-        if search and field.kind == 'text'
-        else base
-    )
-    answer = await api.post(
-        AGGREGATE,
-        {
-            'aggregations': [
-                # The whole list when it can be kept, and at least as far as the page asked for.
-                {'field': field.name, 'op': 'count_values', 'limit': max(store.LIST_LIMIT + 1, offset + limit)},
-                {'field': field.name, 'op': 'distinct_count'},
-            ],
-            'filters': counted,
-        },
-        counting=True,
-        id=target.dataset_id,
-    )
+    searched = bool(search) and field.kind == 'text'
+    counted = _and(base, {'field': field.name, 'operator': 'contains', 'value': search}) if searched else base
+    with_value_op = {'field': _presence(field.name), 'op': 'with_value'}
+    aggregations = [
+        # The whole list when it can be kept, and at least as far as the page asked for.
+        {'field': field.name, 'op': 'count_values', 'limit': max(store.LIST_LIMIT + 1, offset + limit)},
+        {'field': field.name, 'op': 'distinct_count'},
+    ]
+    try:
+        # One read of the view's samples for a field with one value a sample. samples_with_value is over the view,
+        # whatever the search, so a searched text field counts it in a read of its own.
+        answer = await api.post(
+            AGGREGATE,
+            {'aggregations': aggregations + ([] if searched else [with_value_op]), 'filters': counted},
+            counting=True,
+            id=target.dataset_id,
+        )
+        if searched:
+            present = await api.post(
+                AGGREGATE,
+                {'aggregations': [with_value_op], 'filters': base},
+                counting=True,
+                id=target.dataset_id,
+            )
+            with_value = int(present['results'][0]['value'])
+        else:
+            with_value = int(answer['results'][2]['value'])
+    except ToolError as error:
+        if error.code != 'too_slow':
+            raise
+        raise _too_slow_reads(target, total, 'field_values') from None
     entries = [[_typed(item['value'], field.kind), item['count']] for item in answer['results'][0]['value']]
     distinct = int(answer['results'][1]['value'])
     if search and field.kind != 'text':
@@ -533,7 +671,6 @@ async def field_values(api: Api, arguments: dict[str, Any]) -> dict[str, Any]:
         needle = search.casefold()
         entries = [entry for entry in entries if needle in str(entry[0]).casefold()]
         distinct = len(entries)
-    with_value = await _count(api, target.dataset_id, _and(base, _presence(field.name)))
     whole = distinct <= store.LIST_LIMIT
     value_kind = field.kind if field.kind in ('number', 'boolean') else 'text'
     handle = await store.save_list(
@@ -580,40 +717,50 @@ def _instant(seconds: Optional[float]) -> Optional[str]:
     return datetime.datetime.fromtimestamp(seconds, datetime.timezone.utc).isoformat().replace('+00:00', 'Z')
 
 
-async def field_summary(api: Api, arguments: dict[str, Any]) -> dict[str, Any]:
-    target = await _target(api, arguments)
-    field = await _field(api, target.dataset_id, arguments['field'])
-    _check_counted(field, 'field_summary')
-    base = await _images(api, target.dataset_id, await _nodes(target.stages))
-    total = await _count(api, target.dataset_id, base)
-    with_value = await _count(api, target.dataset_id, _and(base, _presence(field.name)))
-    result: dict[str, Any] = {
-        'field': field.name,
-        'type': field.kind,
-        'unit': field.entry.get('unit'),
-        'samples_with_value': with_value,
-        'samples_without': max(0, total - with_value),
-    }
-    numeric = field.kind in ('number', 'datetime')
-    aggregations: list[dict[str, Any]] = [{'field': field.name, 'op': 'distinct_count'}]
-    if not field.private:
-        if numeric:
-            aggregations += [
-                {'field': field.name, 'op': 'bounds'},
-                {'field': field.name, 'op': 'quantiles', 'quantiles': list(QUANTILES)},
-            ]
-            if field.kind == 'number':
-                aggregations.append({'field': field.name, 'op': 'mean'})
-        else:
-            aggregations.append({'field': field.name, 'op': 'count_values', 'limit': 5})
+async def _aggregate(api: Api, target: Target, base: dict[str, Any], aggregations: list[dict[str, Any]]) -> dict:
+    """The aggregations over the view, by operation (field_summary asks each operation once a request)."""
     answer = await api.post(
         AGGREGATE,
         {'aggregations': aggregations, 'filters': base},
         counting=True,
         id=target.dataset_id,
     )
-    results = {item['op']: item for item in answer['results']}
-    result['distinct'] = int(results['distinct_count']['value'])
+    return {item['op']: item for item in answer['results']}
+
+
+async def field_summary(api: Api, arguments: dict[str, Any]) -> dict[str, Any]:
+    """The view's count, then one read of its samples, two for a number or a datetime: first the samples with a value,
+    the smallest, the largest and the mean, then the quantiles, the histogram and the distinct count. When only the
+    second runs out of time, the first's numbers are the answer, each exact, and a note says what is missing and why."""
+    target = await _target(api, arguments)
+    field = await _field(api, target.dataset_id, arguments['field'])
+    _check_counted(field, 'field_summary')
+    base, total = await _counted_view(api, target, 'field_summary')
+    numeric = field.kind in ('number', 'datetime') and not field.private
+    first: list[dict[str, Any]] = [{'field': _presence(field.name), 'op': 'with_value'}]
+    if not numeric:
+        first.append({'field': field.name, 'op': 'distinct_count'})
+        if not field.private:
+            first.append({'field': field.name, 'op': 'count_values', 'limit': 5})
+    else:
+        first.append({'field': field.name, 'op': 'bounds'})
+        if field.kind == 'number':
+            first.append({'field': field.name, 'op': 'mean'})
+    try:
+        results = await _aggregate(api, target, base, first)
+    except ToolError as error:
+        if error.code != 'too_slow':
+            raise
+        raise _too_slow_reads(target, total, 'field_summary') from None
+    with_value = int(results['with_value']['value'])
+    result: dict[str, Any] = {
+        'field': field.name,
+        'type': field.kind,
+        'unit': field.entry.get('unit'),
+        'samples_with_value': with_value,
+        'samples_without': max(0, total - with_value),
+        'distinct': int(results['distinct_count']['value']) if 'distinct_count' in results else None,
+    }
     if field.private:
         return result
     if not numeric:
@@ -627,17 +774,28 @@ async def field_summary(api: Api, arguments: dict[str, Any]) -> dict[str, Any]:
     result['min'], result['max'] = show(low), show(high)
     if field.kind == 'number':
         result['mean'] = results['mean']['value']
+    second: list[dict[str, Any]] = [
+        {'field': field.name, 'op': 'quantiles', 'quantiles': list(QUANTILES)},
+        {'field': field.name, 'op': 'histogram', 'bins': 20},
+        {'field': field.name, 'op': 'distinct_count'},
+    ]
+    try:
+        results = await _aggregate(api, target, base, second)
+    except ToolError as error:
+        if error.code != 'too_slow':
+            raise
+        result.update(quantiles=None, histogram=None)
+        result['note'] = (
+            f'The quantiles, the histogram and the distinct count ran out of time on the {total:,} samples of '
+            f'{_about(target)}: narrow the view to get them. The other numbers are exact.'
+        )
+        return result
+    result['distinct'] = int(results['distinct_count']['value'])
     marks = results['quantiles']['value']
     result['quantiles'] = {f'p{round(q * 100)}': show(value) for q, value in zip(QUANTILES, marks)} if marks else None
-    histogram = await api.post(
-        HISTOGRAM,
-        {'field': field.name, 'filters': base, 'bins': 20},
-        counting=True,
-        id=target.dataset_id,
-    )
     result['histogram'] = [
         {'from': show(bucket['range']['min']), 'to': show(bucket['range']['max']), 'count': bucket['count']}
-        for bucket in histogram.get('buckets', [])
+        for bucket in results['histogram']['value']
         if isinstance(bucket.get('range'), dict)
     ]
     return result
@@ -660,16 +818,21 @@ async def get_samples(api: Api, arguments: dict[str, Any]) -> dict[str, Any]:
         raise ToolError('refused', _NOT_ALLOWED_FIELDS)
     # Sorting by a private field is refused by the API itself (assistant/guard.py), in its own words.
     private_names = _private_names(await api.get(SCHEMA, id=target.dataset_id)) if fields else set()
-    body: dict[str, Any] = {
-        'filters': await _images(api, target.dataset_id, await _nodes(target.stages)),
-        'limit': limit,
-        'offset': offset,
-        'sort_by': sort_by,
-        'sort_order': 'desc' if descending else 'asc',
-    }
-    if not fields:
-        body.update(fields='id', slim=True)
-    page = await api.post(QUERY, body, counting=True, id=target.dataset_id)
+    try:
+        body: dict[str, Any] = {
+            'filters': await _images(api, target.dataset_id, await _nodes(target.stages)),
+            'limit': limit,
+            'offset': offset,
+            'sort_by': sort_by,
+            'sort_order': 'desc' if descending else 'asc',
+        }
+        if not fields:
+            body.update(fields='id', slim=True)
+        page = await api.post(QUERY, body, counting=True, id=target.dataset_id)
+    except ToolError as error:
+        if error.code != 'too_slow' or not (target.stages or sort_by):
+            raise
+        raise await _too_slow_filter(api, target.dataset_id, target.stages, sort_by, 'Reading this page') from None
     shown = [name for name in fields if not private.covered(name, private_names)]
     samples = []
     for item in page['items']:
@@ -733,7 +896,7 @@ MAKE_VIEW = Tool(
     },
     kind='read',
     level='view',
-    routes=(('GET', DATASET), ('POST', PARSE), ('POST', FORMAT), ('POST', QUERY)),
+    routes=(('GET', DATASET), ('GET', SCHEMA), ('POST', PARSE), ('POST', FORMAT), ('POST', QUERY)),
     run=_counting(make_view),
 )
 
@@ -812,7 +975,7 @@ FIELD_SUMMARY = Tool(
     },
     kind='read',
     level='view',
-    routes=(('GET', DATASET), ('GET', SCHEMA), ('POST', AGGREGATE), ('POST', HISTOGRAM), ('POST', QUERY)),
+    routes=(('GET', DATASET), ('GET', SCHEMA), ('POST', AGGREGATE), ('POST', QUERY)),
     run=_counting(field_summary),
 )
 

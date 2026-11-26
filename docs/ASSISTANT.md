@@ -274,7 +274,7 @@ Two things follow:
 | `FRIDGE_ASSISTANT_CALLS_AT_ONCE` (`.env`) | 4 tool calls of one person at once, in each server process | the next is answered `busy` at once ("You have 4 assistant calls running already…"), retryable |
 | `FRIDGE_ASSISTANT_CALLS_PER_PROCESS` (`.env`) | 16 tool calls of everyone at once, in each server process | the next is answered `busy`, retryable |
 | One tool call | 60 seconds | stopped, its work cancelled (its requests and their queries); the model is told "This call took longer than 60 seconds and was stopped. Ask for less at once." (`timeout`) |
-| One database query made for a tool | 45 seconds, for every person (a guest's own limit when shorter) | `too_slow`: narrow the view, or ask an administrator to index the field |
+| One database query made for a tool | 45 seconds, for every person (a guest's own limit when shorter) | `too_slow`, its message saying what ran out and what to do ([What is quick and what is slow](#what-is-quick-and-what-is-slow)); a number's `field_summary` whose second read runs out answers its first read's numbers with a `note` |
 | One request to `/mcp` | 256 KB, and one call (several calls in one request, a JSON-RPC batch, are refused) | 413 (a batch: 400) |
 | Working views and value lists | kept 30 days after their last use | removed by the server's housekeeping, every five minutes |
 | Working views per person | 2,000 | making one more removes their least recently used |
@@ -305,6 +305,76 @@ its first download, or no text model installed) answers `invalid` in its own wor
 A failed load is remembered for a minute in each process: a search by words in that minute gets the same answer at once,
 without trying again, and the first one after it tries once more.
 
+## What is quick and what is slow
+
+The assistant's instructions tell the model this, and `describe_dataset` marks each field `indexed: true` or `false`:
+
+- A filter on an indexed field with `=`, `in` or a narrow range is quick at any size; on a list field, `in` (has any
+  of these values) is, and `=` is not.
+- A filter on a field that is not indexed, a `contains`, or a range that keeps a large share of the samples reads every
+  sample of the dataset: seconds on millions of samples, and it can run out of time on a very large one. An indexed
+  condition in the view first narrows what the rest reads.
+- `field_values` and `field_summary` read every sample of the view, whether or not the field is indexed: an index makes
+  a filter quick and does nothing for counting a field's values. Their time grows with the view's count, so on a large
+  view the model narrows it first. For a whole dataset, `describe_dataset` already gives each field's range, or
+  examples of its values, from the statistics, without reading the samples.
+
+**`indexed`.** A metadata field is indexed when the dataset has an index on it: what the app shows as an indexed field
+(`dataset.promote_field` in the SDK makes one). A list field the server keeps in a column of its own (`tags`, a
+registered array field) is indexed for `in`, which its index serves; `=` on a list tests each sample's list, which no
+index serves. The fields every dataset has, by the indexes of the samples table:
+
+| Field | `indexed` | Why |
+|---|---|---|
+| `id` | true | the `(dataset_id, id)` key |
+| `filepath` | true | the `(dataset_id, filepath)` unique index |
+| `created_at` | true | the `(dataset_id, created_at)` index |
+| `media_type` | true | the `(dataset_id, media_type)` index |
+| `last_modified_at` | false | no index (one would slow every edit) |
+| `tags` | true | its index serves `in` (has any of these values); `=` tests each sample's list and isn't served |
+
+A registered array field is like `tags`: true, for `in`.
+
+**`too_slow`.** Every database query made for a tool has a time limit ([Limits](#limits-and-settings)). When one runs
+out, the tool answers `too_slow` (not retryable), never a partial count, and its message says what ran out:
+
+- From `field_values` and `field_summary`: the tool reads every one of the view's N samples (the view's exact count,
+  which the tool makes first), whether or not the field is indexed, so narrow the view first. When that count is
+  itself what ran out, the message says the same without a number. It never advises an index, which would not help.
+  A number's or a datetime's summary whose second read runs out answers instead ([Working views](#working-views)).
+- From `make_view` and `refine_view`, and from `get_samples` when it sorts or filters: when the filter (or the sort)
+  uses fields that are not indexed, it names them, says every sample of the dataset was read for them, and says to
+  narrow the view by an indexed field first. It adds "or ask an administrator to index" a field only where an index
+  would serve the test: a field tested with `=`, `in` or a range, or sorted by (a `contains`, `exists` or
+  `not exists` reads every sample whether or not the field has an index). A list field tested otherwise than with `in`
+  (with `=`, say), or sorted by, is named the same way, with the advice to test it with `in`. When it uses
+  none, it says to narrow the view, since a `contains` or a wide range reads every sample all the same. Only the
+  view's stages and the sort count, never the condition the tools add to leave object rows out. A private field's
+  name may appear, never a value.
+- From any other tool: "Counting this took longer than the server allows for one statement, so there is no answer, not
+  even a partial one. Narrow the view first."
+
+**Measured**, before and after the counting tools were changed to read the view once (twice for a number's summary):
+the tools called in process with no time limit, median of three runs, in seconds. 4,000,000 image samples with about
+1.5 KB of metadata each (68 fields), each measured field in an indexed copy and a plain copy with the same values,
+PostgreSQL 18 with the repository's `postgresql.conf` (4 parallel workers, `work_mem` 128 MB), warm. A tenth is the
+400,650 samples with `state = "Kansas"`. The answers before and after are the same, but for a mean's last digits.
+The production Compose file's default `work_mem` is 16 MB, where a field with nearly every value different spills more
+of its values to disk (only the values and their counts): a review measured `field_values` on such a field of
+1,000,000 samples at 1.9 s with about 190 MB of temporary data, at 16 MB.
+
+| Tool and field | Whole dataset, indexed | Whole, plain | A tenth, indexed | A tenth, plain |
+|---|---|---|---|---|
+| `field_values serial_number` (1,700 values) | 11.4 → 1.8 | 25.5 → 1.8 | 3.8 → 1.1 | 3.8 → 1.1 |
+| `field_values state` (70 values) | 10.1 → 1.6 | 23.9 → 1.8 | 2.1 → 1.0 | 3.3 → 1.1 |
+| `field_summary brightness` (a number, nearly every value different) | 48.9 → 9.1 | 47.4 → 9.0 | 7.8 → 2.4 | 7.7 → 2.4 |
+| `field_summary digital_gain` (a number, about 250 values) | 38.2 → 4.8 | 36.7 → 5.2 | 7.0 → 2.1 | 6.9 → 2.2 |
+| `field_summary serial_number` (text) | 11.2 → 1.9 | 25.7 → 1.9 | 4.0 → 1.1 | 4.0 → 1.1 |
+
+The index makes no difference to either tool, as the rules above say. A number whose values are nearly all different
+costs the most: its exact distinct count groups 4 million different values. On the same kind of server a count over
+`=` on an indexed field took 0.01 to 0.02 s, and on a plain field about 1 s.
+
 ## The tools
 
 Every tool reads. A tool answers `{"ok": true, "result": ...}` or `{"ok": false, "error": {"code", "message",
@@ -318,7 +388,8 @@ Every tool reads. A tool answers `{"ok": true, "result": ...}` or `{"ok": false,
 - `invalid`: arguments that don't fit, or that the server can't take; one about filter text carries the server's
   `details` (`line`, `column`, `suggestions`) so the model can correct it;
 - `busy`: try again shortly (`retryable` is true);
-- `too_slow`: a count ran into the time limit for one database query ([Limits](#limits-and-settings));
+- `too_slow`: a count or a read ran into the time limit for one database query; its message says what ran out and
+  what to do ([What is quick and what is slow](#what-is-quick-and-what-is-slow));
 - `unknown_tool`.
 
 Through the MCP server two more: `timeout`, a call stopped at 60 seconds, and `failed`, a fault of the server's own
@@ -332,7 +403,7 @@ and comes with the true total and the offset that gets the rest.
 | `make_view` | a working view from filter text, its exact count and link | parse, format, `samples/query` |
 | `refine_view` | a new view: stages added, removed, turned around, or a value list's | the same |
 | `field_values` | a field's values in a view with their counts, kept as a value list | `aggregate`, `samples/query` |
-| `field_summary` | a field's range, quantiles and histogram, or its commonest values | `aggregate`, `histogram` |
+| `field_summary` | a field's range, quantiles and histogram, or its commonest values | `aggregate`, `samples/query` |
 | `get_samples` | a page of a view's samples with their links | `samples/query` |
 | `find_place` | the regions a name could mean, each with its filter text | `GET /api/regions` |
 | `list_concepts` | a dataset's concepts, each with its cut and filter text | `GET .../concepts`, format |
@@ -370,6 +441,8 @@ many fields the page has (`GET /api/datasets/{id}`, then its `field-stats`, `sch
 `objects`, how many object rows it has besides. Each field has:
 - `type`, its kind in the [filter language](FILTER_QUERY.md) (`number`, `datetime`, `text`, `list`, `boolean` or
   `object`);
+- `indexed`: whether a filter on it with `=`, `in` or a narrow range is quick however large the dataset
+  ([What is quick and what is slow](#what-is-quick-and-what-is-slow)), from what the schema already says;
 - `description`, `unit` and `description_source`, as the schema gives them;
 - `samples_with_value`: rows with the field, as the statistics count them, object rows included;
 - `range`: smallest and largest, for number and datetime fields;
@@ -424,8 +497,12 @@ only objects carry keeps the images with a weed object. A field's values and sum
   a handle (`vl_...`), the same for every page of one question, for `in_list` and `not_in_list`, and gives `download`,
   a CSV of every value for the person.
 - **`field_summary`** (`view` or `dataset`, `field`): for a number or a datetime, `min`, `max`, `mean` (numbers),
-  `quantiles` (p5 to p95) and a `histogram` of at most 20 bins that count every sample with a value; for text, list and
-  boolean fields, `distinct` and the five commonest values (`top`); and `samples_with_value` and `samples_without`.
+  `quantiles` (p5 to p95), `distinct` and a `histogram` of at most 20 bins that count every sample with a value; for
+  text, list and boolean fields, `distinct` and the five commonest values (`top`); and `samples_with_value` and
+  `samples_without`. A number's histogram counts the values its `min`, `max` and quantiles count, a number written as
+  text included. A number's or a datetime's summary reads the view twice; when only the second read (quantiles,
+  histogram, distinct count) runs out of time, the answer still has the first's numbers, each exact, with
+  `quantiles`, `histogram` and `distinct` null and a `note` that says so and how many samples the view has.
 - **`get_samples`** (`view` or `dataset`, `limit` up to 50, `offset`, `sort_by`, `descending`, `fields`): a page of the
   view, each sample its `id` and a link. With **The assistant may read samples' fields** on, each sample also carries
   the `fields` asked for, its file path included; off, asking for fields is `refused`.
@@ -436,8 +513,11 @@ as for any field) and refuses `search`; `field_summary` gives counts only; `get_
 assistant)`, and a value list of a private field filters that field only.
 
 **Cost.** `make_view`, `refine_view` and `get_samples` cost what the app's grid costs for the same filter (one count,
-one page). `field_values` and `field_summary` count through the view's samples for the one field asked about, with the
-aggregate and histogram routes the app uses. Every count is exact for the person at the time of the call.
+one page). `field_values` and `field_summary` count the view (one count), then read its samples for the one field
+asked about through the aggregate route: once, or twice for a number's or a datetime's summary (a list or a drawing's
+labels take one more statement, for the samples that have the field). Looking the field up reads no samples. Every
+count is exact for the person at the time of the call. [What is quick and what is slow](#what-is-quick-and-what-is-slow)
+has the times.
 
 ### Links
 

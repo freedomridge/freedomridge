@@ -20,9 +20,11 @@ PRIVATE_FIELD_CODE = guard.CODE
 ROUTE_REFUSED_CODE = 'assistant_route_refused'
 BUSY_STATUSES = (429, 503, 504)
 TRY_AGAIN = 'The server is busy right now; try again in a moment.'
+# What a tool that counts says when a read ran into that limit; the working-view tools say more (working.py:
+# _too_slow_counting, _too_slow_filter).
 TOO_SLOW = (
     'Counting this took longer than the server allows for one statement, so there is no answer, not even a partial '
-    'one. Narrow the view first, or ask an administrator to index the field.'
+    'one. Narrow the view first.'
 )
 
 
