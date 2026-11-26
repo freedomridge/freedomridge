@@ -245,8 +245,9 @@ def test_the_object_grid_of_an_id_list_reads_the_listed_rows_and_their_objects_a
 def test_the_image_grid_of_an_id_list_shows_the_listed_images_and_the_images_of_listed_objects(registry_database):
     """A selection or a search's results on the image grid: the images listed and the images of the objects listed.
     An object with no image (of any kind), one naming another object, another dataset's sample and an empty list
-    bring none; a list within another filter keeps both; and the NOT around the coupled list keeps every image it
-    doesn't match, as before."""
+    bring none; and the NOT around the coupled list keeps every image it doesn't match, as before. A list within
+    another filter is read with it for the image with one of its objects (contract g5, rules 2.1 and 2.2): each test is
+    met by the image or by that object."""
 
     async def scenario(database):
         made = await every_kind(database)
@@ -264,8 +265,10 @@ def test_the_image_grid_of_an_id_list_shows_the_listed_images_and_the_images_of_
             (listed(on_corn, *range(1_000_000_000, 1_000_001_000)), [corn]),  # a list too long for the array
         ):
             assert await rows(grid('image', base)) == (sorted(images), len(images)), base
-        assert await rows(grid('image', WEED, listed(on_corn, soy))) == ([corn], 1)  # the listed weeds' images
-        assert await rows(grid('image', CORN, listed(on_corn, soy))) == ([], 0)  # soy isn't corn, on_corn no image
+        # corn's listed weed; soy itself listed, with its weed.
+        assert await rows(grid('image', WEED, listed(on_corn, soy))) == (sorted([corn, soy]), 2)
+        # corn is corn, with its listed weed; soy isn't corn.
+        assert await rows(grid('image', CORN, listed(on_corn, soy))) == ([corn], 1)
         excluded = {
             'logic': 'AND',
             'filters': [

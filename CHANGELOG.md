@@ -245,6 +245,35 @@ on; the others touch no sample.
   `s3://`), why relative paths are the better choice for local media, the three ways to handle media that moved, and
   that a field marked private must be marked again on the copy before the assistant is used on it.
 
+### Changed
+
+- **On a dataset with objects, a filter is read on an image together with its objects, and on an object together
+  with its image** ([FILTER_QUERY.md](docs/FILTER_QUERY.md#on-a-dataset-with-objects)), in both grids and their
+  counts, the top bar's count, the sidebar, the histogram, the map, Sparse Sample, the export, Select All, bulk edits
+  by filter and the assistant. The page read a filter on one row at a time, so it asked images about the objects'
+  fields and objects about the images'. Now:
+  - a filter over a field of the images and a field of the objects finds the pairs: `colour = "red" AND label =
+    "car"` shows the red images that have a car, and on the objects' grid their cars (it found nothing). Tests joined
+    by `AND` are met with the same object;
+  - on the images' grid `label != "car"` shows the images whose objects are labelled and none is a car (it showed
+    the images with a labelled object that isn't a car);
+  - a `NOT` over several fields needs all of them, and no longer brings an image back through its objects;
+  - `is null` no longer shows every row of the other kind: on the images' grid `label is null` shows the images in
+    which no object has a `label`, and on the objects' grid `colour is null` the objects whose image has no `colour`
+    either;
+  - for a field both kinds have, a negation hides a row when either it or its partner has the value;
+  - `NOT (location within …)`, `location not within` inside an `OR`, and an exclusion sharing a filter card leave out
+    an image inside the place whatever its objects, as the exclusion standing alone does;
+  - a hiding test of a built-in field (`id not in (...)`, as the page sends for rows unticked in a selection and for
+    the duplicates panel) hides the row it names even when another row meets the rest of the filter, and a duplicate
+    hidden by the collapse no longer comes back through its objects;
+  - a `null` value no longer counts as a value for a negation: `colour != "red"` leaves out an image whose `colour`
+    is `null`.
+
+  A dataset without objects, and a filter sent without the page's wrapping (the SDK), read as before. A patch search
+  relayed to a follower ([FOLLOWERS.md](docs/FOLLOWERS.md)) is filtered by the follower's own server, which takes the
+  page's wrapped filter: a follower on an older version reads it the old way until it is upgraded.
+
 ### Fixed
 
 - **A metadata key named `id`, `dataset_id`, `filepath`, `created_at` or `last_modified_at` is refused on edits, not

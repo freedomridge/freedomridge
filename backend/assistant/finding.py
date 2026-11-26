@@ -379,14 +379,6 @@ async def search_similar(api: Api, arguments: dict[str, Any]) -> dict[str, Any]:
     )
     if incomplete:
         answer['search_note'] = SEARCH_NOTE
-    if answer['count'] < len(ids):
-        outside = len(ids) - answer['count']
-        _add_note(
-            answer,
-            f'{outside:,} of the {len(ids):,} images found {"is" if outside == 1 else "are"} not in this view: '
-            f'{"it was" if outside == 1 else "each was"} in the view searched only through one of its objects, and '
-            'the found stage keeps an image by its own id.',
-        )
     return answer
 
 

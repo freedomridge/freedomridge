@@ -68,8 +68,8 @@ is the [region form](#regions)'s mistake (`within` applies only to `location`).
 
 A negation of a field (`!=`, `not in`, or a `NOT` around one field's tests) keeps the samples with another value. On
 a dataset without objects it keeps the samples without the field too: `split != "train"` keeps the samples that have
-no `split`. On a dataset with objects it keeps only the samples that have the field, and a `NOT` around tests of two
-or more fields works differently ([below](#on-a-dataset-with-objects)).
+no `split`. On a dataset with objects it keeps only the samples that have the field, and a `NOT` around tests of
+several fields only those that have every one of them ([below](#on-a-dataset-with-objects)).
 
 ## Concept scores
 
@@ -139,33 +139,68 @@ location within Kansas AND split = train
 
 ## On a dataset with objects
 
-On a dataset with object rows (each naming its image in `parent_id`), the dataset's page reads every filter across
-the images and their objects: an image is kept when it matches the filter or one of its objects does, and on the
-objects' grid an object is kept when it or its image does. The assistant reads filters the same way. An image and its
-objects hold different fields, so there a negation of one field, or of a concept's score, is true only of a row that
-has that field or score at all. Otherwise every object, which has none of its image's fields, would pass every
-negation of them and bring its image back.
+On a dataset with object rows (each naming its image in `parent_id`), an image and its objects hold different fields:
+the images have `colour`, say, and the objects `label`. The dataset's page reads a filter on an image together with
+its objects, and on an object together with its image, and never asks a row about a field it has no value for (a
+value is there and isn't `null`). The assistant reads filters the same way. A filter sent without the page's wrapping
+(from the SDK, say) reads each sample on its own values, as on a dataset without objects.
 
-- `split != "train"`, `split not in (train val)` and `NOT (split contains "tr")` keep only the samples that have a
-  `split`. On a dataset without objects they keep the samples with no `split` too.
-- `not concept "equipment" > 0.62` keeps only the samples the concept scores at or below 0.62. On a dataset without
-  objects it keeps the samples it has no score for too. The assistant's `concept_preview` says how many images have
-  no score (`unscored`) before the filter is applied.
-- A `NOT` around a condition on two or more fields isn't held to this: it is also true of a row that has none of those
-  fields. So the images of such objects are kept too, and on the objects' grid the objects of such images. Where the
-  objects have neither `colour` nor `n`, `NOT (colour = "red" AND n = 0)` keeps every image that has an object, the red
-  images with `n` 0 among them.
-- `location not within "US-KS"` keeps the same samples on both kinds of dataset, those outside the place and those
-  with no location, when it is a filter of its own: one chip in the app, made from a filter card's Query or Builder
-  tab, or a part joined by `AND` at the top of a query. It isn't guarded so, and is also true of an object with
-  no location, so the images inside the place that have such objects are kept too, when a `NOT` is written around a
-  place test (`NOT (location within "US-KS")`), when it sits inside an `OR` group, or, in the app, when it shares one
-  filter card with another test (the card is one filter, linked to the objects as a whole). These cases concern
-  objects with no location: an object with a location of its own is tested like any sample. To leave a place out on a
-  dataset with objects, give `location not within` a filter card of its own.
-- Every row has the built-in fields (`id`, `filepath`, `media_type`, `created_at`, `last_modified_at`), so nothing
-  changes for them. A list (`tags`, or a list field kept in a column of its own) keeps the samples with no value on
-  either kind of dataset: `tags not in (rejected)` keeps the samples without tags.
+- **A test is met when either row meets it.** The images' grid shows an image when the filter is met by its own
+  values together with those of one of its objects, or by its own values alone. So tests joined by `AND` are met with
+  the same object: `colour = "red" AND label = "car"` shows the red images that have a car, and `label = "car" AND
+  score > 0.9` needs one object that is a car with that score. The objects' grid shows an object when the filter is
+  met by its own values together with its image's: there `colour = "red" AND label = "car"` shows the cars of the red
+  images. An object with no image has only its own values, and so has an image with no objects. The two bounds of a
+  range (`between`, a slider, a histogram's bar) are one test, met by one row's value. `is not null` and `exists` are
+  tests like any other.
+- **A negation keeps only the rows that have the fields it compares.** `NOT (X)` shows a row when the row has a value
+  for every field compared inside X, and X doesn't show it (X read as above, with one object). On the images' grid
+  both are asked of the image as a whole, its own values and those of any of its objects; on the objects' grid, of
+  the object with its image. `colour != "red"` is `NOT (colour = "red")`, `label not in (car)` is `NOT (label in
+  (car))`, and `not concept "equipment" > 0.62` keeps only the rows that have a score. So on the images' grid `label
+  != "car"` shows the images whose objects are labelled and none is a car; `NOT (label = "car" AND score > 0.9)`
+  hides an image that has a car with that score, and shows one whose car scores lower and whose truck higher; and a
+  field that both kinds have hides a row when either it or its partner has the value.
+- **`is null` and `not exists` show the rows with nothing for the field**: no value for `is null` (absent or `null`),
+  no key for `not exists` (a `null` under the key counts as there). On the images' grid neither the image nor any of
+  its objects may have one; on the objects' grid, neither the object nor its image. On `location` these tests are
+  about the sample's own location, the one a place tests, read the same way: on the images' grid `location is null`
+  shows the images that have no location and none of whose objects has one. The built-in fields (`id`, `filepath`,
+  `media_type`, `created_at`, `last_modified_at`) are on every row, so there `is null`, `is not null`, `exists` and
+  `not exists` are answered by the grid's own row.
+- **A `NOT`, an `is null` or a `not exists` inside a larger filter is read first, for the row as a whole**, and the
+  rest as above. So on the images' grid `label = "car" AND NOT (occluded = true)` shows the images that have a car
+  and no occluded object, and `label = "car" AND score is null` the images that have a car and in which neither the
+  image nor any object has a `score`. A car that is not occluded is a question for the objects' grid, where the same
+  filter shows each car whose `occluded` is set and isn't true.
+
+Five images: 1 red with a car and a truck; 2 red with a truck; 3 blue with a car; 4 with no `colour`, with a car; 5
+red with no objects.
+
+| Filter | Images' grid | Objects' grid | Why the other images are out |
+|---|---|---|---|
+| `colour = "red" AND label = "car"` | 1 | the car of 1 | |
+| `colour != "red"` | 3 | the car of 3 | 4 has no `colour` |
+| `NOT (colour = "red")` | 3 | the car of 3 | the same filter as `!=` |
+| `label != "car"` | 2 | the trucks of 1 and 2 | 1, 3 and 4 have a car; 5 has no `label` |
+| `NOT (label = "car")` | 2 | the trucks of 1 and 2 | the same filter as `!=` |
+| `NOT (colour = "red" AND label = "car")` | 2, 3 | the truck of 1, the truck of 2, the car of 3 | 1 is red with a car; 4 has no `colour`; 5 has no `label` |
+| `colour is null` | 4 | the car of 4 | |
+| `label is null` | 5 | none | |
+
+- **An excluded place or lasso** (`location not within`, a map region or a lasso excluded) leaves out an image when
+  it or one of its objects is inside, and an object when it or its image is inside. The rows with no location (or no
+  point on the lasso's map) stay, as on a dataset without objects. It reads the same as a chip of its own, sharing a
+  filter card with another test, inside an `OR`, or written as `NOT (location within "US-KS")`.
+- **A hiding test of a field every row has**, `id`, `filepath`, `media_type`, `created_at` or `last_modified_at`
+  (`id not in (...)`, `filepath != "..."`), or of a list (`tags`, or a list field kept in a column of its own, which
+  keep the samples with no value: `tags not in (rejected)` keeps the samples without tags), is answered by the grid's
+  own row: the row it names isn't shown, whichever row meets the rest of the filter. `NOT (tags in (rejected))` is the
+  same filter as `tags not in (rejected)`. The app's collapse of duplicates is read the same way: a duplicate image it
+  hides doesn't come back through its objects, and on the objects' grid an object is hidden only when it is a
+  duplicate itself, whatever its image. A `NOT` around tests of the
+  built-in fields alone reads each row on its own: on the images' grid `NOT (filepath contains "x")` also shows an
+  image whose path holds `x` when one of its objects' paths doesn't.
 
 ## Values
 

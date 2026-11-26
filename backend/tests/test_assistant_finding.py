@@ -391,7 +391,10 @@ def test_concept_preview_counts_and_shows_images_never_object_rows(regions_world
 
 def test_concept_preview_counts_the_rest_itself_where_objects_score_apart_from_their_images(regions_world):
     """At the image grain an image is above the cut when it or one of its objects is, and below when it or one of them
-    is: with objects scored on the other side from their image, it is both, and the rest is counted, never inferred."""
+    is: with objects scored on the other side from their image, it is both, and the rest is counted, never inferred.
+    `remove` is the NOT of `keep` read for the image as a whole (contract g5, rules 2.3 and 2.4): an image is out when
+    it or any of its objects scores above the cut, and it needs a score somewhere; the preview's counts say how many
+    it keeps."""
 
     async def scenario(r: Regions):
         farm = await plant(r, OBJECTS, objects=True)
@@ -412,14 +415,14 @@ def test_concept_preview_counts_the_rest_itself_where_objects_score_apart_from_t
         ), preview
         assert preview['note'].startswith('2 of these images count on both sides'), preview
         # What `remove` does is what the app does: on a dataset with objects its exclusion keeps only images that have
-        # a score, so the unscored images leave with the ones above, as `unscored` said.
+        # a score and of which neither the image nor an object scores above the cut. The unscored images leave with
+        # the ones above, as `unscored` said, and so do the two counted on both sides (image 0's object, and image 1
+        # itself, score above it): the view keeps the images neither above nor unscored.
         whole = await ok(POWER, 'make_view', dataset=OBJECTS)
         removed = await ok(POWER, 'refine_view', view=whole['view'], add=preview['remove'])
-        assert (
-            removed['count'] == preview['below'] == preview['view_count'] - preview['above'] - preview['unscored'] + 2
-        )
+        assert removed['count'] == preview['view_count'] - preview['above'] - preview['unscored'] == len(BELOW) - 1
         kept = await ids_of(POWER, removed['view'])
-        assert not kept & farm.of(lambda n: n not in SCORES) and kept == farm.of(lambda n: n in BELOW or n in (0, 1))
+        assert not kept & farm.of(lambda n: n not in SCORES) and kept == farm.of(lambda n: n in BELOW and n != 0)
 
     regions_world(scenario)
 
@@ -502,9 +505,11 @@ def test_search_similar_finds_images_never_object_rows(regions_world, stand_in):
     regions_world(scenario)
 
 
-def test_a_search_says_when_images_found_through_their_objects_are_not_in_its_view(regions_world, stand_in):
+def test_a_search_keeps_in_its_view_the_images_found_through_their_objects(regions_world, stand_in):
     """An image in the view searched only because one of its objects matched (a field only objects carry) is found,
-    but the found stage keeps an image by its own id: the view's count is smaller, and a note says how many and why."""
+    and the found stage keeps it by its own id: the view's stage and the found stage are read together for the image
+    with one of its objects (contract g5, rules 2.1 and 2.2), the image meeting `id in (...)` and its object `part`.
+    So the images found are in the new view, its count is theirs, and no note says otherwise."""
 
     async def scenario(r: Regions):
         farm = await plant(r, OBJECTS, objects=True)
@@ -523,8 +528,11 @@ def test_a_search_says_when_images_found_through_their_objects_are_not_in_its_vi
         wheels = await ok(POWER, 'make_view', dataset=OBJECTS, filter='part = "wheel"')
         assert wheels['count'] == 3
         found = await ok(POWER, 'search_similar', view=wheels['view'], text='x', limit=3)
-        assert len(found['samples']) == 3 and found['searched'] == 3 and found['count'] == 0, found
-        assert found['note'].startswith('3 of the 3 images found are not in this view'), found['note']
+        assert len(found['samples']) == 3 and found['searched'] == 3, found
+        assert found['count'] == 3 and 'note' not in found, found
+        wheeled = {farm.ids[n] for n in range(3)}
+        assert {item['id'] for item in found['samples']} == wheeled
+        assert await ids_of(POWER, found['view']) == wheeled
         plain = await ok(POWER, 'search_similar', dataset=OBJECTS, text='x', limit=3)
         assert plain['count'] == 3 and 'note' not in plain
 

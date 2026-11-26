@@ -79,6 +79,7 @@ from .. import (
     class_rules,
     dataset_deletion,
     field_usage,
+    grain_reading,
     job_queue,
     job_wait,
     local_writes,
@@ -4808,6 +4809,188 @@ def _strictify_negations(node: Any, partner: bool = False, array_columns: Option
     return node
 
 
+class _GrainRow(NamedTuple):
+    """A row a filter on a dataset with objects is asked of (backend/grain_reading.py): the field mapping its tests
+    compile with, its id column, the name its table goes by, and the dataset id its tests compile with."""
+
+    mapping: Optional[Dict[str, str]]
+    id_col: str
+    table: str
+    dataset_id: Optional[int]
+
+
+class _GrainRows:
+    """The compiler's side of backend/grain_reading.py: the SQL for a row's tests, its objects and an object's image.
+    The partners' subqueries are the lone operators' (has_matching_object, parent_matches, below): each an EXISTS
+    keyed on samples.parent_id and scoped to the dataset as a constant, so the planner can run it as a hashed set."""
+
+    def __init__(
+        self,
+        args: List[Any],
+        arg_idx: int,
+        field_mapping: Optional[Dict[str, str]],
+        numeric_indexed_fields: Optional[set],
+        dataset_id: Optional[int],
+        array_columns: Optional[set],
+        concepts: set,
+    ):
+        self.args, self.arg_idx = args, arg_idx
+        self.field_mapping, self.numeric_indexed_fields = field_mapping, numeric_indexed_fields
+        self.dataset_id, self.array_columns, self.concepts = dataset_id, array_columns, concepts
+        self.ds = dataset_id if dataset_id is not None else (args[0] if args and isinstance(args[0], int) else None)
+        self.arrays = array_columns if array_columns is not None else _get_array_columns_sync()
+
+    def outer(self) -> _GrainRow:
+        id_col = (self.field_mapping or {}).get('id', 'samples.id')
+        table = id_col.rsplit('.', 1)[0] if '.' in id_col else 'samples'
+        return _GrainRow(self.field_mapping, id_col, table, self.dataset_id)
+
+    def _inner(self, alias: str) -> _GrainRow:
+        """A partner row's subquery, named as the lone operators name theirs (`o` an image's object, `s2` an object's
+        image), at any depth: a subquery refers only to the row it is nested in, the nearest of that name, and an
+        unqualified column to its own row."""
+        return _GrainRow({**_realiased(self.field_mapping, alias), 'id': f'{alias}.id'}, f'{alias}.id', alias, self.ds)
+
+    def test(self, node: Any, row: _GrainRow) -> str:
+        sql, self.arg_idx = _compile_filter_node(
+            node,
+            self.args,
+            self.arg_idx,
+            row.mapping,
+            self.numeric_indexed_fields,
+            row.dataset_id,
+            array_columns=self.array_columns,
+            concepts=self.concepts,
+        )
+        return sql
+
+    def has(self, field: str, row: _GrainRow, presence: bool = False) -> str:
+        """The row has a value for the field: there, and not a JSON null. `presence`: for `is null`, where `location` is
+        the sample's own location; otherwise it is a field compared with an operator other than a place's, the
+        metadata field named location. A metadata key's test (`?`) goes first: the same rows, found through the
+        metadata index where few rows have the key."""
+        if field == 'location' and not presence:
+            return f"({_metadata_source(field)}->>'location' IS NOT NULL)"
+        if field == 'segmentation.labels':
+            field = 'segmentation'
+        value = self.test({'field': field, 'operator': 'is_not_null'}, row)
+        keyed = (
+            _is_safe_field_name(field)
+            and '.' not in field
+            and field not in RESERVED_METADATA_KEYS
+            and _derived_field(field) is None
+            and self.row_field(field) is None
+        )
+        return f"({self.test({'field': field, 'operator': 'exists'}, row)} AND {value})" if keyed else value
+
+    def keyed(self, node: Any, row: _GrainRow) -> str:
+        """A test asked of a partner row (an image's object, an object's image), with its metadata key's test first: the
+        same rows, as a comparison holds only where the key is, but found through the metadata index. A field one kind
+        has is never a key of the other kind's rows, so the partners' subquery reads none of them."""
+        sql = self.test(node, row)
+        key = self._compared_key(node)
+        return f"({self.test({'field': key, 'operator': 'exists'}, row)} AND {sql})" if key else sql
+
+    def _compared_key(self, node: Any) -> Optional[str]:
+        """The metadata key a test reads (a comparison, `is not null`, or a range of one field), else None."""
+        if isinstance(node, dict) and node.get('logic') == 'AND' and node.get('filters'):
+            keys = {self._compared_key(child) for child in node['filters']}
+            return keys.pop() if len(keys) == 1 else None
+        if not isinstance(node, dict) or 'logic' in node or 'filters' in node:
+            return None
+        field, operator = node.get('field'), str(node.get('operator', '=')).lower()
+        if operator not in ('=', 'in', '<', '<=', '>', '>=', 'contains', 'is_not_null') or not isinstance(field, str):
+            return None
+        path = label_path(field, self.arrays)
+        key = path[0] if path is not None else 'segmentation' if field == 'segmentation.labels' else field
+        plain = _is_safe_field_name(key) and '.' not in key and key not in RESERVED_METADATA_KEYS
+        return key if plain and _derived_field(key) is None and self.row_field(key) is None else None
+
+    def objects(self, row: _GrainRow, inner: Callable[[_GrainRow], str], plain: Any = None) -> str:
+        """An object of the row (an image) for which `inner` holds; `plain`, a test of the object alone, may bound it
+        by a list of ids (has_matching_object's array, below)."""
+        sub = self._inner('o')
+        sub_sql = inner(sub)
+        alias, scope = sub.table, int(self.ds) if self.ds is not None else f"{row.table}.dataset_id"
+        ids = _id_list_bound(plain) if plain is not None else None
+        if self.ds is None or ids is None or len(ids) > _IMAGES_OF_LISTED_OBJECTS_MAX:
+            return (
+                f"EXISTS (SELECT 1 FROM samples {alias} WHERE {alias}.dataset_id = {scope} "
+                f"AND {alias}.parent_id = {row.id_col} AND {alias}.media_type = 'object' AND ({sub_sql}))"
+            )
+        return (
+            f"{row.id_col} = ANY(ARRAY(SELECT {alias}.parent_id FROM samples {alias} "
+            f"WHERE {alias}.dataset_id = {scope} AND {alias}.parent_id IS NOT NULL AND {alias}.media_type = 'object' "
+            f"AND ({sub_sql})))"
+        )
+
+    def parent(self, row: _GrainRow, inner: Callable[[_GrainRow], str], plain: Any = None) -> str:
+        """The row's image (the row an object) exists and `inner` holds for it; `plain`, a test of the image alone, may
+        bound the object's parent_id by a list of ids (parent_matches', below)."""
+        sub = self._inner('s2')
+        sub_sql = inner(sub)
+        alias = sub.table
+        scope = f"{alias}.dataset_id = {int(self.ds)} AND " if self.ds is not None else ""
+        link = (
+            f"EXISTS (SELECT 1 FROM samples {alias} WHERE {scope}{alias}.id = {row.table}.parent_id "
+            f"AND {alias}.media_type != 'object' AND ({sub_sql}))"
+        )
+        ids = _id_list_bound(plain) if plain is not None else None
+        if ids is None:
+            return link
+        self.args.append(ids)
+        self.arg_idx += 1
+        return f"({row.table}.parent_id = ANY(${self.arg_idx - 1}) AND {link})"
+
+    def row_field(self, field: Any) -> Optional[str]:
+        """'builtin' for a column every row has, 'list' for a list kept in a column of its own (`tags`,
+        `@local.tags`)."""
+        if not isinstance(field, str):
+            return None
+        if field in _CROSSGRAIN_NATIVE_FIELDS:
+            return 'builtin'
+        return 'list' if field == LOCAL_TAGS or field in self.arrays else None
+
+    def label_path(self, field: Any) -> bool:
+        return isinstance(field, str) and label_path(field, self.arrays) is not None
+
+    def id_list(self, node: Any) -> Optional[list]:
+        return _id_list_bound(node)
+
+
+_GRAIN_PARTNERS = {'has_matching_object': 'image', 'parent_matches': 'object'}
+
+
+def _grain_pairs(filters: Any) -> tuple[list[tuple[str, Any]], Any]:
+    """The page's wrapping of a filter B on a dataset with objects among an OR's parts: `cg_self(B)` with
+    `has_matching_object(B)` (its images' grid) or `parent_matches(B)` (its objects' grid), read together by
+    backend/grain_reading.py. Returns the pairs (the grid, B) and the other parts, which, either operator standing alone
+    among them, compile as before."""
+    if not isinstance(filters, list):
+        return [], filters
+
+    def wrapping(node: Any, operators: Collection[str]) -> bool:
+        return (
+            isinstance(node, dict)
+            and 'field' in node
+            and 'logic' not in node
+            and 'filters' not in node
+            and str(node.get('operator', '')).lower() in operators
+            and isinstance(node.get('value'), dict)
+        )
+
+    pairs, used = [], set()
+    for i, own in enumerate(filters):
+        if not wrapping(own, ('cg_self',)):
+            continue
+        for j, partner in enumerate(filters):
+            if j not in used and wrapping(partner, _GRAIN_PARTNERS) and partner['value'] == own['value']:
+                used |= {i, j}
+                pairs.append((_GRAIN_PARTNERS[str(partner['operator']).lower()], own['value']))
+                break
+    return pairs, [node for k, node in enumerate(filters) if k not in used]
+
+
 def _filter_concept_ids(node: Any) -> set:
     """Concept ids a filter tree names, including cross-grain sub-filters, for the sidebar's up-front
     check. A compiled filter is guarded by the ids its compiler collects, not by this walk."""
@@ -5236,6 +5419,22 @@ def _compile_filter_node(
                     field_mapping,
                     array_columns,
                 )
+            else:
+                # The page's wrapping of a filter on a dataset with objects: the image read with its objects, or the
+                # object with its image (backend/grain_reading.py).
+                pairs, sub_filters = _grain_pairs(sub_filters)
+                for grid, base in pairs:
+                    rows = _GrainRows(
+                        args,
+                        arg_idx,
+                        field_mapping,
+                        numeric_indexed_fields,
+                        dataset_id,
+                        array_columns,
+                        concepts,
+                    )
+                    child_sqls.append(grain_reading.read(base, grid, rows))
+                    arg_idx = rows.arg_idx
             for f in sub_filters:
                 sql, arg_idx = _compile_filter_node(
                     f,
@@ -6570,16 +6769,32 @@ def _filter_first_id_order(has_filter: bool, total: int, dataset_rows: Optional[
 
 
 def _plan_indexes_samples(plan: Dict[str, Any]) -> bool:
-    """The skip-count estimate must have an indexed path to the matching samples."""
+    """The skip-count estimate must have an indexed path to the matching samples: an index condition of the statement's
+    own scans. A subquery's (a SubPlan or an InitPlan: on a dataset with objects, the lookup of a row's image or of its
+    objects) finds partners, not the rows of the page."""
     if plan.get('Relation Name') == 'samples' and plan['Node Type'] in (
         'Index Scan',
         'Index Only Scan',
         'Bitmap Heap Scan',
     ):
         condition = plan.get('Index Cond', plan.get('Recheck Cond', ''))
-        # Restricting the dataset alone says nothing about how its filter is resolved.
-        return bool(condition) and not re.fullmatch(r'\(*dataset_id = (?:\d+|\$\d+)\)*', condition)
-    return any(_plan_indexes_samples(child) for child in plan.get('Plans', []))
+        # Restricting the dataset alone says nothing about how its filter is resolved, and nor does a probe from a
+        # sample to its image or objects (a filter on a dataset with objects, backend/grain_reading.py): the walk of
+        # the id index stays, and on an objects' grid it finds the first page in milliseconds, where resolving the
+        # whole filter first took seconds.
+        if not condition or re.fullmatch(r'\(*dataset_id = (?:\d+|\$\d+)\)*', condition):
+            return False
+        parts = [part.strip('() ') for part in condition.split(' AND ')]
+        return not (any(map(_PARTNER_PROBE.fullmatch, parts)) and all(map(_DATASET_OR_PARTNER.fullmatch, parts)))
+    return any(
+        _plan_indexes_samples(child)
+        for child in plan.get('Plans', [])
+        if child.get('Parent Relationship') not in ('SubPlan', 'InitPlan')
+    )
+
+
+_PARTNER_PROBE = re.compile(r'parent_id = \w+\.id|id = \w+\.parent_id')
+_DATASET_OR_PARTNER = re.compile(rf'dataset_id = (?:\d+|\$\d+)|{_PARTNER_PROBE.pattern}')
 
 
 @router.post("/datasets/{id}/samples/query", dependencies=[Depends(require_dataset_access)])

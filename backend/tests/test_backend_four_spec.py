@@ -52,8 +52,8 @@ Where the contract is unclear, or main is not as it says, these tests read it th
   count and in aggregate's count; without objects every negation keeps the images with no location (main, pinned).
   As decided, the exclusion as the whole filter (the text `location not within`, `geo_region_exclude`,
   `geo_polygon_exclude`) is a requirement; a NOT around the place itself, the exclusion inside an OR group or inside
-  the app's coupled form of one filter card, and a NOT over two fields are pins of today, named as pins expected to
-  change.
+  the app's coupled form of one filter card, and a NOT over two fields are read by the later contract on a filter
+  read across images and their objects (g5; backend/tests/test_objects_filter_reading_spec.py).
 - Section 3.4: "a place exclusion" is `geo_region_exclude` or `geo_polygon_exclude` (a lasso on an embedding map
   is not a place); "however it is wrapped" is as the only rule of an AND group, once or twice. The server's part is
   tested here (a lifted exclusion keeps the five images whatever the grouping of its place test); the assistant's
@@ -854,16 +854,16 @@ def test_a_place_excluded_as_the_whole_filter_keeps_the_same_images_with_and_wit
     regions_world(scenario)
 
 
-def test_today_a_not_around_a_place_brings_back_images_inside_through_objects_with_no_location_pin_expected_to_change(
-    regions_world,
-):
-    """A pin of today's behaviour, expected to change when a NOT on a dataset with objects is guarded (a piece of its
-    own, with the NOT over two fields): a NOT around the place itself keeps, on the dataset whose objects carry no
-    location, the images inside the place too (their objects, with no location, are not inside it); without objects,
-    and with objects at their image's location, it keeps what the exclusion keeps."""
+def test_a_not_around_a_place_keeps_what_the_exclusion_keeps_whatever_the_objects_carry(regions_world):
+    """Contract g5 (objects filter reading), 2.8: a NOT around the place itself keeps what the exclusion standing alone
+    keeps, on every dataset: the images outside the place and those with no location, never an image inside brought
+    back through an object with no location (an image inside the place is out, whatever its objects). The exclusion
+    standing alone is asked first, as main answers it."""
 
     async def scenario(r):
         made = await placed(r)
+        for which, dataset in made.items():
+            assert await grid_plots(r, dataset, place('geo_region_exclude', 'XA-NM')) == OUTSIDE_PLACE, which
         for name, form in (
             ('text: NOT (location within "XA-NM")', 'NOT (location within "XA-NM")'),
             ('NOT geo_region', negated(place('geo_region', 'XA-NM'))),
@@ -871,17 +871,17 @@ def test_today_a_not_around_a_place_brings_back_images_inside_through_objects_wi
             ('NOT geo_near', negated(place('geo_near', NEAR))),
         ):
             found = {which: await grid_plots(r, dataset, form) for which, dataset in made.items()}
-            assert found == {'plain': OUTSIDE_PLACE, 'bare': EVERY_PLACE, 'located': OUTSIDE_PLACE}, (name, found)
+            assert found == {'plain': OUTSIDE_PLACE, 'bare': OUTSIDE_PLACE, 'located': OUTSIDE_PLACE}, (name, found)
 
     regions_world(scenario)
 
 
-def test_today_an_excluded_place_inside_a_larger_condition_pin_expected_to_change(regions_world):
-    """A pin of today's behaviour, expected to change with the same piece. The exclusion holds where it is the whole
-    filter or a top-level AND part (each part a stage, as the parse route, the SDK and the assistant make them); it is
-    not guarded inside an OR group, nor inside the app's coupled form of one filter card holding a whole text (the
-    card's parts ANDed into one chip, as frontend/components/filter-stage-editor.tsx makes it, wrapped by the page's
-    withGrain, which test_assistant_views_spec.image_grain writes again). The objects all have `label = "crate"`, a
+def test_an_excluded_place_inside_an_or_or_sharing_a_filter_card_keeps_what_the_exclusion_alone_keeps(regions_world):
+    """Contract g5 (objects filter reading), 2.8: an exclusion inside an OR group, and one sharing a filter card with
+    another test (the card's parts ANDed into one chip, as frontend/components/filter-stage-editor.tsx makes it,
+    wrapped by the page's withGrain, which test_assistant_views_spec.image_grain writes again), keep what the
+    exclusion standing alone keeps. As a top-level AND part (each part a stage, as the parse route, the SDK and the
+    assistant make them) it keeps that already, and that is asked first. The objects all have `label = "crate"`, a
     field the images lack, so a form naming it is asked of the two datasets with objects only."""
 
     async def scenario(r):
@@ -896,33 +896,22 @@ def test_today_an_excluded_place_inside_a_larger_condition_pin_expected_to_chang
                 (OUTSIDE_PLACE, OUTSIDE_PLACE, OUTSIDE_PLACE),
             ),
             (
-                'text: (location not within OR plot = "no-such-plot")',
-                f'(location not within "XA-NM" OR {never[0]})',
-                (OUTSIDE_PLACE, EVERY_PLACE, OUTSIDE_PLACE),
-            ),
-            (
-                'JSON: OR [geo_region_exclude, plot = "no-such-plot"]',
-                either(exclusion, never[1]),
-                (OUTSIDE_PLACE, EVERY_PLACE, OUTSIDE_PLACE),
-            ),
-            (
                 'top-level AND: location not within AND label = "crate"',
                 'location not within "XA-NM" AND label = "crate"',
                 (None, OUTSIDE_PLACE, OUTSIDE_PLACE),
             ),
+            (
+                'text: (location not within OR plot = "no-such-plot")',
+                f'(location not within "XA-NM" OR {never[0]})',
+                (OUTSIDE_PLACE, OUTSIDE_PLACE, OUTSIDE_PLACE),
+            ),
+            (
+                'JSON: OR [geo_region_exclude, plot = "no-such-plot"]',
+                either(exclusion, never[1]),
+                (OUTSIDE_PLACE, OUTSIDE_PLACE, OUTSIDE_PLACE),
+            ),
         ]
-        for name, form, (plain, bare, located) in cases:
-            asked = {'bare': bare, 'located': located, **({'plain': plain} if plain is not None else {})}
-            found = {which: await grid_plots(r, made[which], form) for which in asked}
-            assert found == asked, (name, found)
-        # One filter card holding the last text: one chip, the AND of its parts, which the page couples as a whole.
-        for which in ('bare', 'located'):
-            dataset_id, plots, _ = made[which]
-            parts = await nodes(r, 'location not within "XA-NM" AND label = "crate"', dataset_id)
-            card = {'logic': 'AND', 'filters': parts}
-            kept = await kept_plots(r, dataset_id, plots, {'logic': 'AND', 'filters': [card]}, True)
-            assert kept == (EVERY_PLACE if which == 'bare' else OUTSIDE_PLACE), (which, kept)
-        # The assistant, given the same text: its stages are the text's top-level parts.
+        # The assistant, given the text with label: its stages are the text's top-level parts.
         await open_door(r)
         for which in ('bare', 'located'):
             dataset_id, plots, _ = made[which]
@@ -930,6 +919,18 @@ def test_today_an_excluded_place_inside_a_larger_condition_pin_expected_to_chang
             view = await result(ADMIN, 'make_view', {'dataset': dataset_id, 'filter': text})
             kept = {plots[i] for i in await view_ids(ADMIN, view['view'])}
             assert (view['count'], kept) == (len(OUTSIDE_PLACE), OUTSIDE_PLACE), (which, view['count'], kept)
+        for name, form, (plain, bare, located) in cases:
+            asked = {'bare': bare, 'located': located, **({'plain': plain} if plain is not None else {})}
+            found = {which: await grid_plots(r, made[which], form) for which in asked}
+            assert found == asked, (name, found)
+        # One filter card holding the text with label: one chip, the AND of its parts, which the page couples as a
+        # whole. An image inside the place is out, whatever its objects.
+        for which in ('bare', 'located'):
+            dataset_id, plots, _ = made[which]
+            parts = await nodes(r, 'location not within "XA-NM" AND label = "crate"', dataset_id)
+            card = {'logic': 'AND', 'filters': parts}
+            kept = await kept_plots(r, dataset_id, plots, {'logic': 'AND', 'filters': [card]}, True)
+            assert kept == OUTSIDE_PLACE, (which, kept)
 
     regions_world(scenario)
 
@@ -1042,11 +1043,12 @@ TWO_FIELDS: list[tuple[str, Optional[str], Optional[int], bool]] = [
 ]
 
 
-def test_today_a_not_over_two_fields_brings_an_image_back_through_its_object_pin_expected_to_change(regions_world):
-    """A pin of today's behaviour (contract 3.2's first point), expected to change when the guard covers a NOT over
-    several fields: on a dataset with objects `NOT (colour = "red" AND n = 0)` is true of an object that has neither
-    field, so it keeps the image whose own metadata is colour red and n 0 when that image has an object; on the same
-    images without objects that image is dropped."""
+def test_a_not_over_two_fields_needs_both_fields_and_no_longer_brings_an_image_back_through_its_object(regions_world):
+    """Contract g5 (objects filter reading), 2.3: on a dataset with objects `NOT (colour = "red" AND n = 0)` shows an
+    image that has both fields (itself or through its objects; here the objects have neither) and that the inside
+    doesn't show. The red images with n 0 stay out whether or not they have an object, and the image with neither
+    field is out. On the same images without objects (2.8, unchanged) the negation keeps the image with neither field
+    too."""
 
     async def scenario(r):
         found = {}
@@ -1075,8 +1077,8 @@ def test_today_a_not_over_two_fields_brings_an_image_back_through_its_object_pin
             assert len(filters) == 1 and filters[0]['logic'] == 'NOT', filters
             found[objects] = await kept_plots(r, dataset_id, plots, {'logic': 'AND', 'filters': filters}, objects)
         assert found[False] == {'red-1', 'blue-0', 'neither'}, found[False]
-        # Today: red-0 comes back through its object, which has neither field; red-0-alone, with no object, doesn't.
-        assert found[True] == {'red-0', 'red-1', 'blue-0', 'neither'}, found[True]
+        # red-0 no longer comes back through its object, which has neither field; `neither` has no colour and no n.
+        assert found[True] == {'red-1', 'blue-0'}, found[True]
 
     regions_world(scenario)
 

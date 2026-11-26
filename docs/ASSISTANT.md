@@ -496,9 +496,11 @@ A tool that takes `view` also takes `dataset` instead, meaning the whole dataset
 **A view is of the dataset's images.** On a dataset that keeps objects (patches cut from an image) as rows beside its
 images, every count, value, page and summary is over the images that pass the view's stages: what the dataset's page
 shows when the view's link is opened, and `make_view` of the whole dataset counts what `describe_dataset` calls
-`samples`. An image passes a stage when it matches itself or one of its objects does, so `label = "weed"` on a field
-only objects carry keeps the images with a weed object. A field's values and summaries are the images' own:
-`field_values` on a field only objects carry has no values.
+`samples`. The stages are read as the page reads them, on an image together with its objects
+([FILTER_QUERY.md](FILTER_QUERY.md#on-a-dataset-with-objects)): `label = "weed"` on a field only objects carry keeps
+the images with a weed object, `colour = "red" AND label = "weed"` the red images with one, and a negation only the
+images that have the field. A field's values and summaries are the images' own: `field_values` on a field only
+objects carry has no values.
 
 - **`make_view`** (`dataset`, `filter`): filter text in the [filter language](FILTER_QUERY.md); each top-level AND part
   is a stage. Answers the handle, the exact `count`, `filter` and each stage's `text` as the server read them, and a
@@ -608,9 +610,8 @@ similarity), `searched` is the view's count, and `search_note` says when the sea
 every image (more may match). With a vector index the search is as close as the index's, as in the app. Asked about a
 whole dataset, the answer has no `from`. The words are sent to the search and nowhere else.
 
-`count` is the new view's own count. On a dataset with objects it can be smaller than the number found (an image that
-was in the view searched only through one of its objects isn't kept by the found stage, which keeps an image by its
-own id), and a `note` then says how many and why. A dataset with no embedding field, a `field` that isn't one, words
+`count` is the new view's own count, the images found: each passed the view searched and meets the found stage. A
+dataset with no embedding field, a `field` that isn't one, words
 for a model without text, a server that has no text model or can't load it, or samples not in the dataset: `invalid`,
 saying which and what is possible. The first search by words in a server process waits for the text model to load
 ([Limits and settings](#limits-and-settings)).
