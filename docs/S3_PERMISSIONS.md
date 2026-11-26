@@ -10,8 +10,10 @@ allowance; see the limits table in [Deploy to AWS](DEPLOY_TO_AWS.md#10-public-de
 
 ## Local files
 
-- Sample filepaths are absolute. The backend serves only files below its own
-  `FRIDGE_DATA_ROOT` and returns 403 for anything else.
+- A local sample filepath is relative to the backend's `FRIDGE_DATA_ROOT`, or a
+  full path. The backend serves only files below its own `FRIDGE_DATA_ROOT` and
+  returns 403 for anything else. Relative paths let all the media move with one
+  setting ([Paths, and when media moves](SDK.md#paths-and-when-media-moves)).
 - With `docker-compose.prod.yml`, set `DATA_VOLUME_PATH` and `FRIDGE_DATA_ROOT` in
   `.env` to the same absolute host directory. The backend and job-runner mount it
   read-only at that same path. The AWS guide uses `/data/datasets`.

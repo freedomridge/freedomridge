@@ -2219,6 +2219,7 @@ def run_tests():
 
     _run_access_tests(client)
     _run_computed_description_tests(client)
+    _run_path_tests(client)
 
     # --- CLEANUP ---
     print("\n--- Cleanup ---")
@@ -3519,6 +3520,175 @@ def _run_computed_description_tests(client):
                 print("Deleted the computed-description datasets and their user")
             except Exception as error:  # a cleanup failure must not hide the results above
                 print(f"Computed descriptions cleanup failed: {error}")
+
+
+# =========================================================================
+# PATHS DO NOT CHANGE; A COPY CAN GIVE NEW ONES
+# add_samples_from(..., path_prefixes={old: new}) gives the copies new paths, in filepath and in the texts inside
+# metadata; a rule that would give two samples one path is refused before anything is written; sample.save() after a
+# changed filepath raises and sends nothing; a PATCH carrying another filepath is a 422; a copy keeps objects with
+# their images. The full set of cases is
+# backend/tests/test_paths_do_not_change_spec.py (the app in-process); these check the same rules on a running server.
+# =========================================================================
+PATH_DATASETS = (
+    'sdk-test-paths-source',
+    'sdk-test-paths-target',
+    'sdk-test-paths-collide',
+    'sdk-test-paths-refused',
+    'sdk-test-paths-objects',
+    'sdk-test-paths-objects-copy',
+)
+PATH_PHRASE = "filepath can't be changed"
+
+
+def _run_path_tests(client):
+    print("\n--- Paths do not change ---")
+    base = client.base_url
+
+    def remove_leftovers():
+        for d in client.get_datasets():
+            if d['name'] in PATH_DATASETS:
+                client.delete_dataset(d['id'])
+
+    remove_leftovers()
+    try:
+        source = Dataset('sdk-test-paths-source')
+        source.add_samples(
+            [
+                Sample(
+                    filepath='/media/old/a.jpg',
+                    tags=['t', '/media/old/tag'],
+                    metadata={
+                        'mask': {'maskPath': '/media/old/masks/a.png'},
+                        'lidar': [{'path': '/media/old/lidar/a.bin'}, 3],
+                        'note': 'see /media/old/a.jpg',
+                        'older': '/media/older/a.jpg',
+                        'by_path': {'/media/old/k.jpg': 'v'},
+                    },
+                    location=(-93.5, 41.2),
+                    heading=90.0,
+                    embeddings={'sdk_test_paths_vec': [1.0, 2.0, 3.0]},
+                    hashes={'phash': '00ff00ff00ff00ff'},
+                ),
+                Sample(filepath='/media/older/b.jpg', metadata={'p': '/media/old/b.png'}),
+                Sample(filepath='s3://bucket/c.jpg', metadata={'n': 1}),
+            ],
+        )
+        rule = {'/media/old': '/media/new'}
+
+        @test("add_samples_from with path_prefixes gives the copies new paths in filepath and metadata, the rest kept")
+        def _():
+            target = Dataset('sdk-test-paths-target')
+            result = target.add_samples_from(source, path_prefixes=rule)
+            counted = {key: result.get(key) for key in ('seen', 'added', 'skipped', 'rewritten')}
+            assert counted == {'seen': 3, 'added': 3, 'skipped': 0, 'rewritten': 1}, result
+            a = target['/media/new/a.jpg']
+            assert a.metadata == {
+                'mask': {'maskPath': '/media/new/masks/a.png'},
+                'lidar': [{'path': '/media/new/lidar/a.bin'}, 3],
+                'note': 'see /media/old/a.jpg',
+                'older': '/media/older/a.jpg',
+                'by_path': {'/media/old/k.jpg': 'v'},
+            }, a.metadata
+            assert a.tags == ['t', '/media/old/tag'], a.tags
+            assert target['/media/older/b.jpg'].metadata == {'p': '/media/new/b.png'}
+            assert target['s3://bucket/c.jpg'].metadata == {'n': 1}
+            assert client.get_vectors_by_ids(target.id, [a.id], ['sdk_test_paths_vec']) == {
+                a.id: {'sdk_test_paths_vec': [1.0, 2.0, 3.0]},
+            }
+            assert client.get_hashes_by_ids(target.id, [a.id], ['phash']) == {a.id: {'phash': '00ff00ff00ff00ff'}}
+            again = target.add_samples_from(source, path_prefixes=rule)
+            counted = {key: again.get(key) for key in ('seen', 'added', 'skipped', 'rewritten')}
+            assert counted == {'seen': 3, 'added': 0, 'skipped': 3, 'rewritten': 0}, again
+            assert len(target) == 3
+            assert source['/media/old/a.jpg'].metadata['mask'] == {'maskPath': '/media/old/masks/a.png'}
+
+        _()
+
+        @test("add_samples_from refuses a rule that would give two samples one path, before writing anything")
+        def _():
+            collide = Dataset('sdk-test-paths-collide')
+            paths = ['/media/old/a.jpg', 'fill/0.jpg', 'fill/1.jpg', '/media/new/a.jpg']
+            collide.add_samples([Sample(filepath=path) for path in paths])
+            refused = Dataset('sdk-test-paths-refused')
+            raised = _raises(ValueError, refused.add_samples_from, collide, path_prefixes=rule, batch_size=1)
+            assert '/media/new/a.jpg' in str(raised) or '/media/old/a.jpg' in str(raised), raised
+            assert len(refused) == 0, f"{len(refused)} samples were written before the refusal"
+
+        _()
+
+        @test("add_samples_from refuses a bad rule (not a dict, an empty old, a non-text new)")
+        def _():
+            refused = Dataset('sdk-test-paths-refused')
+            for bad in ([('/media/old', '/media/new')], {'': '/media/new'}, {'/media/old': 1}):
+                _raises(ValueError, refused.add_samples_from, source, path_prefixes=bad)
+            assert len(refused) == 0
+
+        _()
+
+        @test("sample.save() after a changed filepath raises ValueError and writes nothing; the path put back saves")
+        def _():
+            s = source['/media/old/a.jpg']
+            s.filepath = '/media/new/a.jpg'
+            s.metadata['changed'] = True
+            raised = _raises(ValueError, s.save)
+            assert PATH_PHRASE in str(raised), raised
+            assert 'changed' not in source['/media/old/a.jpg'].metadata
+            s.filepath = '/media/old/a.jpg'
+            s.save()
+            assert source['/media/old/a.jpg'].metadata['changed'] is True
+
+        _()
+
+        @test("PATCH with another filepath is a 422 that writes nothing; with the sample's own path it is accepted")
+        def _():
+            sample_id = source['/media/old/a.jpg'].id
+            url = f"{base}/datasets/{source.id}/samples/{sample_id}"
+            moved = client.session.patch(url, json={'filepath': '/media/new/a.jpg', 'metadata': {'patched': 1}})
+            assert moved.status_code == 422 and PATH_PHRASE in moved.text, (moved.status_code, moved.text[:300])
+            assert 'patched' not in source['/media/old/a.jpg'].metadata
+            same = client.session.patch(url, json={'filepath': '/media/old/a.jpg', 'metadata': {'patched': 1}})
+            assert same.status_code == 200, (same.status_code, same.text[:300])
+            assert source['/media/old/a.jpg'].metadata['patched'] == 1
+
+        _()
+
+        @test("add_samples_from links each copied object to the copy of its image")
+        def _():
+            with_objects = Dataset('sdk-test-paths-objects')
+            image = with_objects.add_samples([Sample(filepath='s3://test/paths/img.jpg', metadata={'img': 'I'})])
+            objects = []
+            for name in ('o0', 'o1'):
+                crop = Sample(
+                    filepath=f's3://test/paths/crops/{name}.png',
+                    metadata={'parent_id': image['ids'][0], 'obj': name},
+                )
+                crop.media_type = 'object'
+                objects.append(crop)
+            with_objects.add_samples(objects)
+            copy = Dataset('sdk-test-paths-objects-copy')
+            result = copy.add_samples_from(with_objects, batch_size=1)
+            assert result == {'seen': 3, 'added': 3, 'skipped': 0, 'objects_without_image': 0}, result
+            copied_image = copy['s3://test/paths/img.jpg'].id
+            pivot = {
+                'logic': 'AND',
+                'filters': [
+                    {'field': 'media_type', 'operator': '=', 'value': 'object'},
+                    {'field': 'parent_id', 'operator': 'in', 'value': [copied_image]},
+                ],
+            }
+            found = client.query_samples(copy.id, filters=pivot)['items']
+            assert sorted(item['metadata']['obj'] for item in found) == ['o0', 'o1'], found
+            finder = client.session.post(f"{base}/datasets/{copy.id}/objects/unlinked")
+            assert finder.status_code == 200 and finder.json()['total'] == 0, finder.text[:300]
+
+        _()
+    finally:
+        try:
+            remove_leftovers()
+            print("Deleted the path datasets")
+        except Exception as error:  # a cleanup failure must not hide the results above
+            print(f"Path datasets cleanup failed: {error}")
 
 
 if __name__ == "__main__":

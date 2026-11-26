@@ -2496,12 +2496,17 @@ SAMPLE_CHANGES: dict[str, Any] = {
     'heading': 90.0,
     'array_fields': {'labels_x': ['a']},
 }
+# Fields of the body that no edit ever writes, so no change of them succeeds at any level: a sample's path can't be
+# changed (paths contract 2.3). The body may carry one so the server can refuse a different value; what each level
+# may do with it is test_a_sample_patch_never_changes_the_filepath_at_any_level.
+NEVER_WRITTEN = {'filepath'}
 
 
 def test_a_sample_patch_at_tag_level_changes_tags_and_no_other_field_of_the_model(world):
     """Every field of the sample-update body (datasets.SampleUpdate) other than tags needs edit, alone or beside
-    tags. The fields come from the model, so one added later is covered, and one with no example here fails."""
-    fields = set(datasets.SampleUpdate.model_fields) - {'tags'}
+    tags. The fields come from the model, so one added later is covered, and one with no example here fails; a field
+    no edit ever writes (NEVER_WRITTEN) is checked on its own, below."""
+    fields = set(datasets.SampleUpdate.model_fields) - {'tags'} - NEVER_WRITTEN
     assert 'tags' in datasets.SampleUpdate.model_fields
     missing, stale = sorted(fields - SAMPLE_CHANGES.keys()), sorted(SAMPLE_CHANGES.keys() - fields)
     assert not missing, f'fields of SampleUpdate with no example change in SAMPLE_CHANGES: {missing}'
@@ -2523,6 +2528,40 @@ def test_a_sample_patch_at_tag_level_changes_tags_and_no_other_field_of_the_mode
         for field in sorted(fields):
             done = await w.call(POWER, 'PATCH', sample, json={field: SAMPLE_CHANGES[field]})
             assert done.status_code == 200, (field, done.text)
+
+    world(scenario)
+
+
+def test_a_sample_patch_never_changes_the_filepath_at_any_level(world):
+    """Paths contract 2.3, the field NEVER_WRITTEN: a body carrying a filepath other than the sample's is refused at
+    every level and writes nothing, its tags included (below edit by the level or by the path; at edit with 422 and
+    the text `filepath can't be changed` as its detail). The sample's own path sent back doesn't raise the level an
+    edit needs: tags and the path are still a tag-level edit, and write the tags."""
+
+    async def scenario(w):
+        await prepare(w)
+        c = await new_dataset(w)
+        sample = f'/api/datasets/{c.d}/samples/{c.s0}'
+        own = await w.database.fetchval('SELECT filepath FROM samples WHERE id = $1', c.s0)
+        state = 'SELECT filepath, tags, metadata, last_modified_at FROM samples WHERE id = $1'
+        other = f'moved/{own}'
+        for level in ('tag', 'edit'):
+            await set_share(w, c.d, POWER, level)
+            before = tuple(await w.database.fetchrow(state, c.s0))
+            for body in ({'filepath': other}, {'tags': ['x'], 'filepath': other}):
+                refused = await w.call(POWER, 'PATCH', sample, json=body)
+                said = (refused.status_code, detail(refused))
+                if level == 'tag' and refused.status_code == 403:
+                    assert said == (403, needs('edit')), (level, body, refused.text)
+                else:
+                    assert refused.status_code == 422, (level, body, refused.text)
+                    assert isinstance(said[1], str) and "filepath can't be changed" in said[1], (level, refused.text)
+            assert tuple(await w.database.fetchrow(state, c.s0)) == before, level
+        await set_share(w, c.d, POWER, 'tag')
+        kept = await w.call(POWER, 'PATCH', sample, json={'tags': ['kept'], 'filepath': own})
+        assert kept.status_code == 200, kept.text
+        row = await w.database.fetchrow(state, c.s0)
+        assert (row['filepath'], row['tags']) == (own, ['kept']), tuple(row)
 
     world(scenario)
 

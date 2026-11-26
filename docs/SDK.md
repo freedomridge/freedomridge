@@ -225,7 +225,8 @@ to an existing one needs edit in it ([Sharing a dataset](#sharing-a-dataset)).
 
 Use `dataset.add_samples(batch, on_duplicate="skip")` on the **first attempt and
 every retry**. Keep each sample's `filepath` stable (for S3, use the same
-`s3://bucket/key`); uniqueness is per dataset and filepath. Put metadata, labels
+`s3://bucket/key`); uniqueness is per dataset and filepath, and a path can't be
+changed once added ([Paths, and when media moves](#paths-and-when-media-moves)). Put metadata, labels
 (in metadata), tags, registered array fields, named embeddings, and hashes on
 each `Sample` before calling add. The SDK sends the entire list in one request:
 `POST /api/datasets/{id}/samples` with
@@ -564,6 +565,113 @@ other bulk edits, and as a field's new name in a rename or clone. A sample that 
 stored them) keeps it until it is removed: `sample.save()` may send it back with the value it has, while a changed
 value is refused. Removing such a key is allowed. A name that only contains one (`source_tags`, `created_at_source`)
 is an ordinary key, and so is `heading`.
+
+#### Paths, and when media moves
+
+A sample's `filepath` is stored as you give it and **can't be changed afterwards**: it is how Freedom Ridge recognises
+the sample (adding it again, `dataset[filepath]`, `merge_samples`, a copy and a mirror all match samples by it).
+`sample.save()` after giving a sample another `filepath` raises a `ValueError` and sends nothing, and a `PATCH` of a
+sample with a different `filepath` is refused (422).
+
+The server reads three kinds of path:
+
+| Path | Read from |
+|------|-----------|
+| relative: `photos/2026/a.jpg` | the server's data root, `FRIDGE_DATA_ROOT`, put in front of it |
+| full local: `/data/photos/2026/a.jpg` | the server's disk, only inside `FRIDGE_DATA_ROOT` (anything else is refused, 403, a link that leads outside included) |
+| cloud: `s3://bucket/photos/a.jpg` | S3, through a storage configuration that covers the bucket ([S3 permissions](S3_PERMISSIONS.md)) |
+
+Other schemes (`gs://`, `file://`, ...) are not read. An `https://` address isn't read either: the full view sends the
+browser to it, and it gets no thumbnail.
+
+**For local media, prefer relative paths.** Then moving all of it is one setting: move the folder and point
+`FRIDGE_DATA_ROOT` at its new place. The SDK, when it reads media on your machine (to compute embeddings or hashes),
+puts its own `FRIDGE_DATA_ROOT` in front of a relative path. A full path names the old place in every sample.
+
+When media has moved, do one of three things:
+
+1. **Put it back where the paths say.** Mount the drive at the path it had, or, for relative paths, change
+   `FRIDGE_DATA_ROOT`. Nothing in the database changes.
+2. **Copy the samples into a new dataset with new paths.** `add_samples_from` with `path_prefixes` gives each copy
+   a new path. Copy into a new, empty dataset: a sample the target already has at a new path is kept, and the
+   source's is skipped as copied.
+
+   ```python
+   old = Dataset("field photos")
+   moved = Dataset("field photos (moved)")
+   moved.add_samples_from(old, path_prefixes={"/media/usb/field": "/data/field"})   # the drive copied to /data
+   # {"seen": 120000, "added": 120000, "skipped": 0, "rewritten": 120000}
+   ```
+
+   To make the paths relative to the data root instead, name the folder under it:
+   `path_prefixes={"/media/usb/field": "field"}` (with `FRIDGE_DATA_ROOT=/data`). Every old path contains `field`,
+   so this check reads every path of the source once before copying (below).
+
+   Open a few samples of the new dataset, and when it is right, delete the old one (`old.delete()`).
+3. **Add the samples again** from where they came from (your import script) with the new paths. The samples under the
+   old paths stay until you delete them.
+
+How `path_prefixes={old: new}` works:
+
+- A path that starts with `old` at a folder boundary (it is `old`, or `old` then `/`) has that start replaced by
+  `new`, and keeps the rest exactly: `/media/old` touches `/media/old/a.jpg`, not `/media/older/a.jpg`. A trailing
+  `/` makes no difference. When several `old`s fit, the longest wins. A path no `old` fits is copied unchanged.
+- `new` (and `old`) may be a local folder, a path relative to the data root (`""` is the data root itself), or a cloud
+  location: `{"/media/usb/field": "s3://bucket/field"}` gives S3 paths.
+- The same replacement is made in every text value of the sample's metadata, at any depth: the other media paths
+  (extra media fields, a heatmap's `map_path`, a mask's `maskPath`, a point cloud's `path`, an object's
+  `parent_filepath`). Any text value that starts with `old` at a folder boundary is replaced, so choose an `old`
+  that only paths start with. Nothing else changes.
+- A sample is matched in the target by its new path, so a copy that stops part-way is resumed by running it again
+  with the same arguments: what it copied is skipped. The answer's `rewritten` counts the samples added with a new
+  `filepath`.
+- **It never merges two samples.** When the rule would give two samples of the source the same path (a new path
+  equal to another sample's path, new or unchanged), the copy is refused before anything is written, with a
+  `ValueError` that names the two. Checking costs little in the usual case: the server looks for paths already
+  under each `new` (one pass over the source's rows, which sends nothing back when the folder is new). A `new` that
+  most paths contain (the data root `""`, `"/"`, a short relative folder), or two `old`s sent to the same folder,
+  can make the client read every path of the source once before copying (about a minute per million samples at the
+  default `batch_size`, half that at 5,000), keeping one page in memory. A source held in memory (below) is
+  checked there.
+- The source is only read. A copy into the dataset it comes from is refused.
+
+**A copy keeps objects with their images.** An object (`media_type` `object`) names its image by sample id
+(`metadata.parent_id`), and each server numbers its samples itself, so the copy writes the images before the objects
+(also when it is run again) and gives each object the id, in the target, of the sample at its image's path (after
+`path_prefixes`). An image the target already has at that path counts, whether an earlier copy brought it or it was
+there before the copy. An object whose image isn't in the target (not in the copied view and not there already, or a
+`parent_id` that names no image of the source) is copied with `parent_id` null, never pointing at another sample.
+The answer's `objects_without_image` counts every object the copy added without an image there, for whatever
+reason (one with no `parent_id`, or one that isn't a sample id, too); that key is there whenever the copied view
+holds objects. Only
+objects are touched: another sample's `parent_id` (a `to_patches` crop names its image in another dataset) and a
+`parent_id` that isn't a sample id are copied as they are. A copy made with an earlier version of the SDK left its
+objects without their images, and copying again skips them as already there: delete them in the copy
+(`copy.filter(media_type="object").delete_samples()`) and copy again. A view with no objects costs one count more
+than before. With objects, each batch of objects adds two small reads: about 15 seconds for 200,000 objects on a
+test server, a fifth of the time that copy took without vectors, and less of a copy that carries vectors. A view
+cut with `limit()` or `skip()` reads its ids and media types once first, and a similarity result is fetched again
+by id (its rows lack the heading and the array fields).
+
+What a copy carries: every sample with its metadata, tags, location, heading, array fields, vectors and hashes
+(`embedding_fields` and `hash_fields` choose which), and objects with their images. What it doesn't: the dataset's
+versions, saved views, field descriptions and private marks, access settings, promoted indexes, its id (links name
+the old dataset) and its mirrors (a follower keeps following the old dataset). A large dataset sends every vector
+again, through the machine running the copy, and the database needs room for both datasets until the old one is
+deleted. **Mark private fields again on the copy before the assistant is used on it**, and write the descriptions
+again: a field whose values were kept from the assistant in the old dataset isn't marked in the copy, so the
+assistant can read it there until it is ([keeping a field's values back](ASSISTANT.md#keeping-a-fields-values-back)).
+Sharing fails safe: a new dataset is private.
+
+A copy reads a dataset, a view of one (a filter, a selection cut with `limit()` or `skip()`, a similarity result)
+or a version's view (`dataset.version("v1")`): a version's samples are copied as the version holds them, with the
+same path rule, check and objects; their vectors and hashes are the dataset's current ones (a version doesn't keep
+them), none for a sample deleted since. Anything else is refused before anything is read.
+
+A copy reads its source a page at a time, in bounded memory, except a source that filters would change: a view cut
+with `limit()` or `skip()`, a similarity result, and a version's view cut with `limit()`. Such a source is held in
+memory for the copy, as the id, path and media type of each of its samples: about 400 MB per million samples
+(measured with paths of about 55 characters; shorter paths take less), a tenth more with `path_prefixes`.
 
 #### Sample Properties
 
@@ -1295,6 +1403,10 @@ dataset.merge_samples(preds, key_field="source_id", fields=["predictions"], skip
 target.add_samples_from(source.filter(split="eval"))          # a view, or a whole Dataset
 target.add_samples_from(source.filter(source_id__in=ids), embedding_fields=["dinov3"], hash_fields=[])
 # Matches by filepath; samples already in the target are left untouched. Streams in batches.
+# The copies can get new paths (media moved; a sample's own path can't be changed):
+target.add_samples_from(source, path_prefixes={"/media/usb/field": "/data/field"})
+# -> {"seen", "added", "skipped", "rewritten"}; see "Paths, and when media moves"
+# Objects are linked to the copies of their images; "objects_without_image" counts those whose image isn't there.
 ```
 
 ### Field descriptions
@@ -2417,7 +2529,9 @@ class Dataset:
     def clone_field(field_name, new_name, *, wait=True, timeout=1800) -> dict | Job
     def clear_field(field_name, *, wait=True, timeout=1800) -> dict | Job
     def merge_samples(source, key_field="filepath", fields=None, skip_existing=False) -> int
-    def add_samples_from(source, *, embedding_fields=None, hash_fields=None, batch_size=500) -> dict  # {"seen","added","skipped"}
+    # {"seen","added","skipped"}, "rewritten" (added with a new filepath) with path_prefixes={old: new}, and
+    # "objects_without_image" (objects added with parent_id null) when the view holds objects
+    def add_samples_from(source, *, embedding_fields=None, hash_fields=None, batch_size=500, path_prefixes=None) -> dict
 
     # Embeddings & visualization
     # Both return {"total", "written", "dropped", "dropped_sample_ids"}

@@ -200,9 +200,13 @@ class Sample:
             '_snapshot_version_id',
             '_original_metadata_keys',
             '_loaded_fields',
+            '_stored_filepath',
             'distance',
         )
         if name in _core:
+            if name == 'filepath' and self.__dict__.get('id') is not None and '_stored_filepath' not in self.__dict__:
+                # The path the server has: a sample's path can't be changed, so save() refuses a different one.
+                super().__setattr__('_stored_filepath', self.__dict__.get('filepath'))
             super().__setattr__(name, value)
             # Replacing the metadata dict WHOLESALE is a replace of our local view, not an
             # instruction to delete server-side keys. Re-baseline so save() sends a plain merge.
@@ -274,8 +278,11 @@ class Sample:
             sample.metadata["checked_at"] = datetime.now()
             sample.save()
 
+        A sample's ``filepath`` can't be changed: a save after assigning it a different path raises and
+        sends nothing (copy the samples with ``add_samples_from(..., path_prefixes=...)`` instead).
+
         Raises:
-            ValueError: If sample was not loaded from a dataset
+            ValueError: If sample was not loaded from a dataset, or its filepath was changed
         """
         if self._snapshot_version_id is not None:
             raise ValueError("Snapshot samples are read-only. Load the live sample to edit it.")
@@ -286,6 +293,22 @@ class Sample:
             )
         if self.id is None:
             raise ValueError("Cannot save: Sample has no ID. Add it to a dataset first with dataset.add_samples().")
+        stored = self.__dict__.get('_stored_filepath', self.filepath)
+        if self.filepath != stored:
+            # Checked before anything is sent: the path was never part of the edit, so this save used to write
+            # the other changes and silently keep the old path.
+            if stored == '' and 'filepath' not in self._loaded_fields:
+                # Read with select_fields and no filepath: the server's path isn't known here, only that it stays.
+                kept = "this sample was read without its filepath, and a path given to it here isn't saved"
+            else:
+                kept = f"it stays {stored!r}"
+            raise ValueError(
+                f"Cannot save sample {self.id}: filepath can't be changed ({kept}; nothing was saved). It is how "
+                "the app recognises the sample. If the media moved, put it back where the path says, or copy the "
+                "samples into a new dataset with new paths: "
+                "new_dataset.add_samples_from(dataset, path_prefixes={old_start: new_start}). Leave the path as it "
+                "was read to save other changes.",
+            )
 
         # Keys the sample had when it was loaded but no longer has -> explicit removals.
         removed = sorted(self._original_metadata_keys - set(self.metadata))

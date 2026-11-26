@@ -6736,11 +6736,12 @@ async def _list_samples_post(id: int, request: SamplesRequest):
             else:
                 data['location'] = None
 
-            # Remove raw lat/lon/heading from top level
+            # Remove raw lat/lon from top level, and the heading when the location holds it. A sample with a heading
+            # and no location (an upload or an edit can set it alone) keeps it here: a copy reads it from the row.
             del data['lon']
             del data['lat']
-            if 'heading' in data:
-                del data['heading']
+            if data['location'] is not None or data.get('heading') is None:
+                data.pop('heading', None)
 
         # filepath stays as-is (s3://... or local absolute path). The frontend
         # uses /api/samples/{id}/media for image rendering and shows filepath
@@ -7929,11 +7930,21 @@ class SampleUpdate(BaseModel):
     location: Optional[Dict[str, Any]] = None
     heading: Optional[float] = None
     array_fields: Optional[Dict[str, List[str]]] = None
+    # Never written: a sample's path can't be changed (FILEPATH_UNCHANGEABLE). Accepted only as the path the sample
+    # has, so a client that sends a whole sample back keeps working.
+    filepath: Optional[str] = None
 
     @field_validator('location')
     @classmethod
     def _location(cls, loc: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         return _point_location(loc)
+
+
+FILEPATH_UNCHANGEABLE = (
+    "filepath can't be changed: a sample keeps the path it was added with, which is how the app recognises it. "
+    "If the media moved, put it back where the path says, or copy the samples into a new dataset with new paths "
+    "(SDK: add_samples_from with path_prefixes). Nothing was written."
+)
 
 
 @checks_level('tag when only tags or a mirror\'s own @local.tags change, edit otherwise')
@@ -7944,8 +7955,9 @@ async def _sample_update_level(
     user: dict = Depends(get_current_user),
 ) -> dict:
     """update_sample's caller: the tag level sends `tags` alone, or `array_fields` holding only a mirror's own
-    `@local.tags` (that server's tags field). Any other field sent, a later one too, needs edit."""
-    sent = request.model_fields_set
+    `@local.tags` (that server's tags field). Any other field sent, a later one too, needs edit. `filepath` is never
+    written (update_sample refuses a different one), so it doesn't count."""
+    sent = request.model_fields_set - {'filepath'}
     tags_only = (sent == {'tags'} and request.tags is not None) or (
         sent == {'array_fields'} and set(request.array_fields or {}) == {LOCAL_TAGS}
     )
@@ -7975,7 +7987,20 @@ async def update_sample(
 
     On a mirror, `@local.<name>` keys in metadata / remove_metadata_keys, and `@local.tags` in array_fields, write
     this server's own fields (docs/FOLLOWERS.md): a request with them changes nothing of the primary's.
+
+    - filepath: can't be changed. A different one is refused (422) before anything is written; the sample's own
+      path sent back is accepted and changes nothing.
     """
+    if request.filepath is not None:
+        stored = await db.fetchval(
+            "SELECT filepath FROM samples WHERE id = $1 AND dataset_id = $2",
+            sample_id,
+            id,
+        )
+        if stored is None:
+            raise HTTPException(status_code=404, detail="Sample not found")
+        if stored != request.filepath:
+            raise HTTPException(status_code=422, detail=FILEPATH_UNCHANGEABLE)
     local_set, local_remove, primary_set, primary_remove = local_writes.split_metadata(
         request.metadata,
         request.remove_metadata_keys,

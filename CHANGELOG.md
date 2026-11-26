@@ -226,6 +226,18 @@ on; the others touch no sample.
   a private field that goes and comes back is still private. Migration `0035_field_descriptions.sql` adds three
   columns to `dataset_fields` and touches no rows. A follower still on 2.13 receives the primary's described built-in
   fields as rows it ignores; each new one queues one pass of statistics there that finds nothing to measure.
+- **A copy can give its samples new paths, for media that moved**
+  ([Paths, and when media moves](docs/SDK.md#paths-and-when-media-moves)). A sample's path can't be changed once it
+  is added; `dataset.add_samples_from(source, path_prefixes={"/media/usb/photos": "/data/photos"})` copies the samples
+  into another dataset with the start of each path replaced, at a folder boundary (the longest start that fits wins), and
+  the same start replaced in every text value of the metadata, at any depth, so masks, heatmaps and extra media
+  fields follow. A copy that stops part-way resumes when run again: samples are matched by their new path. The copy
+  is refused before it writes anything when the rule would give two samples the same path, with an example; the
+  answer gains `rewritten`, the number of samples added with a new path. The source is a dataset, a view of one or
+  a version's view, whose samples are copied as the version holds them; anything else is refused before anything is
+  read. The docs now say how each kind of path is read (relative to `FRIDGE_DATA_ROOT`, full local inside it,
+  `s3://`), why relative paths are the better choice for local media, the three ways to handle media that moved, and
+  that a field marked private must be marked again on the copy before the assistant is used on it.
 
 ### Fixed
 
@@ -331,6 +343,26 @@ on; the others touch no sample.
   page of chosen fields (`samples/query` with `fields`) and the GET sample list caught every query error as a 500
   "Internal query error". A data error (any class-22 error: a value that can't be cast, a number out of range, a
   concept that isn't the dataset's) now answers 400 "Invalid input: …", as the other reads do.
+- **Changing a sample's path says it can't, instead of being ignored.** `sample.filepath = ...; sample.save()`
+  returned normally, wrote the sample's other changes and kept the old path; it now raises a `ValueError` ("filepath
+  can't be changed", with what to do instead) and sends nothing. A `PATCH` of a sample whose body carries a
+  different `filepath` answered 200 and is now refused (422) with nothing written; the sample's own path sent back is
+  still accepted. The docs that called an object's path its image's, or every local path absolute, are corrected.
+- **`add_samples_from` keeps objects with their images.** It copied each object's `metadata.parent_id` as it was:
+  the id of its image in the source. On the same server every copied object was left without an image (listed as
+  unlinked, and removed by default by "delete objects with no image" once the source was deleted); copied to
+  another server, an object could be linked to an unrelated image of the target, and deleted with it. The copy now
+  writes the images first and gives each object the target's id of the image at its image's path (after
+  `path_prefixes`), or null when the target has no image there; the answer's `objects_without_image` counts every
+  object it added without an image, whenever the copied view holds objects. Samples that aren't objects keep their `parent_id`. Objects copied by an
+  earlier version are skipped by a new copy as already there: delete them in the copy
+  (`copy.filter(media_type="object").delete_samples()`) and copy again
+  ([details](docs/SDK.md#paths-and-when-media-moves)).
+- **A sample's heading without a location is read back, and copied.** An upload or an edit can set a heading on a
+  sample with no location, but `POST /api/datasets/{id}/samples/query`, which the SDK reads samples with, carried
+  the heading only inside `location`, so it never came back and `add_samples_from` dropped it. Such a sample's row
+  now has `heading` beside its null `location` (`sample.heading` in the SDK); a sample with a location carries it
+  inside `location` as before.
 
 ## 2.13.2 (2026-11-18)
 

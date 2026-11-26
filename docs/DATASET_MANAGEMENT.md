@@ -91,12 +91,12 @@ Use `"skip"` for a script you may re-run. Send smaller batches if you get HTTP 4
 
 | Field | Notes |
 |-------|-------|
-| `filepath` | Required. A local path that resolves inside the backend's `FRIDGE_DATA_ROOT`, or `s3://bucket/key`. Paths outside the data root are not served. |
+| `filepath` | Required. A path relative to the backend's `FRIDGE_DATA_ROOT`, a full local path inside it, or `s3://bucket/key`. Paths outside the data root are not served. It can't be changed once the sample is added: see [Paths, and when media moves](SDK.md#paths-and-when-media-moves) for the kinds of path and what to do when media moves. |
 | `media_type` | Optional; detected from the extension (`image`, `video`, `audio`). |
 | `tags` | List of strings. |
 | `metadata` | Free-form JSON. Types are detected from the values; ISO-8601 dates and times become datetimes ([below](#dates-and-times)). |
 | `location` | GeoJSON Point, `{"type": "Point", "coordinates": [lon, lat]}`. |
-| `heading` | Compass heading in degrees. |
+| `heading` | Compass heading in degrees. A sample read back with `samples/query` carries it inside `location`, or, when it has no location, as `heading` beside it. |
 | `embeddings` | `{field_name: [floats]}`. A field name's dimension is fixed server-wide by its first vectors. |
 | `hashes` | `{name: "hex string"}`, for example `{"phash_8": "c3a1..."}`. |
 | `array_fields` | `{field_name: [strings]}` for array fields created on the dataset. |
@@ -150,6 +150,9 @@ requests.patch(
     },
 ).raise_for_status()
 ```
+
+A sample's `filepath` can't be changed: a body whose `filepath` differs from the sample's is refused (422, "filepath
+can't be changed") and nothing is written; the sample's own path sent back is accepted and changes nothing.
 
 For many samples, `POST /api/datasets/{id}/samples/bulk-set` merges the same
 `metadata` into every listed sample (`{"sample_ids": [...], "metadata": {...}}`),

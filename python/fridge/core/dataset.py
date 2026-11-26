@@ -8,11 +8,21 @@ import warnings
 from datetime import datetime
 from itertools import islice
 from types import SimpleNamespace
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
 from .client import _check_everyone_level, get_client
+from .copy_objects import (
+    OBJECT,
+    copy_passes,
+    image_paths,
+    listing,
+    parent_sample_id,
+    parents_in_target,
+    refuse_unknown,
+)
+from .path_prefixes import PathRule, check_collisions
 from .sample import Sample, _jsonable
 from .version_view import VersionView
 from .view import Condition, DatasetView, SampleQuery, filters_from_view_content
@@ -1166,7 +1176,15 @@ class Dataset:
         print(f"merge_samples: merged into {n} samples")
         return n
 
-    def add_samples_from(self, source, *, embedding_fields=None, hash_fields=None, batch_size: int = 500) -> dict:
+    def add_samples_from(
+        self,
+        source,
+        *,
+        embedding_fields=None,
+        hash_fields=None,
+        batch_size: int = 500,
+        path_prefixes: Optional[Dict[str, str]] = None,
+    ) -> dict:
         """Copy samples from ``source`` into this dataset, adding the ones that aren't here.
 
         Unlike ``merge_samples`` (which only merges metadata into samples that already exist), this
@@ -1179,23 +1197,56 @@ class Dataset:
         bounded however large the source is. Interrupted? Run it again; samples already copied are
         skipped.
 
+        A sample's path can't be changed once it is added, so this is also how samples get new paths
+        when their media has moved: ``path_prefixes`` replaces the start of each copy's path (see
+        docs/SDK.md, "Paths, and when media moves").
+
+        Objects (``media_type`` ``object``) stay with their images: the images are copied first, and each
+        object's ``metadata.parent_id`` becomes the id, here, of the sample at its image's path (after
+        ``path_prefixes``), or null when this dataset has no image there. Another sample's ``parent_id``, and
+        one that isn't a sample id, are copied as they are.
+
         Args:
-            source: a Dataset (copy everything) or a DatasetView (copy just that selection). The source
-                may live on a different Freedom Ridge instance.
+            source: a Dataset (copy everything), a DatasetView (copy just that selection), or a
+                version's view (``dataset.version(...)``, copy the samples as the version holds them). The
+                source may live on a different Freedom Ridge instance.
             embedding_fields: embedding fields to copy (default: every stored field, patch embeddings
                 included; ``[]`` for none).
             hash_fields: hash fields to copy (default: all; ``[]`` for none).
             batch_size: samples per request.
+            path_prefixes: ``{old: new}``: the copies get new paths. A path that starts with ``old`` at a
+                folder boundary (it is ``old``, or ``old`` then ``/``) has that start replaced by ``new``;
+                the rest of the path is kept exactly. The longest ``old`` that fits wins; a trailing ``/``
+                makes no difference; a path no ``old`` fits is copied unchanged. ``new`` may be a local
+                folder, a path relative to the server's data root (``""`` is the data root itself) or a
+                cloud location such as ``s3://bucket/prefix``. The same replacement is made in every text
+                value of the copy's metadata, at any depth (its other media paths). A sample is matched in
+                this dataset by its new path, so a rerun skips what it already copied. Before anything is
+                written, the copy is refused when the rule would give two samples of the source the same
+                path. ``{}`` is no rule.
 
         Returns:
-            dict: ``{"seen": n, "added": n, "skipped": n}`` (``skipped`` = already in this dataset).
+            dict: ``{"seen": n, "added": n, "skipped": n}`` (``skipped`` = already in this dataset), and
+            with ``path_prefixes``, ``"rewritten"``: how many of the samples added got a new ``filepath``.
+            When the view holds objects, ``"objects_without_image"``: how many objects were added with
+            ``parent_id`` null (0 when every object found its image).
+
+        Raises:
+            ValueError: a bad ``path_prefixes`` (not a dict, an empty ``old``, an ``old`` or ``new`` that
+                isn't text, the same path twice), or a rule that would give two samples the same path.
+            TypeError: a source of another kind, before anything is read.
 
         Example:
             target.add_samples_from(source.filter(split="eval"))
             # select by a metadata key:
             target.add_samples_from(source.filter(source_id__in=source_ids))
+            # the media moved from a USB drive to /data/photos:
+            moved = Dataset("photos (moved)")
+            moved.add_samples_from(Dataset("photos"), path_prefixes={"/media/usb/photos": "/data/photos"})
         """
+        rule = PathRule.parse(path_prefixes)
         view = source.all() if isinstance(source, Dataset) else source
+        refuse_unknown(view)
         src = view._dataset
         if src.client.base_url == self.client.base_url and src.id == self._id:
             raise ValueError("source and target are the same dataset")
@@ -1210,6 +1261,11 @@ class Dataset:
             missing = sorted(set(wanted) - set(stored))
             if missing:
                 raise ValueError(f"source dataset '{src.name}' has no {kind} field(s) {missing}")
+        # A source filters would change (cut, a similarity result, a cut version's view) is listed once: its ids, paths
+        # and media types serve the collision check, the passes and its objects' images (copy_objects.py).
+        listed = listing(view, batch_size)
+        if rule is not None:
+            check_collisions(rule, view, batch_size, None if listed is None else [path for _, path, _ in listed])
 
         # Listing the source's array fields also registers them, so iterating it returns their values.
         array_names = [name for name in src.list_array_fields() if name != 'tags']
@@ -1219,26 +1275,64 @@ class Dataset:
                 if name not in existing:
                     self.create_array_field(name)
 
-        seen = added = skipped = 0
-        samples = view.iter_samples(batch_size=batch_size)
-        while batch := list(islice(samples, batch_size)):
-            ids = [sample.id for sample in batch]
-            vectors = src.client.get_vectors_by_ids(src.id, ids, embeddings) if embeddings else {}
-            hash_values = src.client.get_hashes_by_ids(src.id, ids, hashes) if hashes else {}
-            rows = []
-            for sample in batch:
-                row = sample.to_dict()
-                row["embeddings"] = vectors.get(sample.id)
-                row["hashes"] = hash_values.get(sample.id)
-                rows.append(row)
-            result = self.client.add_samples(self._id, rows, on_duplicate='skip')
-            seen += len(batch)
-            added += len(result.get("ids", []))
-            skipped += result.get("skipped", 0)
+        # Every image before any object, so each object finds the copy of its image (copy_objects.py).
+        has_objects, passes = copy_passes(view, listed, batch_size)
+        images_of = image_paths(view, listed)
+        seen = added = skipped = rewritten = without_image = 0
+        for samples in passes:
+            while batch := list(islice(samples, batch_size)):
+                ids = [sample.id for sample in batch]
+                vectors = src.client.get_vectors_by_ids(src.id, ids, embeddings) if embeddings else {}
+                hash_values = src.client.get_hashes_by_ids(src.id, ids, hashes) if hashes else {}
+                objects = [sample for sample in batch if sample.media_type == OBJECT]
+                parents = parents_in_target(images_of, self, rule, objects) if objects else {}
+                # Written apart by (new path, object without its image), so the server's ids count the added ones.
+                groups: Dict[Tuple[bool, bool], List[Dict[str, Any]]] = {}
+                for sample in batch:
+                    row = sample.to_dict()
+                    row["embeddings"] = vectors.get(sample.id)
+                    row["hashes"] = hash_values.get(sample.id)
+                    moved = orphan = False
+                    if rule is not None:
+                        row["filepath"] = rule.apply(sample.filepath)
+                        row["metadata"] = rule.apply_metadata(row["metadata"])
+                        moved = row["filepath"] != sample.filepath
+                    if sample.media_type == OBJECT:
+                        parent = parent_sample_id(sample.metadata.get("parent_id"))
+                        if parent is not None:
+                            # The target's id of its image, or null: never the source's id.
+                            row["metadata"]["parent_id"] = parents.get(parent)
+                        elif "parent_id" in sample.metadata:
+                            row["metadata"]["parent_id"] = _jsonable(sample.metadata["parent_id"])  # as it is
+                        orphan = parent not in parents
+                    groups.setdefault((moved, orphan), []).append(row)
+                seen += len(batch)
+                if rule is not None:
+                    paths = [row["filepath"] for group in groups.values() for row in group]
+                    if len(set(paths)) != len(paths):
+                        # Checked before the copy started: only a sample added to the source since can do this.
+                        raise ValueError(
+                            "path_prefixes gives two samples of this batch the same path: the source changed during "
+                            f"the copy. {added} samples were added before it stopped; run it again to check it whole.",
+                        )
+                for (moved, orphan), group in groups.items():
+                    result = self.client.add_samples(self._id, group, on_duplicate='skip')
+                    count = len(result.get("ids", []))
+                    added += count
+                    skipped += result.get("skipped", 0)
+                    rewritten += count if moved else 0
+                    without_image += count if orphan else 0
         if added:
             self._dirty = True
-        print(f"add_samples_from: {added} added, {skipped} already present ({seen} read from '{src.name}')")
-        return {"seen": seen, "added": added, "skipped": skipped}
+        note = f", {rewritten} of them with a new path" if rule is not None else ""
+        note += f", {without_image} objects without their image here" if has_objects else ""
+        print(f"add_samples_from: {added} added{note}, {skipped} already present ({seen} read from '{src.name}')")
+        answer = {"seen": seen, "added": added, "skipped": skipped}
+        if rule is not None:
+            answer["rewritten"] = rewritten
+        if has_objects:
+            answer["objects_without_image"] = without_image
+        return answer
 
     def list_views(self) -> list:
         """List all saved views for this dataset."""
@@ -3633,7 +3727,9 @@ class Dataset:
         the grid like any other.
 
         For the crops to be servable, put ``patches_dir`` under FRIDGE_DATA_ROOT
-        (local serving) or upload them and rewrite filepaths afterward.
+        (local serving), or upload them and copy the new dataset into another with the
+        uploaded paths: ``other.add_samples_from(patches, path_prefixes={patches_dir: "s3://bucket/patches"})``
+        (a sample's own path can't be changed).
         """
         import os
 
