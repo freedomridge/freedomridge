@@ -19,19 +19,28 @@ import time
 from typing import Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 from .. import job_queue, job_wait
 from ..access import require_dataset_access, require_level
 from ..database import db
 from ..field_registry import (
+    PROTECTED_METADATA_KEYS,
     REQUEST_FULL_REFRESH,
     invalidate_values,
     lock_field_lifecycle,
     prune_fields,
+    refuse_column_keys,
     register_fields,
 )
 from ..index_jobs import submit_ann_index, valid_hnsw_index
+
+
+def _written_key(name: str) -> str:
+    """The metadata key a score or a group id is written under: not `tags` or `media_type` (field_registry)."""
+    refuse_column_keys([name], PROTECTED_METADATA_KEYS)
+    return name
+
 
 router = APIRouter(
     prefix="/datasets/{id}/quality",
@@ -129,6 +138,8 @@ class UniquenessRequest(BaseModel):
     metadata_field: str = "uniqueness"
     allow_seq_scan: bool = False
 
+    _key = field_validator('metadata_field')(_written_key)
+
 
 @router.post("/uniqueness/compute")
 async def uniqueness_compute(id: int, request: UniquenessRequest, user: dict = Depends(require_level("edit"))):
@@ -221,6 +232,8 @@ class RepresentativenessComputeRequest(BaseModel):
     chunk: int = 20000
     metadata_field: str = "representativeness"
 
+    _key = field_validator('metadata_field')(_written_key)
+
 
 @router.post("/representativeness/compute")
 async def representativeness_compute(
@@ -299,6 +312,8 @@ class NormalizeRequest(BaseModel):
     span: float  # max - min (0 => everything maps to 0)
     after_id: int = 0
     chunk: int = 50000
+
+    _key = field_validator('metadata_field')(_written_key)
 
 
 @router.post("/normalize")
@@ -414,6 +429,8 @@ async def duplicates_compute(
 class DuplicatesFinalizeRequest(BaseModel):
     token: str
     group_field: str = "emb_dup_group"
+
+    _key = field_validator('group_field')(_written_key)
 
 
 @router.post("/duplicates/finalize")

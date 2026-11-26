@@ -18,6 +18,7 @@ from ..database import db
 from ..diskspace import estimate_snapshot_bytes, require_free_space
 from ..field_registry import (
     LOCAL_PREFIX,
+    PROTECTED_METADATA_KEYS,
     REQUEST_FULL_REFRESH,
     _value_names,
     forget_definitions,
@@ -38,6 +39,11 @@ from .datasets import (
 # Router-level dependency → every endpoint under /datasets/{id}/versions/*
 # automatically enforces access control. One line, impossible to forget on
 # a new endpoint.
+# A snapshot's metadata as a revert writes it back: a version saved before migration 0042 can hold keys named tags or
+# media_type, which name a sample's own fields and are refused since (field_registry.PROTECTED_METADATA_KEYS), so a
+# revert, and the samples it re-creates, leave them out. Compared in this form too, so they count as no change.
+RESTORED_METADATA = "(v.metadata - ARRAY[" + ", ".join(f"'{key}'" for key in sorted(PROTECTED_METADATA_KEYS)) + "])"
+
 router = APIRouter(
     prefix="/datasets/{id}/versions",
     tags=["versions"],
@@ -439,9 +445,9 @@ async def _changed_restore_fields(conn, version_id: int, dataset_id: int, arr_co
             CROSS JOIN LATERAL (
                 SELECT keys.key FROM (
                     SELECT jsonb_object_keys(COALESCE(s.metadata, '{{}}'::jsonb))
-                    UNION SELECT jsonb_object_keys(COALESCE(v.metadata, '{{}}'::jsonb))
+                    UNION SELECT jsonb_object_keys(COALESCE({RESTORED_METADATA}, '{{}}'::jsonb))
                 ) keys(key)
-                WHERE s.metadata->keys.key IS DISTINCT FROM v.metadata->keys.key
+                WHERE s.metadata->keys.key IS DISTINCT FROM {RESTORED_METADATA}->keys.key
                 UNION ALL SELECT 'tags' WHERE s.tags IS DISTINCT FROM v.tags
                 UNION ALL SELECT 'media_type'
                     WHERE v.media_type IS NOT NULL AND v.media_type IS DISTINCT FROM s.media_type
@@ -1762,7 +1768,7 @@ async def _restore_version(
             # filter meant nothing after a revert. Every row is still written, so
             # samples_reverted keeps counting the version's rows that still exist.
             changed = (
-                f"(s.metadata IS DISTINCT FROM v.metadata OR s.tags IS DISTINCT FROM v.tags"
+                f"(s.metadata IS DISTINCT FROM {RESTORED_METADATA} OR s.tags IS DISTINCT FROM v.tags"
                 f"{geo_diff}{af_diff}{media_diff})"
             )
             # Which fields this restore changes, before it changes them (all of them when samples are
@@ -1775,7 +1781,7 @@ async def _restore_version(
             update_status = await conn.execute(
                 f"""
                 UPDATE samples s
-                SET metadata = v.metadata,
+                SET metadata = {RESTORED_METADATA},
                     tags = v.tags,
                     filepath = v.filepath,
                     media_type = COALESCE(v.media_type, s.media_type),
@@ -1822,7 +1828,7 @@ async def _restore_version(
                             WHEN lower(v.filepath) ~ '\\.(mp3|wav|ogg|flac)$' THEN 'audio'
                             ELSE 'unknown'
                         END),
-                        COALESCE(v.tags, '{{}}'), COALESCE(v.metadata, '{{}}'::jsonb),
+                        COALESCE(v.tags, '{{}}'), COALESCE({RESTORED_METADATA}, '{{}}'::jsonb),
                         v.location, v.heading, COALESCE(v.created_at, NOW()), NOW(), $3{af_insert_vals}
                     FROM version_snapshots v
                     WHERE v.version_id = $1

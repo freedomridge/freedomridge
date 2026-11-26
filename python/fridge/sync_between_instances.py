@@ -23,6 +23,10 @@ from typing import Dict
 
 from .core.client import Client, _raise_for_status
 
+# Metadata keys a server of this version refuses (they name a sample's own fields, which are copied as such): an older
+# source can still hold them, so they are left out, and the run says how often.
+PROTECTED_METADATA_KEYS = ('tags', 'media_type')
+
 
 def sync(
     source_url: str,
@@ -117,6 +121,9 @@ def sync(
     # object is sent with its parent's target id when the parent is already there, and given it afterwards
     # otherwise (a parent paged after its objects); on a re-sync, existing objects get it the same way.
     parents: Dict[int, int] = {}
+    # Samples whose metadata held a key the target refuses (PROTECTED_METADATA_KEYS), and which keys those were.
+    left_out = 0
+    left_out_keys: set = set()
 
     while offset < total:
         # query_samples (POST /samples/query), NOT get_samples: GET /samples declares
@@ -133,6 +140,11 @@ def sync(
         payload = []
         for item in items:
             metadata = dict(item.get('metadata') or {})
+            held = [key for key in PROTECTED_METADATA_KEYS if key in metadata]
+            for key in held:
+                del metadata[key]
+            left_out += bool(held)
+            left_out_keys.update(held)
             parent = _sample_id(metadata.get('parent_id'))
             if parent is not None:
                 parents[item['id']] = parent
@@ -176,6 +188,13 @@ def sync(
         print(f"  Samples: {synced:,} / {total:,} ({rate:.0f}/s)")
 
     print(f"Samples complete: {synced:,} in {time.time() - start:.0f}s")
+    if left_out:
+        keys = ' and '.join(sorted(left_out_keys))
+        print(
+            f"  Left out the metadata key{'s' if len(left_out_keys) > 1 else ''} {keys} of {left_out:,} "
+            f"sample{'s' if left_out > 1 else ''}: a server of this version refuses them, as they name a sample's "
+            "own fields (the samples' own tags and media_type were copied)",
+        )
 
     if parents:
         updates = [

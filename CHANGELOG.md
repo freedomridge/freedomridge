@@ -10,14 +10,53 @@ This release adds an AI assistant: Claude Code and other MCP clients answer ques
 through thirteen read-only tools at `/mcp`, reading as the person using them, and an administrator's client can read
 the server's status, background jobs, backups and index advice through four more. It is off until an administrator
 switches it on. Also new: named regions as a filter, a text form for concept filters, and a description and unit for
-each field. Eight migrations, none of which touches a sample.
+each field. Nine migrations: one removes the metadata keys named `tags` or `media_type`, which are refused from now
+on; the others touch no sample.
 
 ### Upgrade notes
 
-- Eight database migrations, `0034_regions.sql` to `0041_jobs_across_datasets.sql`, and changed database functions,
-  applied with `scripts/apply_migrations.sh` (step 4 of [Upgrading](docs/UPGRADING.md)). They add empty tables and
-  columns and touch no rows. `0041` builds two indexes on the jobs table, about a second per million jobs, while job
-  writes wait.
+- Nine database migrations, `0034_regions.sql` to `0042_protected_metadata_keys.sql`, and changed database
+  functions, applied with `scripts/apply_migrations.sh` (step 4 of [Upgrading](docs/UPGRADING.md)). The first eight add
+  empty tables and columns and touch no rows. `0041` builds two indexes on the jobs table, about a second per million
+  jobs, while job writes wait. `0042` is the next item.
+- **Metadata keys named `tags` or `media_type` are refused, and the stored ones are removed for good.** Such a key
+  names a sample's own field, so it was stored but never listed, filtered or shown. A script that writes one (an
+  upload, an edit, a bulk edit, a rename or clone onto the name) is now refused with an error that names the key
+  (`metadata key(s) ['tags'] name sample columns`). `0042_protected_metadata_keys.sql` removes the stored keys from the
+  samples that carry them, and a revert to an older version doesn't bring them back: **the values are gone.** It
+  prints a line for each dataset, with the keys it removed and from how many samples; with such keys it runs with the
+  app stopped, as step 4 has it, and refuses while anything else is connected. A field renamed or cloned onto one of
+  the names, which earlier releases allowed, goes too (on a dataset that is no mirror): the field list shows the
+  sample's own `tags` and `media_type` again, counted from the samples by the statistics job once the app is up, with
+  the description, unit and private mark written about the name kept, and the migration names any index left over
+  that key for you to remove (`DROP INDEX CONCURRENTLY`). To see beforehand
+  which datasets carry such keys:
+
+  ```sql
+  SELECT d.id, d.name, count(*) FILTER (WHERE s.metadata ? 'tags') AS tags,
+         count(*) FILTER (WHERE s.metadata ? 'media_type') AS media_type
+    FROM samples s JOIN datasets d ON d.id = s.dataset_id
+   WHERE s.metadata ?| ARRAY['tags', 'media_type'] GROUP BY d.id ORDER BY d.id;
+  ```
+
+  To keep the values, give them another key before upgrading, a name no sample uses yet (here `old_tags`; the same for
+  `media_type`), and register it as a field (`list` instead of `string` where the values are lists). A mirror's
+  samples are left out: a mirror refuses the change, and its values are kept on its primary, where the same statement
+  keeps them.
+
+  ```sql
+  BEGIN;
+  UPDATE samples SET metadata = (metadata - 'tags') || jsonb_build_object('old_tags', metadata->'tags')
+   WHERE metadata ? 'tags' AND dataset_id NOT IN (SELECT dataset_id FROM mirrors);
+  INSERT INTO dataset_fields (dataset_id, field_name, field_type)
+  SELECT DISTINCT dataset_id, 'old_tags', 'string' FROM samples WHERE metadata ? 'old_tags'
+  ON CONFLICT (dataset_id, field_name) DO NOTHING;
+  COMMIT;
+  ```
+
+  A dataset version saved before the upgrade counts the samples the migration cleaned as modified when compared with
+  the dataset, also after a revert to it: a version keeps a fingerprint of each sample's metadata, the removed key
+  included. Save a version after upgrading: the dataset then shows as at that version.
 - The job runner loads the region boundaries by itself on its first start after the upgrade: its image now carries
   the boundary file (40.7 MB more). The load takes about half a minute on a desktop computer, a few minutes on a
   small server, and adds 151 MB to the database. A development checkout runs `python -m backend.regions fetch` once
@@ -184,6 +223,13 @@ each field. Eight migrations, none of which touches a sample.
 
 ### Fixed
 
+- **A metadata key named `tags` or `media_type` is refused instead of kept out of sight**, as `id`, `dataset_id`,
+  `filepath`, `created_at` and `last_modified_at` already were when samples are added. The two are refused wherever
+  metadata is written: adding samples (every `on_duplicate` mode), `PATCH`, both kinds of bulk-set, a field's new
+  name in a rename or clone, and a quality score's field; removing such a key still works. Migration `0042` removes the
+  stored ones, and a field renamed or cloned onto one of the names, so the field list shows the sample's own field
+  again (Upgrade notes). The SDK shows the server's sentence, and `fridge.sync_between_instances` leaves such keys out
+  of a copy from an older server, saying how many samples had one.
 - **A CSV from the Export dialog can't run a formula in a spreadsheet.** A cell that starts with `=`, `+`, `-`, `@`,
   a tab or a carriage return (a metadata value such as `=HYPERLINK(...)`, put there by whoever supplied the data) was
   written as it was, and a spreadsheet opening the file ran it as a formula. A text that would start a formula, the

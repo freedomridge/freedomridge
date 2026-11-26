@@ -46,6 +46,7 @@ from backend.field_descriptions import (
 )
 from backend.field_registry import (
     LOCAL_PREFIX,
+    PROTECTED_METADATA_KEYS,
     REQUEST_FULL_REFRESH,
     cached_distinct_values,
     field_stats,
@@ -54,6 +55,7 @@ from backend.field_registry import (
     lock_field_lifecycle,
     presentation_type,
     prune_fields,
+    refuse_column_keys,
     register_fields,
     validate_metadata,
 )
@@ -7542,13 +7544,6 @@ def _finite_vector(name: str, vector: List[float]) -> List[float]:
     return vector
 
 
-# Metadata keys that name a sample COLUMN: stored in metadata they were registered as fields and
-# merged into the column's stats (`id: -1`, `dataset_id: 7`, `created_at: 1999-…` became sidebar
-# fields beside the real ones). The Sample's own attributes carry these.
-# (`heading`, `tags`, `media_type` are NOT refused: importers may write them into metadata.)
-_RESERVED_METADATA_KEYS = frozenset({'id', 'dataset_id', 'filepath', 'created_at', 'last_modified_at'})
-
-
 class SampleCreate(BaseModel):
     filepath: str
     media_type: Optional[str] = None
@@ -7571,9 +7566,7 @@ class SampleCreate(BaseModel):
     @field_validator('metadata')
     @classmethod
     def _metadata(cls, md: Dict[str, Any]) -> Dict[str, Any]:
-        reserved = sorted(_RESERVED_METADATA_KEYS & md.keys())
-        if reserved:
-            raise ValueError(f"metadata key(s) {reserved} name sample columns — set them on the sample itself")
+        refuse_column_keys(md)
         return validate_metadata(md)
 
     @field_validator('embedding')
@@ -7925,7 +7918,10 @@ class SampleUpdate(BaseModel):
     @classmethod
     def _metadata(cls, metadata: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         # `@local.` keys are a mirror's own fields: update_sample routes them (local_writes).
-        return validate_metadata(metadata, allow_local=True) if metadata is not None else None
+        if metadata is None:
+            return None
+        refuse_column_keys(metadata, PROTECTED_METADATA_KEYS)
+        return validate_metadata(metadata, allow_local=True)
 
     tags: Optional[List[str]] = None
     metadata: Optional[Dict[str, Any]] = None
@@ -8525,6 +8521,7 @@ async def tag_samples(id: int, request: BulkTagRequest, user: dict, made_by: str
 
 def _metadata_with_local(metadata: Dict[str, Any]) -> Dict[str, Any]:
     """`@local.` keys are a mirror's own fields: bulk_set_metadata routes them (local_writes)."""
+    refuse_column_keys(metadata, PROTECTED_METADATA_KEYS)
     return validate_metadata(metadata, allow_local=True)
 
 
@@ -8854,6 +8851,10 @@ async def _check_field_target(
     _refuse_local_field_operation(field_name, new_name)
     _validate_field_name(field_name)
     _validate_field_name(new_name)
+    try:
+        refuse_column_keys([new_name], PROTECTED_METADATA_KEYS)  # its values would be stored under that key
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from None
     if new_name == field_name:
         raise HTTPException(status_code=400, detail="new_name is the field's current name")
     connection = connection or db

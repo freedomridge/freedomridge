@@ -13,11 +13,9 @@ computed from the rows planted here, or is what main answers today where a line 
    /api/search, a version's query and aggregate, and a bulk tag (its job's count and the rows it tags). Its negation
    keeps every other sample; text that isn't digits keeps none and is no error; as text it is `id contains "12"`.
    Every other operator on `id`, and `contains` on other fields, answer as main does.
-2. On hold (the owner decides what a metadata key named `tags` or `media_type` should do; the tests that expect it
-   refused wait on the branch tests/backend-four-section2-hold). Here only today's behaviour is pinned: the five keys
-   main refuses (`id`, `dataset_id`, `filepath`, `created_at`, `last_modified_at`) are refused where samples are
-   added, with main's status and sentence, storing nothing; a `tags` or `media_type` key already stored reads and
-   filters as today.
+2. Replaced by the protected-keys contract (test_protected_metadata_keys_spec.py). Here only the five keys main
+   refuses (`id`, `dataset_id`, `filepath`, `created_at`, `last_modified_at`) stay pinned: refused where samples are
+   added, with main's status and sentence, storing nothing.
 3. On a dataset without objects a negation (`not concept "x" > t`, `!=`, `NOT (... = ...)`, `not in`) keeps the images
    that have no score or no such field too; with objects, the image grid keeps only the images that have one. The
    docs say so.
@@ -40,11 +38,10 @@ Where the contract is unclear, or main is not as it says, these tests read it th
   the bulk tag job's `updated_count`, beside the rows it tagged. The sidebar's facet is checked by its min and max
   when some sample is kept (main answers its cached numbers for a filter that keeps none). The same checks run on the
   same ids listed with `in`, which pass today, so a failure of the `contains` tests is the filter's, not the checks'.
-- Section 2 (on hold): main refuses five keys, not four, and only where samples are added (POST /samples): PATCH
-  /samples/{id} and POST /samples/bulk-set (each of its three modes) store a `created_at` key in metadata today. So
-  "refused exactly as before" is pinned where samples are added only; what the edit routes do with those keys is not
-  tested either way. Removing a stored key with remove_metadata_keys still works. Section 2.4 is an investigation:
-  no test.
+- Section 2 (now the protected-keys contract): main refuses five keys, not four, and only where samples are added
+  (POST /samples): PATCH /samples/{id} and POST /samples/bulk-set (each of its three modes) store a `created_at` key
+  in metadata today. So "refused exactly as before" is pinned where samples are added only; what the edit routes do
+  with those keys is not tested either way.
 - Section 3: "the image grid's query" is the filter itself on a dataset without objects, and on one with objects the
   filter the dataset page wraps it in (test_assistant_views_spec.image_grain). Objects here carry none of their
   images' fields or scores. The docs test is light: no sentence of docs/FILTER_QUERY.md keeps "the samples the concept
@@ -603,54 +600,6 @@ def test_the_keys_main_refuses_are_refused_where_samples_are_added_as_today(regi
         response = await upload(r, [{'filepath': 'k1.jpg', 'metadata': {'created_at': 'x'}}], on_duplicate='update')
         assert (response.status_code, response.json()) == (422, refused_at(0, 'created_at')), response.text
         assert await stored(r) == before  # nothing added, nothing changed
-
-    regions_world(scenario)
-
-
-def test_a_stored_tags_or_media_type_key_still_reads_and_filters_as_today(regions_world):
-    """Pins main: these pass before the fix. A key stored before the rule, written into the database directly."""
-
-    async def scenario(r):
-        ids = await keyed(r)
-        old = ids[0]
-        await r.database.execute(
-            """UPDATE samples SET metadata = metadata || '{"tags": "legacy", "media_type": "legacy-kind"}'::jsonb
-               WHERE id = $1""",
-            old,
-        )
-        carried = {'ok': 0, 'tags': 'legacy', 'media_type': 'legacy-kind'}
-        listed = await ok(await post(r, f'/api/datasets/{KEYED}/samples/query', {'limit': 100}))
-        item = next(item for item in listed['items'] if item['id'] == old)
-        assert (item['metadata'], item['tags'], item['media_type']) == (carried, ['kept'], 'image'), item
-        page = await ok(await r.call(ADMIN, 'GET', f'/api/datasets/{KEYED}/samples', params={'limit': 10}))
-        item = next(item for item in page['items'] if item['id'] == old)
-        assert (item['metadata'], item['tags'], item['media_type']) == (carried, ['kept'], 'image'), item
-        # Filters read the sample's own columns, as they did.
-        for node, expected in (
-            ({'field': 'tags', 'operator': 'in', 'value': ['legacy']}, set()),
-            ({'field': 'tags', 'operator': 'in', 'value': ['kept']}, set(ids)),
-            ({'field': 'media_type', 'operator': '=', 'value': 'legacy-kind'}, set()),
-            ({'field': 'media_type', 'operator': '=', 'value': 'image'}, set(ids)),
-            ({'field': 'ok', 'operator': '=', 'value': 0}, {old}),
-        ):
-            assert await selected(r, node, KEYED) == expected, node
-        assert await nodes(r, 'tags in ("legacy")', KEYED) == [{'field': 'tags', 'operator': 'in', 'value': ['legacy']}]
-        schema = await ok(await r.call(ADMIN, 'GET', f'/api/datasets/{KEYED}/schema'))
-        names = [field['name'] for field in schema]
-        assert sorted(names) == sorted(['media_type', 'tags', 'created_at', 'last_modified_at', 'id', 'filepath', 'ok'])
-        # An edit that doesn't set either key goes through and keeps them; removing one is not setting it.
-        await ok(await r.call(ADMIN, 'PATCH', f'/api/datasets/{KEYED}/samples/{old}', json={'metadata': {'ok': 5}}))
-        metadata = await r.database.fetchval('SELECT metadata FROM samples WHERE id = $1', old)
-        assert metadata == {**carried, 'ok': 5}, metadata
-        response = await r.call(
-            ADMIN,
-            'PATCH',
-            f'/api/datasets/{KEYED}/samples/{old}',
-            json={'remove_metadata_keys': ['tags']},
-        )
-        await ok(response)
-        metadata = await r.database.fetchval('SELECT metadata FROM samples WHERE id = $1', old)
-        assert metadata == {'ok': 5, 'media_type': 'legacy-kind'}, metadata
 
     regions_world(scenario)
 

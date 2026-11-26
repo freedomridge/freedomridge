@@ -298,6 +298,32 @@ def run_tests():
 
     _()
 
+    @test("a metadata key named tags or media_type is refused with the server's sentence, on upload and on save()")
+    def _():
+        for key in ('tags', 'media_type'):
+            fp = f's3://test/reserved_{key}.jpg'
+            refused_with_the_servers_sentence(
+                key,
+                lambda: ds.add_samples([Sample(filepath=fp, metadata={key: 'x', 'kept': 1})]),
+                lambda: delete_if_stored(fp),
+            )
+            try:
+                ds[fp]
+                assert False, f"the sample with a metadata key named {key} was stored"
+            except KeyError:
+                pass
+            s = ds['s3://test/img_6.jpg']
+            before = dict(s.metadata)
+            s.metadata[key] = 'x'
+            refused_with_the_servers_sentence(
+                key,
+                s.save,
+                lambda: ds.client.update_sample(ds._id, s.id, remove_metadata_keys=[key]),
+            )
+            assert ds['s3://test/img_6.jpg'].metadata == before, "a refused save changed the sample"
+
+    _()
+
     # --- TAGS ---
     print("\n--- Health ---")
 

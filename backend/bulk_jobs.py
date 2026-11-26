@@ -11,10 +11,12 @@ from .api_errors import CodedHTTPException
 from .diskspace import INGEST_ROW_BYTES, require_free_space
 from .field_registry import (
     LOCAL_PREFIX,
+    PROTECTED_METADATA_KEYS,
     forget_definitions,
     invalidate_values,
     lock_field_lifecycle,
     prune_fields,
+    refuse_column_keys,
     register_fields,
 )
 from .job_runner import StepResult
@@ -503,28 +505,32 @@ async def _mutate(connection, job, ids, removed_fields, targeted=None):
             )
         await invalidate_values(connection, dataset_id, [request['field_name']])
         return int(status.split()[-1])
-    names = set(request.get('metadata', {})) | set(request.get('remove_metadata_keys', []))
+    # A job queued before `tags` and `media_type` were refused (field_registry.PROTECTED_METADATA_KEYS) leaves them out.
+    protected = sorted(PROTECTED_METADATA_KEYS)
+    setting = {k: v for k, v in request.get('metadata', {}).items() if k not in PROTECTED_METADATA_KEYS}
+    names = set(setting) | set(request.get('remove_metadata_keys', []))
     if operation == 'set':
         if request.get('per_sample'):
             rows = await connection.fetch(
-                """UPDATE samples s SET metadata=COALESCE(s.metadata,'{}') || t.patch
+                """UPDATE samples s SET metadata=COALESCE(s.metadata,'{}') || (t.patch - $4::text[])
                    FROM bulk_job_targets t WHERE t.job_id=$1 AND t.sample_id=s.id
-                   AND s.dataset_id=$2 AND s.id=ANY($3::int[]) RETURNING t.patch""",
+                   AND s.dataset_id=$2 AND s.id=ANY($3::int[]) RETURNING t.patch - $4::text[] AS patch""",
                 job['id'],
                 dataset_id,
                 ids,
+                protected,
             )
             patches = [row['patch'] for row in rows]
             count = len(rows)
             names.update(key for patch in patches for key in patch)
         else:
-            patch = {k: v for k, v in request['metadata'].items() if k not in request['remove_metadata_keys']}
+            patch = {k: v for k, v in setting.items() if k not in request['remove_metadata_keys']}
             status = await connection.execute(
                 """UPDATE samples SET metadata=(COALESCE(metadata,'{}') || $3::jsonb)-$4::text[]
                    WHERE dataset_id=$1 AND id=ANY($2::int[])""",
                 dataset_id,
                 ids,
-                request['metadata'],
+                setting,
                 request['remove_metadata_keys'],
             )
             patches, count = [patch], int(status.split()[-1])
@@ -544,6 +550,7 @@ async def _mutate(connection, job, ids, removed_fields, targeted=None):
         )
         values = [dataset_id, ids, field]
         if operation != 'clear':
+            refuse_column_keys([request['new_name']], PROTECTED_METADATA_KEYS)  # a rename queued before the refusal
             values.append(request['new_name'])
             names.add(request['new_name'])
         status = await connection.execute(

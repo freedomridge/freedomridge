@@ -51,6 +51,27 @@ def canonical_type(field_type: str) -> str:
     }.get(field_type, field_type if field_type in FIELD_TYPES else 'unknown')
 
 
+# The names a metadata key can't have: a sample's own fields, which every filter, list and statistic by that name
+# reads. Stored in metadata, `id`, `dataset_id`, `filepath`, `created_at` and `last_modified_at` were registered as
+# fields beside the real ones; `tags` and `media_type` were never listed, filtered or shown, but for a field renamed or
+# cloned onto one, which stood in the field list in place of the sample's own. The five are refused when samples are
+# added; `tags` and `media_type` (PROTECTED_METADATA_KEYS) wherever metadata is written: added, edited, set in bulk, a
+# field's new name in a rename or clone, a quality score's field. Migration 0042 removed stored keys and such fields.
+# `heading` stays allowed: no filter or list names its column, so a metadata key of that name is a field like any other.
+RESERVED_METADATA_KEYS = frozenset(
+    {'id', 'dataset_id', 'filepath', 'created_at', 'last_modified_at', 'tags', 'media_type'},
+)
+PROTECTED_METADATA_KEYS = frozenset({'tags', 'media_type'})
+
+
+def refuse_column_keys(names: Iterable[str], refused: frozenset[str] = RESERVED_METADATA_KEYS) -> None:
+    """ValueError for metadata keys among `refused`, names of a sample's own fields. Removing such a key is no
+    setting of it: callers pass the keys a write sets."""
+    reserved = sorted(refused.intersection(names))
+    if reserved:
+        raise ValueError(f"metadata key(s) {reserved} name sample columns — set them on the sample itself")
+
+
 def validate_metadata(metadata: dict[str, Any], *, allow_local: bool = False) -> dict[str, Any]:
     """Reject non-finite/out-of-float8-range numbers before JSON can silently turn them into null, and keys that name
     a mirror's own fields, except in an edit that routes them there (allow_local: local_writes)."""

@@ -3729,5 +3729,6 @@ INSERT INTO schema_migrations (filename) VALUES
     ('0038_assistant_working_views.sql'),
     ('0039_region_sets_bundled.sql'),
     ('0040_assistant_admin_tools.sql'),
-    ('0041_jobs_across_datasets.sql')
+    ('0041_jobs_across_datasets.sql'),
+    ('0042_protected_metadata_keys.sql')
 ON CONFLICT (filename) DO NOTHING;
