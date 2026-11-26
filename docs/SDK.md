@@ -563,8 +563,10 @@ key named like any of them wherever metadata is written, with an error that name
 sample columns`), and nothing of the request is written: when samples are added, by `sample.save()`, `set_values` and
 other bulk edits, and as a field's new name in a rename or clone. A sample that already carries one (an older release
 stored them) keeps it until it is removed: `sample.save()` may send it back with the value it has, while a changed
-value is refused. Removing such a key is allowed. A name that only contains one (`source_tags`, `created_at_source`)
-is an ordinary key, and so is `heading`.
+value is refused. Such a stored key is not a field: it is not listed, and a filter or a value search by its name reads
+the sample's own field (for `dataset_id`, it answers as if no sample had the key), never the stored key. Removing such
+a key is allowed, from one sample or from many with a bulk edit's `remove_metadata_keys`. A name that only contains one
+(`source_tags`, `created_at_source`) is an ordinary key, and so is `heading`.
 
 #### Paths, and when media moves
 

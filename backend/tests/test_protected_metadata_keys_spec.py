@@ -63,7 +63,8 @@ Where the contract is unclear, or main doesn't show what it names, these tests r
 - 2.8: main makes such a field with a rename or a clone onto the name (it answers 200), leaving a `dataset_fields` row
   (string, metadata, owner self), the values under that key, and once indexed `is_promoted` and an index
   `idx_samples_meta_<dataset>_<field>`; the code under test refuses that rename, so the state is written with SQL in
-  that shape (a pin checks it shows on main as the problem: the field's values in the sidebar's `tags`). "Counted from
+  that shape (a test checks that the state is the one the migration is for, and that, as the reserved-names-never-
+  fields contract (f7) has it, such a row is no field when read even before the migration). "Counted from
   the samples" is checked after the statistics runner has run once, not forced, as the app's runner runs it: that is
   where the migration's marking must show. "The other fields' statistics untouched" is their values and counts: main's
   runner rewrites every row of a dataset it counts, so the time of the count is left aside. Followers hear of a field
@@ -80,7 +81,7 @@ Where the contract is unclear, or main doesn't show what it names, these tests r
 - 3.2: current-diff's `modified` list against a version saved before the upgrade names the cleaned sample, also after
   a revert to that version, and is empty against a version saved after.
 - The new migration is found as the files after 0041, the last on the main this was written against; with none,
-  every migration test fails saying so (the 2.8 pin of main's problem runs on main's own schema).
+  every migration test fails saying so (the 2.8 test of the state before it runs on the database before it).
 - Section 3 is checked lightly: one paragraph or list of the uploader docs (docs/SDK.md, docs/DATASET_MANAGEMENT.md,
   docs/QUICK_START.md) names all seven keys, and CHANGELOG.md's Unreleased upgrade notes name both keys and say the
   migration removes the stored ones.
@@ -1286,22 +1287,67 @@ async def own_values(w: World, dataset: int) -> tuple[list[str], list[str]]:
     return list(tags), list(kinds)
 
 
-def test_before_the_migration_a_metadata_field_named_tags_shows_in_place_of_the_samples_own(upgrade):
-    """Pins main (2.8's problem, passes before the fix): a field renamed onto `tags` or `media_type` shows in the
-    sidebar under the built-in's name, its values for the sample's own (or none, when its values were removed), and
-    a filter on `tags` finds nothing by those values."""
+def test_before_the_migration_a_metadata_field_named_tags_is_no_field_when_read(upgrade):
+    """The state the 2.8 tests start from, before migration 0042 runs: the registry rows are there in main's shape
+    (string metadata fields named `tags` and `media_type`, owner self, one indexed with its index, one a mirror's) and
+    the samples carry the keys. A requirement of the reserved-names-never-fields contract (f7, 1.1 and 1.2: reading
+    counts too, and the seven names follow one rule): such a row is no field when read, also before the migration has
+    cleaned it. The field list shows `tags` and `media_type` once each, as the sample's own, with the samples' own
+    values and not indexed; the value picker offers no stored value; a filter on `tags` reads the sample's own tags.
+    On main e0f754fe the field list showed the stored values there instead (`L0`, `L1` in the sidebar's `tags`, which
+    was indexed; no `own` where the values were removed; `k` in `media_type`)."""
     u = upgrade(require_new=False)
 
     async def scenario(w: UpgradeWorld) -> None:
         await plant_fields(w)
-        listed = await sidebar(w, FIELD_TAGS)
-        assert {'L0', 'L1'} <= set(listed['tags'].get('values') or []), listed['tags']
-        assert listed['tags'].get('is_promoted') is True, listed['tags']
-        empty = await sidebar(w, FIELD_EMPTY)
-        assert 'own' not in (empty['tags'].get('values') or []), empty['tags']
-        assert (await own_values(w, FIELD_EMPTY))[0] == ['own']
-        media = await sidebar(w, FIELD_MEDIA)
-        assert 'k' in (media['media_type'].get('values') or []), media['media_type']
+        rows = await w.database.fetch(
+            'SELECT dataset_id, field_name, field_type, origin, owner, is_promoted FROM dataset_fields '
+            "WHERE field_name IN ('tags', 'media_type') ORDER BY dataset_id",
+        )
+        assert [tuple(row) for row in rows] == [
+            (FIELD_TAGS, 'tags', 'string', 'metadata', 'self', True),
+            (FIELD_EMPTY, 'tags', 'string', 'metadata', 'self', False),
+            (FIELD_MEDIA, 'media_type', 'string', 'metadata', 'self', False),
+            (FIELD_MIRROR, 'tags', 'string', 'metadata', 'primary', False),
+        ], rows
+        assert await w.database.fetchval('SELECT 1 FROM pg_indexes WHERE indexname = $1', LEFTOVER_INDEX)
+        carried = {
+            dataset: await w.database.fetchval(
+                'SELECT count(*) FROM samples WHERE dataset_id = $1 AND metadata ? $2',
+                dataset,
+                FIELD_OF[dataset],
+            )
+            for dataset in FIELD_NAMES
+        }
+        assert carried == {FIELD_TAGS: 4, FIELD_EMPTY: 0, FIELD_MEDIA: 4, FIELD_MIRROR: 0}, carried
+        stored = {FIELD_TAGS: ('L0', 'L1'), FIELD_EMPTY: (), FIELD_MEDIA: ('k',)}
+        for dataset, values in stored.items():
+            tags, kinds = await own_values(w, dataset)
+            listed = await sidebar(w, dataset)
+            assert sorted(listed['tags'].get('values') or []) == tags, (dataset, listed['tags'])
+            assert sorted(listed['media_type'].get('values') or []) == kinds, (dataset, listed['media_type'])
+            assert not listed['tags'].get('is_promoted'), (dataset, listed['tags'])
+            schema = await w.call(ADMIN, 'GET', f'/api/datasets/{dataset}/schema')
+            names = [entry['name'] for entry in schema.json()]
+            assert names.count('tags') == names.count('media_type') == 1, (dataset, names)
+            for name in ('tags', 'media_type'):
+                offered = await w.call(
+                    ADMIN,
+                    'POST',
+                    f'/api/datasets/{dataset}/fields/{name}/autocomplete',
+                    json={'limit': 100},
+                )
+                if offered.status_code == 200:
+                    picked = {item['value'] for item in offered.json()['values']}
+                    assert not picked & set(values), (dataset, name, offered.text)
+        own = await w.database.fetch(
+            'SELECT id FROM samples WHERE dataset_id = $1 AND $2 = ANY(tags)',
+            FIELD_TAGS,
+            'own',
+        )
+        assert await found(w, {'field': 'tags', 'operator': 'in', 'value': ['own']}, FIELD_TAGS) == {
+            row['id'] for row in own
+        }
         assert await found(w, {'field': 'tags', 'operator': 'in', 'value': ['L1']}, FIELD_TAGS) == set()
 
     u.phase(scenario)

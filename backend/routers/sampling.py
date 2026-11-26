@@ -14,6 +14,7 @@ from pydantic import BaseModel, Field, model_validator
 
 from ..access import require_dataset_access
 from ..database import db
+from ..field_registry import RESERVED_METADATA_KEYS
 from ..request_limits import guest_heavy
 from .auth import get_optional_user
 from .datasets import (
@@ -401,8 +402,9 @@ async def _sparse_sample(dataset_id: int, request: SparseSampleRequest, stop: th
 
             select_parts.append(f'{alias}.x AS "{field}_x"')
             select_parts.append(f'{alias}.y AS "{field}_y"')
-            # Also grab metadata value as fallback for numeric fields
-            select_parts.append(f"(s.metadata->>'{field}') AS \"meta_{field}\"")
+            # Also grab metadata value as fallback for numeric fields; never a stored key named as a sample's own field
+            source = "'{}'::jsonb" if field in RESERVED_METADATA_KEYS else 's.metadata'
+            select_parts.append(f"({source}->>'{field}') AS \"meta_{field}\"")
             field_dimensions[field] = [f"{field}_x", f"{field}_y", f"meta_{field}"]
 
     if not field_dimensions:
@@ -528,6 +530,8 @@ async def get_available_fields(dataset_id: int):
     for r in num_rows:
         if r["field_name"] in _RESERVED_NUMERIC_FIELDS:
             continue  # id / foreign-key fields are numeric but meaningless to diversify on
+        if r["field_name"] in RESERVED_METADATA_KEYS:
+            continue  # statistics a stored key named as a sample's own field left: no field
         available.append(
             {
                 "name": r["field_name"],

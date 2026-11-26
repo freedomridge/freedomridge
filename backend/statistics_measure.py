@@ -6,6 +6,7 @@ from pathlib import Path
 
 import asyncpg
 
+from .field_registry import RESERVED_METADATA_KEYS
 from .job_queue import _terminate_connection
 from .job_tasks import run_isolated
 from .label_fields import LABEL_CACHES, LEGACY_GEOMETRY_FIELDS, label_context
@@ -87,8 +88,11 @@ async def definitions(connection, dataset_id):
         dict(row)
         for row in await connection.fetch(
             f'SELECT field_name, field_type, origin, {DEFINITION_TOKEN} AS token FROM dataset_fields '
-            "WHERE dataset_id=$1 AND origin<>'system' ORDER BY field_name",
+            "WHERE dataset_id=$1 AND origin<>'system' "
+            # a metadata row of a name a metadata key can't have is no field (an older release's, before 0043)
+            "AND NOT (origin='metadata' AND field_name=ANY($2::text[])) ORDER BY field_name",
             dataset_id,
+            sorted(RESERVED_METADATA_KEYS),
         )
     ]
 
@@ -132,6 +136,7 @@ async def aggregate_field(pool, dataset_id, name, partial=None, limit=128):
         definition = await connection.fetchrow(
             f'SELECT field_name, field_type, origin, {DEFINITION_TOKEN} AS token FROM dataset_fields '
             "WHERE dataset_id=$1 AND field_name=ANY($2::text[]) AND origin<>'system' "
+            "AND NOT (origin='metadata' AND field_name=ANY($6::text[])) "
             "AND (field_name=$3 OR (field_name='segmentation' AND $3='segmentation.labels') "
             "OR field_name=ANY($4::text[]) OR EXISTS (SELECT 1 FROM dataset_field_stats discovery "
             "WHERE discovery.dataset_id=$1 AND discovery.field_name=ANY($5::text[]) "
@@ -143,6 +148,7 @@ async def aggregate_field(pool, dataset_id, name, partial=None, limit=128):
             name,
             sorted(LEGACY_GEOMETRY_FIELDS),
             list(LABEL_CACHES),
+            sorted(RESERVED_METADATA_KEYS),
         )
         parent = definition['field_name'] if definition else name
         token = definition['token'] if definition else None

@@ -27,7 +27,7 @@ from ..coordinates import (
 )
 from ..database import db
 from ..diskspace import COORDINATE_ROW_BYTES, INGEST_ROW_BYTES, estimate_viz_rank_bytes, require_free_space
-from ..field_registry import lock_field_lifecycle, map_swap_holder, map_swap_refusal
+from ..field_registry import RESERVED_METADATA_KEYS, lock_field_lifecycle, map_swap_holder, map_swap_refusal
 from ..index_jobs import ann_index_name
 from ..local_fields import local_field
 from ..map_artifacts import LocalArtifactStore
@@ -114,6 +114,11 @@ def _build_include_fields(
                     continue
                 parent, child = parts
                 alias = fn.replace('.', '_')
+                if parent in RESERVED_METADATA_KEYS:
+                    # Into a stored key named as a sample's own field: null, as the plain name gives.
+                    qualified.append(f"NULL::text as {alias}")
+                    unqualified.append(alias)
+                    continue
                 qualified.append(
                     f"COALESCE("
                     f"{table_prefix}.metadata->'{parent}'->0->>'{child}', "
@@ -125,6 +130,10 @@ def _build_include_fields(
                 continue
             elif fn in _DIRECT_FIELDS or (array_fields is not None and fn in array_fields):
                 qualified.append(f"{table_prefix}.{fn}")
+                unqualified.append(fn)
+            elif fn in RESERVED_METADATA_KEYS:
+                # A stored key named as a sample's own field is no field: null, as where no sample has the key.
+                qualified.append(f"NULL::text as {fn}")
                 unqualified.append(fn)
             else:
                 qualified.append(f"{table_prefix}.metadata->>'{fn}' as {fn}")

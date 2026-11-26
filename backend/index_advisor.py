@@ -42,6 +42,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from . import field_usage, job_queue
+from .field_registry import leftover_row_sql
 from .job_queue import JobPolicy
 from .job_runner import StepResult
 
@@ -231,8 +232,9 @@ async def collect(pool, dataset_id: Optional[int]) -> Dict[str, Any]:
             snapshot['fields'] = [
                 dict(row)
                 for row in await connection.fetch(
-                    """SELECT field_name, field_type, origin, is_promoted FROM dataset_fields
-                       WHERE dataset_id = $1 ORDER BY field_name""",
+                    # A metadata field an older release left under a sample's own field's name is no field.
+                    f"""SELECT field_name, field_type, origin, is_promoted FROM dataset_fields
+                       WHERE dataset_id = $1 AND NOT {leftover_row_sql()} ORDER BY field_name""",
                     dataset_id,
                 )
             ]

@@ -28,7 +28,7 @@ from . import job_heartbeat, job_queue, patch_search
 from .assistant.rule import NEW_DATASET_CLOSED_SQL
 from .crypto import decrypt_secret
 from .diskspace import INGEST_ROW_BYTES, require_free_space
-from .field_registry import EMPTIED_TO_FLAG, LOCAL_PREFIX, lock_field_lifecycle
+from .field_registry import EMPTIED_TO_FLAG, LOCAL_PREFIX, lock_field_lifecycle, without_reserved_fields
 from .job_runner import StepResult
 from .routers import datasets as datasets_router
 from .routers import followers
@@ -767,8 +767,11 @@ async def write_fields(connection, dataset_id: int, fields: list) -> None:
     A field the primary no longer has goes, except a private flag set here (values_private): its row stays, emptied to
     the 'system' row that holds a flag on a field with no row of its own (field_registry.EMPTIED_TO_FLAG), so the field
     is private again if the primary sends it back. The primary renaming a field reads as one going and another
-    coming: the flag stays with the old name, and the new one arrives unflagged."""
-    fields = [field for field in fields if not field['field_name'].startswith(LOCAL_PREFIX)]
+    coming: the flag stays with the old name, and the new one arrives unflagged.
+
+    An older primary may still list a metadata field named as a sample's own field (`created_at`): it is no field here
+    (without_reserved_fields), so it reads as one the primary doesn't have, or as the built-in's description."""
+    fields = without_reserved_fields(field for field in fields if not field['field_name'].startswith(LOCAL_PREFIX))
     names = [field['field_name'] for field in fields]
     await connection.execute(
         f"""UPDATE dataset_fields SET {EMPTIED_TO_FLAG}

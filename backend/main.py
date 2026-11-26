@@ -21,6 +21,7 @@ from .api_errors import CodedHTTPException
 from .colormaps import COLORMAPS
 from .crypto import assert_secure_encryption_key, warn_insecure_session_cookie
 from .database import lifespan
+from .field_registry import RESERVED_METADATA_KEYS
 from .media_cache import CacheFill, read_cache, write_cache
 from .request_limits import RequestLimitsMiddleware
 from .routers import (
@@ -824,6 +825,10 @@ def _build_media_path_sql(field: str, versioned: bool = False) -> str:
                      WHERE v.version_id = $2 AND d.include_metadata) samples"""
     if field == "filepath":
         return f"SELECT dataset_id, filepath AS path FROM {source} WHERE id = $1"
+    if segments[0] in RESERVED_METADATA_KEYS:
+        # A stored key named as a sample's own field (or a path into one) is no field: no media, as where no sample
+        # has the key, without reading it.
+        return f"SELECT dataset_id, NULL::text AS path FROM {source} WHERE id = $1"
 
     # Nested JSONB: intermediate segments use `->` (returns jsonb), final uses `->>`
     # (returns text). e.g. metadata->'<key>'->>'map_path'
@@ -1139,6 +1144,8 @@ async def _serve_composite(
     # Read the heatmap metadata dict. The field must be a top-level metadata key.
     if not _SAFE_FIELD_RE.match(overlay_field):
         raise HTTPException(status_code=400, detail=f"Invalid overlay field: {overlay_field}")
+    if overlay_field in RESERVED_METADATA_KEYS:  # a stored key named as a sample's own field is no field: as without it
+        raise HTTPException(status_code=404, detail=f"Sample {sample_id} has no heatmap in metadata.{overlay_field}")
     width = _thumbnail_width(width)
 
     if version_id is None:

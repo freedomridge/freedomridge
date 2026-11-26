@@ -47,10 +47,12 @@ from backend.field_descriptions import (
 from backend.field_registry import (
     LOCAL_PREFIX,
     REQUEST_FULL_REFRESH,
+    RESERVED_METADATA_KEYS,
     cached_distinct_values,
     field_stats,
     forget_definitions,
     invalidate_values,
+    leftover_row_sql,
     lock_field_lifecycle,
     presentation_type,
     prune_fields,
@@ -170,7 +172,9 @@ def _field_text_sql(name: str) -> str:
         local = local_field(name)
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from None
-    return local.text if local is not None else f"metadata->>'{_validate_field_name(name)}'"
+    if local is not None:
+        return local.text
+    return f"{_metadata_source(name)}->>'{_validate_field_name(name)}'"
 
 
 def _validate_field_name(name) -> str:
@@ -2124,7 +2128,8 @@ async def _get_dataset_field_stats_impl(
             )
 
         is_promoted = await db.fetchval(
-            "SELECT is_promoted FROM dataset_fields WHERE dataset_id = $1 AND field_name = $2",
+            "SELECT is_promoted FROM dataset_fields WHERE dataset_id = $1 AND field_name = $2 "
+            f"AND NOT {leftover_row_sql()}",  # a metadata field `tags` an older release left is no field
             id,
             col_name,
         )
@@ -2262,7 +2267,10 @@ async def _get_dataset_field_stats_impl(
     # Read with what was written about each field (field_descriptions), which every entry carries: no query of its
     # own on this request, which lightning mode keeps short. Before any entry is final (finish).
     _cfg_rows = await db.fetch(
-        """SELECT field_name, overlay_config, description, unit, values_private FROM dataset_fields
+        # A metadata field an older release left under a name of a sample's own field lends the entry only what it
+        # says about the name, never its overlay settings (field_registry.leftover_row_sql).
+        f"""SELECT field_name, CASE WHEN {leftover_row_sql()} THEN NULL ELSE overlay_config END AS overlay_config,
+                  description, unit, values_private FROM dataset_fields
            WHERE dataset_id = $1
              AND (overlay_config IS NOT NULL OR description IS NOT NULL OR unit IS NOT NULL OR values_private)""",
         id,
@@ -3254,6 +3262,27 @@ _KEPT_FLAG_SQL = (
 )
 
 
+def _reserved_row(row: Any, field_name: str) -> Any:
+    """A dataset_fields row of a name a metadata key can't have (field_registry.RESERVED_METADATA_KEYS), read as what
+    migration 0043 (forget_definitions' rule) leaves of it, so a stored key of the name is never a field, before that
+    migration too and on a mirror: `dataset_id` has no field of its own (no row); a metadata row of a built-in field's
+    name is the built-in's row holding its description, unit and private mark, or no row with none of them."""
+    if field_name not in BUILT_IN_FIELDS:
+        return None
+    if row['origin'] != 'metadata':
+        return row
+    if row['description'] is None and row['unit'] is None and not row['values_private']:
+        return None
+    return {
+        **dict(row),
+        'field_type': 'unknown',
+        'origin': 'system',
+        'is_promoted': False,
+        'display_type': None,
+        'overlay_config': None,
+    }
+
+
 def _kept_flag(row: Any) -> bool:
     """A 'system' row holding nothing but a private flag kept when its field went (forget_definitions)."""
     return (
@@ -3272,12 +3301,15 @@ async def _definition(connection: Any, dataset_id: int, field_name: str, columns
     listing read."""
     if columns != '*':
         named = [column.strip() for column in columns.split(',')]
-        columns = ', '.join(named + [column for column in _KEPT_FLAG_COLUMNS if column not in named])
+        wanted = (*_KEPT_FLAG_COLUMNS, 'values_private')  # values_private: _reserved_row
+        columns = ', '.join(named + [column for column in wanted if column not in named])
     row = await connection.fetchrow(
         f'SELECT {columns} FROM dataset_fields WHERE dataset_id = $1 AND field_name = $2',
         dataset_id,
         field_name,
     )
+    if row is not None and field_name in RESERVED_METADATA_KEYS:
+        row = _reserved_row(row, field_name)
     if _kept_flag(row) and not await _listed_without_row(connection, dataset_id, field_name):
         return None
     return row
@@ -3307,7 +3339,11 @@ async def set_field_description(
             'WHERE dataset_id = $1 AND field_name = $2'
         )
         current = await conn.fetchrow(query + ' FOR UPDATE', id, field_name)
-        if (current is None or current['origin'] == 'system') and not await _listed_without_row(conn, id, field_name):
+        # `dataset_id` is no field of its own, whatever row a stored key of the name left (_reserved_row).
+        reserved = field_name in RESERVED_METADATA_KEYS and field_name not in BUILT_IN_FIELDS
+        if reserved or (
+            (current is None or current['origin'] == 'system') and not await _listed_without_row(conn, id, field_name)
+        ):
             raise HTTPException(status_code=404, detail=f"Field '{field_name}' is not a field of this dataset")
         if current is None:
             if all(getattr(request, key) in (None, False) for key in sent):
@@ -3408,7 +3444,7 @@ async def _autocomplete_impl(id: int, field_name: str, q: str, limit: int, filte
     array_cols = await get_dataset_array_columns(id)
     scalar_meta = False
     path = None if local is not None else label_path(field_name, array_cols)
-    scalar_text = local.text if local is not None else f"metadata->>'{field_name}'"
+    scalar_text = local.text if local is not None else f"{_metadata_source(field_name)}->>'{field_name}'"
     if path and path[1] == 'label':
         arr = _validate_field_name(path[0])
         val_source = (
@@ -3438,7 +3474,7 @@ async def _autocomplete_impl(id: int, field_name: str, q: str, limit: int, filte
         # A datetime field's index is on its instant, not its text (backend/datetimes.py): no probe to ride.
         promoted = await db.fetchval(
             "SELECT is_promoted AND field_type <> 'datetime' FROM dataset_fields "
-            "WHERE dataset_id = $1 AND field_name = $2",
+            f"WHERE dataset_id = $1 AND field_name = $2 AND NOT {leftover_row_sql()}",
             id,
             field_name,
         )
@@ -3533,7 +3569,9 @@ async def _kept_value_lists(id: int, is_stale: Optional[Callable[[str], bool]]) 
            WHERE s.dataset_id = $1 AND s.unique_values IS NOT NULL
              AND (s.field_name IN ('media_type', 'tags') OR EXISTS (
                  SELECT 1 FROM dataset_fields f WHERE f.dataset_id = $1 AND f.field_name = s.field_name
-                   AND f.is_promoted AND f.field_type <> 'number'))""",
+                   AND f.is_promoted AND f.field_type <> 'number' AND NOT """
+        + leftover_row_sql('f')
+        + """))""",
         id,
     )
     lists: Dict[str, Dict[str, Any]] = {name: {'stats_pending': True} for name in ('media_type', 'tags')}
@@ -4463,7 +4501,7 @@ def _grid_order_by(sort_by: str, direction: str, field_type_row) -> str:
         return "ORDER BY id"  # not a known field: fall back to the default order
     field_type = field_type_row['field_type']
     local = local_field(sort_by)  # a mirror's own field: its key in local_metadata
-    source, key = ('local_metadata', local.name) if local is not None else ('metadata', sort_by)
+    source, key = ('local_metadata', local.name) if local is not None else (_metadata_source(sort_by), sort_by)
     if local is not None and local.array:
         return "ORDER BY id"  # `@local.tags` is an array, as unsortable as tags
     if field_type in ('number', 'float', 'int', 'integer'):
@@ -4599,7 +4637,7 @@ async def get_promoted_numeric_fields(dataset_id: int, source=None) -> set:
     rows = await (source or db).fetch(
         "SELECT field_name FROM dataset_fields "
         "WHERE dataset_id = $1 AND is_promoted = TRUE "
-        "AND field_type IN ('number', 'float', 'int', 'integer')",
+        f"AND field_type IN ('number', 'float', 'int', 'integer') AND NOT {leftover_row_sql()}",
         dataset_id,
     )
     return {r['field_name'] for r in rows}
@@ -4892,6 +4930,14 @@ SAMPLES_JOIN_FIELD_MAPPING: Dict[str, str] = {
     'id': 's.id',
     'created_at': 's.created_at',
 }
+
+
+def _metadata_source(field: str, table: str = '') -> str:
+    """The JSON a field named `field` is read from when it is no column (`table`: the samples alias with its dot):
+    metadata, but for a name a metadata key can't have (field_registry.RESERVED_METADATA_KEYS). A stored one, from
+    before such keys were refused, is no field: a filter, a histogram, a value search, a lookup or a sort by its name
+    answers as on a dataset where no sample has it."""
+    return "'{}'::jsonb" if field in RESERVED_METADATA_KEYS else f'{table}metadata'
 
 
 def _realiased(field_mapping: Optional[Dict[str, str]], alias: str) -> Dict[str, str]:
@@ -5301,7 +5347,9 @@ def _compile_filter_node(
         if local is None:
             _validate_field_name(field)
         # The JSON column and key a metadata-like field is read from.
-        json_source, json_key = ('local_metadata', local.name) if local is not None else ('metadata', field)
+        json_source, json_key = (
+            ('local_metadata', local.name) if local is not None else (_metadata_source(field), field)
+        )
 
         # Derived fields: an embedding or hash (rows in their own tables, not metadata keys) or the
         # location, named `embeddings.<field>` / `hashes.<field>` / `location`. They answer presence
@@ -5436,7 +5484,7 @@ def _compile_filter_node(
 
         else:
             # Metadata field
-            col = f"metadata->>'{field}'"
+            col = f"{json_source}->>'{field}'"
 
         # Generate SQL based on operator
         array_cols = array_columns if array_columns is not None else _get_array_columns_sync()
@@ -6346,7 +6394,7 @@ async def lookup_samples(id: int, request: LookupRequest):
         f"""
         SELECT v.val AS val, MIN(s.id) AS id
         FROM unnest($2::text[]) AS v(val)
-        JOIN samples s ON s.dataset_id = $1 AND s.metadata->>'{request.field}' = v.val
+        JOIN samples s ON s.dataset_id = $1 AND {_metadata_source(request.field, 's.')}->>'{request.field}' = v.val
         GROUP BY v.val
         """,
         id,
@@ -6477,7 +6525,8 @@ async def _list_samples_post(id: int, request: SamplesRequest):
         field_type_row = None
         if request.sort_by not in _NATIVE_SORT_COLUMNS:
             field_type_row = await db.fetchrow(
-                "SELECT field_type, is_promoted FROM dataset_fields WHERE dataset_id = $1 AND field_name = $2",
+                "SELECT field_type, is_promoted FROM dataset_fields WHERE dataset_id = $1 AND field_name = $2 "
+                f"AND NOT {leftover_row_sql()}",
                 id,
                 request.sort_by,
             )
@@ -6827,7 +6876,8 @@ async def _list_samples(
         field_type_row = None
         if sort_by not in _NATIVE_SORT_COLUMNS:
             field_type_row = await db.fetchrow(
-                "SELECT field_type, is_promoted FROM dataset_fields WHERE dataset_id = $1 AND field_name = $2",
+                "SELECT field_type, is_promoted FROM dataset_fields WHERE dataset_id = $1 AND field_name = $2 "
+                f"AND NOT {leftover_row_sql()}",
                 id,
                 sort_by,
             )
@@ -7033,7 +7083,7 @@ async def _histogram(
         raise HTTPException(status_code=400, detail=str(error)) from None
     if local is None:
         _validate_field_name(field)
-    json_source, json_key = ('local_metadata', local.name) if local is not None else ('metadata', field)
+    json_source, json_key = ('local_metadata', local.name) if local is not None else (_metadata_source(field), field)
     meta_text, meta_json = f"{json_source}->>'{json_key}'", f"{json_source}->'{json_key}'"
 
     # Detect datetime metadata fields the way the rest of the app does — from the
@@ -7042,7 +7092,7 @@ async def _histogram(
     # get a time-binned histogram instead of a per-timestamp categorical grouping
     # (thousands of near-unique buckets, which reads as "broken").
     stats_type = await db.fetchval(
-        "SELECT field_type FROM dataset_fields WHERE dataset_id = $1 AND field_name = $2",
+        f"SELECT field_type FROM dataset_fields WHERE dataset_id = $1 AND field_name = $2 AND NOT {leftover_row_sql()}",
         id,
         field,
     )
@@ -7465,7 +7515,8 @@ async def get_sample_stats(id: int, sample_ids: Optional[str] = None):
         args = [id]
 
     field_rows = await db.fetch(
-        "SELECT field_name, field_type FROM dataset_fields WHERE dataset_id = $1 AND origin = 'metadata'",
+        "SELECT field_name, field_type FROM dataset_fields WHERE dataset_id = $1 AND origin = 'metadata' "
+        f"AND NOT {leftover_row_sql()}",
         id,
     )
     field_param = f"${len(args) + 1}"
@@ -8924,7 +8975,8 @@ async def _check_field_target(
             detail=f"Field '{new_name}' already has values in this dataset; pass overwrite=true to replace them",
         )
     if taken and await connection.fetchval(
-        "SELECT is_promoted FROM dataset_fields WHERE dataset_id = $1 AND field_name = $2",
+        "SELECT is_promoted FROM dataset_fields WHERE dataset_id = $1 AND field_name = $2 "
+        f"AND NOT {leftover_row_sql()}",
         dataset_id,
         new_name,
     ):
@@ -8980,7 +9032,8 @@ async def _field_index_operation(connection, dataset_id: int, *, index_ddl: bool
 async def _is_promoted(dataset_id: int, field_name: str) -> bool:
     return bool(
         await db.fetchval(
-            'SELECT is_promoted FROM dataset_fields WHERE dataset_id = $1 AND field_name = $2',
+            'SELECT is_promoted FROM dataset_fields WHERE dataset_id = $1 AND field_name = $2 '
+            f'AND NOT {leftover_row_sql()}',
             dataset_id,
             field_name,
         ),
@@ -9044,7 +9097,8 @@ async def rename_field(
             )
             was_promoted = bool(
                 await conn.fetchval(
-                    'SELECT is_promoted FROM dataset_fields WHERE dataset_id = $1 AND field_name = $2',
+                    'SELECT is_promoted FROM dataset_fields WHERE dataset_id = $1 AND field_name = $2 '
+                    f'AND NOT {leftover_row_sql()}',
                     id,
                     field_name,
                 ),
@@ -9306,7 +9360,7 @@ def _agg_value_expr(field: str, array_columns: Optional[set] = None) -> str:
             "THEN metadata->'segmentation'->'labels' ELSE '[]'::jsonb END)"
         )
     _validate_field_name(field)
-    return f"metadata->>'{field}'"
+    return f"{_metadata_source(field)}->>'{field}'"
 
 
 def _unnested(field: str, array_columns: set) -> bool:
@@ -9368,7 +9422,7 @@ def _number_source(field: str, datetime_fields: Collection[str]) -> _NumberSourc
         return _micros_of(instant_sql(text))
 
     return _NumberSource(
-        f"metadata->>'{field}'",
+        f"{_metadata_source(field)}->>'{field}'",
         lambda text: _number_of(text, datetime_field),
         micros if datetime_field else None,
     )

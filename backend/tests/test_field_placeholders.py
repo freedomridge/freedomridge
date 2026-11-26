@@ -57,22 +57,23 @@ def test_a_metadata_key_named_as_a_described_built_in_is_refused_and_the_descrip
         assert written.status_code == 422, written.text
         assert await row(w, 'created_at') == ('system', 'When it arrived.', 'UTC', False)
         assert (await listed(w))['created_at']['description'] == 'When it arrived.'
-        # A sample that already carries one (written into `samples` directly, registered as such a write registered
-        # it before the refusal) keeps the description on the registered row.
+        # A sample that already carries one (written into `samples` directly, as an older release stored it) is no
+        # field (the reserved-names-never-fields contract): through a statistics refresh and the key's removal, the
+        # built-in keeps its row, its description and its unit.
         await w.database.execute(
             "UPDATE samples SET metadata = metadata || jsonb_build_object('created_at', 'x') WHERE id = $1",
             ids[0],
         )
-        await w.database.execute(
-            "UPDATE dataset_fields SET field_type = 'string', origin = 'metadata' "
-            "WHERE dataset_id = $1 AND field_name = 'created_at'",
-            D,
-        )
-        assert await row(w, 'created_at') == ('metadata', 'When it arrived.', 'UTC', False)
+        await run_refresh(w.database, D)
+        assert await row(w, 'created_at') == ('system', 'When it arrived.', 'UTC', False)
         assert (await listed(w))['created_at']['description'] == 'When it arrived.'
-        # Cleared, the key goes and the built-in keeps its description.
-        cleared = await w.call(ADMIN, 'POST', f'/api/datasets/{D}/fields/created_at/clear')
-        assert cleared.is_success, cleared.text
+        removed = await w.call(
+            ADMIN,
+            'PATCH',
+            f'/api/datasets/{D}/samples/{ids[0]}',
+            json={'remove_metadata_keys': ['created_at']},
+        )
+        assert removed.is_success, removed.text
         assert await row(w, 'created_at') == ('system', 'When it arrived.', 'UTC', False)
         assert (await listed(w))['created_at']['description'] == 'When it arrived.'
         carried = "SELECT count(*) FROM samples WHERE dataset_id = $1 AND metadata ? 'created_at'"

@@ -23,6 +23,7 @@ from ..field_registry import (
     _value_names,
     forget_definitions,
     lock_field_lifecycle,
+    without_reserved_fields,
 )
 from ..label_fields import DISCOVERY_TYPES, LEGACY_LABEL_FIELDS, DatasetArrayColumns, label_context
 from ..request_limits import guest_heavy
@@ -254,7 +255,8 @@ async def _restore_field_registry(conn, dataset_id: int, version):
     snapshot = version['dataset_snapshot']
     if snapshot is not None:
         normalized = await conn.fetchval('SELECT normalize_dataset_snapshot($1::jsonb)', snapshot)
-        fields = normalized['fields']
+        # A version saved while a stored key named as a sample's own field was registered doesn't bring it back.
+        fields = without_reserved_fields(normalized['fields'])
         described = any('description' in field for field in snapshot.get('fields') or [])
         await conn.execute(
             """INSERT INTO dataset_fields
@@ -296,7 +298,8 @@ async def _restore_field_registry(conn, dataset_id: int, version):
                    'metadata'
                FROM version_snapshots snapshot CROSS JOIN LATERAL jsonb_each(snapshot.metadata)
                WHERE snapshot.version_id = $2
-                 AND key NOT IN ('tags', 'media_type', 'detections.label', 'ground_truth.label',
+                 AND key NOT IN ('tags', 'media_type', 'id', 'dataset_id', 'filepath', 'created_at', 'last_modified_at',
+                     'detections.label', 'ground_truth.label',
                      'predictions.label', 'polygons.label', 'segmentation.labels', '__heatmap_fields__',
                      '__probability_fields__', '__mask_overlay_fields__', '__keypoint_fields__', '__cuboid_fields__',
                      '__classification_fields__',

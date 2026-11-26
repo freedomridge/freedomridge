@@ -7,7 +7,7 @@ from typing import Any
 import asyncpg
 
 from . import job_queue, statistics_measure
-from .field_registry import REQUEST_FULL_REFRESH
+from .field_registry import REQUEST_FULL_REFRESH, leftover_row_sql
 from .job_runner import StepResult
 
 KIND = 'statistics'
@@ -249,6 +249,7 @@ async def _publish_field(connection, dataset_id, field):
     token = await connection.fetchval(
         f'SELECT {statistics_measure.DEFINITION_TOKEN} FROM dataset_fields '
         "WHERE dataset_id=$1 AND field_name=ANY($2::text[]) AND origin<>'system' "
+        f'AND NOT {leftover_row_sql()} '  # as the measurement's definitions (statistics_measure)
         'ORDER BY (field_name=$3) DESC LIMIT 1',
         dataset_id,
         [field['field_name'], field.get('parent_field', statistics_measure.parent_field(field['field_name']))],
@@ -348,6 +349,9 @@ def handler(pool):
                              SELECT field_name FROM dataset_block_field_stats WHERE dataset_id=$1
                              UNION SELECT field_name FROM dataset_field_stats WHERE dataset_id=$1
                              UNION SELECT field_name FROM dataset_fields WHERE dataset_id=$1 AND origin<>'system'
+                                 AND NOT """
+                        + leftover_row_sql()
+                        + """
                              UNION SELECT 'tags' UNION SELECT 'media_type'
                              UNION SELECT unnest($2::text[])) names
                            ORDER BY (field_name=ANY($2::text[])) DESC, field_name COLLATE "C"

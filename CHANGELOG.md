@@ -10,15 +10,15 @@ This release adds an AI assistant: Claude Code and other MCP clients answer ques
 through thirteen read-only tools at `/mcp`, reading as the person using them, and an administrator's client can read
 the server's status, background jobs, backups and index advice through four more. It is off until an administrator
 switches it on. Also new: named regions as a filter, a text form for concept filters, and a description and unit for
-each field. Nine migrations: one removes the metadata keys named `tags` or `media_type`, which are refused from now
+each field. Ten migrations: one removes the metadata keys named `tags` or `media_type`, which are refused from now
 on; the others touch no sample.
 
 ### Upgrade notes
 
-- Nine database migrations, `0034_regions.sql` to `0042_protected_metadata_keys.sql`, and changed database
+- Ten database migrations, `0034_regions.sql` to `0043_reserved_names_never_fields.sql`, and changed database
   functions, applied with `scripts/apply_migrations.sh` (step 4 of [Upgrading](docs/UPGRADING.md)). The first eight add
   empty tables and columns and touch no rows. `0041` builds two indexes on the jobs table, about a second per million
-  jobs, while job writes wait. `0042` is the next item.
+  jobs, while job writes wait. `0042` is the next item; `0043` changes only the field list (the item after it).
 - **Metadata keys named `tags` or `media_type` are refused, and the stored ones are removed for good.** Such a key
   names a sample's own field, so it was stored but never listed, filtered or shown. A script that writes one (an
   upload, an edit, a bulk edit, a rename or clone onto the name) is now refused with an error that names the key
@@ -63,6 +63,12 @@ on; the others touch no sample.
   is written. Stored ones stay, with no migration (a stored `created_at` can be the only copy of an original date), and
   a sample that carries one stays editable: `sample.save()` may send the key back with the value it has, and the key
   can be removed.
+- **A stored key named `id`, `dataset_id`, `filepath`, `created_at` or `last_modified_at` is no longer a field.**
+  `0043_reserved_names_never_fields.sql` changes the field list only: the metadata fields an older release registered
+  under those names go back to the sample's own field (what was written about the name, its description, unit and
+  private mark, is kept), and the statistics of those names are counted again from the samples once the app is up.
+  The stored values stay in the samples' metadata. It reads and writes no sample, so it takes moments; it prints a line
+  for each field it changed, naming any index left over that key for you to remove (`DROP INDEX CONCURRENTLY`).
 - The job runner loads the region boundaries by itself on its first start after the upgrade: its image now carries
   the boundary file (40.7 MB more). The load takes about half a minute on a desktop computer, a few minutes on a
   small server, and adds 151 MB to the database. A development checkout runs `python -m backend.regions fetch` once
@@ -246,6 +252,14 @@ on; the others touch no sample.
   field's statistics (a `created_at` of `1999-…` beside the real dates), or showed as a second `dataset_id` field. The
   seven names now have one rule on every route that writes metadata; an edit of one sample may send a stored one back
   with the value it has.
+- **A stored key named like a sample's own field is not a field.** Keys stored before such keys were refused were still
+  registered as fields: a stored `dataset_id` showed as a field of its own, stored strings went into the statistics of
+  `created_at` and the others, the value search offered them, and a filter on `dataset_id` read them. Such a key is
+  now never registered, by any write, a revert to an older version or a mirror's sync, and a filter, a histogram, a
+  value search or a value count by the name (the assistant's `field_values` too) reads the sample's own field
+  (`dataset_id` answers as if no sample had the key). A registration an older release left is not a field even before
+  migration `0043` turns it back (Upgrade notes): the field list and the field routes by name (describe, promote,
+  rename, clone, clear) answer as on a dataset without such keys. The values stay in the samples.
 - **A metadata key named `tags` or `media_type` is refused instead of kept out of sight**, as `id`, `dataset_id`,
   `filepath`, `created_at` and `last_modified_at` already were when samples are added. The two are refused wherever
   metadata is written: adding samples (every `on_duplicate` mode), `PATCH`, both kinds of bulk-set, a field's new
