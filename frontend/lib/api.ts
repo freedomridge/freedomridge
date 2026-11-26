@@ -1293,7 +1293,8 @@ export async function formatFilterQuery(datasetId: number, filters: ComplexFilte
     return res.json();
 }
 
-// True data extent (min/max lon/lat) for the current filters — used by "Zoom to Data".
+// True data extent for the current filters, used by "Zoom to Data". When the located samples fit in half the globe
+// across the antimeridian, the box crosses it and `w` is greater than `e` (lib/map-bounds.ts extentCorners).
 export async function getMapExtent(
     datasetId: number,
     filters?: ComplexFilter,

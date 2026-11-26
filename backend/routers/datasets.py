@@ -5809,10 +5809,20 @@ class MapExtentRequest(BaseModel):
 @router.post("/datasets/{id}/map_extent", dependencies=[Depends(require_dataset_access)])
 @guest_heavy
 async def get_dataset_map_extent(id: int, request: MapExtentRequest):
-    """True bounding box (min/max lon/lat) of located samples for the current filters.
-    Drives 'Zoom to Data' so it fits the ACTUAL data extent — coarse-cluster centroids
-    collapse to a point for small/polygon selections and make fitBounds over-zoom.
-    Fast: min/max over the stored lon/lat columns (covering index)."""
+    """The box (w, s, e, n) that holds the located samples of the filter, and their count, or only `{"count": 0}`
+    when none is located. Drives 'Zoom to Data' so it fits the ACTUAL data extent: coarse-cluster centroids collapse
+    to a point for small/polygon selections and make fitBounds over-zoom.
+
+    When the samples fit in half the globe across the antimeridian, the box crosses it and `w` is greater than `e`,
+    as in GeoJSON: samples in Fiji at 177.4 and -178.2 are w 177.4, e -178.2, not the whole world. That is when the
+    widest stretch of longitude with no sample doesn't include longitude 180 and is at least 180 degrees wide; the box
+    runs from the sample east of that stretch round to the sample west of it, both real samples' longitudes.
+    Otherwise `w` <= `e`, the smallest and largest longitude, as it always was: samples over several continents (the
+    United States, Europe and Australia; the United States and China) keep today's box.
+
+    Fast: one read, min/max over the stored lon/lat columns (covering index), in every case. A stretch with no sample
+    at least 180 degrees wide that avoids longitude 180 holds longitude 0, so the same read also takes the largest
+    longitude below 0 and the smallest from 0 on, the two ends such a stretch would have."""
     conditions = ["dataset_id = $1", "location IS NOT NULL"]
     args: list = [id]
     if request.filters:
@@ -5828,13 +5838,26 @@ async def get_dataset_map_extent(id: int, request: MapExtentRequest):
         )
         conditions.append(sql)
     where = " AND ".join(conditions)
+    # gap_w and gap_e are two more aggregates of this one read, about a tenth to a seventh more than the read without
+    # them on a million samples. Don't fetch them as index probes, `(SELECT max(lon) ... AND lon < 0)`: with no filter
+    # a probe is free, but with one it walks the index until a row passes the filter. On a million samples worldwide,
+    # with a filter matching only those east of longitude 100, the probes took 3.2 s and this read 0.24 s.
     row = await db.fetchrow(
-        f"SELECT min(lon) AS w, max(lon) AS e, min(lat) AS s, max(lat) AS n, count(*) AS c FROM samples WHERE {where}",
+        "SELECT min(lon) AS w, max(lon) AS e, min(lat) AS s, max(lat) AS n, count(*) AS c, "
+        "max(lon) FILTER (WHERE lon < 0) AS gap_w, min(lon) FILTER (WHERE lon >= 0) AS gap_e "
+        f"FROM samples WHERE {where}",
         *args,
     )
     if not row or row["c"] == 0 or row["w"] is None:
         return {"count": 0}
-    return {"w": row["w"], "s": row["s"], "e": row["e"], "n": row["n"], "count": row["c"]}
+    # Wider than half the globe, the samples may fit in half of it the other way, across the antimeridian: when the
+    # stretch around longitude 0, from the largest longitude below it to the smallest from it on, holds no sample and
+    # is at least 180 degrees wide. (One that ends at 0, with a sample there, is exactly 180 wide, and either box will
+    # do.) The box then runs from the sample east of that stretch round to the sample west of it.
+    w, e = row["w"], row["e"]
+    if e - w > 180.0 and row["gap_w"] is not None and row["gap_e"] is not None and row["gap_e"] - row["gap_w"] >= 180.0:
+        w, e = row["gap_e"], row["gap_w"]
+    return {"w": w, "s": row["s"], "e": e, "n": row["n"], "count": row["c"]}
 
 
 class SelectionTokenRequest(BaseModel):

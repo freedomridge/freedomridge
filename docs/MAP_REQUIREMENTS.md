@@ -8,9 +8,10 @@ re-read this file and verify every item below still holds afterward.**
 
 Key code:
 - Backend: `_get_dataset_map_points_impl`, constants `_MAP_POINT_ZOOM`,
-  `_MAP_CLUSTER_MIN_POINTS`, `_cluster_cell_deg`, `_map_lon_window` in `backend/routers/datasets.py`.
-- Frontend: `frontend/components/map-panel.tsx`, `tileBbox` and `viewBbox` in `frontend/lib/map-bounds.ts`,
-  `getMapPoints` in `frontend/lib/api.ts`.
+  `_MAP_CLUSTER_MIN_POINTS`, `_cluster_cell_deg`, `_map_lon_window`, `get_dataset_map_extent` in
+  `backend/routers/datasets.py`.
+- Frontend: `frontend/components/map-panel.tsx`, `tileBbox`, `viewBbox`, `extentCorners` and `pointsCorners` in
+  `frontend/lib/map-bounds.ts`, `getMapPoints` and `getMapExtent` in `frontend/lib/api.ts`.
 
 ---
 
@@ -91,6 +92,32 @@ filters**. It must work after global filters are cleared (fetch the real extent;
 rely on whatever points happen to be loaded). Fit to the TRUE min/max lon/lat
 (`/map_extent`), NOT the bbox of coarse cluster centroids — those collapse to a single
 point for a small/polygon selection and make it over-zoom and miss most of the data.
+
+**Across the antimeridian.** Samples in Fiji at 177.4 and -178.2 used to come back from `/map_extent` as west -178.2,
+east 177.4, their smallest and largest longitude: nearly the whole world, and Zoom to Data zoomed out to it. When the
+samples fit in half the globe across the antimeridian, the box now crosses it and is answered with `w` greater than
+`e` (177.4 to -178.2), as GeoJSON and the regions' boxes are (docs/REGIONS.md). That is when the widest stretch of
+longitude with no sample doesn't include longitude 180 and is at least 180 degrees wide; the box runs from the sample
+east of that stretch round to the sample west of it, so `w` and `e` are the longitudes of real samples, and it is at
+most 180 degrees wide. Fiji, Chukotka with Alaska, Fiji with Europe, and the United States with Australia get it. In
+every other case the answer is exactly what it was, the smallest and largest longitude: a dataset over several
+continents (the United States, Europe and Australia; the United States and China) has a widest empty stretch too,
+but leaving it out would turn Zoom to Data round to centre on the Pacific for a few degrees' gain. Latitudes, `count`
+and `{"count": 0}` are as before. The answer still comes from one read of the samples, in every case: a stretch with
+no sample at least 180 degrees wide that avoids longitude 180 holds longitude 0, so it runs from the largest longitude
+below 0 to the smallest from 0 on, and today's smallest-and-largest statement takes those two values as well. That
+read costs about a tenth to a seventh more than it did (medians on a million samples: 162 to 179 ms in the United
+States, 170 to 196 ms worldwide). Don't fetch the two values as index probes instead: with a filter, a probe walks the
+index until a row passes it, and with one matching only the samples east of longitude 100 the probes took 3.2 s
+against the read's 0.24 s.
+
+Every fit to an extent fits the box across: `extentCorners` in `frontend/lib/map-bounds.ts` takes a `w` greater than
+`e` as a box whose east is 360 degrees on, past 180. That is Zoom to Data, and the fit after a region or a drawn
+polygon is applied (each asks `/map_extent`; a region with no sample in it falls back to its own box, which already
+crossed). The fit to selected samples (#12) fits their box by the same rule (`pointsCorners`). A bubble's
+extent (#14) and a drawn polygon's own corners are in the view's frame already, east past 180 across it. Tests:
+`backend/tests/test_map_extent_antimeridian_spec.py`, `e2e/map-extent-antimeridian.spec.ts`,
+`backend/tests/test_map_extent_half_globe.py`, `tests/map-fit-corners.test.cjs`.
 
 ## 8. NO auto-zoom on POLYGON delete
 

@@ -188,6 +188,14 @@ each field. Six migrations, none of which touches a sample.
   the dataset without the link and rewrites the address: the page says so, with **Try again** and **Open the dataset
   without it**, and the link stays in the address, so a reload opens it again. A link that is refused (a view that
   doesn't exist, text the dataset can't take) is told as before.
+- **"Zoom to Data" fits data either side of longitude 180.** For samples in Fiji, or in Chukotka and Alaska, Zoom to
+  Data, the fit to selected samples and the fit after a region or a drawn polygon is applied all zoomed out to the
+  whole world. `POST /api/datasets/{id}/map_extent` now answers a box across the antimeridian, with `w` greater than
+  `e` as GeoJSON writes it (west 177.4, east -178.2), when the samples fit in half the globe that way, and the map
+  fits it. Data anywhere else, and data spread round the globe or over continents that don't fit in half of it across
+  180 (the United States, Europe and Australia; the United States and China), gets the box and the view it always
+  got. A program that reads this route should expect `w` greater than `e`
+  ([MAP_REQUIREMENTS.md](docs/MAP_REQUIREMENTS.md)).
 - **A number too large for a double in filter text is an error, not a 500.** `score > 1e999` (and the same in `in`,
   `between` or a concept's threshold) parsed to infinity, which the parse route then failed to send. It is now
   `'1e999' is out of range for a number`, with its line and column. A concept filter sent as JSON with a threshold

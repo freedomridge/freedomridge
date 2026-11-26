@@ -4,7 +4,7 @@ import { useEffect, useMemo, useState, useCallback, useRef } from 'react';
 import Map, { Source, Layer, ScaleControl, MapRef, type MapEvent, type MapMouseEvent, type LayerProps } from 'react-map-gl/mapbox';
 import { useQueries, useQuery, useQueryClient, type UseQueryResult } from '@tanstack/react-query';
 import { getMapPoints, getMapExtent, getDatasetCoverage, getRegion, type ComplexFilter, type Region } from '@/lib/api';
-import { tileBbox, viewBbox, type Bbox } from '@/lib/map-bounds';
+import { extentCorners, pointsCorners, tileBbox, viewBbox, type Bbox } from '@/lib/map-bounds';
 import { bboxCorners, newlyIncluded, outlineLines, type RegionTest } from '@/lib/regions';
 import { useRuntimeConfig } from '@/lib/runtime-config';
 import type { Feature, FeatureCollection, Geometry, Point, Polygon } from 'geojson';
@@ -279,16 +279,12 @@ export function MapPanel({
         // Fit to the TRUE data extent (min/max lon/lat) for the CURRENT filters — coarse
         // cluster centroids collapse to a point for small/polygon selections and make
         // fitBounds over-zoom. Respects filters (incl. the polygon), no stale state.
+        // Across the antimeridian the extent's west is greater than its east (extentCorners).
         setZooming(true);
         try {
             const ext = await getMapExtent(datasetId, filters);
             if (!ext.count || ext.w == null || ext.e == null || ext.s == null || ext.n == null) return;
-            let { w, e, s, n } = ext as { w: number; e: number; s: number; n: number };
-            // Degenerate box (points coincide) -> pad so it doesn't slam to maxZoom.
-            if (e - w < 1e-6) { w -= 0.0005; e += 0.0005; }
-            if (n - s < 1e-6) { s -= 0.0005; n += 0.0005; }
-            const LngLatBounds = mapboxgl.LngLatBounds;
-            mapRef.current.fitBounds(new LngLatBounds([w, s], [e, n]), { padding: 60, maxZoom: 16, duration: 600 });
+            mapRef.current.fitBounds(extentCorners(ext as { w: number; s: number; e: number; n: number }), { padding: 60, maxZoom: 16, duration: 600 });
         } catch { /* ignore */ } finally { setZooming(false); }
     }, [datasetId, filters]);
 
@@ -328,9 +324,8 @@ export function MapPanel({
                 if (pts.length === 1) {
                     mapRef.current.flyTo({ center: [pts[0].lon, pts[0].lat], zoom: 18, duration: 800 });
                 } else {
-                    const LngLatBounds = mapboxgl.LngLatBounds;
-                    const bounds = pts.reduce((b: LngLatBounds, p) => b.extend([p.lon, p.lat] as [number, number]), new LngLatBounds());
-                    mapRef.current.fitBounds(bounds, { padding: 80, maxZoom: 17, duration: 800 });
+                    // Across the antimeridian when the selection fits in half the globe that way (pointsCorners).
+                    mapRef.current.fitBounds(pointsCorners(pts), { padding: 80, maxZoom: 17, duration: 800 });
                 }
             } catch { /* ignore */ }
         })();
@@ -382,10 +377,7 @@ export function MapPanel({
                 const ext = await getMapExtent(datasetId, filtersRef.current);
                 if (cancelled) return;
                 if (mapRef.current && ext.count && ext.w != null && ext.e != null && ext.s != null && ext.n != null) {
-                    let { w, e, s, n } = ext as { w: number; e: number; s: number; n: number };
-                    if (e - w < 1e-6) { w -= 0.0005; e += 0.0005; }
-                    if (n - s < 1e-6) { s -= 0.0005; n += 0.0005; }
-                    mapRef.current.fitBounds(new mapboxgl.LngLatBounds([w, s], [e, n]), { padding: 60, maxZoom: 17, duration: 800 });
+                    mapRef.current.fitBounds(extentCorners(ext as { w: number; s: number; e: number; n: number }), { padding: 60, maxZoom: 17, duration: 800 });
                     return;
                 }
             } catch { /* fall back to the region */ }
@@ -515,11 +507,7 @@ export function MapPanel({
             };
             const ext = await getMapExtent(datasetId, combined);
             if (mapRef.current && ext.count && ext.w != null && ext.e != null && ext.s != null && ext.n != null) {
-                let { w, e, s, n } = ext as { w: number; e: number; s: number; n: number };
-                if (e - w < 1e-6) { w -= 0.0005; e += 0.0005; }
-                if (n - s < 1e-6) { s -= 0.0005; n += 0.0005; }
-                const LngLatBounds = mapboxgl.LngLatBounds;
-                mapRef.current.fitBounds(new LngLatBounds([w, s], [e, n]), { padding: 60, maxZoom: 17, duration: 800 });
+                mapRef.current.fitBounds(extentCorners(ext as { w: number; s: number; e: number; n: number }), { padding: 60, maxZoom: 17, duration: 800 });
                 return;
             }
         } catch { /* fall back to the drawn shape */ }
