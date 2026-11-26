@@ -19,11 +19,14 @@ export default async function globalSetup() {
         });
     }
 
-    // Clean up leftovers from a crashed run
+    // Clean up leftovers from a crashed run. One listed while its deletion was ending is gone by the time it is deleted
+    // again (404): that is what this cleanup wants.
     const datasets = await apiFetch(cookie, '/datasets');
     for (const d of datasets) {
         if (d.name === DATASET_NAME) {
-            await deleteDatasetAndWait(cookie, d.id);
+            await deleteDatasetAndWait(cookie, d.id).catch(error => {
+                if (!String(error).includes(`DELETE /datasets/${d.id} -> 404`)) throw error;
+            });
         }
     }
 

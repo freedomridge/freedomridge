@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { test as base, expect } from '@playwright/test';
-import { AUTH_STATE } from './helpers';
+import { AUTH_STATE, retryOnReset } from './helpers';
 
 const test = base.extend<{ datasetId: number }>({
     datasetId: async ({ request }, provide) => {
@@ -10,7 +10,7 @@ const test = base.extend<{ datasetId: number }>({
         try {
             await provide(dataset.id);
         } finally {
-            const deleted = await request.delete(`/api/datasets/${dataset.id}`);
+            const deleted = await retryOnReset(() => request.delete(`/api/datasets/${dataset.id}`));
             expect(deleted.ok()).toBeTruthy();
         }
     },

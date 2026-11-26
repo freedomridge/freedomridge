@@ -1,5 +1,5 @@
 import fs from 'fs';
-import { STATE_FILE, adminLogin, apiFetch, datasetJobs, readState } from './api';
+import { STATE_FILE, adminLogin, datasetJobs, deleteDatasetAndWait, readState } from './api';
 
 export default async function globalTeardown() {
     let strays: Awaited<ReturnType<typeof datasetJobs>> = [];
@@ -7,7 +7,9 @@ export default async function globalTeardown() {
         const { datasetId, setupJobs } = readState();
         const cookie = await adminLogin();
         strays = (await datasetJobs(cookie, datasetId)).filter(job => !setupJobs.includes(job.id));
-        await apiFetch(cookie, `/datasets/${datasetId}`, { method: 'DELETE' });
+        // Until its deletion ends: the next Playwright command against this server (scripts/ci_local.sh runs the fits
+        // after the other specs) would list it while it is still being deleted.
+        await deleteDatasetAndWait(cookie, datasetId);
         fs.unlinkSync(STATE_FILE);
         console.log(`[e2e] deleted fixture dataset id=${datasetId}`);
     } catch (e) {

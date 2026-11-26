@@ -5,6 +5,21 @@ import { readState } from './api';
 export const AUTH_STATE = path.join(__dirname, '.auth-state.json');
 
 /**
+ * Sends a request once more if its connection was reset before any answer came. Playwright's request contexts keep
+ * connections open; the frontend server closes one left idle for 5 s (Node's default, plus Node's 1 s buffer; `next
+ * dev` has no option to change it), and a request sent on it in that moment fails with ECONNRESET without reaching
+ * the server. Only for a request that does the same when sent twice, such as a fixture's cleanup DELETE.
+ */
+export async function retryOnReset<T>(send: () => Promise<T>): Promise<T> {
+    try {
+        return await send();
+    } catch (error) {
+        if (!/ECONNRESET|socket hang up/.test(String(error))) throw error;
+        return await send();
+    }
+}
+
+/**
  * Wait until React has hydrated the element, so typing into it reaches React state.
  *
  * `page.goto()` resolves when the server HTML is parsed — BEFORE hydration. A `fill()` in that

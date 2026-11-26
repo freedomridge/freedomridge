@@ -29,7 +29,10 @@
 #   and the e2e URLs point at this run's database, clone and servers, and the run refuses ports that are
 #   already in use, so nothing reaches a database or server holding real data.
 # - The jobs run one after another, and the Python jobs share uv environments synced from uv.lock.
-# - e2e serves a production build with `next start` instead of Playwright starting `next dev`.
+# - e2e serves a production build with `next start` instead of Playwright starting `next dev`, keeping idle
+#   connections for 10 minutes (Node closes them after 6 s). A Playwright request context lives for one test and
+#   reuses a kept-alive connection with no time limit of its own; a request sent just as the server closed it
+#   failed with ECONNRESET. 10 minutes is longer than the longest time limit a test sets (420 s today).
 #
 # The steps follow ci.yml. When ci.yml changes, update them to match and set CI_YML_SHA256 to its
 # `sha256sum`; a run stops while the two disagree.
@@ -345,7 +348,8 @@ if want e2e; then
   result "e2e backend start" $?
   cd "$W/frontend" || exit 1
   npx playwright install chromium > "$L/playwright-install.log" 2>&1
-  FRIDGE_BACKEND_URL=http://127.0.0.1:$APIPORT setsid npx next start -p "$FEPORT" > "$L/next.log" 2>&1 &
+  FRIDGE_BACKEND_URL=http://127.0.0.1:$APIPORT setsid npx next start -p "$FEPORT" --keepAliveTimeout 600000 \
+    > "$L/next.log" 2>&1 &
   FRONTEND=$!
   timeout 60 bash -c "until curl -sf -o /dev/null http://localhost:$FEPORT/login; do sleep 1; done"
   result "e2e frontend start" $?
