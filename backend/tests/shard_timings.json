@@ -135,7 +135,6 @@
 "backend/tests/test_job_wait.py": 12.8,
 "backend/tests/test_jobs_api.py": 1.1,
 "backend/tests/test_jobs_http_contract.py": 0.0,
-"backend/tests/test_jobs_python_compatibility.py": 1.4,
 "backend/tests/test_jobs_sdk.py": 0.1,
 "backend/tests/test_label_any_field.py": 16.2,
 "backend/tests/test_label_cuboids.py": 1.7,
