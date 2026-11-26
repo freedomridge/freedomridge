@@ -1167,16 +1167,16 @@ def test_a_loop_of_busy_refusals_leaves_one_row_a_minute(registry_database, assi
 
 
 def test_the_request_context_reaches_the_tools_requests_through_the_deadline(registry_database, monkeypatch):
-    """With the real core, for a guest in public mode: the call runs in the deadline's own task, and every in-process
-    request the tool makes still starts with the /mcp request's context (the request limits' context, its user the
-    guest, so the guest statement limit applies), sees the user's call counted, and is itself signed in as the guest,
-    which gives it the guest's budgets."""
+    """With the real core, for a power user in public mode: the call runs in the deadline's own task, and every
+    in-process request the tool makes still starts with the /mcp request's context (the request limits' context, its
+    user the caller, so the statement limits apply), sees the user's call counted, and is itself signed in as the
+    caller, which gives it the caller's budgets. (This test was a guest's; no guest may use the MCP door now.)"""
     monkeypatch.setenv('DEMO_MODE', 'true')
 
     async def scenario(database):
-        guest = await account(database, 'mcp-context-guest', role='guest')
+        caller = await account(database, 'mcp-context-user')
         await database.execute('UPDATE assistant_settings SET mcp_enabled = TRUE')
-        await database.execute('INSERT INTO assistant_users (user_id, allowed) VALUES ($1, TRUE)', guest['id'])
+        await database.execute('INSERT INTO assistant_users (user_id, allowed) VALUES ($1, TRUE)', caller['id'])
         entered: list = []
         signed_in: list = []
         stack = main.app.middleware_stack or main.app.build_middleware_stack()
@@ -1195,16 +1195,16 @@ def test_the_request_context_reaches_the_tools_requests_through_the_deadline(reg
         with pytest.MonkeyPatch.context() as patch:
             patch.setattr(main.app, 'middleware_stack', spy)
             patch.setattr(auth, 'set_request_user', recorded)
-            async with door(database) as url, sdk_client(url, guest['mcp'], 'auto') as client:
+            async with door(database) as url, sdk_client(url, caller['mcp'], 'auto') as client:
                 called = await client.call_tool('list_datasets', {})
                 assert not called.is_error, called.content
         assert entered
         for context, running in entered:
             assert context is not None, 'the in-process request lost the /mcp request context'
-            assert context.scope['path'] == '/mcp' and context.user['id'] == guest['id']
-            assert running == {guest['id']: 1}
+            assert context.scope['path'] == '/mcp' and context.user['id'] == caller['id']
+            assert running == {caller['id']: 1}
         inner = [each for each in signed_in if each[0] != '/mcp']
-        assert inner and all(each[1:] == (guest['id'], 'guest') for each in inner)
+        assert inner and all(each[1:] == (caller['id'], 'power_user') for each in inner)
 
     registry_database(scenario)
 

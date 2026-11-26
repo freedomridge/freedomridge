@@ -149,18 +149,20 @@ def test_the_rule_in_its_order(world):
         await world.database.execute('INSERT INTO group_members (group_id, user_id) VALUES ($1, $2)', group, POWER)
         assert (await world.api(ADMIN, 'PUT', f'/api/admin/assistant/groups/{group}')).status_code == 200
         assert await assistant.door_refusal(user_id=POWER, door='mcp') is None
-        # A user's own answer decides before their groups and role, both ways.
+        # A user's own answer decides before their groups and role, both ways; a guest never may (checked below),
+        # whatever theirs says.
         await world.api(ADMIN, 'PUT', f'/api/admin/assistant/users/{POWER}', json={'allowed': False})
         await world.api(ADMIN, 'PUT', f'/api/admin/assistant/users/{ADMIN}', json={'allowed': False})
+        await world.api(ADMIN, 'PUT', f'/api/admin/assistant/users/{OTHER}', json={'allowed': True})
         await world.api(ADMIN, 'PUT', f'/api/admin/assistant/users/{GUEST}', json={'allowed': True})
         assert await assistant.door_refusal(user_id=POWER, door='mcp') == rule.NOT_LET_IN
         assert await assistant.door_refusal(user_id=ADMIN, door='mcp') == rule.NOT_LET_IN
-        assert await assistant.door_refusal(user_id=GUEST, door='mcp') is None
+        assert await assistant.door_refusal(user_id=OTHER, door='mcp') is None
         await world.api(ADMIN, 'DELETE', f'/api/admin/assistant/users/{ADMIN}')
         assert await assistant.door_refusal(user_id=ADMIN, door='mcp') is None
         # A demo account never may, whatever its own answer says.
-        await world.database.execute('UPDATE users SET is_demo_account = TRUE WHERE id = $1', GUEST)
-        assert await assistant.door_refusal(user_id=GUEST, door='mcp') == rule.NOT_LET_IN
+        await world.database.execute('UPDATE users SET is_demo_account = TRUE WHERE id = $1', OTHER)
+        assert await assistant.door_refusal(user_id=OTHER, door='mcp') == rule.NOT_LET_IN
         # The account's own state, in the API's own words; after the door, before the rest.
         await world.database.execute('UPDATE users SET must_change_password = TRUE WHERE id = $1', ADMIN)
         assert await assistant.door_refusal(user_id=ADMIN, door='mcp') == rule.PASSWORD_CHANGE_REQUIRED
@@ -172,6 +174,8 @@ def test_the_rule_in_its_order(world):
         odd_ids: tuple[Any, ...] = (2**40, -1, '7', None, True)
         for odd in odd_ids:
             assert await assistant.door_refusal(user_id=odd, door='mcp') == rule.ACCOUNT_INACTIVE
+        # The guest's own answer, allowed: true, lets no guest in.
+        assert await assistant.door_refusal(user_id=GUEST, door='mcp') == rule.NOT_LET_IN
         await world.database.execute('UPDATE assistant_settings SET mcp_enabled = FALSE')
         assert await assistant.door_refusal(user_id=POWER, door='mcp') == rule.MCP_OFF
 
@@ -924,7 +928,11 @@ def test_calling_the_tools_writes_nothing(world):
     world(scenario)
 
 
-def test_a_guest_in_public_mode_takes_guest_slots_and_a_full_queue_is_busy(world, monkeypatch):
+def test_a_guest_in_public_mode_is_refused_before_any_request_takes_a_guest_slot(world, monkeypatch):
+    """A guest let in by role and by their own answer is still refused (no guest may use the MCP door), before the
+    tool makes a request: no guest slot is taken, and with the guest's slots all taken the answer is the same refusal at
+    once, not a wait for a slot nor busy. (This test ran a guest's whole call through the guest's slots; no door lets a
+    guest in now. test_a_busy_answer_is_busy_and_retryable keeps the busy answer itself.)"""
     import asyncio
     import dataclasses
 
@@ -932,6 +940,7 @@ def test_a_guest_in_public_mode_takes_guest_slots_and_a_full_queue_is_busy(world
 
     async def scenario(world):
         await world.switch_on(guest=True)
+        await world.api(ADMIN, 'PUT', f'/api/admin/assistant/users/{GUEST}', json={'allowed': True})
         await world.database.execute('UPDATE datasets SET is_global = TRUE WHERE id = $1', TRIALS)
         await ingest([{'score': 1}], dataset_id=TRIALS)
         monkeypatch.setenv('DEMO_MODE', 'true')
@@ -940,20 +949,17 @@ def test_a_guest_in_public_mode_takes_guest_slots_and_a_full_queue_is_busy(world
             'settings',
             dataclasses.replace(public_settings.settings, guest_queue_seconds=0.2),
         )
-        # A whole tool call as a guest, every heavy request through the guest's slots: nothing waits on a disconnect.
         answer = await asyncio.wait_for(world.tool(GUEST, 'describe_dataset', dataset=TRIALS), 30)
-        assert answer['ok'] and answer['result']['dataset']['samples'] == 1
+        assert refused(answer, 'not_allowed') == rule.NOT_LET_IN
         assert not request_limits._guest_slots
-        # The guest's slots all taken: the field statistics wait their turn, then the queue's 503 is busy, retryable.
+        # The guest's slots all taken: still the refusal.
         monkeypatch.setitem(
             request_limits._guest_slots,
             GUEST,
             request_limits.GuestSlots(asyncio.Semaphore(0), requests=1),
         )
-        answer = await world.tool(GUEST, 'describe_dataset', dataset=TRIALS)
-        assert answer['ok'] is False and answer['error']['code'] == 'busy', answer
-        assert answer['error']['retryable'] is True
-        assert answer['error']['message'] == 'Too many simultaneous guest queries. Please try again shortly.'
+        answer = await asyncio.wait_for(world.tool(GUEST, 'describe_dataset', dataset=TRIALS), 30)
+        assert refused(answer, 'not_allowed') == rule.NOT_LET_IN
 
     world(scenario)
 

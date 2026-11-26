@@ -34,14 +34,16 @@ An administrator, once:
    backend. In production it goes in the same `.env` as `ALLOWED_ORIGINS`, and `docker-compose.prod.yml` passes it to
    the backend. The assistant's answers carry links into the app, and every link starts with this address
    ([Links](#links)).
-2. Open **Settings → Assistant** and switch on **MCP server**. It ships off.
+2. Open **Settings → Assistant** and switch on **MCP server**. It ships off. Once it is on, the page links to the
+   tokens page with the MCP kind chosen (step 5).
 3. On the same page, say who may use it ([Who may use it](#who-may-use-it)). As shipped, only administrators may.
 4. Places ("the images in Kansas") need region boundaries. On a Docker install they are ready a few minutes after the
    first start: the server loads them by itself. A source checkout loads them once `python -m backend.regions fetch`
    has run ([regions](REGIONS.md#loading-a-set)). **Settings → System status → Region boundaries** shows what is
    loaded.
 
-Each person who uses it (a power user or an administrator: guests make no tokens):
+Each person who uses it (a power user or an administrator: a guest can't use the MCP server, whatever the settings
+say, and makes no tokens):
 
 5. Open **Settings → API Tokens**, click **Create New Token**, give it a name, choose **Used by: An AI client (MCP)**
    and click **Create Token**. That kind is offered only to someone who may use the assistant right now. The token is
@@ -74,7 +76,7 @@ Two things to know before you start:
 - **403, "The MCP server is switched off on this server" or "Your account may not use the assistant on this
   server":** ask an administrator.
 - **No "An AI client (MCP)" kind on the tokens page:** you may not use the assistant right now. Ask an administrator.
-  Guests make no tokens at all.
+  A guest can't use the MCP server, and makes no tokens at all.
 - **`claude mcp list` shows it failed to connect:** check that the address ends in `/mcp`, and that the header is
   exactly `Authorization: Bearer <token>`.
 
@@ -116,10 +118,12 @@ follower token, or a browser's signed-in session gets 401, so a web page can't d
 browser. A request from a web page of another origin is refused (403) before anything else.
 
 An MCP token is made, listed, revoked and expires like any other token (`"scope": "mcp"` on `POST /api/tokens`).
-Power users and administrators make tokens, so a guest can't connect a client, whatever the assistant's settings say.
-Deactivating a person, or resetting their password with **Also revoke their API tokens**, ends their MCP tokens with
-the rest. The server never passes the token on: no tool carries it, and it is in no log. Anyone holding the token can
-read what you can read through the assistant, so revoke it on the tokens page when it is no longer needed.
+Power users and administrators make tokens. A guest can't use the MCP server, whatever the assistant's settings say:
+the server refuses them, so a token made before someone became a guest is refused (403, "Your account may not use the
+assistant on this server"). Made a power user again, the settings decide for them as before. Deactivating a person, or
+resetting their password with **Also revoke their API tokens**, ends their MCP tokens with the rest. The server never
+passes the token on: no tool carries it, and it is in no log. Anyone holding the token can read what you can read
+through the assistant, so revoke it on the tokens page when it is no longer needed.
 
 ### Behind your own web server
 
@@ -158,16 +162,20 @@ While the MCP server is switched on, in this order:
 1. A person with an answer of their own gets that answer: **May not use it** keeps out someone their role or group
    would let in, and **May use it** lets in someone their role and groups would not.
 2. Otherwise, a person in at least one ticked group may. A group only ever lets people in.
-3. Otherwise their role decides (**Roles**). As shipped: administrators yes, power users and guests no. Guests make
-   no tokens, so ticking **Guests** lets no guest use the MCP server today; it will matter for the chat in the app.
-4. A demo account (the shared account of a public demo) never may, nor a follower instance's account, whatever the
+3. Otherwise their role decides (**Roles**: administrators and power users). As shipped: administrators yes, power
+   users no.
+4. A guest never may, whatever their own answer, their groups or the setting for guests say. That is a rule of the
+   server, not only because guests make no tokens. Guests will have the assistant through the chat in the app: the
+   setting for guests (`roles.guest`, which the page doesn't show), a guest's own answer and groups with guests in
+   them are kept for it.
+5. A demo account (the shared account of a public demo) never may, nor a follower instance's account, whatever the
    settings say.
-5. An account that is inactive, or that owes a password change, never may.
+6. An account that is inactive, or that owes a password change, never may.
 
-The **People** table shows each person's own answer and whether they may use it now. Deleting a group or a person
-removes their entry. The rule is checked again on every tool call and on every request a tool makes: a person
-deactivated, or taken off the list, between two calls is stopped at the second, and a request to `/mcp` from such a
-person is refused (403, saying why).
+The **People** table shows each person's own answer and whether they may use it now. A guest's row says **No**, and
+their own answer can't be changed there. Deleting a group or a person removes their entry. The rule is checked again
+on every tool call and on every request a tool makes: a person deactivated, made a guest, or taken off the list,
+between two calls is stopped at the second, and a request to `/mcp` from such a person is refused (403, saying why).
 
 ### Through the API
 
@@ -187,7 +195,8 @@ them (a key left out doesn't change):
 
 `PUT /api/admin/assistant/groups/{group_id}` ticks a group and `DELETE` takes that back.
 `PUT /api/admin/assistant/users/{user_id}` with `{"allowed": true}` or `{"allowed": false}` sets a person's own answer,
-and `DELETE` removes it. An unknown group or person is 404. Each answers the whole settings.
+and `DELETE` removes it. An unknown group or person is 404. Each answers the whole settings. `roles.guest`, a guest's
+own answer and a group's guests are kept for the chat in the app: none of them lets a guest use the MCP server.
 
 ## What the assistant may read
 
@@ -619,8 +628,10 @@ await assistant.call_tool(user_id=7, door='mcp', name='list_datasets', arguments
   cache isn't queued again. That is not a write to the dataset.
 - **`GET /api/auth/me`** says whether the signed-in person could use the MCP server now:
   `"assistant": {"mcp": true}`. It is a hint for the app: each server process reads the switch at most every 5 seconds
-  for it, so it costs no query while the MCP server is off, and an error reading it answers false. The tools
-  themselves read everything afresh.
+  for it, so it costs no query while the MCP server is off, and an error reading it answers false. A guest's answer is
+  false without a query. `GET /api/auth/me?fresh=1` reads the switch from the database for that request, whichever
+  process answers; the API Tokens page asks so as it opens, so it offers the MCP kind just after the switch is turned
+  on. The tools themselves read everything afresh.
 - **No connection held across a request.** Nothing in `backend/assistant` holds a pooled database connection while a
   tool's request runs; the request takes its own, as any other does. A guest's request waits for a guest slot and has
   the guest statement timeout, as from the app, and a busy answer (429, 503, 504) is `busy`.

@@ -8,6 +8,12 @@ import { type Level, type TestUser, allSteps, createGroup, createSmallDataset, c
 // it, whether new datasets start closed), a dataset's own switch in Dataset Settings (manage level), and each field's
 // "Keep this field's values from the assistant" (edit level). Every change is sent at once; a control shows its new
 // state once the server has answered.
+// A guest can't use the MCP server (the contract "guests and the MCP server; a way from the Assistant page to a token",
+// section 2): Roles has no Guests tick, a guest's row reads No and their own answer can't be given, whatever the
+// settings store (roles.guest, a guest's own answer and a group with a guest in it are kept for the chat in the app, so
+// these tests store them through the API), and while the MCP server is on its section links to making an MCP token.
+// Read here: "the row's own-answer control" is the row's "Assistant for <name>" select, and its accessible description
+// is exactly "Guests can't use the MCP server".
 // The settings are the server's own, so this spec runs in the one-at-a-time project after every other spec
 // (playwright.config.ts: *.fits.spec.ts), and puts them back as it found them.
 test.use({ storageState: AUTH_STATE });
@@ -31,6 +37,9 @@ const datasetIds: number[] = [];
 const MCP_ON = 'An assistant such as Claude can connect to this server, as one of the people below, and read the datasets that person can open.';
 const MCP_OFF = 'No assistant can connect to this server. Switch it on to let the people below use one.';
 const OFF_NOTE = 'While the MCP server is off, nobody can use it, whatever this column says.';
+const NEVER = 'A guest or a demo account never may.';
+const GUEST_ROW = 'Guests can\'t use the MCP server';
+const TO_A_TOKEN = 'To connect an AI client, create an MCP token. Each person who may use it makes their own, under Settings → API Tokens.';
 const DATASETS_NOTE = 'A dataset\'s managers open or close it to the assistant in its Dataset Settings, and anyone who can edit it can keep a field\'s values from the assistant there. Datasets that exist already are not changed by this setting.';
 const OPEN = 'Open: when an administrator lets them use the assistant (Settings → Assistant), it reads this dataset as the person using it.';
 const CLOSED = 'Closed: the assistant leaves this dataset out for everyone, administrators too. People open it here as before.';
@@ -71,7 +80,7 @@ async function dataset(name: string) {
 }
 
 const settings = (): Promise<Settings> => apiFetch(cookie, '/admin/assistant');
-const patchSettings = (changes: Partial<Settings>) => apiFetch(cookie, '/admin/assistant', { method: 'PATCH', body: JSON.stringify(changes) });
+const patchSettings = (changes: Partial<Omit<Settings, 'roles'>> & { roles?: Partial<Settings['roles']> }) => apiFetch(cookie, '/admin/assistant', { method: 'PATCH', body: JSON.stringify(changes) });
 
 /** The changes the page sends (PATCH, PUT, DELETE) to a path starting with `prefix`: method, path and body. */
 function writesTo(page: Page, prefix: string) {
@@ -104,7 +113,8 @@ async function openAssistant(page: Page) {
 }
 
 const mcpSwitch = (page: Page) => page.getByRole('switch', { name: 'MCP server', exact: true });
-const roleBox = (page: Page, name: 'Administrators' | 'Power users' | 'Guests') => page.getByRole('group', { name: 'Roles', exact: true }).getByRole('checkbox', { name, exact: true });
+const rolesGroup = (page: Page) => page.getByRole('group', { name: 'Roles', exact: true });
+const roleBox = (page: Page, name: 'Administrators' | 'Power users') => rolesGroup(page).getByRole('checkbox', { name, exact: true });
 const groupsBox = (page: Page) => page.getByRole('group', { name: 'Groups whose members may use it', exact: true });
 const newClosedBox = (page: Page) => page.getByRole('region', { name: 'Datasets', exact: true }).getByRole('checkbox', { name: 'New datasets start closed to the assistant', exact: true });
 const peopleTable = (page: Page) => page.getByRole('table', { name: 'People and the assistant', exact: true });
@@ -206,26 +216,86 @@ test('the MCP server switch: off as shipped; a click shows the new state once th
     expect(sent.at(-1)).toEqual(['PATCH', '/api/admin/assistant', { mcp_enabled: false }]);
 });
 
-test('Roles: administrators only as shipped; each checkbox sends only its role, and survives a reload', async ({ page }) => {
-    const sent = writesTo(page, '/api/admin/assistant');
+test('the MCP server on: under its note, a sentence whose "create an MCP token" links to the tokens page with the MCP kind; shown as soon as it is switched on, gone while it is off', async ({ page }) => {
+    await patchSettings({ mcp_enabled: false });
     await openAssistant(page);
-    await expect(roleBox(page, 'Administrators')).toBeChecked();
-    await expect(roleBox(page, 'Power users')).not.toBeChecked();
-    await expect(roleBox(page, 'Guests')).not.toBeChecked();
-    const keys = { Administrators: 'admin', 'Power users': 'power_user', Guests: 'guest' } as const;
-    for (const [name, key] of Object.entries(keys) as Array<[keyof typeof keys, string]>) {
-        const was = await roleBox(page, name).isChecked();
-        await roleBox(page, name).click();
-        await expect(roleBox(page, name)).toBeChecked({ checked: !was });
-        expect(sent.at(-1), name).toEqual(['PATCH', '/api/admin/assistant', { roles: { [key]: !was } }]);
+    const region = page.getByRole('region', { name: 'MCP server', exact: true });
+    const link = region.getByRole('link', { name: 'create an MCP token', exact: true });
+    const anyLink = page.getByRole('link', { name: 'create an MCP token' });
+    try {
+        // Off (as shipped): neither the sentence nor the link.
+        await expect(mcpSwitch(page)).toHaveAttribute('aria-checked', 'false');
+        await expect(region).toContainText(MCP_OFF);
+        await expect(region).not.toContainText(TO_A_TOKEN);
+        await expect(anyLink).toHaveCount(0);
+
+        // Switched on: both, without a reload, under the note.
+        await mcpSwitch(page).click();
+        await expect(mcpSwitch(page)).toHaveAttribute('aria-checked', 'true');
+        await expect(region).toContainText(TO_A_TOKEN);
+        await expect(link).toHaveAttribute('href', '/settings/tokens?kind=mcp');
+        const text = (await region.innerText()).replace(/\s+/g, ' ');
+        expect(text.indexOf(MCP_ON), 'the note').toBeGreaterThanOrEqual(0);
+        expect(text.indexOf(MCP_ON), 'the sentence under the note').toBeLessThan(text.indexOf('To connect an AI client'));
+
+        // Switched off: gone, without a reload.
+        await mcpSwitch(page).click();
+        await expect(mcpSwitch(page)).toHaveAttribute('aria-checked', 'false');
+        await expect(region).not.toContainText(TO_A_TOKEN);
+        await expect(anyLink).toHaveCount(0);
+
+        // On again, and after a reload; the link opens the tokens page with the MCP kind asked for.
+        await mcpSwitch(page).click();
+        await expect(mcpSwitch(page)).toHaveAttribute('aria-checked', 'true');
         await page.reload();
-        await expect(roleBox(page, name)).toBeChecked({ checked: !was });
-        expect((await settings()).roles[key as keyof Settings['roles']]).toBe(!was);
-        await roleBox(page, name).click();
-        await expect(roleBox(page, name)).toBeChecked({ checked: was });
-        expect(sent.at(-1), name).toEqual(['PATCH', '/api/admin/assistant', { roles: { [key]: was } }]);
+        await expect(region).toContainText(TO_A_TOKEN);
+        await link.click();
+        await expect(page).toHaveURL(/\/settings\/tokens\?kind=mcp$/);
+        await expect(page.getByRole('heading', { name: 'API Tokens', level: 1 })).toBeVisible();
+    } finally {
+        await patchSettings({ mcp_enabled: false });
     }
-    expect(sent).toHaveLength(6);
+});
+
+test('Roles: two ticks, Administrators and Power users, and no Guests tick, whatever roles.guest stores; administrators only as shipped; each sends only its role, and survives a reload', async ({ page }) => {
+    const sent = writesTo(page, '/api/admin/assistant');
+    try {
+        // roles.guest stored true (kept for the chat in the app): still no tick for it, and nothing here changes it.
+        await patchSettings({ roles: { ...found.roles, guest: true } });
+        await openAssistant(page);
+        await expect(rolesGroup(page).getByRole('checkbox')).toHaveCount(2);
+        for (const [index, name] of ['Administrators', 'Power users'].entries()) {
+            await expect(rolesGroup(page).getByRole('checkbox').nth(index)).toHaveAccessibleName(name);
+        }
+        await expect(page.getByRole('checkbox', { name: 'Guests' })).toHaveCount(0);
+        await expect(rolesGroup(page)).not.toContainText('Guests');
+        await expect(roleBox(page, 'Administrators')).toBeChecked();
+        await expect(roleBox(page, 'Power users')).not.toBeChecked();
+        const keys = { Administrators: 'admin', 'Power users': 'power_user' } as const;
+        for (const [name, key] of Object.entries(keys) as Array<[keyof typeof keys, string]>) {
+            const was = await roleBox(page, name).isChecked();
+            await roleBox(page, name).click();
+            await expect(roleBox(page, name)).toBeChecked({ checked: !was });
+            expect(sent.at(-1), name).toEqual(['PATCH', '/api/admin/assistant', { roles: { [key]: !was } }]);
+            await page.reload();
+            await expect(roleBox(page, name)).toBeChecked({ checked: !was });
+            expect((await settings()).roles[key as keyof Settings['roles']]).toBe(!was);
+            await roleBox(page, name).click();
+            await expect(roleBox(page, name)).toBeChecked({ checked: was });
+            expect(sent.at(-1), name).toEqual(['PATCH', '/api/admin/assistant', { roles: { [key]: was } }]);
+        }
+        expect(sent).toHaveLength(4);
+        expect((await settings()).roles.guest, 'roles.guest as stored').toBe(true);
+    } finally {
+        await patchSettings({ roles: found.roles });
+    }
+});
+
+test('Who may use it says that a guest or a demo account never may', async ({ page }) => {
+    await openAssistant(page);
+    const who = page.getByRole('region', { name: 'Who may use it', exact: true });
+    await expect(who).toContainText(NEVER);
+    await expect(who).not.toContainText('A demo account never may.');
 });
 
 test('Groups: one checkbox per group, by name; a click lets its members in or takes it back; with none, the page says where to make them', async ({ page }) => {
@@ -348,21 +418,24 @@ test('People: active people by name, followers and demo guests left out; Find a 
         await check(pat, sessions.pat, 'No', 'role and groups decide');
         expect((await settings()).users.find(user => user.id === pat.id)).toBeUndefined();
 
-        // The role decides when nothing else does; a demo guest never may.
+        // The role decides when nothing else does; a guest never may, roles.guest stored true (through the API: the
+        // page has no Guests tick), nor a demo guest.
         await roleBox(page, 'Power users').click();
         await expect(roleBox(page, 'Power users')).toBeChecked();
         await check(pat, sessions.pat, 'Yes', 'power users ticked');
         await check(amy, sessions.amy, 'Yes', 'power users ticked');
         await check(gil, sessions.gil, 'No', 'power users ticked');
-        await roleBox(page, 'Guests').click();
-        await expect(roleBox(page, 'Guests')).toBeChecked();
-        await check(gil, sessions.gil, 'Yes', 'guests ticked');
-        await expect.poll(() => mcpFor(demoSession), { message: 'a demo guest, guests ticked' }).toBe(false);
-        await roleBox(page, 'Guests').click();
-        await expect(roleBox(page, 'Guests')).not.toBeChecked();
+        await patchSettings({ roles: { guest: true } });
+        await page.reload();
+        await find.fill(PP);
+        await check(gil, sessions.gil, 'No', 'roles.guest stored true');
+        await expect.poll(() => mcpFor(demoSession), { message: 'a demo guest, roles.guest stored true' }).toBe(false);
+        await patchSettings({ roles: { guest: false } });
+        await page.reload();
+        await find.fill(PP);
         await roleBox(page, 'Power users').click();
         await expect(roleBox(page, 'Power users')).not.toBeChecked();
-        await check(gil, sessions.gil, 'No', 'guests unticked');
+        await check(gil, sessions.gil, 'No', 'power users unticked');
         await check(amy, sessions.amy, 'No', 'power users unticked');
 
         // With the MCP server off, the column still says what the rule says, the note says it doesn't count, and
@@ -379,6 +452,73 @@ test('People: active people by name, followers and demo guests left out; Find a 
     } finally {
         await patchSettings({ mcp_enabled: false, roles: found.roles });
         await apiFetch(cookie, `/followers/${follower.id}`, { method: 'DELETE' });
+    }
+});
+
+test('People: a guest\'s row reads No and their own answer can\'t be given, saying why, whatever the settings store for them (roles.guest, a ticked group, their own "May use it"); everyone else\'s row is as before', async ({ page }) => {
+    test.setTimeout(240_000);
+    const GP = `gp${S}`;
+    const make = async (name: string, role: 'power_user' | 'guest' = 'power_user') => {
+        const user = await createUser(cookie, `${GP}_${name}`, role);
+        people.push(user);
+        return user;
+    };
+    const gail = await make('gail', 'guest');  // roles.guest alone
+    const gus = await make('gus', 'guest');  // and their own answer, allowed: true
+    const gwen = await make('gwen', 'guest');  // and a ticked group
+    const pia = await make('pia');  // a power user with their own answer, allowed: true
+    const group = await createGroup(cookie, `${GP}_crew`, [gwen]);
+    groupIds.push(group.id);
+    const guests: Array<[TestUser, string]> = [[gail, await sessionOf(gail)], [gus, await sessionOf(gus)], [gwen, await sessionOf(gwen)]];
+    const piaSession = await sessionOf(pia);
+    try {
+        await patchSettings({ mcp_enabled: true, roles: { guest: true } });
+        await apiFetch(cookie, `/admin/assistant/users/${gus.id}`, { method: 'PUT', body: JSON.stringify({ allowed: true }) });
+        await apiFetch(cookie, `/admin/assistant/users/${pia.id}`, { method: 'PUT', body: JSON.stringify({ allowed: true }) });
+        await apiFetch(cookie, `/admin/assistant/groups/${group.id}`, { method: 'PUT' });
+        // Stored as sent: the settings keep their shape.
+        const stored = await settings();
+        expect(stored.roles.guest).toBe(true);
+        expect(stored.users.find(user => user.id === gus.id)?.allowed).toBe(true);
+        expect(stored.groups.map(each => each.id)).toContain(group.id);
+        // The server is on as auth/me reads it (it reads the switch every few seconds): the power user may.
+        await expect.poll(() => mcpFor(piaSession), { message: 'a power user, their own "May use it"', timeout: 15_000 }).toBe(true);
+
+        const sent = writesTo(page, '/api/admin/assistant');
+        for (const pass of ['opened', 'reloaded']) {
+            if (pass === 'opened') await openAssistant(page);
+            else await page.reload();
+            await page.getByRole('textbox', { name: 'Find a person', exact: true }).fill(GP);
+            await expect(peopleTable(page).getByRole('row').filter({ has: page.getByRole('cell') }), pass).toHaveCount(4);
+            for (const [guest, session] of guests) {
+                const step = `${pass}: ${guest.username}`;
+                await expect(rowOf(page, guest.username), step).toContainText('guest');
+                await expect(mayUse(page, guest.username), step).toHaveText('No');
+                await expect(answerOf(page, guest.username), step).toBeDisabled();
+                await expect(answerOf(page, guest.username), step).toHaveAccessibleDescription(GUEST_ROW);
+                expect(await mcpFor(session), `${step}: auth/me`).toBe(false);
+            }
+            // Everyone else's row as before: a power user's own answer can be given, and the column follows it.
+            await expect(mayUse(page, pia.username), pass).toHaveText('Yes');
+            await expect(answerOf(page, pia.username), pass).toBeEnabled();
+            await expectAnswer(page, pia.username, 'May use it');
+            await expect(answerOf(page, pia.username), pass).not.toHaveAccessibleDescription(GUEST_ROW);
+        }
+        await answerOf(page, pia.username).selectOption({ label: 'May not use it' });
+        await expectAnswer(page, pia.username, 'May not use it');
+        await expect(mayUse(page, pia.username)).toHaveText('No');
+        await expect.poll(() => mcpFor(piaSession), { message: 'a power user, their own "May not use it"', timeout: 15_000 }).toBe(false);
+        expect(sent, 'only the power user\'s answer was sent').toEqual([['PUT', `/api/admin/assistant/users/${pia.id}`, { allowed: false }]]);
+        // The guests' stored entries are still there, as stored.
+        const after = await settings();
+        expect(after.roles.guest).toBe(true);
+        expect(after.users.find(user => user.id === gus.id)?.allowed).toBe(true);
+        expect(after.groups.map(each => each.id)).toContain(group.id);
+    } finally {
+        await allSteps([
+            () => patchSettings({ mcp_enabled: false, roles: found.roles }),
+            () => apiFetch(cookie, `/admin/assistant/groups/${group.id}`, { method: 'DELETE' }),
+        ]);
     }
 });
 
@@ -433,11 +573,11 @@ test('a refused change shows the server\'s words at the top and the next change 
     await expect(page.getByRole('alert').filter({ hasText: 'e2e: this change is refused' })).toHaveText('e2e: this change is refused');
     await expect(mcpSwitch(page)).toHaveAttribute('aria-checked', 'false');
     await page.unroute('**/api/admin/assistant');
-    await roleBox(page, 'Guests').click();
-    await expect(roleBox(page, 'Guests')).toBeChecked();
+    await roleBox(page, 'Power users').click();
+    await expect(roleBox(page, 'Power users')).toBeChecked();
     await expect(page.getByRole('alert').filter({ hasText: 'e2e:' })).toHaveCount(0);
-    await roleBox(page, 'Guests').click();
-    await expect(roleBox(page, 'Guests')).not.toBeChecked();
+    await roleBox(page, 'Power users').click();
+    await expect(roleBox(page, 'Power users')).not.toBeChecked();
 
     await page.route('**/api/admin/assistant', (route: Route) => (route.request().method() === 'GET'
         ? route.fulfill({ status: 500, json: { detail: 'e2e: the settings could not be read' } })

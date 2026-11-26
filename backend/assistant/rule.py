@@ -4,13 +4,14 @@ The doors: 'mcp', the MCP server, which an administrator switches on in Settings
 in the app, which is always off in this release. For a door that is on, in order: a user's own answer
 (assistant_users) decides; otherwise a user in a listed group (assistant_groups) may; otherwise their role decides.
 A demo account never may, nor a follower instance's account, nor an inactive account or one that owes a password
-change.
+change. A guest never may use the MCP server, whatever the settings say of them (kept for the chat in the app).
 
 `door_refusal` answers it for the doors, `call_tool` before each tool call, `get_current_user` for each request a
 tool makes, and `GET /api/auth/me` for the signed-in user's own account. Each reads the database afresh, through the
 handle its caller passes (`source`: the authentication passes its own) or the application's (database.db), read at
 the call. Only `GET /api/auth/me`, a hint for the app, first asks `mcp_switched_on`, which reads the switch at most
-once every few seconds per process: while the MCP server is off, that page load costs no query.
+once every few seconds per process: while the MCP server is off, that page load costs no query. Asked with
+`?fresh=1`, it skips that memory and asks the rule.
 """
 
 import time
@@ -81,6 +82,8 @@ def decide(row: Any, door: str) -> Optional[str]:
     if row['must_change_password']:
         return PASSWORD_CHANGE_REQUIRED
     if row['is_demo_account'] or row['follower_account']:  # a public demo's guest, or a follower instance's machine
+        return NOT_LET_IN
+    if door == 'mcp' and row['role'] == 'guest':  # whatever the settings say: guests get only the chat in the app
         return NOT_LET_IN
     if row['own_answer'] is not None:
         return None if row['own_answer'] else NOT_LET_IN

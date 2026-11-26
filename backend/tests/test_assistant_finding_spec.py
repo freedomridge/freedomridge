@@ -45,7 +45,9 @@ from backend.tests.test_access_rule_spec import ADMIN, GUEST, LEVELS, OTHER_ADMI
 from backend.tests.test_assistant_core_spec import (
     CLOSED,
     HOSTILE,
+    NOT_LET_IN,
     READ_POSTS,
+    VIEWER,
     add,
     assistant,
     open_door,
@@ -534,13 +536,17 @@ def test_saved_views_are_exactly_what_the_api_shows_each_user_and_a_slug_is_not_
     async def scenario(w):
         p = await plant(w)
         slugs = await saved_views(w, p)
+        # The guest, whom the MCP door never lets in, is refused; a let-in power user with the guest's view of the
+        # dataset, owning no view and sharing in no other dataset, is checked in the guest's place.
+        await w.user(VIEWER, 'power_user')
+        await w.share(F, VIEWER, 'view')
         await open_door(w)
         before = await snapshot(w)
         never = 'no-such-view-' + secrets.token_hex(4)
         cases = [
             (ADMIN, None),
             (OTHER_ADMIN, None),
-            (GUEST, 'view'),
+            (VIEWER, 'view'),
             (OTHER_POWER, None),
             *[(POWER, level) for level in LEVELS],
         ]
@@ -578,6 +584,18 @@ def test_saved_views_are_exactly_what_the_api_shows_each_user_and_a_slug_is_not_
                 else:
                     assert by_slug.status_code == 404, by_slug.text
                     assert masked(theirs, slug) == masked(nothing, never), (user_id, theirs, nothing)
+        # The API shows the guest the views; the MCP door never lets a guest in, whatever the settings tick.
+        assert (await w.call(GUEST, 'GET', f'/api/datasets/{F}/views')).status_code == 200
+        asked: list[tuple[str, dict[str, Any]]] = [
+            ('list_saved_views', {'dataset': F, 'limit': 50}),
+            *[('open_saved_view', {'slug': slug}) for slug in [*slugs.values(), never]],
+        ]
+        for name, arguments in asked:
+            refused = await call(GUEST, name, arguments)
+            assert refused == {
+                'ok': False,
+                'error': {'code': 'not_allowed', 'message': NOT_LET_IN, 'retryable': False},
+            }, (name, arguments)
         # A dataset closed to the assistant.
         assert (await w.call(ADMIN, 'PATCH', f'/api/datasets/{F}', json={'assistant_closed': True})).status_code == 200
         for name, arguments in (

@@ -476,16 +476,22 @@ async def logout(request: Request, response: Response):
 
 
 @router.get("/auth/me", response_model=UserResponse)
-async def get_me(user: dict = Depends(get_current_user)):
-    return {**user, 'can_share_views': not private_guest(user), 'assistant': {'mcp': await _could_use_mcp(user)}}
+async def get_me(fresh: bool = False, user: dict = Depends(get_current_user)):
+    """`fresh` (?fresh=1): whether the user could use the MCP server is read from the database for this request,
+    not from this process's memory of the switch (the API Tokens page asks so as it opens). Nothing else changes."""
+    mcp = await _could_use_mcp(user, fresh)
+    return {**user, 'can_share_views': not private_guest(user), 'assistant': {'mcp': mcp}}
 
 
-async def _could_use_mcp(user: dict) -> bool:
-    """Whether the user could use the MCP server now, a hint for the app. While the server is switched off, no query
-    (the switch is read at most every few seconds per process); while it is on, the rule's one query. Its failure is
-    logged and answered as false: it never fails the account's own answer."""
+async def _could_use_mcp(user: dict, fresh: bool = False) -> bool:
+    """Whether the user could use the MCP server now, a hint for the app. A guest never may: no query. While the server
+    is switched off, no query either (the switch is read at most every few seconds per process), unless `fresh`; while
+    it is on, or `fresh`, the rule's one query, which reads the switch itself. Its failure is logged and answered as
+    false: it never fails the account's own answer."""
+    if user.get('role') == 'guest':  # the rule refuses every guest at the MCP door (backend/assistant/rule.py)
+        return False
     try:
-        if not await assistant_rule.mcp_switched_on(db):
+        if not fresh and not await assistant_rule.mcp_switched_on(db):
             return False
         return await assistant_rule.door_refusal(user_id=user['id'], door='mcp', source=db) is None
     except Exception:  # noqa: BLE001 - a hint; the rest of /auth/me stands

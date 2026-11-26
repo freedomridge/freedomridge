@@ -25,7 +25,8 @@ interface UserContextType {
     logout: () => Promise<void>;
     // revokeTokens: also revoke every API token of the account; answers how many of each scope were revoked.
     changePassword: (current: string, newPass: string, revokeTokens?: boolean) => Promise<RevokedTokens | undefined>;
-    checkAuth: () => Promise<void>;
+    // fresh: ask GET /api/auth/me?fresh=1, which reads the MCP switch from the database for that request.
+    checkAuth: (options?: { fresh?: boolean }) => Promise<void>;
     isAuthenticated: boolean;
 }
 
@@ -40,22 +41,29 @@ export function UserProvider({ children }: { children: React.ReactNode }) {
     const authRetry = useRef<ReturnType<typeof setTimeout> | null>(null);
     const authRequest = useRef<Promise<void> | null>(null);
     const authController = useRef<AbortController | null>(null);
+    const authRequestFresh = useRef(false);  // whether the request under way asked ?fresh=1
 
     // Named so the retry timer can call it: the hook's own `checkAuth` isn't declared yet here.
-    const checkAuth = useCallback(function check(): Promise<void> {
-        if (authRequest.current) return authRequest.current;
+    // `fresh` (the API Tokens page, as it opens): GET /api/auth/me?fresh=1, which reads the MCP switch from the
+    // database instead of a server process's few-second memory of it. It never reuses an ordinary request under way:
+    // it takes that request's place, so the older answer can't land after its own.
+    const checkAuth = useCallback(function check(options?: { fresh?: boolean }): Promise<void> {
+        const fresh = options?.fresh === true;
+        if (authRequest.current && (authRequestFresh.current || !fresh)) return authRequest.current;
+        if (authRequest.current) authController.current?.abort();
         if (authRetry.current !== null) clearTimeout(authRetry.current);
         authRetry.current = null;
         const controller = new AbortController();
         authController.current = controller;
+        authRequestFresh.current = fresh;
         const retry = () => {
             if (!controller.signal.aborted) {
-                authRetry.current = setTimeout(() => { void check(); }, 5000);
+                authRetry.current = setTimeout(() => { void check(options); }, 5000);
             }
         };
         authRequest.current = (async () => {
             try {
-                const res = await fetch('/api/auth/me', { signal: controller.signal });
+                const res = await fetch(fresh ? '/api/auth/me?fresh=1' : '/api/auth/me', { signal: controller.signal });
                 if (res.ok) {
                     const userData = await res.json();
                     if (controller.signal.aborted) return;

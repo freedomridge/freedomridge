@@ -76,6 +76,9 @@ database = test_upgrade_paths.database
 pytestmark = pytest.mark.skipif(not os.getenv('FRIDGE_TEST_POSTGRES_DSN'), reason='Requires disposable PostgreSQL')
 
 ADMIN_USER = {'id': ADMIN, 'role': 'admin', 'username': f'user-{ADMIN}'}
+# A power user made by a test that needs the least-privileged user the assistant lets in (view where shared, nothing
+# else); a guest, who once stood in for that user, may never use the MCP server.
+VIEWER = 12
 CODES = {'not_allowed', 'refused', 'not_found', 'invalid', 'busy', 'unknown_tool'}
 MCP_OFF = 'The MCP server is switched off on this server'
 CHAT_OFF = 'The assistant is switched off on this server'
@@ -318,16 +321,23 @@ def test_who_may_use_the_assistant_follows_the_rule_in_its_order(world):
         assert put.is_success, put.text
         assert (await settings(w))['groups'] == [{'id': team, 'name': 'agronomy'}]
         assert [await may(u) for u in (POWER, OTHER_POWER)] == [True, False]
-        # A user's own answer goes over groups and role, either way.
-        for user_id, allowed in ((POWER, False), (ADMIN, False), (GUEST, True)):
+        # A user's own answer goes over groups and role, either way. A guest's is kept (it lets no guest in: below).
+        for user_id, allowed in ((POWER, False), (ADMIN, False), (OTHER_POWER, True)):
             put = await w.call(ADMIN, 'PUT', f'{SETTINGS}/users/{user_id}', json={'allowed': allowed})
             assert put.is_success, put.text
             assert await may(user_id) is allowed, user_id
+        put = await w.call(ADMIN, 'PUT', f'{SETTINGS}/users/{GUEST}', json={'allowed': True})
+        assert put.is_success, put.text
         users = {entry['id']: entry for entry in (await settings(w))['users']}
-        assert {user_id: users[user_id]['allowed'] for user_id in users} == {POWER: False, ADMIN: False, GUEST: True}
+        assert {user_id: users[user_id]['allowed'] for user_id in users} == {
+            POWER: False,
+            ADMIN: False,
+            OTHER_POWER: True,
+            GUEST: True,
+        }
         assert users[GUEST]['username'] == f'user-{GUEST}'
         # Removing a user's answer gives the group and role their say back.
-        for user_id, then in ((POWER, True), (ADMIN, True), (GUEST, False)):
+        for user_id, then in ((POWER, True), (ADMIN, True), (OTHER_POWER, False), (GUEST, False)):
             removed = await w.call(ADMIN, 'DELETE', f'{SETTINGS}/users/{user_id}')
             assert removed.is_success, removed.text
             assert await may(user_id) is then, user_id
@@ -350,6 +360,10 @@ def test_who_may_use_the_assistant_follows_the_rule_in_its_order(world):
         ):
             response = await w.call(ADMIN, method, path, **({} if body is None else {'json': body}))
             assert response.status_code == 404, (method, path, response.text)
+        # A guest's own answer `allowed: true` never lets a guest in.
+        put = await w.call(ADMIN, 'PUT', f'{SETTINGS}/users/{GUEST}', json={'allowed': True})
+        assert put.is_success, put.text
+        assert await may(GUEST) is False
 
     world(scenario)
 
@@ -471,16 +485,21 @@ def test_on_a_mirror_the_switch_is_this_servers_own(world):
 
 def test_each_tool_shows_a_user_exactly_what_the_api_shows_them(world):
     """Every caller of the access matrix (roles, own shares, group shares, the everyone level, no access) in a dataset
-    of their own: each user's list and each dataset's description against the API's answers to that user."""
+    of their own: each user's list and each dataset's description against the API's answers to that user. The guest,
+    whom the MCP door never lets in, is refused every one of them; a let-in power user with the guest's low access
+    (view in the datasets shared with the guest, no share elsewhere) is checked in the guest's place."""
 
     async def scenario(w):
         await prepare(w)
+        await w.user(VIEWER, 'power_user')
         made = []
         for caller in CALLERS:
             c = await open_dataset(w, caller)
             made.append(c.d)
+            if caller.guest and caller.source in ('own', 'plain'):
+                await w.share(c.d, VIEWER, 'view')
         await open_door(w)
-        for user_id in (ADMIN, POWER, GUEST, OTHER_POWER):
+        for user_id in (ADMIN, POWER, VIEWER, OTHER_POWER):
             api = {row['id']: row for row in (await w.call(user_id, 'GET', '/api/datasets')).json()}
             listed = {row['id']: row for row in await every_dataset(user_id)}
             assert set(listed) == {i for i, row in api.items() if not row.get('deleting')}, user_id
@@ -512,6 +531,11 @@ def test_each_tool_shows_a_user_exactly_what_the_api_shows_them(world):
                     assert response.status_code == 404, response.text
                     assert answer['error']['code'] == 'not_found', (user_id, dataset_id, answer)
                     assert str(dataset_id) in answer['error']['message'], answer
+        # The guest, whom the API shows their datasets, is refused every tool.
+        assert (await w.call(GUEST, 'GET', '/api/datasets')).status_code == 200
+        for name, arguments in [('list_datasets', {}), *[('describe_dataset', {'dataset': d}) for d in made]]:
+            failure = await error(GUEST, name, arguments)
+            assert failure == {'code': 'not_allowed', 'message': NOT_LET_IN, 'retryable': False}, (name, arguments)
 
     world(scenario)
 

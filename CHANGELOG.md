@@ -40,9 +40,11 @@ each field. Six migrations, none of which touches a sample.
     2025-06-18, streamable HTTP) and keeps nothing between requests, so any backend process answers any request.
   - **Who may use it.** It is off on every server until an administrator switches the MCP server on in the new
     **Settings → Assistant**, which also says who may use it: by role (as shipped, administrators only), by group,
-    and by a person's own answer, which decides first; a demo account never may (`GET`/`PATCH
-    /api/admin/assistant`, `PUT`/`DELETE /api/admin/assistant/groups/{id}` and `.../users/{id}`). `GET /api/auth/me`
-    says whether its user could use it now. Each request checks that afresh (403, saying why).
+    and by a person's own answer, which decides first; a guest or a demo account never may (`GET`/`PATCH
+    /api/admin/assistant`, `PUT`/`DELETE /api/admin/assistant/groups/{id}` and `.../users/{id}`). A guest is refused
+    by the server, not only for having no tokens; the setting for guests is kept for the chat in the app. `GET
+    /api/auth/me` says whether its user could use it now (`?fresh=1` reads the switch from the database, as the API
+    Tokens page does when it opens). Each request checks that afresh (403, saying why).
   - **What it may not read.** A dataset's manager can close it to the assistant in Dataset Settings → Access
     (`assistant_closed` on `PATCH /api/datasets/{id}`, carried by every answer that describes a dataset): its tools
     then refuse it however they come to it and leave it out of lists, and nothing changes outside the assistant.
@@ -52,10 +54,10 @@ each field. Six migrations, none of which touches a sample.
     made for a tool, with words that say what works instead). **The assistant may read samples' fields** (off as
     shipped) decides whether it reads samples' own fields.
   - **Connecting.** An AI client opens `/mcp` with an **MCP token**, a new kind on Settings → API Tokens
-    (`"scope": "mcp"`), offered to a person who may use the assistant; after making one the page shows the address,
-    the header and Claude Code's `claude mcp add` command. An MCP token opens `/mcp` and nothing else: every other
-    route refuses it as a token that doesn't exist, and `/mcp` takes no other token and no browser session. A request
-    from another origin is refused.
+    (`"scope": "mcp"`), offered to a person who may use the assistant (Settings → Assistant links there once the MCP
+    server is on); after making one the page shows the address, the header and Claude Code's `claude mcp add`
+    command. An MCP token opens `/mcp` and nothing else: every other route refuses it as a token that doesn't exist,
+    and `/mcp` takes no other token and no browser session. A request from another origin is refused.
   - **The tools.** `list_datasets` and `describe_dataset` (a dataset's samples and object rows, and its fields with
     their meaning, type, counts, ranges and examples of their values, from the statistics the server keeps,
     `complete: false` where they aren't up to date). `make_view` and `refine_view` keep each step of a conversation as

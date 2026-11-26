@@ -11,6 +11,14 @@ import { type TestUser, allSteps, createGroup, createSmallDataset, createUser, d
 // The assistant's settings and its call log are the server's own, so this spec runs in the one-at-a-time project after
 // every other spec (playwright.config.ts: *.fits.spec.ts), and puts the settings back as it found them.
 //
+// A guest can't use the MCP server, whatever the settings say, and the tokens page opened as /settings/tokens?kind=mcp
+// starts its create form on the MCP kind for someone it is offered to, asking the server as the page opens
+// (GET /api/auth/me?fresh=1, which reads the MCP switch from the database whichever server process answers) (the
+// contract "guests and the MCP server; a way from the Assistant page to a token", sections 1 and 3). The parameter
+// chooses the kind; the form still opens with Create New Token. Read here: "exactly as without the parameter" is checked
+// as the same page on arrival and with the form opened (whether it opened by itself, the kinds offered, the one chosen,
+// the MCP kind's help); and "any other value of kind" is taken literally, "MCP" in capitals and an empty value included.
+//
 // Requests to /mcp follow the 2026-07-28 revision's Streamable HTTP binding
 // (modelcontextprotocol.io/specification/2026-07-28/basic/transports/streamable-http): a POST with
 // Accept: application/json, text/event-stream, MCP-Protocol-Version and Mcp-Method headers (Mcp-Name for tools/call),
@@ -201,26 +209,197 @@ test('the MCP kind is offered only to someone who could use the MCP server now: 
     }
 });
 
-test('guests make no tokens of any kind, and a demo guest may never use the MCP server', async ({ browser }) => {
+test('guests make no tokens of any kind and may never use the MCP server, whatever the settings say (roles.guest, a ticked group, their own answer); nor may a demo guest', async ({ browser }) => {
     test.setTimeout(120_000);
     const gil = await person('gil', 'guest');
     const gilSession = await sessionOf(gil);
     const demo = await fetch(`${API}/auth/demo-login`, { method: 'POST' });
     const demoSession = `session_id=${(demo.headers.get('set-cookie') || '').match(/session_id=([^;]+)/)?.[1]}`;
+    const group = await createGroup(cookie, `${PREFIX}guests`, [gil]);
+    groupIds.push(group.id);
     try {
         await patchSettings({ mcp_enabled: true, roles: { guest: true } });
-        await expect.poll(() => mcpFor(gilSession), { message: 'a guest, guests ticked', timeout: 15_000 }).toBe(true);
-        await expect.poll(() => mcpFor(demoSession), { message: 'a demo guest, guests ticked', timeout: 15_000 }).toBe(false);
+        // The server on, as auth/me reads it (it reads the switch every few seconds): an administrator may.
+        await expect.poll(() => mcpFor(cookie), { message: 'an administrator', timeout: 15_000 }).toBe(true);
+        expect(await mcpFor(gilSession), 'a guest, roles.guest ticked').toBe(false);
+        await apiFetch(cookie, `/admin/assistant/groups/${group.id}`, { method: 'PUT' });
+        expect(await mcpFor(gilSession), 'a guest, also in a ticked group').toBe(false);
+        await answerFor(gil, true);
+        expect(await mcpFor(gilSession), 'a guest, also their own "May use it"').toBe(false);
+        expect(await mcpFor(demoSession), 'a demo guest').toBe(false);
         const { context, page } = await signIn(browser, gil);
         try {
-            await page.goto('/settings/tokens');
-            await expect(page.getByText(/^Guest users cannot create API tokens\./)).toBeVisible();
-            await expect(page.getByRole('combobox', { name: 'Used by', exact: true })).toHaveCount(0);
-            await expect(page.getByRole('button', { name: 'Create New Token', exact: true })).toHaveCount(0);
+            for (const path of ['/settings/tokens', '/settings/tokens?kind=mcp']) {
+                await page.goto(path);
+                await expect(page.getByText(/^Guest users cannot create API tokens\./), path).toBeVisible();
+                await expect(page.getByRole('combobox', { name: 'Used by', exact: true }), path).toHaveCount(0);
+                await expect(page.getByRole('button', { name: 'Create New Token', exact: true }), path).toHaveCount(0);
+            }
+            for (const scope of [undefined, 'full', 'worker', 'mcp']) {
+                const refused = await page.request.post('/api/tokens', { data: { name: `${PREFIX}guest-${scope}`, ...(scope ? { scope } : {}) } });
+                expect(refused.status(), `the API refuses a guest a token: ${scope ?? 'no kind named'}`).toBe(403);
+            }
         } finally {
             await context.close();
         }
     } finally {
+        await answerFor(gil, null);
+        await patchSettings({ mcp_enabled: false, roles: found.roles });
+    }
+});
+
+/** The tokens page at `path`, once it knows who is signed in and has listed their tokens: whether the create form is
+ * open on arrival, then, the form opened, the kinds it offers, the one chosen and whether the MCP kind's help shows. */
+async function tokenPageAt(page: Page, path: string) {
+    const signedIn = page.waitForResponse(response => new URL(response.url()).pathname === '/api/auth/me');
+    await page.goto(path);
+    await signedIn;
+    await expect(page.getByRole('heading', { name: 'API Tokens', level: 1 })).toBeVisible();
+    await expect(page.getByText('Loading tokens...', { exact: true })).toHaveCount(0);
+    // A negative wait: long enough for a form that would open by itself to have opened.
+    await page.waitForTimeout(1_000);
+    const kind = page.getByRole('combobox', { name: 'Used by', exact: true });
+    const create = page.getByRole('button', { name: 'Create New Token', exact: true });
+    const state = {
+        guestLine: await page.getByText(/^Guest users cannot create API tokens\./).isVisible(),
+        openOnArrival: await kind.isVisible(),
+        createButton: await create.isVisible(),
+        kinds: [] as string[],
+        chosen: null as string | null,
+        help: false,
+    };
+    if (state.createButton) await create.click();
+    if (await kind.count()) {
+        state.kinds = await kind.getByRole('option').evaluateAll(options => options.map(option => (option as HTMLOptionElement).value));
+        state.chosen = await kind.inputValue();
+        state.help = await page.getByText(HELP, { exact: true }).isVisible();
+    }
+    return state;
+}
+
+test('opened as /settings/tokens?kind=mcp by someone the MCP kind is offered to, the form opens with Create New Token as before and starts on "An AI client (MCP)"; another kind can still be chosen and made', async ({ page, browser }) => {
+    test.setTimeout(180_000);
+    const pia = await person('pia');
+    const piaSession = await sessionOf(pia);
+    let context: BrowserContext | undefined;
+    const startsOnMcp = { guestLine: false, openOnArrival: false, createButton: true, kinds: OFFERED, chosen: 'mcp', help: true };
+    try {
+        await patchSettings({ mcp_enabled: true });
+        await answerFor(pia, true);
+        await expect.poll(() => mcpFor(cookie), { message: 'an administrator', timeout: 15_000 }).toBe(true);
+        await expect.poll(() => mcpFor(piaSession), { message: 'a power user, their own "May use it"', timeout: 15_000 }).toBe(true);
+
+        // An administrator: the form closed on arrival; opened, the MCP kind chosen.
+        expect(await tokenPageAt(page, '/settings/tokens?kind=mcp'), 'an administrator').toEqual(startsOnMcp);
+        const kind = page.getByRole('combobox', { name: 'Used by', exact: true });
+        await expect(kind.locator('option:checked')).toHaveText(KIND_TEXT.mcp);
+        await expect(kind).toHaveAccessibleDescription(HELP);
+        await expect(kind.getByRole('option')).toHaveText([KIND_TEXT.full, KIND_TEXT.worker, KIND_TEXT.mcp]);
+        // Another kind can be chosen, and is the one made.
+        await kind.selectOption('worker');
+        await expect(kind).toHaveValue('worker');
+        await kind.selectOption('full');
+        await expect(kind).toHaveValue('full');
+        await expect(page.getByText(HELP, { exact: true })).toHaveCount(0);
+        const name = `${PREFIX}from-the-link`;
+        await page.getByPlaceholder('e.g., \'my-laptop\', \'ci-server\', \'data-pipeline\'').fill(name);
+        const made = page.waitForResponse(response => response.request().method() === 'POST' && new URL(response.url()).pathname === '/api/tokens');
+        await page.getByRole('button', { name: 'Create Token', exact: true }).click();
+        const answer = await made;
+        tokenIds.push((await answer.json()).id);
+        expect(answer.request().postDataJSON()).toMatchObject({ name, scope: 'full' });
+        await expect(page.getByText('Usage: Authorization: Bearer {token}')).toBeVisible();
+
+        // A power user it is offered to, the same.
+        ({ context } = await signIn(browser, pia));
+        const theirs = await context.newPage();
+        expect(await tokenPageAt(theirs, '/settings/tokens?kind=mcp'), 'a power user it is offered to').toEqual(startsOnMcp);
+        const their = theirs.getByRole('combobox', { name: 'Used by', exact: true });
+        await their.selectOption('full');
+        await expect(their).toHaveValue('full');
+    } finally {
+        await context?.close();
+        await answerFor(pia, null);
+        await patchSettings({ mcp_enabled: false });
+    }
+});
+
+test('the whole path: an administrator switches the MCP server on, follows "create an MCP token" at once, clicks Create New Token and finds "An AI client (MCP)" offered and chosen, with no reload and no wait for a periodic refresh', async ({ page }) => {
+    test.setTimeout(120_000);
+    await patchSettings({ mcp_enabled: false });
+    try {
+        await expect.poll(() => mcpFor(cookie), { message: 'the server off', timeout: 15_000 }).toBe(false);
+        await page.goto('/settings/assistant');
+        const mcpSwitch = page.getByRole('switch', { name: 'MCP server', exact: true });
+        await expect(mcpSwitch).toHaveAttribute('aria-checked', 'false');
+        // A mark on this document: a reload or a full page load would wipe it.
+        await page.evaluate(() => { (window as unknown as { e2eNoReload?: boolean }).e2eNoReload = true; });
+        await mcpSwitch.click();
+        await expect(mcpSwitch).toHaveAttribute('aria-checked', 'true');
+        const link = page.getByRole('region', { name: 'MCP server', exact: true }).getByRole('link', { name: 'create an MCP token', exact: true });
+        await expect(link).toBeVisible();
+        // The page's own read as it opens: GET /api/auth/me?fresh=1, which reads the switch from the database whichever
+        // server process answers (one process here can't show the several-process case, so the request is watched).
+        const asked: string[] = [];
+        page.on('request', request => {
+            const url = new URL(request.url());
+            if (request.method() === 'GET' && url.pathname === '/api/auth/me') asked.push(url.search);
+        });
+        await link.click();
+        await expect(page).toHaveURL(/\/settings\/tokens\?kind=mcp$/);
+        await expect(page.getByRole('heading', { name: 'API Tokens', level: 1 })).toBeVisible();
+        await page.getByRole('button', { name: 'Create New Token', exact: true }).click();
+        // Well inside the app's own refresh of who is signed in (once a minute).
+        const kind = page.getByRole('combobox', { name: 'Used by', exact: true });
+        await expect(kind.getByRole('option'), 'the MCP kind offered').toHaveText([KIND_TEXT.full, KIND_TEXT.worker, KIND_TEXT.mcp], { timeout: 10_000 });
+        await expect(kind, 'and chosen').toHaveValue('mcp', { timeout: 10_000 });
+        await expect(kind.locator('option:checked')).toHaveText(KIND_TEXT.mcp);
+        expect(await page.evaluate(() => (window as unknown as { e2eNoReload?: boolean }).e2eNoReload), 'no reload on the way').toBe(true);
+        expect(asked.some(search => new URLSearchParams(search).get('fresh') === '1'), `the page asked /api/auth/me?fresh=1 (asked: ${JSON.stringify(asked)})`).toBe(true);
+    } finally {
+        await patchSettings({ mcp_enabled: false });
+    }
+});
+
+test('for anyone the MCP kind is not offered to, and for any other value of kind, the tokens page is exactly as without ?kind', async ({ page, browser }) => {
+    test.setTimeout(300_000);
+    const pete = await person('nokind');
+    const gus = await person('nokind_guest', 'guest');
+    const contexts: BrowserContext[] = [];
+    try {
+        await patchSettings({ mcp_enabled: true, roles: { guest: true } });
+        await answerFor(gus, true);
+        await expect.poll(() => mcpFor(cookie), { message: 'an administrator', timeout: 15_000 }).toBe(true);
+
+        // Any other value of kind, for an administrator the MCP kind is offered to.
+        const plain = await tokenPageAt(page, '/settings/tokens');
+        expect(plain).toEqual({ guestLine: false, openOnArrival: false, createButton: true, kinds: OFFERED, chosen: 'full', help: false });
+        for (const other of ['other', 'worker', 'full', 'MCP', '']) {
+            expect(await tokenPageAt(page, `/settings/tokens?kind=${encodeURIComponent(other)}`), `?kind=${other}`).toEqual(plain);
+        }
+
+        // A power user nothing lets in, and a guest (let in by roles.guest and their own answer, which count for
+        // nothing at the MCP door).
+        for (const [user, expected] of [
+            [pete, { guestLine: false, openOnArrival: false, createButton: true, kinds: NOT_OFFERED, chosen: 'full', help: false }],
+            [gus, { guestLine: true, openOnArrival: false, createButton: false, kinds: [], chosen: null, help: false }],
+        ] as const) {
+            const { context, page: theirs } = await signIn(browser, user);
+            contexts.push(context);
+            const without = await tokenPageAt(theirs, '/settings/tokens');
+            expect(without, user.username).toEqual(expected);
+            expect(await tokenPageAt(theirs, '/settings/tokens?kind=mcp'), `${user.username}: ?kind=mcp`).toEqual(without);
+        }
+
+        // Anyone, with the server off: an administrator.
+        await patchSettings({ mcp_enabled: false });
+        await expect.poll(() => mcpFor(cookie), { message: 'the server off', timeout: 15_000 }).toBe(false);
+        const off = await tokenPageAt(page, '/settings/tokens');
+        expect(off).toEqual({ ...plain, kinds: NOT_OFFERED });
+        expect(await tokenPageAt(page, '/settings/tokens?kind=mcp'), 'the server off: ?kind=mcp').toEqual(off);
+    } finally {
+        for (const context of contexts) await context.close();
+        await answerFor(gus, null);
         await patchSettings({ mcp_enabled: false, roles: found.roles });
     }
 });

@@ -97,8 +97,10 @@ from backend.tests.test_access_rule_spec import ADMIN, GUEST, LEVELS, OTHER_ADMI
 from backend.tests.test_assistant_core_spec import (
     CLOSED,
     HOSTILE,
+    NOT_LET_IN,
     READ_POSTS,
     SETTINGS,
+    VIEWER,
     add,
     assistant,
     open_door,
@@ -1672,9 +1674,17 @@ def test_the_five_tools_answer_each_user_what_the_api_answers_them(world):
             ('field_summary', {'dataset': V, 'field': 'brightness'}),
             ('get_samples', {'dataset': V}),
         ]
-        cases = [(ADMIN, None), (GUEST, 'view'), (OTHER_POWER, None), *[(POWER, level) for level in LEVELS]]
+        # A let-in power user with the guest's view and nothing else is checked in the guest's place; the guest, whom
+        # the MCP door never lets in, is refused (below).
+        await w.user(VIEWER, 'power_user')
+        cases = [
+            (ADMIN, None),
+            (VIEWER, 'view'),
+            (OTHER_POWER, None),
+            *[(POWER, level) for level in LEVELS],
+        ]
         for user_id, level in cases:
-            if user_id in (POWER, GUEST):
+            if user_id in (POWER, VIEWER):
                 await set_share(w, V, user_id, level)
             response = await w.call(
                 user_id,
@@ -1695,6 +1705,12 @@ def test_the_five_tools_answer_each_user_what_the_api_answers_them(world):
             assert states['values'] == [{'value': 'Kansas', 'count': len(items)}], (user_id, states)
             everything_ = await result(user_id, 'get_samples', {'dataset': V})
             assert everything_['total'] == await api_total(w, user_id, V, None), user_id
+        # The API answers the guest, who can view the dataset; the MCP door never lets a guest in, whatever the
+        # settings tick.
+        assert await api_total(w, GUEST, V, None) == N
+        for name, arguments in calls:
+            refused = await error(GUEST, name, arguments)
+            assert refused == {'code': 'not_allowed', 'message': NOT_LET_IN, 'retryable': False}, name
         # Closed to the assistant: every tool refuses, for every user; the API still answers them.
         assert (await w.call(ADMIN, 'PATCH', f'/api/datasets/{V}', json={'assistant_closed': True})).status_code == 200
         for user_id in (ADMIN, POWER):

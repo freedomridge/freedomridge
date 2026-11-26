@@ -1,6 +1,6 @@
 'use client';
 
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { Copy, Trash2, Plus, Check } from 'lucide-react';
 import Link from 'next/link';
@@ -24,6 +24,12 @@ interface Token {
 
 type TokenScope = 'full' | 'worker' | 'mcp';
 
+/** The kind the create form starts with: the MCP kind when the address asks for it (?kind=mcp, the link on Settings →
+ * Assistant), else the first. Where the MCP kind isn't offered, the form shows the first kind all the same. */
+function startingScope(): TokenScope {
+    return new URLSearchParams(window.location.search).get('kind') === 'mcp' ? 'mcp' : 'full';
+}
+
 export default function TokensPage() {
     const [showCreateForm, setShowCreateForm] = useState(false);
     const [newTokenName, setNewTokenName] = useState('');
@@ -32,11 +38,16 @@ export default function TokensPage() {
     const [createdToken, setCreatedToken] = useState<Token | null>(null);
     const [copiedToken, setCopiedToken] = useState(false);
     const [copiedCommand, setCopiedCommand] = useState(false);
-    // The MCP kind is offered only to a user who could use the MCP server right now (GET /api/auth/me).
-    const { user } = useUser();
+    // The MCP kind is offered only to a user who could use the MCP server right now (GET /api/auth/me), read again as
+    // the page opens: an administrator may just have switched the server on, on Settings → Assistant, which links here.
+    // That read is ?fresh=1, so whichever server process answers reads the switch from the database.
+    const { user, checkAuth } = useUser();
     const mcpOffered = user?.assistant?.mcp === true;
     const chosenScope: TokenScope = scope === 'mcp' && !mcpOffered ? 'full' : scope;
     const origin = typeof window === 'undefined' ? '' : window.location.origin;
+    useEffect(() => { void checkAuth({ fresh: true }); }, [checkAuth]);
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- the address is read once mounted, not while rendering on the server
+    useEffect(() => setScope(startingScope()), []);
 
     const queryClient = useQueryClient();
 
@@ -66,7 +77,7 @@ export default function TokensPage() {
             setCreatedToken(data);
             setShowCreateForm(false);
             setNewTokenName('');
-            setScope('full');
+            setScope(startingScope());
             queryClient.invalidateQueries({ queryKey: ['api-tokens'] });
         }
     });

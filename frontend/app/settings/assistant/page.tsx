@@ -23,11 +23,13 @@ interface Person {
     role: 'admin' | 'power_user' | 'guest';
 }
 
-const ROLE_LABELS: Record<keyof AssistantSettings['roles'], string> = {
+// The roles ticked here. Guests aren't among them: a guest never may use the MCP server (the server keeps their
+// setting for the chat in the app).
+const ROLE_LABELS: Record<Exclude<keyof AssistantSettings['roles'], 'guest'>, string> = {
     admin: 'Administrators',
     power_user: 'Power users',
-    guest: 'Guests',
 };
+const GUEST_REFUSED = "Guests can't use the MCP server";
 type Answer = 'default' | 'allowed' | 'refused';
 const ANSWER_LABELS: Record<Answer, string> = {
     default: 'Role and groups decide',
@@ -35,9 +37,10 @@ const ANSWER_LABELS: Record<Answer, string> = {
     refused: 'May not use it',
 };
 
-/** Whether `person` may use the assistant by the settings (the server's rule, backend/assistant/rule.py), the door
- * aside: their own answer, else a listed group they are in, else their role. */
+/** Whether `person` may use the MCP server by the settings (the server's rule, backend/assistant/rule.py), the switch
+ * aside: never a guest; otherwise their own answer, else a listed group they are in, else their role. */
 function mayUse(person: Person, settings: AssistantSettings, groups: Group[]): boolean {
+    if (person.role === 'guest') return false;
     const own = settings.users.find(user => user.id === person.id);
     if (own) return own.allowed;
     const listed = new Set(settings.groups.map(group => group.id));
@@ -108,6 +111,12 @@ function AssistantSettingsPanel() {
                         ? 'An assistant such as Claude can connect to this server, as one of the people below, and read the datasets that person can open.'
                         : 'No assistant can connect to this server. Switch it on to let the people below use one.'}
                 </p>
+                {current.mcp_enabled && (
+                    <p className="text-sm text-zinc-400">
+                        To connect an AI client, <Link href="/settings/tokens?kind=mcp" className="text-cyan-400 hover:underline">create an MCP token</Link>.
+                        Each person who may use it makes their own, under Settings → API Tokens.
+                    </p>
+                )}
             </section>
 
             <section aria-labelledby="assistant-who-heading" className="space-y-4">
@@ -115,13 +124,13 @@ function AssistantSettingsPanel() {
                     <h2 id="assistant-who-heading" className="text-xl font-semibold text-white">Who may use it</h2>
                     <p className="text-sm text-zinc-400">
                         A person&apos;s own answer decides first; otherwise being in one of the groups ticked here lets them in;
-                        otherwise their role decides. A demo account never may. The assistant reads as the person using it: it
+                        otherwise their role decides. A guest or a demo account never may. The assistant reads as the person using it: it
                         sees only the datasets they can open, and changes nothing.
                     </p>
                 </div>
                 <fieldset className="space-y-2" disabled={busy}>
                     <legend className="text-sm font-medium text-zinc-300 mb-1">Roles</legend>
-                    {(Object.keys(ROLE_LABELS) as (keyof AssistantSettings['roles'])[]).map(role => (
+                    {(Object.keys(ROLE_LABELS) as (keyof typeof ROLE_LABELS)[]).map(role => (
                         <label key={role} className="flex items-center gap-2 text-sm text-zinc-200">
                             <input type="checkbox" checked={current.roles[role]}
                                 onChange={event => act(() => change.mutate({ roles: { [role]: event.target.checked } }))}
@@ -165,12 +174,14 @@ function AssistantSettingsPanel() {
                             {shown.map(person => {
                                 const own = current.users.find(each => each.id === person.id);
                                 const answer: Answer = own ? (own.allowed ? 'allowed' : 'refused') : 'default';
+                                const guest = person.role === 'guest';
                                 return (
                                     <tr key={person.id}>
                                         <td className="py-2 pr-4 text-white">{person.username}</td>
                                         <td className="py-2 pr-4 text-zinc-400">{person.role.replace('_', ' ')}</td>
                                         <td className="py-2 pr-4">
-                                            <select aria-label={`Assistant for ${person.username}`} value={answer} disabled={busy}
+                                            <select aria-label={`Assistant for ${person.username}`} value={answer} disabled={busy || guest}
+                                                title={guest ? GUEST_REFUSED : undefined}
                                                 onChange={event => {
                                                     const next = event.target.value as Answer;
                                                     act(() => user.mutate({ id: person.id, allowed: next === 'default' ? null : next === 'allowed' }));
