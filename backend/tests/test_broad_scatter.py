@@ -149,7 +149,7 @@ def test_rank_concurrent_transactions_and_rollback(registry_database):
         {'logic': 'NOT', 'filters': [{'field': 'tags', 'operator': 'in', 'value': ['bad']}]},
         {'logic': 'NOT', 'filters': [{'field': 'tags', 'operator': 'contains', 'value': 'bad'}]},
         conjunction(GRAIN, CONCEPT, DUPS, TAG),
-        conjunction(GRAIN, {**CONCEPT, 'value': {'concept_id': 2, 'op': '<=', 'threshold': 1}}),
+        conjunction(GRAIN, {**CONCEPT, 'value': {'concept_id': 1, 'op': '<=', 'threshold': 1}}),
     ],
 )
 @pytest.mark.parametrize('pct', [0, 30, 100])

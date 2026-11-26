@@ -33,7 +33,7 @@
 #
 # The steps follow ci.yml. When ci.yml changes, update them to match and set CI_YML_SHA256 to its
 # `sha256sum`; a run stops while the two disagree.
-CI_YML_SHA256=ede3c8937d0cdd16ffd50a24111d43a06c562f4f819d9586c5fc4a8f061bd6a4
+CI_YML_SHA256=f957cdbb07b1512561cf0f4e6e40c5ac7e9cac2cd760ac672d0886a37c38a3bb
 set -u
 
 JOBS=${2:-lint,example-tests,backend-tests,db-recovery,frontend,quality,e2e}
@@ -349,8 +349,9 @@ if want e2e; then
   FRONTEND=$!
   timeout 60 bash -c "until curl -sf -o /dev/null http://localhost:$FEPORT/login; do sleep 1; done"
   result "e2e frontend start" $?
-  # Playwright finds the server on E2E_BASE_URL and reuses it instead of starting `next dev`.
-  export E2E_BASE_URL=http://localhost:$FEPORT E2E_API_URL=http://localhost:$APIPORT/api
+  # Playwright finds the server on E2E_BASE_URL and reuses it instead of starting `next dev`. This run's database is
+  # thrown away, so the region specs may load their boundary fixture into it (ci.yml sets the same).
+  export E2E_BASE_URL=http://localhost:$FEPORT E2E_API_URL=http://localhost:$APIPORT/api FRIDGE_E2E_LOAD_REGIONS=1
   # Two commands, the ordinary specs then the fits (playwright.config.ts), so the fits run even when an ordinary spec
   # failed: in one command Playwright skips a project whose dependency failed. With E2E_SPECS, only the specs named
   # (a fits spec named as a plain file would first run the whole default project, its dependency).
@@ -377,7 +378,7 @@ if want e2e; then
   if [ -n "$run_fits" ]; then
     npx playwright test --project=fits --no-deps --output=test-results/fits $fits >> "$L/e2e.log" 2>&1 || status=1
   fi
-  unset E2E_BASE_URL E2E_API_URL
+  unset E2E_BASE_URL E2E_API_URL FRIDGE_E2E_LOAD_REGIONS
   # A failed test's trace (its network requests too) and page snapshot, kept with the logs, so they outlive
   # the clone; ci.yml uploads the same folder.
   if [ "$status" != 0 ] && [ -d test-results ]; then cp -r test-results "$L/e2e-test-results"; fi

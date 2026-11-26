@@ -178,7 +178,14 @@ def test_the_schema_lists_last_modified_at_with_bounds_when_every_field_is_compu
         assert (field['min'], field['max']) == ('2025-12-31T23:59:59+00:00', '2026-01-02T00:00:00.000001+00:00')
         lightning = await datasets._get_dataset_field_stats_impl(1, None, lightning_mode=True)
         (field,) = [field for field in lightning if field.get('name') == 'last_modified_at']
-        assert field == {'name': 'last_modified_at', 'type': 'datetime', 'provenance': 'cached'}
+        description = {'description', 'unit', 'values_private', 'description_source'}  # every field's (descriptions)
+        assert {key: value for key, value in field.items() if key not in description} == {
+            'name': 'last_modified_at',
+            'type': 'datetime',
+            'provenance': 'cached',
+        }
+        assert description <= set(field) and field['description_source'] == 'default' and field['description']
+        assert (field['unit'], field['values_private']) == (None, False)
         schema = await datasets.get_dataset_schema(1, None, lightning_mode=False)
         assert {'name': 'last_modified_at', 'type': 'datetime'}.items() <= next(
             entry for entry in schema if entry['name'] == 'last_modified_at'

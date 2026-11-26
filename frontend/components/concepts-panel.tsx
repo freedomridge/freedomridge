@@ -24,6 +24,7 @@ import {
 } from '@/lib/api';
 import { getSampleMediaUrl } from '@/lib/media-utils';
 import { useFilters } from '@/contexts/FilterContext';
+import { conceptStage } from '@/lib/filter-query';
 import { refusal, type AccessLevel } from '@/lib/access-level';
 
 interface Props {
@@ -272,6 +273,9 @@ function ConceptCard({
     const stageIdx = viewStages.findIndex((s) => s.metadata?.concept && s.metadata?.conceptId === concept.id);
     const applied = stageIdx >= 0;
     const mode: Mode = applied ? ((viewStages[stageIdx].metadata?.mode as Mode) ?? 'exclude') : 'off';
+    // The applied chip's comparison: the panel makes `>`, and a chip opened from text may have another, which the
+    // panel's counts and changes keep.
+    const op: string = (applied ? viewStages[stageIdx].filter?.value?.op : undefined) ?? '>';
     const cutMode = mode === 'off' || mode === 'exclude' || mode === 'select'; // slider/band relevant
 
     // Slider ranges to the concept's actual [min,max] band (calibrated scores cluster narrow).
@@ -354,8 +358,8 @@ function ConceptCard({
     };
 
     const { data: preview } = useQuery({
-        queryKey: ['concept-preview', datasetId, concept.id, debounced],
-        queryFn: () => conceptPreview(datasetId, concept.id, '>', debounced),
+        queryKey: ['concept-preview', datasetId, concept.id, op, debounced],
+        queryFn: () => conceptPreview(datasetId, concept.id, op, debounced),
         enabled: !!datasetId && cutMode && !collapsed && !scoring,
         staleTime: 10_000,
         refetchOnWindowFocus: false,
@@ -363,9 +367,9 @@ function ConceptCard({
 
     // Borderline band straddling the cut (closest scores both sides) — shifts as you drag.
     const { data: boundary } = useQuery({
-        queryKey: ['concept-boundary', datasetId, concept.id, debounced],
+        queryKey: ['concept-boundary', datasetId, concept.id, op, debounced],
         queryFn: async () => {
-            const band = await conceptBoundary(datasetId, concept.id, '>', debounced, 8);
+            const band = await conceptBoundary(datasetId, concept.id, op, debounced, 8);
             if (!band.length) return [] as Array<BoundarySample & { sample: Sample }>;
             const ids = band.map((b) => b.sample_id);
             const items = (
@@ -419,16 +423,11 @@ function ConceptCard({
                 metadata: { concept: true, conceptId: concept.id, conceptName: concept.name, mode: 'sources' },
             };
         } else {
-            stage = {
-                type: 'filter',
-                description: m === 'select' ? `Only: ${concept.name}` : `Exclude: ${concept.name}`,
-                filter: {
-                    field: '_concept',
-                    operator: m === 'select' ? 'concept_select' : 'concept_exclude',
-                    value: { concept_id: concept.id, op: '>', threshold },
-                },
-                metadata: { concept: true, conceptId: concept.id, conceptName: concept.name, op: '>', threshold, mode: m },
-            };
+            stage = conceptStage(concept.name, {
+                field: '_concept',
+                operator: m === 'select' ? 'concept_select' : 'concept_exclude',
+                value: { concept_id: concept.id, op, threshold },
+            });
         }
         if (applied) updateStage(stageIdx, stage);
         else addStage(stage);
@@ -446,7 +445,7 @@ function ConceptCard({
             filter: {
                 field: '_concept',
                 operator: m === 'select' ? 'concept_select' : 'concept_exclude',
-                value: { concept_id: concept.id, op: '>', threshold },
+                value: { concept_id: concept.id, op, threshold },
             },
             metadata: { ...st.metadata, threshold },
         });
@@ -476,7 +475,7 @@ function ConceptCard({
                     filter: {
                         field: '_concept',
                         operator: mode === 'select' ? 'concept_select' : 'concept_exclude',
-                        value: { concept_id: concept.id, op: '>', threshold: updated.threshold },
+                        value: { concept_id: concept.id, op, threshold: updated.threshold },
                     },
                     metadata: { ...st.metadata, threshold: updated.threshold },
                 });

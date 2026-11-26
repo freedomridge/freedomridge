@@ -7,12 +7,13 @@ A filter written as text. The same text works in four places:
 - **The HTTP API:** `POST /api/datasets/{id}/filter_query/parse` and `.../format` convert between text and filters, for scripts and for AI tools.
 - **Links:** `/datasets/<id>?q=<text>` opens the dataset on the filter, one chip per top-level `AND` part, and **Copy link** writes one when every chip has a text form ([links](DATASET_MANAGEMENT.md#links-to-a-filter-a-view-or-a-sample)).
 
-The server parses every query against the dataset's own fields (`backend/filter_query.py`). A misspelt field, an operator that doesn't apply, or a value of the wrong type is reported with its line, column and suggestions. It is never quietly turned into a filter that matches nothing.
+The server parses every query against the dataset's own fields and concepts (`backend/filter_query.py`). A misspelt field or concept, an operator that doesn't apply, or a value of the wrong type is reported with its line, column and suggestions. It is never quietly turned into a filter that matches nothing.
 
 ```
 serial_number in (103000752 103001025 103004080)
 AND split = "train"
 AND NOT (score < 0.2 OR note exists)
+AND not concept "equipment" > 0.62
 ```
 
 ## In the filter cards
@@ -41,6 +42,8 @@ A query is an AND of parts. In the SDK and the API, each top-level `AND` part be
 - On a mirror, its own fields are named `@local.<name>` and written as they are: `@local.weeds > 3`,
   `@local.tags in ("checked")` ([FOLLOWERS.md](FOLLOWERS.md#fields-of-its-own)).
 - A name that isn't a plain word, or that is one of the language's keywords, goes in backticks: `` `weather station` = "A" `` or `` `in` = 1 ``.
+- A field named `concept` needs no backticks: followed by an operator, `concept` is the field (`concept = "a"`,
+  `concept exists`, `concept in (a b)`), and only followed by a name is it a [concept part](#concept-scores).
 - Names are case sensitive. `Split` gets "unknown field 'Split'" with the suggestion `split`.
 
 ## Operators
@@ -55,12 +58,78 @@ A query is an AND of parts. In the SDK and the API, each top-level `AND` part be
 | `exists`, `not exists` | the field is present, or absent | all |
 | `is null`, `is not null` | no value (absent or null), or a value | all |
 
-Logic: `AND`, `OR` and `NOT`, with brackets. Keywords aren't case sensitive.
+Logic: `AND`, `OR` and `NOT`, with brackets. Keywords aren't case sensitive. `concept` is a keyword only where it
+starts a [concept part](#concept-scores): followed by a name (quoted, or a plain word) it is a concept's score,
+followed by an operator it is a field named concept. `within` counts as an operator there, so `concept within "US-KS"`
+is the [region form](#regions)'s mistake (`within` applies only to `location`).
+
+## Concept scores
+
+A [concept](SDK.md#concepts-learned-scores) scores every sample from 0 to 1. A concept part keeps or hides the
+samples by that score, as the Concepts panel's **show only** and **exclude** do:
+
+- `concept "equipment" > 0.62` keeps the samples whose score for the dataset's concept named `equipment` passes the
+  comparison: `>`, `>=`, `<` or `<=`.
+- `not concept "equipment" > 0.62` hides them and keeps the rest, the samples the concept has no score for included,
+  as the panel's exclude does. `NOT (concept "equipment" > 0.62)` is the same filter. A `NOT` around more than the
+  one concept part, such as `NOT (concept "equipment" > 0.62 AND split = "train")`, is a `NOT` of its parts.
+- `concept "equipment"`, with no comparison, takes the concept's saved threshold with `>`, as it is when the text is
+  read. The text the app and `format` write always has the comparison, so a link keeps its meaning when the saved
+  threshold changes.
+- The name is quoted, or written bare when it is a plain word: `concept equipment > 0.62`. A name that is one of the
+  language's keywords, or `within`, is quoted: `concept "in" > 0.5`, `concept "within" > 0.5`. Names are case
+  sensitive.
+- A concept part combines like any other: `split = "train" AND not concept "equipment" > 0.62`, inside brackets and
+  with `OR`.
+
+A concept is named by its name, so text that names one stops working when the concept is deleted or renamed: the
+error names the unknown concept and suggests the dataset's close names. On a mirror, a `?q=` link names a concept,
+so it resolves against that server's own concepts, since concepts and their ids belong to each instance.
+
+An `f=` link, a saved view or the default view holds a concept by its id. A stage naming a concept the dataset no
+longer has opens without that filter, and the app says so, naming the stage by its label: `From this link, “Exclude:
+scrap” was left out: it filters by a concept this dataset no longer has.` A concept test inside a larger stage takes
+that whole stage with it, as what is left would filter differently. A view that lost a stage this way differs from
+what is applied, so **Update this view** is offered. The default view's notice is shown once in each browser, and
+again when the view's filters change. Stages are checked against the dataset's concepts before they are applied: on a
+slow server they wait for the list.
+
+The server refuses a filter naming a concept that isn't the dataset's, deleted, never made or another dataset's,
+wherever a filter is read (400: `Concept 12 doesn't exist; it may have been deleted`, or, for one that exists in
+another dataset, `Concept 12 doesn't exist in this dataset; it may have been deleted`), and a bulk edit
+naming one when it is submitted, with nothing queued. It used to keep every sample or none. The dataset's own
+concept being rescored is still refused with a 409 until its job ends; another dataset's gets the 400 even then.
+
+## Regions
+
+`location within` names a loaded region ([REGIONS.md](REGIONS.md)): a country, a state or province, or a group of
+them.
+
+```
+location within "US-KS"
+location not within US:midwest
+location within Kansas AND split = train
+```
+
+- **`location within R`** keeps the samples located inside R; **`location not within R`** keeps every other sample,
+  samples with no location included. They are the filters `geo_region` and `geo_region_exclude`.
+- **R is a key or a name, in any case,** quoted or not: `"US-KS"`, `us-ks`, `Kansas`, `"New South Wales"` (a name
+  with spaces needs quotes). The text is always written back with the key: `location within "US-KS"`.
+- **A name that several regions have is a mistake** whose suggestions are their keys, with their kinds and countries
+  in the message: `'Georgia' names 2 regions: GE (country), US-GA (state or province of United States of America);
+  write the key of the one you mean`.
+- **A region this server doesn't have** (no boundary set loaded, or no such key or name) is a mistake too, with close
+  keys as suggestions: `unknown region 'US-KZ': the boundary set isn't loaded on this server or has no such region`
+  (suggestions `US-KS`, `US-KY`, `KZ-KUS`).
+- **`within` and `not within` after `location` are the region form; `location` with any other operator is the
+  dataset's own field named `location`,** as it was before regions: `location = "north field"` filters that field. On a
+  dataset with no such field, `location = ...` is a mistake that points to `within`. `within` applies only to
+  `location`.
 
 ## Values
 
-- **Text:** `"double"` or `'single'` quotes, with `\"`, `\\`, `\n` and `\t` escapes. A plain word needs no quotes: `split = train`. `and`, `or`, `not`, `in`, `contains`, `exists`, `is`, `null`, `between` and `like` always need quotes.
-- **Numbers:** `12`, `-1.5`, `1e3`.
+- **Text:** `"double"` or `'single'` quotes, with `\"`, `\\`, `\n` and `\t` escapes. A plain word needs no quotes: `split = train`. `and`, `or`, `not`, `in`, `contains`, `exists`, `is`, `null`, `between` and `like` always need quotes. `within` is a keyword only after `location`: a field or a value named within needs none. `concept`, a keyword only before a concept's name, doesn't need them either.
+- **Numbers:** `12`, `-1.5`, `1e3`. A number too large for a double, such as `1e999`, is an error: `'1e999' is out of range for a number`.
 - **Dates:** ISO text, quoted or not: `created_at >= 2026-01-01T00:00:00Z`. Text that isn't an ISO date and time is an error.
   On `created_at`, `last_modified_at` and any field declared `datetime`, dates compare as moments: `2026-01-01T10:00:00+02:00` is the same
   moment as `2026-01-01T08:00:00Z`, and a date or time written without an offset is UTC. A value written to the day,
@@ -86,11 +155,13 @@ A value takes the field's type:
 
 ## Limits
 
-A query takes at most 500 comparisons, and brackets and `NOT` nest at most 100 deep. A list in `in (...)` is one comparison however many values it holds, so put many values in one list rather than writing `a = 1 OR a = 2 OR …`.
+A query takes at most 500 comparisons, and brackets and `NOT` nest at most 100 deep. A list in `in (...)` is one comparison however many values it holds, so put many values in one list rather than writing `a = 1 OR a = 2 OR …`. A concept part is one comparison.
 
 ## What stays a chip
 
-These filters have no text form: concept scores, map regions, lassos, selections and similarity searches. Their values are ids, polygons or tokens rather than something to type. `format` returns `null` for each of them, and they stay stages of their own. Their chips have no card: a click on a map region, a lasso, a selection or a search toggles it between including and excluding what it holds.
+These filters have no text form: regions drawn on the map, lassos, selections and similarity searches. Their values are ids, polygons or tokens rather than something to type. `format` returns `null` for each of them, and for a concept filter whose concept no longer exists, and they stay stages of their own. Their chips have no card: a click on a drawn map region, a lasso, a selection or a search toggles it between including and excluding what it holds. A named region (`location within "US-KS"`) has a text form, so it is a part like any other.
+
+A concept's chip has no card either: its text is for links and for typing. A concept part on its own, in a link or in a filter card's text, makes the Concepts panel's chip (**Exclude:** or **Only:** and the concept's name), which the panel changes. So does a stage that is one concept test in a view saved by the SDK (`create_view(query=...)`) or the API, when the app opens that view. Inside a larger part it is one rule of that part's chip, which has a card.
 
 ## HTTP API
 
@@ -137,6 +208,8 @@ Other messages include:
 - `'>' does not apply to the text field 'split'; use one of: =, !=, in, not in, ...`
 - `'abc' is not a number, and 'score' is a number field`
 - `expected ) to close the ( at line 1, column 1`
+- `unknown concept 'equpment'`, with the suggestion `equipment`
+- `'=' does not apply to the concept 'equipment'; use one of: >, >=, <, <=`
 
 **`POST /api/datasets/{id}/filter_query/format`**
 

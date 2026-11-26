@@ -916,8 +916,10 @@ results = dataset.filter(scene="highway").aggregate([
 ```
 
 Supported ops: `count`, `sum`, `mean`, `std`, `min`, `max`, `bounds`,
-`quantiles` (numeric); `count_values`, `distinct`, `values` (categorical/any,
-with optional `limit`). `view.schema()` returns the dataset field schema.
+`quantiles` (numeric; a datetime field's instants as seconds since 1970 UTC);
+`count_values` (commonest first, ties by value), `distinct`, `values`
+(categorical/any, with optional `limit`) and `distinct_count` (how many distinct
+values). `view.schema()` returns the dataset field schema.
 
 ---
 
@@ -1281,6 +1283,75 @@ target.add_samples_from(source.filter(split="eval"))          # a view, or a who
 target.add_samples_from(source.filter(source_id__in=ids), embedding_fields=["dinov3"], hash_fields=[])
 # Matches by filepath; samples already in the target are left untouched. Streams in batches.
 ```
+
+### Field descriptions
+
+Say what a field means, and its unit, so the people filtering on it (and the assistant) know what
+`digital_gain` is. It needs edit access to the dataset; the app has the same under Dataset Settings → Fields, and
+the filter sidebar shows a field's description on its name.
+
+```python
+dataset.set_field_description("digital_gain", "Sensor gain applied before readout; higher in dark scenes.", unit="dB")
+dataset.set_field_description("digital_gain", unit="")    # only the arguments given change; "" clears one
+# {"field_name": "digital_gain", "description": "Sensor gain ...", "unit": None,
+#  "values_private": False, "description_source": "set"}
+
+for field in dataset.get_schema():
+    print(field["name"], field["description"], field["unit"], field["description_source"])
+```
+
+- A description holds at most 1,000 characters and a unit 40, trimmed; a description may hold line breaks, and
+  neither may hold other control characters (422).
+- Every field in `get_schema()` carries `description`, `unit`, `description_source` and `values_private`.
+  `description_source` is `"set"` when someone wrote the description, `"default"` when the server supplies one,
+  and None when there is none.
+- **Defaults.** The server describes the fields every dataset has (`id`, `filepath`, `created_at`,
+  `last_modified_at`, `tags`, `media_type`) and those `compute_metadata()` and `compute_metrics()` write, while
+  nobody has set a description: setting one replaces the default (`"set"`), clearing it brings the default back
+  (`"default"`). The defaults go by name: a field of your own called `brightness` gets the metric's description
+  until you describe it.
+- **Default units.** Where a default description has a unit, the server supplies it too, while nobody has set a
+  unit; a unit you set replaces it, and clearing yours brings the default unit back. Each falls back on its own:
+  `description_source` speaks of the description only, so a field with your description and no unit of yours shows
+  the default unit.
+
+  | Unit | Fields |
+  |---|---|
+  | `px` | `width`, `height` |
+  | `MP` | `megapixels` |
+  | `bytes` | `file_size_bytes` |
+  | `bits` | `entropy` |
+  | `%` | `salt_and_pepper`, `pct_underexposed`, `pct_overexposed` |
+  | none | `id`, `filepath`, `created_at`, `last_modified_at`, `tags`, `media_type`, `aspect_ratio`, `brightness`, `blurriness`, `contrast`, `saturation` |
+
+- **Which fields.** A field the dataset's schema lists takes a description: its own fields, the built-in ones and
+  label fields such as `detections.label`. Anything else is a 404, a key that exists only in some samples' metadata
+  and that nothing registered (so neither the schema nor the field statistics list it) included.
+- `rename_field` takes the description, unit and `values_private` to the new name, and `clone_field` copies them.
+  `clear_field` removes the description and unit with the field. A field no sample holds any more stays listed
+  while it has a description or a unit, as one with a display type does.
+- `values_private` marks a field whose values aren't given to the
+  [assistant](ASSISTANT.md#keeping-a-fields-values-back) (`PATCH .../description` with `{"values_private": true}`).
+  It outlives the field: when a
+  private field goes (`clear_field`, a bulk clear, its last sample deleted, a revert to a version without it), the
+  flag stays behind, shown nowhere and costing nothing, and the field is private again when it comes back (written
+  again, restored by a revert, or a field renamed or cloned onto its name). While it is gone, the name is no field
+  of the dataset (404, as for a name it never had; clearing it again does nothing), so the mark can only be taken
+  off once the field exists again. A flag whose field never comes back stays with the dataset and goes when the
+  dataset is deleted. A rename takes the flag along: the old name keeps
+  none.
+- **Versions** save a field's description and unit with its type, and a revert restores them (from a version made
+  before fields had descriptions, the current ones stay). Those of the built-in and label fields aren't versioned,
+  like their types: a revert changes `width`'s description but never `created_at`'s. `values_private` never is, and
+  a revert neither sets nor clears it.
+- **On a mirror**, the primary's fields take their description and unit from the primary, with the rest of its field
+  settings: changing them on the mirror is refused (409), as changing their type is, and a request that carries one
+  of them changes nothing, its `values_private` included. The mirror's own `@local.` fields are described on the
+  mirror. `values_private` belongs to each instance and isn't synced: a mirror sets it on any field of the dataset,
+  the built-in ones included (`filepath`, say). The sync never resets it: a field the primary describes later keeps
+  it, and a field the primary removes (cleared, or its last sample deleted) keeps its flag here, so it is private
+  again if it comes back. The primary renaming a field reaches the mirror as one field going and another coming, so
+  the flag stays with the old name and the new name starts unflagged: mark it again.
 
 ## Geospatial filtering
 
@@ -2041,6 +2112,7 @@ and `dataset.samples[...]` all produce them.
 | `is_null` / `is_not_null` | The value is null or missing / has a value | `{"field": "score", "operator": "is_null"}` |
 | `geo_polygon` | Location inside a polygon given as a list of `[lon, lat]` points (not a GeoJSON object) | `{"field": "location", "operator": "geo_polygon", "value": [[-122.5, 37.7], [-122.35, 37.7], [-122.35, 37.82], [-122.5, 37.82]]}` |
 | `geo_near` | Location within `max_distance` metres of a point | `{"field": "location", "operator": "geo_near", "value": {"point": [-122.42, 37.77], "max_distance": 5000}}` |
+| `geo_region` / `geo_region_exclude` | Location inside a loaded region (a country, a state or province, or a group of them, by its key: [REGIONS.md](REGIONS.md)) / every other sample, those with no location included | `{"field": "location", "operator": "geo_region", "value": "US-KS"}` |
 
 ### Custom Embeddings
 
@@ -2302,6 +2374,8 @@ class Dataset:
     def export(export_dir, format="coco", label_field="ground_truth")   # also on DatasetView
 
     # Field management & merge
+    def get_schema(filters=None) -> list[dict]   # each field with description, unit, description_source, values_private
+    def set_field_description(field, description=None, unit=None) -> dict   # needs edit; "" clears one
     # Each waits for its server job; wait=False returns the Job
     def rename_field(field_name, new_name, *, wait=True, timeout=1800) -> dict | Job
     def clone_field(field_name, new_name, *, wait=True, timeout=1800) -> dict | Job

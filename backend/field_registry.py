@@ -10,6 +10,7 @@ import asyncpg
 from fastapi import HTTPException
 
 from .datetimes import parse_instant
+from .field_descriptions import BUILT_IN_FIELDS
 from .label_fields import LABEL_CACHES, LEGACY_GEOMETRY_FIELDS, LEGACY_LABEL_FIELDS, label_context, overlay_type
 
 FIELD_TYPES = frozenset({'unknown', 'boolean', 'number', 'string', 'datetime', 'list', 'object'})
@@ -120,6 +121,9 @@ async def register_fields(
     Existing concrete definitions are read, not locked or rewritten. Missing/unknown
     definitions are visited in name order, including concurrent first writers.
     Call once after the sample writes, using only successfully written metadata.
+    A 'system' row of the name (a built-in's description, or a private flag kept when the
+    field went: forget_definitions) is a placeholder the definition takes over, keeping
+    its description, unit and values_private.
     """
     fields = infer_fields(metadata)
     if not fields:
@@ -136,9 +140,10 @@ async def register_fields(
             """INSERT INTO dataset_fields (dataset_id, field_name, field_type, origin)
                SELECT $1, name, kind, 'metadata'
                FROM unnest($2::text[], $3::text[]) AS definitions(name, kind) ORDER BY name
-               ON CONFLICT (dataset_id, field_name) DO UPDATE SET field_type = EXCLUDED.field_type
-               WHERE dataset_fields.field_type = 'unknown' AND EXCLUDED.field_type <> 'unknown'
-                 AND dataset_fields.origin = 'metadata'
+               ON CONFLICT (dataset_id, field_name) DO UPDATE SET field_type = EXCLUDED.field_type, origin = 'metadata'
+               WHERE dataset_fields.origin = 'system'
+                  OR (dataset_fields.field_type = 'unknown' AND EXCLUDED.field_type <> 'unknown'
+                      AND dataset_fields.origin = 'metadata')
                RETURNING field_name, xmax = 0 AS inserted""",
             dataset_id,
             candidates,
@@ -153,6 +158,47 @@ async def register_fields(
         )
         declared = {row['field_name']: row['field_type'] for row in existing}
     return declared
+
+
+# What a field definition becomes when it goes while this instance marks the field private (values_private, 0035):
+# an otherwise empty 'system' row instead of none. The registry's readers pass over it, so the field shows nowhere and
+# is measured by nothing; a definition of the name coming back takes the row over and is private again
+# (register_fields, local_writes.register, rename and clone, a version restore, a mirror's sync).
+EMPTIED_TO_FLAG = (
+    "field_type = 'unknown', origin = 'system', is_promoted = FALSE, display_type = NULL, overlay_config = NULL, "
+    'description = NULL, unit = NULL'
+)
+
+
+async def forget_definitions(connection: Any, dataset_id: int, names: Iterable[str]) -> None:
+    """Remove these fields' definitions, keeping a private flag on an emptied row (EMPTIED_TO_FLAG). A 'system' row
+    stays as it is: it is no definition, and holds a built-in field's description or a flag already. A metadata key
+    named as a built-in field (a sample PATCH or bulk-set can write `created_at`) shares that field's row: when it goes,
+    the row goes back to holding the built-in's description and unit too."""
+    names = sorted(set(names))
+    if not names:
+        return
+    await connection.execute(
+        "UPDATE dataset_fields SET field_type = 'unknown', origin = 'system', is_promoted = FALSE, "
+        'display_type = NULL, overlay_config = NULL '
+        'WHERE dataset_id = $1 AND field_name = ANY($2::text[]) AND field_name = ANY($3::text[]) '
+        "AND origin <> 'system' AND (description IS NOT NULL OR unit IS NOT NULL OR values_private)",
+        dataset_id,
+        names,
+        sorted(BUILT_IN_FIELDS),
+    )
+    await connection.execute(
+        f'UPDATE dataset_fields SET {EMPTIED_TO_FLAG} '
+        "WHERE dataset_id = $1 AND field_name = ANY($2::text[]) AND origin <> 'system' AND values_private",
+        dataset_id,
+        names,
+    )
+    await connection.execute(
+        'DELETE FROM dataset_fields '
+        "WHERE dataset_id = $1 AND field_name = ANY($2::text[]) AND origin <> 'system' AND NOT values_private",
+        dataset_id,
+        names,
+    )
 
 
 REQUEST_FULL_REFRESH = (
@@ -351,13 +397,16 @@ async def invalidate_values(connection: Any, dataset_id: int, names: Iterable[st
 
 
 async def prune_fields(connection: Any, dataset_id: int, names: Iterable[str]) -> None:
-    """Remove unused implicit declarations under the exclusive gate with first-match existence probes."""
+    """Remove unused implicit declarations under the exclusive gate with first-match existence probes. A field someone
+    gave a setting (an index, a display type, an overlay, a description, a unit) stays declared; one only marked
+    private goes, its flag kept (forget_definitions)."""
     candidates = sorted(set(names) - SYSTEM_FIELDS)
     if candidates:
         eligible = await connection.fetch(
             """SELECT field_name FROM dataset_fields WHERE dataset_id = $1
                AND field_name = ANY($2::text[]) AND origin = 'metadata'
                AND NOT is_promoted AND display_type IS NULL AND overlay_config IS NULL
+               AND description IS NULL AND unit IS NULL
                ORDER BY field_name""",
             dataset_id,
             candidates,
@@ -374,11 +423,7 @@ async def prune_fields(connection: Any, dataset_id: int, names: Iterable[str]) -
             ):
                 unused.append(field['field_name'])
         if unused:
-            await connection.execute(
-                'DELETE FROM dataset_fields WHERE dataset_id = $1 AND field_name = ANY($2::text[])',
-                dataset_id,
-                unused,
-            )
+            await forget_definitions(connection, dataset_id, unused)
             await connection.execute(
                 'DELETE FROM dataset_field_stats WHERE dataset_id = $1 AND field_name = ANY($2::text[])',
                 dataset_id,

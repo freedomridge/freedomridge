@@ -1,0 +1,378 @@
+{
+ "type": "FeatureCollection",
+ "name": "e2e regions, Natural Earth admin 1 property names",
+ "features": [
+  {
+   "type": "Feature",
+   "properties": {
+    "iso_3166_2": "US-KS",
+    "adm1_code": "USA-3514",
+    "iso_a2": "US",
+    "adm0_a3": "USA",
+    "admin": "United States of America",
+    "name_en": "Kansas",
+    "name": "Kansas",
+    "region": "Midwest"
+   },
+   "geometry": {
+    "type": "Polygon",
+    "coordinates": [
+     [
+      [
+       -102.05,
+       37.0
+      ],
+      [
+       -94.6,
+       37.0
+      ],
+      [
+       -94.6,
+       40.0
+      ],
+      [
+       -102.05,
+       40.0
+      ],
+      [
+       -102.05,
+       37.0
+      ]
+     ]
+    ]
+   }
+  },
+  {
+   "type": "Feature",
+   "properties": {
+    "iso_3166_2": "US-NE",
+    "adm1_code": "USA-3520",
+    "iso_a2": "US",
+    "adm0_a3": "USA",
+    "admin": "United States of America",
+    "name_en": "Nebraska",
+    "name": "Nebraska",
+    "region": "Midwest"
+   },
+   "geometry": {
+    "type": "Polygon",
+    "coordinates": [
+     [
+      [
+       -104.05,
+       40.0
+      ],
+      [
+       -95.3,
+       40.0
+      ],
+      [
+       -95.3,
+       43.0
+      ],
+      [
+       -104.05,
+       43.0
+      ],
+      [
+       -104.05,
+       40.0
+      ]
+     ]
+    ]
+   }
+  },
+  {
+   "type": "Feature",
+   "properties": {
+    "iso_3166_2": "US-GA",
+    "adm1_code": "USA-3533",
+    "iso_a2": "US",
+    "adm0_a3": "USA",
+    "admin": "United States of America",
+    "name_en": "Georgia",
+    "name": "Georgia",
+    "region": "South"
+   },
+   "geometry": {
+    "type": "Polygon",
+    "coordinates": [
+     [
+      [
+       -85.6,
+       30.4
+      ],
+      [
+       -80.8,
+       30.4
+      ],
+      [
+       -80.8,
+       35.0
+      ],
+      [
+       -85.6,
+       35.0
+      ],
+      [
+       -85.6,
+       30.4
+      ]
+     ]
+    ]
+   }
+  },
+  {
+   "type": "Feature",
+   "properties": {
+    "iso_3166_2": "US-HI",
+    "adm1_code": "USA-3517",
+    "iso_a2": "US",
+    "adm0_a3": "USA",
+    "admin": "United States of America",
+    "name_en": "Hawaii",
+    "name": "Hawaii",
+    "region": "West"
+   },
+   "geometry": {
+    "type": "MultiPolygon",
+    "coordinates": [
+     [
+      [
+       [
+        -156.1,
+        18.9
+       ],
+       [
+        -154.8,
+        18.9
+       ],
+       [
+        -154.8,
+        20.3
+       ],
+       [
+        -156.1,
+        20.3
+       ],
+       [
+        -156.1,
+        18.9
+       ]
+      ]
+     ],
+     [
+      [
+       [
+        -160.3,
+        21.8
+       ],
+       [
+        -159.2,
+        21.8
+       ],
+       [
+        -159.2,
+        22.3
+       ],
+       [
+        -160.3,
+        22.3
+       ],
+       [
+        -160.3,
+        21.8
+       ]
+      ]
+     ]
+    ]
+   }
+  },
+  {
+   "type": "Feature",
+   "properties": {
+    "iso_3166_2": "GE-TB",
+    "adm1_code": "GEO-1",
+    "iso_a2": "GE",
+    "adm0_a3": "GEO",
+    "admin": "Georgia",
+    "name_en": "Tbilisi",
+    "name": "Tbilisi",
+    "region": null
+   },
+   "geometry": {
+    "type": "Polygon",
+    "coordinates": [
+     [
+      [
+       44.6,
+       41.6
+      ],
+      [
+       45.0,
+       41.6
+      ],
+      [
+       45.0,
+       41.9
+      ],
+      [
+       44.6,
+       41.9
+      ],
+      [
+       44.6,
+       41.6
+      ]
+     ]
+    ]
+   }
+  },
+  {
+   "type": "Feature",
+   "properties": {
+    "iso_3166_2": "NL-LI",
+    "adm1_code": "NLD-1",
+    "iso_a2": "NL",
+    "adm0_a3": "NLD",
+    "admin": "Netherlands",
+    "name_en": "Limburg",
+    "name": "Limburg",
+    "region": null
+   },
+   "geometry": {
+    "type": "Polygon",
+    "coordinates": [
+     [
+      [
+       5.5,
+       50.7
+      ],
+      [
+       6.2,
+       50.7
+      ],
+      [
+       6.2,
+       51.8
+      ],
+      [
+       5.5,
+       51.8
+      ],
+      [
+       5.5,
+       50.7
+      ]
+     ]
+    ]
+   }
+  },
+  {
+   "type": "Feature",
+   "properties": {
+    "iso_3166_2": "BE-VLI",
+    "adm1_code": "BEL-1",
+    "iso_a2": "BE",
+    "adm0_a3": "BEL",
+    "admin": "Belgium",
+    "name_en": "Limburg",
+    "name": "Limburg",
+    "region": null
+   },
+   "geometry": {
+    "type": "Polygon",
+    "coordinates": [
+     [
+      [
+       4.8,
+       50.7
+      ],
+      [
+       5.5,
+       50.7
+      ],
+      [
+       5.5,
+       51.3
+      ],
+      [
+       4.8,
+       51.3
+      ],
+      [
+       4.8,
+       50.7
+      ]
+     ]
+    ]
+   }
+  },
+  {
+   "type": "Feature",
+   "properties": {
+    "iso_3166_2": "FJ-W",
+    "adm1_code": "FJI-1",
+    "iso_a2": "FJ",
+    "adm0_a3": "FJI",
+    "admin": "Fiji",
+    "name_en": "Western",
+    "name": "Western",
+    "region": null
+   },
+   "geometry": {
+    "type": "MultiPolygon",
+    "coordinates": [
+     [
+      [
+       [
+        177.0,
+        -19.0
+       ],
+       [
+        180.0,
+        -19.0
+       ],
+       [
+        180.0,
+        -16.0
+       ],
+       [
+        177.0,
+        -16.0
+       ],
+       [
+        177.0,
+        -19.0
+       ]
+      ]
+     ],
+     [
+      [
+       [
+        -180.0,
+        -19.0
+       ],
+       [
+        -178.0,
+        -19.0
+       ],
+       [
+        -178.0,
+        -16.0
+       ],
+       [
+        -180.0,
+        -16.0
+       ],
+       [
+        -180.0,
+        -19.0
+       ]
+      ]
+     ]
+    ]
+   }
+  }
+ ]
+}

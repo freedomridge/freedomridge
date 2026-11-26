@@ -262,6 +262,7 @@ The generated values include:
 | `FRIDGE_DEMO_*`, `FRIDGE_GUEST_*`, `FRIDGE_DB_ACQUIRE_TIMEOUT_SECONDS` | Optional public-demo limits (demo-account caps per IP and in total, guest query timeout and concurrency, guest saved-view quota). The defaults in `.env.example` suit the demo; numeric limits must be positive; `FRIDGE_DEMO_IP_ALLOWLIST` accepts trusted IPs/CIDRs (see section 10) |
 | `DEMO_MODE` | `true`; shows the **Try as Guest** button on the login page |
 | `ALLOWED_ORIGINS` | `https://YOUR_DOMAIN`, exact browser origin |
+| `FRIDGE_PUBLIC_URL` | Optional: the address the assistant's links start with. Without it the first `ALLOWED_ORIGINS` entry is used, so that entry must be the server's public HTTPS origin |
 | `SESSION_COOKIE_SECURE` | `true` (also the production Compose default) |
 | `DOMAIN_NAME` | `YOUR_DOMAIN` |
 | `LETSENCRYPT_EMAIL` | Your notification email |

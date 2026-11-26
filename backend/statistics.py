@@ -19,6 +19,23 @@ FULL_REFRESH_ACTIVE = f"""SELECT {job_queue.JOB_COLUMNS} FROM {job_queue.JOB_TAB
     ORDER BY created_at,id LIMIT 1"""
 
 
+async def stale_fields(source, dataset_id):
+    """Whether each field's statistics are behind the dataset's samples now, as a test of a field's name: a change the
+    statistics haven't counted yet names the field, or a label list's field (dataset_stats_pending), or names no field,
+    or the dataset's statistics were never counted whole or wait to be published (dataset_stats_state). One query; the
+    pending changes are read as their distinct sets of names, which repeat."""
+    rows = await source.fetch(
+        """SELECT DISTINCT field_names FROM dataset_stats_pending WHERE dataset_id = $1
+           UNION ALL
+           SELECT NULL::text[] FROM dataset_stats_state
+           WHERE dataset_id = $1 AND (NOT initialized OR publish_pending)""",
+        dataset_id,
+    )
+    everything = any(row['field_names'] is None for row in rows)
+    names = {name for row in rows for name in row['field_names'] or ()}
+    return lambda field: everything or field in names or statistics_measure.parent_field(field) in names
+
+
 async def request_refresh(pool, dataset_id, *, created_by=None, force=False, unless_full_active=False):
     """unless_full_active: a full refresh already queued or running is returned instead, with no new request,
     checked under the enqueue's lock so callers arriving together get one job."""

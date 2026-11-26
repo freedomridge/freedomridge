@@ -5,13 +5,15 @@ import { toggleOverlayField } from '@/lib/labels';
 import { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import type { Feature, Polygon } from 'geojson';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { ApiError, isRescoringRefusal, getSamples, getDatasetSchema, getDataset, getEmbeddingFields, searchSimilar, searchByImage, searchObjectToPatches, setClassRule, sampleDuplicates, notifySamplesMutated, createSelectionToken, getView, parseFilterQuery, formatFilterQuery, FilterQueryProblem, type Filters, type Sample, type SchemaField, type ComplexFilter, type ViewStage } from '@/lib/api';
-import { describeFilter, convertSimpleFiltersToComplex } from '@/lib/filter-utils';
-import { copyLink, datasetAddress, datasetLink, decodeStages, joinQueryParts, LinkError, mayBeText, type DatasetLink } from '@/lib/links';
+import { ApiError, isRescoringRefusal, getSamples, getDatasetSchema, getDataset, getEmbeddingFields, searchSimilar, searchByImage, searchObjectToPatches, setClassRule, sampleDuplicates, notifySamplesMutated, createSelectionToken, getView, getWorkingView, parseFilterQuery, formatFilterQuery, FilterQueryProblem, listConcepts, type Filters, type Sample, type SchemaField, type ComplexFilter, type ViewStage } from '@/lib/api';
+import { conceptNames, describeFilter, convertSimpleFiltersToComplex, stageOfFilter, workingViewStages } from '@/lib/filter-utils';
+import { filterHasConcept, missingConceptsNotice, sealedValuesNotice, withConceptChips, withoutMissingConcepts, withoutSealedValues } from '@/lib/filter-query';
+import { copyLink, datasetAddress, datasetLink, decodeStages, joinQueryParts, LinkError, mayBeText, UNKNOWN_WORKING_VIEW_NOTICE, type DatasetLink } from '@/lib/links';
 import { useToast } from '@/contexts/ToastContext';
 import { STALE_LASSO_WARNING, lassoFilter, lassoKey, staleLasso } from '@/lib/stale-lasso';
 import { type SourceView, mayUpdateView, sameStages, sourceOf } from '@/lib/source-view';
 import { defaultViewStages } from '@/lib/default-view';
+import { regionTests } from '@/lib/regions';
 import { usePatchState } from '@/hooks/usePatchState';
 import { useSampleCount } from '@/hooks/useSampleCount';
 import Link from 'next/link';
@@ -74,12 +76,44 @@ async function retryDropped<T>(request: () => Promise<T>): Promise<T> {
     }
 }
 
-// The stages a link's filter opens on (its view, else its encoded stages, else its query: lib/links.ts), or null
-// when it sets no filter, with the view they came from (lib/source-view.ts). A link that can't be opened here throws
-// a LinkError saying why.
-async function linkStages(datasetId: number, link: DatasetLink): Promise<{ stages: ViewStage[] | null; source: SourceView | null }> {
+// Stages the app didn't make (a saved view, the default view, an f= link), as it applies them (lib/filter-query.ts): a
+// concept test on its own becomes the Concepts panel's chip, as the concept is named now (`saved`, the stages as the
+// view holds them, for its source); a stage naming a concept the dataset no longer has is left out (`stages`), and
+// `dropped` names it for the notice. They wait for the list: a request the network dropped is asked again
+// (retryDropped). Without the list (the server refused it), they stay as they are, and the server refuses a concept that
+// isn't the dataset's when they are read.
+async function openedStages(datasetId: number, stages: ViewStage[]): Promise<{
+    stages: ViewStage[]; saved: ViewStage[]; dropped: string[]; concepts?: ReadonlyMap<number, string>;
+}> {
+    const concepts = stages.some(stage => filterHasConcept(stage.filter))
+        ? await retryDropped(() => listConcepts(datasetId)).catch(() => undefined)
+        : undefined;
+    if (!concepts) return { stages, saved: stages, dropped: [] };
+    const names = conceptNames(concepts);
+    const saved = withConceptChips(stages, names);
+    return { ...withoutMissingConcepts(saved, names), saved, concepts: names };
+}
+
+// Whether this browser was already told `version` under `key`, which it then records. Without storage, it was not.
+const toldInPage = new Map<string, string>();
+function toldOnce(key: string, version: string): boolean {
+    let told = toldInPage.get(key) === version;
+    try {
+        told ||= localStorage.getItem(key) === version;
+        localStorage.setItem(key, version);
+    } catch {
+        // No storage (a private window, blocked site data): told once in this page.
+    }
+    toldInPage.set(key, version);
+    return told;
+}
+
+// The stages a link's filter opens on (its view, else its working view, else its encoded stages, else its query:
+// lib/links.ts), or null when it sets no filter, with the view they came from (lib/source-view.ts) and a notice of
+// stages left out. A link that can't be opened here throws a LinkError saying why.
+async function linkStages(datasetId: number, link: DatasetLink): Promise<{ stages: ViewStage[] | null; source: SourceView | null; notice?: string }> {
     if (link.view !== undefined) {
-        const view = await getView(link.view).catch((error: unknown) => {
+        const view = await retryDropped(() => getView(link.view!)).catch((error: unknown) => {
             if (error instanceof ApiError && error.status === 404) return null;  // also a view the reader can't open
             throw error;
         });
@@ -87,22 +121,48 @@ async function linkStages(datasetId: number, link: DatasetLink): Promise<{ stage
         // Its stages, as choosing it in Saved Views applies them. A view saved before views kept their stages holds
         // only its compiled filter: one stage named after the view, as the default view does.
         const filter = view.content.filters;
-        const stages: ViewStage[] = view.content.viewStages
-            ?? (filter?.filters?.length || filter?.field ? [{ type: 'filter', description: view.name, filter }] : []);
+        if (view.content.viewStages) {
+            const opened = await openedStages(datasetId, view.content.viewStages);
+            const notice = opened.dropped.length ? missingConceptsNotice(opened.dropped, `the view “${view.name}”`) : undefined;
+            return { stages: opened.stages, source: sourceOf(view, opened.saved), notice };
+        }
+        const stages: ViewStage[] = filter?.filters?.length || filter?.field ? [{ type: 'filter', description: view.name, filter }] : [];
         return { stages, source: sourceOf(view, stages) };
+    }
+    if (link.w !== undefined) {
+        // An assistant's working view, for its user only: anyone else, and a handle unknown or expired, is told the
+        // server's words. One of another dataset is told as an unknown handle is. Its stages open as an f= link's do,
+        // without a stage on a value still sealed (it can't be read), the ordinary ones named by the app.
+        const view = await retryDropped(() => getWorkingView(link.w!)).catch((error: unknown) => {
+            if (error instanceof ApiError && error.status === 404) throw new LinkError(error.message);
+            throw error;
+        });
+        if (view.dataset_id !== datasetId || !Array.isArray(view.stages)) throw new LinkError(UNKNOWN_WORKING_VIEW_NOTICE);
+        const readable = withoutSealedValues(view.stages);
+        // Named by the app before they are opened: a stage left out for a concept that is gone is named in its words.
+        const opened = await openedStages(datasetId, workingViewStages(readable.stages));
+        const notices = [
+            readable.fields.length ? sealedValuesNotice(readable.fields, 'this link') : '',
+            opened.dropped.length ? missingConceptsNotice(opened.dropped, 'this link') : '',
+        ].filter(Boolean);
+        return { stages: workingViewStages(opened.stages, opened.concepts), source: null, notice: notices.join(' ') || undefined };
+    }
+    if (link.f !== undefined) {
+        const opened = await openedStages(datasetId, await decodeStages(link.f));
+        return { stages: opened.stages, source: null, notice: opened.dropped.length ? missingConceptsNotice(opened.dropped, 'this link') : undefined };
     }
     return { stages: await encodedStages(datasetId, link), source: null };
 }
 
-// The stages of a link that holds its filter (`f=` encoded, or `q=` text), or null when it holds none.
+// The stages of a link that holds its filter as `q=` text, or null when it holds none.
 async function encodedStages(datasetId: number, link: DatasetLink): Promise<ViewStage[] | null> {
-    if (link.f !== undefined) return decodeStages(link.f);
     if (link.q !== undefined) {
         if (!link.q.trim()) return [];  // "no filters", as Copy link writes it for a dataset with none applied
         try {
-            // One chip per top-level AND part, named as Add Filter names it.
-            const { filters } = await parseFilterQuery(datasetId, link.q, []);
-            return filters.map((filter): ViewStage => ({ type: 'filter', description: describeFilter(filter), filter }));
+            // One chip per top-level AND part, named as Add Filter names it; a concept part is the Concepts panel's chip.
+            const { filters } = await retryDropped(() => parseFilterQuery(datasetId, link.q!, []));
+            const concepts = filters.some(filterHasConcept) ? conceptNames(await listConcepts(datasetId).catch(() => undefined)) : undefined;
+            return filters.map(filter => stageOfFilter(filter, concepts));
         } catch (error) {
             if (!(error instanceof FilterQueryProblem)) throw error;
             const hint = error.suggestions.length ? ` (did you mean ${error.suggestions.map(n => `'${n}'`).join(' or ')}?)` : '';
@@ -280,6 +340,7 @@ function DatasetPageContent() {
         sourceView,
         setSourceView,
         openView,
+        stagesRestored,
         expiredSelections,
         setExpiredSelections,
         addStage,
@@ -391,8 +452,25 @@ function DatasetPageContent() {
 
     // The dataset opens on its default view (FilterContext applies it once it knows which it is).
     useEffect(() => {
-        if (dataset) setDefaultView(dataset.default_view ?? null);
-    }, [dataset, setDefaultView]);
+        if (!dataset) return;
+        // Its stages as the app applies them (openedStages): once they are, when one names a concept. A stage left out is
+        // told once for the view as it is now, in this browser: again only when the view's filters change.
+        const view = dataset.default_view ?? null;
+        const stages = view?.content?.viewStages;
+        if (!view || !stages || !stages.some(stage => filterHasConcept(stage.filter))) {
+            setDefaultView(view);
+            return;
+        }
+        let current = true;
+        void openedStages(dataset.id, stages).then(opened => {
+            if (!current) return;
+            setDefaultView({ ...view, content: { ...view.content, viewStages: opened.stages }, savedStages: opened.saved });
+            if (opened.dropped.length && !toldOnce(`fridge-default-view-notice-${dataset.id}`, `${view.id}:${view.updated_at ?? ''}`)) {
+                addToast(missingConceptsNotice(opened.dropped, `the default view “${view.name}”`), 'warning', 10000);
+            }
+        });
+        return () => { current = false; };
+    }, [dataset, setDefaultView, addToast]);
 
 
     // Does this dataset have object rows at all? The cross-grain link only applies when it
@@ -761,6 +839,8 @@ function DatasetPageContent() {
     // would copy for its state, with the grids' sort as it is when the address is made. Text the server didn't answer
     // for goes in f=, which opens the same filters.
     const linkTexts = useRef(new Map<string, string | null>());
+    // The saved view chosen last: one chosen while an earlier one waits for its concepts (openedStages) wins.
+    const viewChosen = useRef(0);
     const addressOf = useCallback(async ({ stages, expired, source }: AddressState) => datasetAddress({
         origin: window.location.origin,
         datasetId: datasetId!,
@@ -776,6 +856,17 @@ function DatasetPageContent() {
     // Once the dataset has answered (a dataset the reader can't open answers as it does without a link), the link's
     // filter replaces the restored one, then its sample opens, with next/previous walking the grid as it loads.
     const linkOpenedRef = useRef(false);
+    // A link whose request failed (the network, the server) rather than was refused: until the person tries again or
+    // opens the dataset without it, the page waits and the link stays in the address, so a reload opens it again. The
+    // address names the link until its filters are in place (or it is refused): FilterContext writes it from then on.
+    const [linkFailure, setLinkFailure] = useState<string | null>(null);
+    const [linkTries, setLinkTries] = useState(0);
+    // The link's filters in place (null: the dataset as it opens without the link), then its sample: the entry the link
+    // opened has it open (FilterContext), and the address keeps it while it is shown.
+    const settleOpenedLink = useCallback(async (stages: ViewStage[] | null, source: SourceView | null) => {
+        settleLink(stages, source);
+        if (link?.sample !== undefined) await showSampleById(Number(link.sample));
+    }, [link, settleLink, showSampleById]);
     useEffect(() => {
         if (!link || !dataset || datasetId == null || linkOpenedRef.current) return;
         linkOpenedRef.current = true;
@@ -784,14 +875,17 @@ function DatasetPageContent() {
             let opened: Awaited<ReturnType<typeof linkStages>> = { stages: null, source: null };
             try {
                 opened = await linkStages(datasetId, link);
+                if (opened.notice) notice(opened.notice);
             } catch (error) {
-                notice(error instanceof LinkError ? error.message : `Couldn't open the link: ${(error as Error).message}`);
+                if (!(error instanceof LinkError)) {
+                    setLinkFailure(`Couldn't open the link: ${(error as Error).message}`);
+                    return;
+                }
+                notice(error.message);
             }
-            settleLink(opened.stages, opened.source);
-            // The entry the link opened has its sample open (FilterContext): the address keeps it while it is shown.
-            if (link.sample !== undefined) await showSampleById(Number(link.sample));
+            await settleOpenedLink(opened.stages, opened.source);
         })();
-    }, [link, dataset, datasetId, settleLink, addToast, showSampleById]);
+    }, [link, dataset, datasetId, addToast, settleOpenedLink, linkTries]);
     // A dataset that doesn't answer has nothing to open the link on: the page shows why, without the link.
     useEffect(() => {
         if (!link || !datasetError || linkOpenedRef.current) return;
@@ -894,6 +988,8 @@ function DatasetPageContent() {
         }
         return mapFilters;
     }, [imageGrainFilters, currentPolygon]);
+    // The region chips applied, whose outlines the map draws.
+    const mapRegions = useMemo(() => regionTests(viewStages.map(s => s.filter)), [viewStages]);
 
     // Rank order for the grid when a similarity / patch search is active: the search returned its
     // matches ranked, so render them in that order (not default id order). The rank is GRAIN-
@@ -1422,6 +1518,8 @@ function DatasetPageContent() {
                         <MapPanel
                             datasetId={datasetId!}
                             filters={mapDisplayFilters}
+                            regions={mapRegions}
+                            regionsRestored={stagesRestored}
                             selectedIds={selectedIds}
                             initialPolygon={currentPolygon}
                             onSelection={(ids, polygon) => {
@@ -1579,8 +1677,33 @@ function DatasetPageContent() {
         return (
             <div className="h-screen flex flex-col bg-zinc-950">
                 <Header />
-                <div data-testid="link-opening" className="flex-1 flex items-center justify-center text-sm text-zinc-400">
-                    Opening the link…
+                <div data-testid="link-opening" className="flex-1 flex flex-col items-center justify-center gap-3 text-sm text-zinc-400">
+                    {linkFailure ? (
+                        <>
+                            <p role="alert" className="text-amber-300">{linkFailure}</p>
+                            <div className="flex gap-3">
+                                <button
+                                    onClick={() => {
+                                        setLinkFailure(null);
+                                        linkOpenedRef.current = false;
+                                        setLinkTries(tries => tries + 1);
+                                    }}
+                                    className="px-3 py-1.5 rounded bg-cyan-600 hover:bg-cyan-500 text-white font-medium"
+                                >
+                                    Try again
+                                </button>
+                                <button
+                                    onClick={() => {
+                                        setLinkFailure(null);
+                                        void settleOpenedLink(null, null);
+                                    }}
+                                    className="px-3 py-1.5 rounded bg-zinc-800 hover:bg-zinc-700 text-white"
+                                >
+                                    Open the dataset without it
+                                </button>
+                            </div>
+                        </>
+                    ) : 'Opening the link…'}
                 </div>
             </div>
         );
@@ -1706,10 +1829,17 @@ function DatasetPageContent() {
                                 level={level}
                                 onDefaultViewChanged={() => queryClient.invalidateQueries({ queryKey: ['dataset', datasetId] })}
                                 onLoadView={(view) => {
-                                    if (view.content.viewStages) {
-                                        openView(view, view.content.viewStages);
+                                    const stages = view.content.viewStages;
+                                    if (!stages) return;
+                                    const chosen = ++viewChosen.current;
+                                    const open = (opened: Awaited<ReturnType<typeof openedStages>>) => {
+                                        if (chosen !== viewChosen.current) return;
+                                        openView(view, opened.stages, opened.saved);
                                         setExpiredSelections([]);
-                                    }
+                                        if (opened.dropped.length) addToast(missingConceptsNotice(opened.dropped, `the view “${view.name}”`), 'warning', 10000);
+                                    };
+                                    if (stages.some(stage => filterHasConcept(stage.filter))) void openedStages(view.dataset_id, stages).then(open);
+                                    else open({ stages, saved: stages, dropped: [] });
                                 }}
                                 sourceView={sourceView}
                                 onViewSaved={(view) => {

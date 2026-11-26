@@ -19,7 +19,8 @@ class TokenCreate(BaseModel):
     # born expired — both are now refused.
     expires_days: Optional[int] = Field(90, ge=1, le=36500)
     # 'worker': for a compute worker (python -m fridge.worker); only the worker endpoints accept it.
-    scope: Literal['full', 'worker'] = 'full'
+    # 'mcp': for an AI client; only the MCP server at /mcp accepts it (backend/mcp_door.py).
+    scope: Literal['full', 'worker', 'mcp'] = 'full'
 
 
 class TokenResponse(BaseModel):

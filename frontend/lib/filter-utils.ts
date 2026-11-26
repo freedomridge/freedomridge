@@ -1,4 +1,5 @@
 import { ComplexFilter, ViewStage } from './api';
+import { conceptStage, isConceptFilter, isReadOnlyStage } from './filter-query';
 
 // A range bound for numeric/datetime fields (either side optional).
 export type RangeFilter = { min?: string | number; max?: string | number };
@@ -82,15 +83,21 @@ const describeList = (v: unknown): string => {
     return v.length > 2 ? `${head} +${v.length - 2}` : head;
 };
 
+/** Each concept's name, by its id: what a concept's score filter is labelled with. */
+export function conceptNames(concepts: { id: number; name: string }[] | undefined): ReadonlyMap<number, string> {
+    return new Map((concepts ?? []).map(concept => [concept.id, concept.name]));
+}
+
 /**
  * A filter stage's chip label that names the value(s): `tags: AnnualCrop`, `country: US, CA +3`,
- * `score: 0.5–0.9`, `idx ≥ 9`. Chips said only "Filter (tags)", and Apply clears the sidebar's
- * draft, so the active value was visible nowhere.
+ * `score: 0.5–0.9`, `idx ≥ 9`, `not concept equipment > 0.62` (the concept named from `concepts`, by its id when it
+ * isn't there). Chips said only "Filter (tags)", and Apply clears the sidebar's draft, so the active value was
+ * visible nowhere.
  */
-export function describeFilter(f: ComplexFilter): string {
+export function describeFilter(f: ComplexFilter, concepts?: ReadonlyMap<number, string>): string {
     if (f.logic) {
         const kids = f.filters ?? [];
-        if (f.logic === 'NOT') return `not ${kids.map(child => child.logic ? `(${describeFilter(child)})` : describeFilter(child)).join('; ')}`;
+        if (f.logic === 'NOT') return `not ${kids.map(child => child.logic ? `(${describeFilter(child, concepts)})` : describeFilter(child, concepts)).join('; ')}`;
         if (f.logic === 'OR' && kids.length > 0 && kids.every(child => !child.logic && child.field === kids[0].field && (child.operator === 'in' || child.operator === 'contains'))) {
             return `${kids[0].field}: ${kids.map(child => child.operator === 'in' ? describeList(child.value) : `contains ${JSON.stringify(child.value)}`).join(' or ')}`;
         }
@@ -99,9 +106,14 @@ export function describeFilter(f: ComplexFilter): string {
             const hi = kids.find(k => k.operator === '<=');
             if (lo && hi) return `${lo.field}: ${describeValue(lo.value)}–${describeValue(hi.value)}`;
         }
-        return kids.map(describeFilter).join(f.logic === 'OR' ? ' or ' : '; ');
+        return kids.map(child => describeFilter(child, concepts)).join(f.logic === 'OR' ? ' or ' : '; ');
     }
     const symbol: Record<string, string> = { '>=': '≥', '<=': '≤', '!=': '≠' };
+    if (isConceptFilter(f)) {
+        const { concept_id: id, op = '>', threshold = 0.5 } = f.value ?? {};
+        const concept = concepts?.get(id) ?? `#${id}`;
+        return `${f.operator === 'concept_exclude' ? 'not ' : ''}concept ${concept} ${symbol[op] ?? op} ${describeValue(threshold)}`;
+    }
     switch (f.operator) {
         case 'in': return `${f.field}: ${describeList(f.value)}`;
         case 'not in': return `${f.field}: not ${describeList(f.value)}`;
@@ -110,13 +122,24 @@ export function describeFilter(f: ComplexFilter): string {
         case 'not_exists': return `${f.field}: no value`;
         case 'exists':
         case 'is_not_null': return `${f.field}: has a value`;
+        case 'geo_region': return `${f.field} within ${describeValue(f.value)}`;
+        case 'geo_region_exclude': return `${f.field} not within ${describeValue(f.value)}`;
         default: return `${f.field} ${symbol[f.operator ?? ''] ?? f.operator} ${describeList(f.value)}`;
     }
 }
 
 /** An auto-generated chip label (not one the user or a search named), safe to regenerate on edit. */
-export function isAutoFilterLabel(description: string, filter: ComplexFilter): boolean {
-    return description === 'Advanced Query' || /^Filter( \(|$)/.test(description) || description === describeFilter(filter);
+export function isAutoFilterLabel(description: string, filter: ComplexFilter, concepts?: ReadonlyMap<number, string>): boolean {
+    return description === 'Advanced Query' || /^Filter( \(|$)/.test(description) || description === describeFilter(filter, concepts);
+}
+
+/**
+ * A filter as a new chip, as a `q=` link's part or a filter card's text makes one: a concept's score filter on its own
+ * is the Concepts panel's chip (when `concepts` names it), any other is named as Add Filter names it.
+ */
+export function stageOfFilter(filter: ComplexFilter, concepts?: ReadonlyMap<number, string>): ViewStage {
+    const name = isConceptFilter(filter) ? concepts?.get(filter.value?.concept_id) : undefined;
+    return name !== undefined ? conceptStage(name, filter) : { type: 'filter', description: describeFilter(filter, concepts), filter };
 }
 
 /**
@@ -364,4 +387,18 @@ export function getMapStage(polygon: { geometry: { coordinates: number[][][] } }
             value: polygon.geometry.coordinates[0]
         }
     };
+}
+
+/**
+ * The stages of an assistant's working view (a `w=` link) named in the app's words, whatever the view called them: an
+ * ordinary filter as Add Filter names it, from its filter and `concepts` (a concept's name now; without it, `#<id>`),
+ * so a stage whose values were kept from the assistant shows them to the person. Applied before the stages are opened
+ * (a concept test on its own, so a concept the dataset no longer has is named `concept #<id>` in the left-out notice,
+ * never in the view's words) and again after, with the concepts' names. A region chip and a concept's chip are named
+ * by the app already; every other chip keeps its words.
+ */
+export function workingViewStages(stages: ViewStage[], concepts?: ReadonlyMap<number, string>): ViewStage[] {
+    return stages.map(stage => (stage.type === 'filter' && !isReadOnlyStage(stage)
+        ? { ...stage, description: describeFilter(stage.filter, concepts) }
+        : stage));
 }

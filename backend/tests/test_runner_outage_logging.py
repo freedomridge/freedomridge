@@ -11,6 +11,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
 
 from backend import (
+    assistant_calls,
     auth_cleanup,
     compute_launcher,
     concept_jobs,
@@ -170,6 +171,7 @@ def test_service_logs_migration_and_outage_transitions_only(monkeypatch, caplog)
         monkeypatch.setattr(follower_search, 'serve', schedule_statistics)
         monkeypatch.setattr(compute_launcher, 'schedule', schedule_statistics)
         monkeypatch.setattr(auth_cleanup, 'scheduled_cleanup', schedule_statistics)
+        monkeypatch.setattr(assistant_calls, 'prune', schedule_statistics)
         monkeypatch.setenv('JOB_STATISTICS_SECONDS', '1000000')
         monkeypatch.setenv('JOB_CONCEPT_SECONDS', '1000000')
         monkeypatch.setattr(loop, 'time', lambda: original_time() + elapsed)

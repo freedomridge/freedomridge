@@ -986,7 +986,9 @@ class Dataset:
     def get_schema(self, filters=None) -> list:
         """Get the field schema for this dataset.
 
-        Returns list of field dicts with name, type, min/max, values, etc.
+        Returns list of field dicts with name, type, min/max, values, etc., and what each field means:
+        ``description``, ``unit``, ``description_source`` (``"set"`` when someone wrote it, ``"default"`` when the
+        server supplies one, None when there is none) and ``values_private``.
         """
         return self.client.get_schema(self._id, filters=filters)
 
@@ -999,6 +1001,16 @@ class Dataset:
         result = self.client.set_field_type(self._id, field_name, field_type)
         self._dirty = True
         return result
+
+    def set_field_description(self, field: str, description: Optional[str] = None, unit: Optional[str] = None) -> dict:
+        """Say what a field means: a description (at most 1,000 characters) and a unit (at most 40), shown in the app
+        and returned with the schema. Needs edit access to the dataset.
+
+        Only the arguments given are changed; pass ``""`` to clear one (a field the server describes by default, such
+        as ``brightness``, gets that description back). Returns the field's ``description``, ``unit``,
+        ``values_private`` and ``description_source``. On a mirror, the primary's fields are described on the
+        primary."""
+        return self.client.set_field_description(self._id, field, description=description, unit=unit)
 
     def set_field_classes(self, field_name: str, names, colors=None) -> dict:
         """Name a mask or class-probability field's classes, and optionally colour them.

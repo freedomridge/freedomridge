@@ -226,18 +226,10 @@ async def get_view(slug: str, request: Request):
     if not row:
         raise HTTPException(status_code=404, detail="View not found")
 
-    # View visibility never exceeds dataset visibility. For an authenticated
-    # caller every denial is a 404 (not 403) so the endpoint doesn't confirm
-    # which slugs exist.
-    try:
-        await check_dataset_access(row['dataset_id'], user)
-    except HTTPException as e:
-        if e.status_code in (403, 404):
-            raise HTTPException(status_code=404, detail="View not found")
-        raise
-
     # is_public = visible to any logged-in user with dataset access; private /
     # specifically-shared views additionally require owner/admin/shared status.
+    # Checked first: a view the caller may not see is missing whatever its
+    # dataset says (a closed dataset's refusal below told a tool the slug exists).
     if not row['is_public']:
         allowed = (
             user.get('role') == 'admin'
@@ -246,6 +238,15 @@ async def get_view(slug: str, request: Request):
         )
         if not allowed:
             raise HTTPException(status_code=404, detail="View not found")
+
+    # View visibility never exceeds dataset visibility. For an authenticated
+    # caller every denial is a 404 (not 403) so the endpoint doesn't confirm
+    # which slugs exist. A dataset closed to the assistant keeps its refusal for a
+    # tool's request (access.AssistantClosed): that user can open the dataset.
+    # The dataset is kept on the request's state: a tool's request is sealed for
+    # it (assistant/inner.py), as the slug names no dataset.
+    with missing_unless_allowed("View not found"):
+        await check_dataset_access(row['dataset_id'], user, state=request.state)
 
     data = dict(row)
     data['content'] = _decode_content(data['content'])

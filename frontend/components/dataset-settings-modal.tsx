@@ -3,8 +3,8 @@
 import { segmentationLabelChoices } from '@/lib/labels';
 
 import * as Dialog from '@radix-ui/react-dialog';
-import { useState, useMemo, type ReactNode } from 'react';
-import { Dataset, updateDataset, getDatasetSchema, promoteField, demoteField, setFieldDisplayType, setFieldType, SegmentationConfig, saveOverlayConfig, notifySamplesMutated, noticeLevelRefusal, getDatasetAccess, getAccessCandidates, grantDatasetAccess, revokeDatasetAccess, type DatasetMirror, type SchemaField, type DeclaredFieldType } from '@/lib/api';
+import { useId, useState, useMemo, type ReactNode } from 'react';
+import { Dataset, updateDataset, getDatasetSchema, promoteField, demoteField, setFieldDescription, setFieldDisplayType, setFieldType, SegmentationConfig, saveOverlayConfig, notifySamplesMutated, noticeLevelRefusal, getDatasetAccess, getAccessCandidates, grantDatasetAccess, revokeDatasetAccess, type DatasetMirror, type SchemaField, type DeclaredFieldType } from '@/lib/api';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { SAMPLE_COUNT_KEY } from '@/hooks/useSampleCount';
 import { SegmentationSettingsPanel } from './SegmentationSettingsPanel';
@@ -604,6 +604,46 @@ const REMOVE_OWN_SHARE = 'Remove your own share of this dataset?\n\n'
 // be changed or removed, and a picker to share it with another user or group. Each change is sent at once. A change's
 // error goes to `onError`, which the Access section shows: a refusal for the level re-reads the dataset, which can
 // replace this list with the user's own level, and the server's words must stay.
+// Dataset Settings → Access: whether the assistant may read the dataset (assistant_closed, docs/ASSISTANT.md). Sent at
+// once, at manage level; below it, the level's reason. This server's own, on a mirror too.
+function AssistantAccess({ dataset, manageRefusal }: { dataset: Dataset; manageRefusal?: string }) {
+    const queryClient = useQueryClient();
+    const [closed, setClosed] = useState(!!dataset.assistant_closed);
+    const save = useMutation({
+        mutationFn: (next: boolean) => updateDataset(dataset.id, { assistant_closed: next }),
+        onSuccess: updated => {
+            setClosed(!!updated.assistant_closed);
+            // PATCH answers no sidebar_expand_all or access_level: keep the cached ones.
+            queryClient.setQueryData<Dataset>(['dataset', dataset.id], old => old && {
+                ...old, assistant_closed: updated.assistant_closed,
+            });
+            queryClient.invalidateQueries({ queryKey: ['dataset', dataset.id] });
+            queryClient.invalidateQueries({ queryKey: ['datasets'] });
+        },
+    });
+    const noteId = useId();
+    return (
+        <div className="space-y-1">
+            <label className="inline-flex items-center gap-3 text-sm text-zinc-200">
+                <button type="button" role="switch" aria-checked={!closed} aria-label="The assistant may read this dataset"
+                    aria-describedby={noteId} disabled={!!manageRefusal || save.isPending} title={manageRefusal}
+                    onClick={() => save.mutate(!closed)}
+                    className={`relative inline-flex h-6 w-11 shrink-0 items-center rounded-full transition-colors disabled:opacity-50 ${closed ? 'bg-zinc-700' : 'bg-cyan-600'}`}>
+                    <span className={`inline-block h-5 w-5 rounded-full bg-white transition-transform ${closed ? 'translate-x-0.5' : 'translate-x-5'}`} />
+                </button>
+                The assistant may read this dataset
+            </label>
+            <p id={noteId} className="text-xs text-zinc-500">
+                {manageRefusal
+                    ?? (closed
+                        ? 'Closed: the assistant leaves this dataset out for everyone, administrators too. People open it here as before.'
+                        : 'Open: when an administrator lets them use the assistant (Settings → Assistant), it reads this dataset as the person using it.')}
+            </p>
+            {save.error && <p role="alert" className="text-xs text-red-400">{save.error.message}</p>}
+        </div>
+    );
+}
+
 function DatasetShares({ datasetId, onError }: { datasetId: number; onError: (message: string | null) => void }) {
     const queryClient = useQueryClient();
     const { user } = useUser();
@@ -732,13 +772,114 @@ interface Props {
 const DECLARED_TYPES: DeclaredFieldType[] = ['unknown', 'boolean', 'number', 'string', 'datetime', 'list', 'object'];
 const REBUILDING_NOTE = 'Its index is being rebuilt in the background (Jobs shows its progress). Until then it filters and sorts correctly, only slower.';
 
-function FieldTypeRow({ datasetId, field, readOnly, onSaved }: {
+// What a field means, under its name in the Fields tab: its description and unit, saved together with their own
+// Save. A default description (the server's, for the built-in fields and the SDK's metrics) fills the text area and
+// is marked as such until someone saves their own; saving an empty one brings the default back.
+const DEFAULT_DESCRIPTION_NOTE = 'Default description: nobody has written one for this field yet.';
+// The server's refusal of a change to a field the primary owns, on a mirror (guard_mirror_fields): the reason its
+// description and unit are disabled there. The mirror's own `@local.` fields are described here.
+const MIRROR_REFUSAL = 'This dataset is a read-only mirror of a dataset on another Freedom Ridge instance: change it there';
+
+function FieldDescriptionEditor({ datasetId, field, readOnly, mirrored, onSaved }: {
+    datasetId: number; field: SchemaField; readOnly: boolean; mirrored: boolean; onSaved: () => Promise<void>;
+}) {
+    const [description, setDescription] = useState(field.description ?? '');
+    const [unit, setUnit] = useState(field.unit ?? '');
+    const [saving, setSaving] = useState(false);
+    const [error, setError] = useState<string | null>(null);
+    const noteId = useId();
+    const isDefault = field.description_source === 'default';
+    // Only what was changed is sent: a default left as it is stays the default.
+    const changes = {
+        ...(description !== (field.description ?? '') ? { description } : {}),
+        ...(unit !== (field.unit ?? '') ? { unit } : {}),
+    };
+    // Below edit, the level says why (as the server checks it first); on a mirror, a field of the primary's.
+    const reason = readOnly ? needsLevel('edit') : mirrored && field.origin !== 'local' ? MIRROR_REFUSAL : undefined;
+    const locked = reason !== undefined;
+
+    const save = async () => {
+        setSaving(true);
+        setError(null);
+        try {
+            await setFieldDescription(datasetId, field.name, changes);
+            await onSaved();
+        } catch (failure) {
+            setError(failure instanceof Error ? failure.message : 'Could not save the description');
+        } finally {
+            setSaving(false);
+        }
+    };
+
+    return (
+        <div className="space-y-1.5">
+            <textarea aria-label={`Description of ${field.name}`} value={description} rows={2} maxLength={1000}
+                disabled={locked || saving} title={reason}
+                aria-describedby={isDefault && !locked ? noteId : undefined}
+                placeholder="What this field means"
+                onChange={event => { setDescription(event.target.value); setError(null); }}
+                className={`w-full bg-zinc-800 border border-zinc-700 rounded px-2 py-1 text-sm disabled:opacity-50 ${isDefault && !('description' in changes) ? 'italic text-zinc-400' : 'text-zinc-200'}`} />
+            {isDefault && <p id={noteId} className="text-xs text-zinc-500">{DEFAULT_DESCRIPTION_NOTE}</p>}
+            <div className="flex items-center gap-3">
+                <input aria-label={`Unit of ${field.name}`} value={unit} maxLength={40} disabled={locked || saving}
+                    title={reason} placeholder="Unit"
+                    onChange={event => { setUnit(event.target.value); setError(null); }}
+                    className="w-32 bg-zinc-800 border border-zinc-700 rounded px-2 py-1 text-sm text-zinc-200 disabled:opacity-50" />
+                <button aria-label={`Save description and unit of ${field.name}`} onClick={save}
+                    disabled={locked || saving || Object.keys(changes).length === 0} title={reason}
+                    className="ml-auto px-3 py-1 text-sm bg-cyan-700 hover:bg-cyan-600 rounded text-white disabled:opacity-40">
+                    {saving ? 'Saving…' : 'Save description'}
+                </button>
+            </div>
+            {error && <p role="alert" className="text-xs text-red-400">{error}</p>}
+        </div>
+    );
+}
+
+// Whether the assistant gets a field's values (values_private, docs/ASSISTANT.md): sent at once, at edit level. This
+// server's own, on a mirror too, so it is offered for every field there.
+function FieldPrivacyToggle({ datasetId, field, readOnly, onSaved }: {
     datasetId: number; field: SchemaField; readOnly: boolean; onSaved: () => Promise<void>;
+}) {
+    const [saving, setSaving] = useState(false);
+    const [error, setError] = useState<string | null>(null);
+    const reason = readOnly ? needsLevel('edit') : undefined;
+    const toggle = async (values_private: boolean) => {
+        setSaving(true);
+        setError(null);
+        try {
+            await setFieldDescription(datasetId, field.name, { values_private });
+            await onSaved();
+        } catch (failure) {
+            setError(failure instanceof Error ? failure.message : "Could not change whether the assistant gets this field's values");
+        } finally {
+            setSaving(false);
+        }
+    };
+    return (
+        <div>
+            <label className="inline-flex items-center gap-2 text-sm text-zinc-300">
+                {/* The reason on the control itself, as the description and unit boxes carry theirs: a title, which is
+                    also its accessible description (its name is the label's words). */}
+                <input type="checkbox" checked={!!field.values_private} disabled={readOnly || saving} title={reason}
+                    onChange={event => toggle(event.target.checked)}
+                    className="rounded bg-zinc-800 border-zinc-700 text-cyan-600 focus:ring-cyan-500 disabled:opacity-50" />
+                Keep this field&apos;s values from the assistant
+            </label>
+            {error && <p role="alert" className="text-xs text-red-400">{error}</p>}
+        </div>
+    );
+}
+
+// A field in the Fields tab: its declared type (metadata fields only) and what it means.
+function FieldTypeRow({ datasetId, field, readOnly, mirrored, onSaved }: {
+    datasetId: number; field: SchemaField; readOnly: boolean; mirrored: boolean; onSaved: () => Promise<void>;
 }) {
     const [fieldType, setType] = useState<DeclaredFieldType>(field.declared_type || 'unknown');
     const [saving, setSaving] = useState(false);
     const [error, setError] = useState<string | null>(null);
     const disabled = readOnly || saving || field.is_promoted;
+    const typed = field.origin === 'metadata' && !!field.declared_type;
 
     const save = async () => {
         setSaving(true);
@@ -754,24 +895,29 @@ function FieldTypeRow({ datasetId, field, readOnly, onSaved }: {
     };
 
     return (
-        <div className="border border-zinc-800 rounded-lg p-3 space-y-2">
+        <div role="group" aria-label={field.name} className="border border-zinc-800 rounded-lg p-3 space-y-2">
             <div className="flex items-center gap-3">
                 <span className="flex-1 text-sm font-mono text-zinc-200 truncate" title={field.name}>{field.name}</span>
-                <select aria-label={`Declared type for ${field.name}`} value={fieldType} disabled={disabled}
-                    title={readOnly ? needsLevel('edit') : undefined}
-                    onChange={event => { setType(event.target.value as DeclaredFieldType); setError(null); }}
-                    className="bg-zinc-800 border border-zinc-700 rounded px-2 py-1 text-sm text-zinc-200 disabled:opacity-50">
-                    {DECLARED_TYPES.map(type => <option key={type} value={type}>{type}</option>)}
-                </select>
-                <button aria-label={`Save type for ${field.name}`} onClick={save}
-                    disabled={disabled || fieldType === field.declared_type}
-                    title={readOnly ? needsLevel('edit') : undefined}
-                    className="px-3 py-1 text-sm bg-cyan-700 hover:bg-cyan-600 rounded text-white disabled:opacity-40">
-                    {saving ? 'Saving…' : 'Save'}
-                </button>
+                {typed && <>
+                    <select aria-label={`Declared type for ${field.name}`} value={fieldType} disabled={disabled}
+                        title={readOnly ? needsLevel('edit') : undefined}
+                        onChange={event => { setType(event.target.value as DeclaredFieldType); setError(null); }}
+                        className="bg-zinc-800 border border-zinc-700 rounded px-2 py-1 text-sm text-zinc-200 disabled:opacity-50">
+                        {DECLARED_TYPES.map(type => <option key={type} value={type}>{type}</option>)}
+                    </select>
+                    <button aria-label={`Save type for ${field.name}`} onClick={save}
+                        disabled={disabled || fieldType === field.declared_type}
+                        title={readOnly ? needsLevel('edit') : undefined}
+                        className="px-3 py-1 text-sm bg-cyan-700 hover:bg-cyan-600 rounded text-white disabled:opacity-40">
+                        {saving ? 'Saving…' : 'Save'}
+                    </button>
+                </>}
             </div>
-            {field.is_promoted && <p className="text-xs text-zinc-500">Remove this field&apos;s index in the Indexes tab before changing its type.</p>}
+            {typed && field.is_promoted && <p className="text-xs text-zinc-500">Remove this field&apos;s index in the Indexes tab before changing its type.</p>}
             {error && <p role="alert" className="text-xs text-red-400">{error}</p>}
+            <FieldDescriptionEditor key={`${field.description}:${field.unit}:${field.description_source}`}
+                datasetId={datasetId} field={field} readOnly={readOnly} mirrored={mirrored} onSaved={onSaved} />
+            <FieldPrivacyToggle datasetId={datasetId} field={field} readOnly={readOnly} onSaved={onSaved} />
         </div>
     );
 }
@@ -972,10 +1118,15 @@ export function DatasetSettingsModal({ dataset, onClose, onViewSamples }: Props)
                                     Display overrides and cached statistics are reset; statistics refresh separately.
                                     Native and system fields have fixed types.
                                 </p>
+                                <p className="text-sm text-zinc-400">
+                                    Say what each field means and its unit: the filters show it on the field&apos;s name.
+                                    A field whose values are kept from the assistant still shows them here; the assistant
+                                    learns what the field means and how many samples have it, never a value.
+                                </p>
                                 {!schema && <p className="text-sm text-zinc-500">Loading field definitions…</p>}
-                                {schema?.filter(field => field.origin === 'metadata' && field.declared_type).map(field => (
+                                {schema?.map(field => (
                                     <FieldTypeRow key={`${field.name}:${field.declared_type}`} datasetId={dataset.id}
-                                        field={field} readOnly={readOnly} onSaved={async () => {
+                                        field={field} readOnly={readOnly} mirrored={!!dataset.mirror} onSaved={async () => {
                                             await Promise.all([
                                                 queryClient.invalidateQueries({ queryKey: ['dataset-schema', dataset.id] }),
                                                 queryClient.invalidateQueries({ queryKey: ['schema'] }),
@@ -983,9 +1134,6 @@ export function DatasetSettingsModal({ dataset, onClose, onViewSamples }: Props)
                                             ]);
                                         }} />
                                 ))}
-                                {schema && !schema.some(field => field.origin === 'metadata' && field.declared_type) && (
-                                    <p className="text-sm text-zinc-500">No metadata fields to edit.</p>
-                                )}
                             </div>
                         )}
                         {activeTab === 'general' && (
@@ -1142,6 +1290,7 @@ export function DatasetSettingsModal({ dataset, onClose, onViewSamples }: Props)
                                         <DatasetShares datasetId={dataset.id} onError={setShareError} />
                                     )}
                                     {shareError && <p role="alert" data-testid="dataset-access-error" className="text-xs text-red-400">{shareError}</p>}
+                                    <AssistantAccess dataset={dataset} manageRefusal={manageRefusal} />
                                 </section>
                             </div>
                         )}

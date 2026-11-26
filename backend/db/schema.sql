@@ -47,7 +47,10 @@ CREATE TABLE IF NOT EXISTS datasets (
     -- (0033) The level a global dataset gives every signed-in user: 1 view, 2 tag, 3 edit. Read only while is_global;
     -- view until a manager raises it (0033 gave the datasets already global edit).
     everyone_level SMALLINT NOT NULL DEFAULT 1
-        CONSTRAINT datasets_everyone_level_check CHECK (everyone_level BETWEEN 1 AND 3)
+        CONSTRAINT datasets_everyone_level_check CHECK (everyone_level BETWEEN 1 AND 3),
+    -- (0036) The assistant may not read it (docs/ASSISTANT.md): this installation's own, never synced. A new dataset
+    -- starts closed while assistant_settings.new_datasets_closed is on (the code that creates datasets reads it).
+    assistant_closed BOOLEAN NOT NULL DEFAULT FALSE
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_datasets_active_name ON datasets(name) WHERE NOT deleting;
@@ -93,6 +96,76 @@ CREATE TABLE IF NOT EXISTS dataset_group_access (
 );
 
 CREATE INDEX IF NOT EXISTS idx_dataset_group_access_group ON dataset_group_access(group_id);
+
+-- (0036) The assistant (docs/ASSISTANT.md): who may use it. One row of settings: the MCP door starts off, and of the
+-- roles only administrators are let in. A group listed in assistant_groups lets its members in; a user's own answer in
+-- assistant_users decides for that user before their groups and role. This installation's own: never synced. seal_key:
+-- a random key the server makes for itself, which seals private values for the assistant (backend/assistant/private.py).
+CREATE TABLE IF NOT EXISTS assistant_settings (
+    singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
+    mcp_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+    admin_allowed BOOLEAN NOT NULL DEFAULT TRUE,
+    power_user_allowed BOOLEAN NOT NULL DEFAULT FALSE,
+    guest_allowed BOOLEAN NOT NULL DEFAULT FALSE,
+    new_datasets_closed BOOLEAN NOT NULL DEFAULT FALSE,
+    updated_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now(),
+    seal_key BYTEA NOT NULL DEFAULT sha512((gen_random_uuid()::text || gen_random_uuid()::text || gen_random_uuid()::text
+                                    || gen_random_uuid()::text)::bytea),
+    -- (0038) Whether the assistant may read samples' own fields and file paths.
+    sample_fields BOOLEAN NOT NULL DEFAULT FALSE
+);
+INSERT INTO assistant_settings (singleton) VALUES (TRUE) ON CONFLICT DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS assistant_groups (
+    group_id INTEGER PRIMARY KEY REFERENCES groups(id) ON DELETE CASCADE,
+    added_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    added_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS assistant_users (
+    user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    allowed BOOLEAN NOT NULL,
+    set_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    set_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now()
+);
+
+-- (0038) The assistant's working views and value lists (docs/ASSISTANT.md, "Working views"): its own rows, for the
+-- user who made them, removed with their dataset, their user, or 30 days after they were last used. A view's stages
+-- are the app's filter nodes, except one from a value list, which names it ({"list", "field", "exclude"}); `lists`
+-- holds those handles. A list keeps its values (`entries`) when it has at most 10,000, else the filter it was counted
+-- over (`source`).
+CREATE TABLE IF NOT EXISTS assistant_views (
+    handle TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    dataset_id INTEGER NOT NULL REFERENCES datasets(id) ON DELETE CASCADE,
+    stages JSONB NOT NULL,
+    lists TEXT[] NOT NULL DEFAULT '{}',
+    from_handle TEXT,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now(),
+    used_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_assistant_views_dataset ON assistant_views (dataset_id, handle);
+CREATE INDEX IF NOT EXISTS idx_assistant_views_user ON assistant_views (user_id);
+CREATE INDEX IF NOT EXISTS idx_assistant_views_used ON assistant_views (used_at);
+CREATE INDEX IF NOT EXISTS idx_assistant_views_lists ON assistant_views USING gin (lists);
+
+CREATE TABLE IF NOT EXISTS assistant_lists (
+    handle TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    dataset_id INTEGER NOT NULL REFERENCES datasets(id) ON DELETE CASCADE,
+    field_name TEXT NOT NULL,
+    value_kind TEXT NOT NULL CHECK (value_kind IN ('text', 'number', 'boolean')),
+    distinct_count BIGINT NOT NULL,
+    entries JSONB,
+    source JSONB,
+    search TEXT,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now(),
+    used_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_assistant_lists_dataset ON assistant_lists (dataset_id, handle);
+CREATE INDEX IF NOT EXISTS idx_assistant_lists_user ON assistant_lists (user_id);
+CREATE INDEX IF NOT EXISTS idx_assistant_lists_used ON assistant_lists (used_at);
 
 -- Samples table (images)
 CREATE TABLE IF NOT EXISTS samples (
@@ -183,7 +256,9 @@ LANGUAGE SQL IMMUTABLE PARALLEL SAFE AS $$
                     THEN COALESCE(field->>'display_type', 'enum') ELSE field->>'display_type' END,
                 'overlay_config', field->'overlay_config',
                 'origin', COALESCE(field->>'origin',
-                    CASE WHEN field->>'field_type' = 'array' THEN 'native_array' ELSE 'metadata' END)
+                    CASE WHEN field->>'field_type' = 'array' THEN 'native_array' ELSE 'metadata' END),
+                'description', field->>'description',
+                'unit', field->>'unit'
             ) ORDER BY field->>'field_name')
             FROM jsonb_array_elements(COALESCE(snapshot->'fields', '[]'::jsonb)) field
             WHERE COALESCE(field->>'origin', 'metadata') <> 'system'
@@ -220,6 +295,8 @@ LANGUAGE SQL IMMUTABLE PARALLEL SAFE AS $$
                     THEN COALESCE(lhs_field, rhs_field)->>'origin' <> 'metadata'
                       OR COALESCE(lhs_field, rhs_field)->>'display_type' IS NOT NULL
                       OR COALESCE(lhs_field, rhs_field)->>'overlay_config' IS NOT NULL
+                      OR COALESCE(lhs_field, rhs_field)->>'description' IS NOT NULL
+                      OR COALESCE(lhs_field, rhs_field)->>'unit' IS NOT NULL
                     ELSE TRUE
                 END
         )
@@ -235,14 +312,22 @@ CREATE TABLE IF NOT EXISTS dataset_fields (
     field_type TEXT NOT NULL CONSTRAINT dataset_fields_type_check CHECK (field_type IN ('unknown', 'boolean', 'number', 'string', 'datetime', 'list', 'object')),
     origin TEXT NOT NULL DEFAULT 'metadata' CONSTRAINT dataset_fields_origin_check CHECK (origin IN ('metadata', 'native_array', 'system', 'local')),
     CONSTRAINT dataset_fields_native_type_check CHECK (origin <> 'native_array' OR field_type = 'list'),
-    -- origin is where a field is stored, owner who may change it (0022). The `@local.` names are origin 'local'.
-    CONSTRAINT dataset_fields_local_check CHECK (starts_with(field_name, '@local.') = (origin = 'local')),
+    -- origin is where a field is stored, owner who may change it (0022). The `@local.` names are origin 'local', or
+    -- 'system' for a row that only keeps a private flag once the field went (0035).
+    CONSTRAINT dataset_fields_local_check
+        CHECK (origin = 'system' OR starts_with(field_name, '@local.') = (origin = 'local')),
     is_promoted BOOLEAN DEFAULT FALSE,
     display_type TEXT,       -- Override: 'enum' to show dropdown instead of slider for numbers
     overlay_config JSONB,    -- Per-field overlay display config: heatmap colormap/range/opacity
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     -- 'primary' on a mirror for the primary's fields, 'self' for this instance's: set by dataset_fields_owner (0022).
     owner TEXT NOT NULL DEFAULT 'self' CONSTRAINT dataset_fields_owner_check CHECK (owner IN ('self', 'primary')),
+    -- (0035) What the field means, written by people: NULL for none. On a mirror, the primary's for its fields.
+    description TEXT
+        CONSTRAINT dataset_fields_description_check CHECK (char_length(description) BETWEEN 1 AND 1000),
+    unit TEXT CONSTRAINT dataset_fields_unit_check CHECK (char_length(unit) BETWEEN 1 AND 40),
+    -- (0035) Its values aren't given to the assistant. This instance's own, never synced or versioned.
+    values_private BOOLEAN NOT NULL DEFAULT FALSE,
     UNIQUE(dataset_id, field_name)
 );
 
@@ -952,11 +1037,33 @@ CREATE TABLE IF NOT EXISTS api_tokens (
     is_active BOOLEAN DEFAULT TRUE,
     -- 'worker': a compute worker's token, which only the worker endpoints accept (routers/workers.py).
     -- 'follower': a follower instance's token, which only the follower endpoints accept (routers/followers.py).
-    scope TEXT NOT NULL DEFAULT 'full' CONSTRAINT api_tokens_scope_check CHECK (scope IN ('full', 'worker', 'follower'))
+    -- 'mcp' (0037): opens the MCP server at /mcp and nothing else (backend/mcp_door.py).
+    scope TEXT NOT NULL DEFAULT 'full'
+        CONSTRAINT api_tokens_scope_check CHECK (scope IN ('full', 'worker', 'follower', 'mcp'))
 );
 
 CREATE INDEX IF NOT EXISTS idx_api_tokens_token ON api_tokens(token);
 CREATE INDEX IF NOT EXISTS idx_api_tokens_user_id ON api_tokens(user_id);
+
+-- (0037) One row per tool call made through one of the assistant's doors ('mcp': /mcp; 'chat': the chat in the app):
+-- never the arguments, never the result. dataset_id is the number the arguments named, with no key, so deleting a
+-- dataset never waits on the log; a deleted user leaves its rows with no user. The job service removes rows older
+-- than 30 days (backend/assistant_calls.py).
+CREATE TABLE IF NOT EXISTS assistant_calls (
+    id BIGSERIAL PRIMARY KEY,
+    user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    door TEXT NOT NULL CHECK (door IN ('mcp', 'chat')),
+    tool TEXT NOT NULL,
+    dataset_id INTEGER,
+    started_at TIMESTAMP WITH TIME ZONE NOT NULL,
+    duration_ms INTEGER NOT NULL CHECK (duration_ms >= 0),
+    ok BOOLEAN NOT NULL,
+    error_code TEXT,
+    CHECK (ok = (error_code IS NULL))
+);
+
+CREATE INDEX IF NOT EXISTS idx_assistant_calls_started_at ON assistant_calls(started_at);
+CREATE INDEX IF NOT EXISTS idx_assistant_calls_user_id ON assistant_calls(user_id);
 
 -- Dataset field stats cache
 CREATE TABLE IF NOT EXISTS dataset_field_stats (
@@ -1246,17 +1353,45 @@ CREATE TABLE IF NOT EXISTS concept_score_count_deltas (
 -- filter, where it is a One-Time Filter on an unchanged plan. Inside each concept EXISTS it was a join
 -- filter that flipped the anti join to hash every sample, and PARALLEL UNSAFE forbade the parallel plan
 -- (a broad exclusion filter: 0.18 s without a guard, 1.31 s with it). It only reads, and an error raised in a
--- parallel worker reaches the client with its SQLSTATE, so it is PARALLEL SAFE.
+-- parallel worker reaches the client with its SQLSTATE, so it is PARALLEL SAFE. A concept that doesn't exist
+-- (deleted since a link or view named it) has no scores, so its test would keep every sample or none: it is
+-- refused as bad input (SQLSTATE 22023, a 400).
 CREATE OR REPLACE FUNCTION require_concept_scores(target_concepts INTEGER[])
 RETURNS BOOLEAN AS $$
 DECLARE
     concept_name TEXT;
+    missing INTEGER;
 BEGIN
+    SELECT wanted INTO missing FROM unnest(target_concepts) AS wanted
+    WHERE NOT EXISTS (SELECT 1 FROM embedding_concepts WHERE id = wanted) ORDER BY wanted LIMIT 1;
+    IF FOUND THEN
+        RAISE EXCEPTION 'Concept % doesn''t exist; it may have been deleted', missing USING ERRCODE = '22023';
+    END IF;
     SELECT name INTO concept_name FROM embedding_concepts
     WHERE id = ANY(target_concepts) AND NOT scores_ready ORDER BY id LIMIT 1;
     IF FOUND THEN
         RAISE EXCEPTION 'Concept "%" is being rescored; use it again when its scoring job finishes', concept_name
             USING ERRCODE = '55000';
+    END IF;
+    RETURN TRUE;
+END;
+$$ LANGUAGE plpgsql STABLE PARALLEL SAFE;
+
+-- The concepts a filter on a dataset reads are that dataset's: another dataset's concept id exists but scores none of
+-- its samples, so its test would keep every sample or none. The filter compiler ANDs this beside
+-- require_concept_scores where it knows the dataset; existence and ownership only, so a concept being rescored keeps
+-- that guard's 409. SQLSTATE 22023, a 400.
+CREATE OR REPLACE FUNCTION require_dataset_concepts(target_concepts INTEGER[], target_dataset INTEGER)
+RETURNS BOOLEAN AS $$
+DECLARE
+    missing INTEGER;
+BEGIN
+    SELECT wanted INTO missing FROM unnest(target_concepts) AS wanted
+    WHERE NOT EXISTS (SELECT 1 FROM embedding_concepts WHERE id = wanted AND dataset_id = target_dataset)
+    ORDER BY wanted LIMIT 1;
+    IF FOUND THEN
+        RAISE EXCEPTION 'Concept % doesn''t exist in this dataset; it may have been deleted', missing
+            USING ERRCODE = '22023';
     END IF;
     RETURN TRUE;
 END;
@@ -1964,6 +2099,12 @@ BEGIN
     target_dataset := CASE WHEN TG_OP = 'DELETE' THEN OLD.dataset_id ELSE NEW.dataset_id END;
     -- Bulk field jobs visit every captured block; definition changes need no full rebuild.
     IF current_setting('fridge.bulk_dataset', TRUE) = target_dataset::text THEN
+        RETURN NULL;
+    END IF;
+    -- (0035) A built-in field's row (origin 'system') holds only what is written about it: nothing to measure. A field
+    -- that becomes one (a mirror's private flag kept once its primary removed the field) goes as if deleted.
+    IF COALESCE(CASE WHEN TG_OP <> 'INSERT' THEN OLD.origin END, 'system') = 'system'
+       AND COALESCE(CASE WHEN TG_OP <> 'DELETE' THEN NEW.origin END, 'system') = 'system' THEN
         RETURN NULL;
     END IF;
     IF TG_OP = 'INSERT' AND NEW.origin = 'metadata' AND EXISTS (
@@ -3189,14 +3330,21 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
--- The field registry of a mirror is the primary's, except this instance's own `@local.` fields (0022). is_promoted
--- and owner (set by dataset_fields_owner) stay local: is_promoted stands for an index here.
+-- The field registry of a mirror is the primary's, except this instance's own `@local.` fields (0022). is_promoted,
+-- values_private (0035) and owner (set by dataset_fields_owner) stay local: is_promoted stands for an index here.
 CREATE OR REPLACE FUNCTION guard_mirror_fields() RETURNS trigger AS $$
 BEGIN
     IF TG_OP = 'UPDATE' AND (OLD.dataset_id, OLD.field_name, OLD.field_type, OLD.origin, OLD.display_type,
-                             OLD.overlay_config)
+                             OLD.overlay_config, OLD.description, OLD.unit)
         IS NOT DISTINCT FROM (NEW.dataset_id, NEW.field_name, NEW.field_type, NEW.origin, NEW.display_type,
-                              NEW.overlay_config) THEN
+                              NEW.overlay_config, NEW.description, NEW.unit) THEN
+        RETURN NULL;
+    END IF;
+    -- (0035) A row that says nothing about the field but holds this instance's values_private: what a mirror's
+    -- private flag on a field its primary gave no row (id, filepath, ...) is stored in.
+    IF TG_OP = 'INSERT' AND NEW.origin = 'system' AND NEW.field_type = 'unknown' AND NOT NEW.is_promoted
+       AND (NEW.display_type, NEW.overlay_config, NEW.description, NEW.unit) IS NOT DISTINCT FROM
+           (NULL::text, NULL::jsonb, NULL::text, NULL::text) THEN
         RETURN NULL;
     END IF;
     IF TG_OP <> 'INSERT' AND current_setting('fridge.deletion_dataset', TRUE) = OLD.dataset_id::text THEN
@@ -3398,6 +3546,130 @@ CREATE TRIGGER follower_truncate_guard BEFORE TRUNCATE ON datasets
 CREATE TRIGGER follower_truncate_guard BEFORE TRUNCATE ON embedding_layouts
     FOR EACH STATEMENT EXECUTE FUNCTION refuse_followed_truncate();
 
+-- (0034) Named regions: countries, states or provinces, and named groups of states, loaded from a public boundary
+-- set (backend/regions.py, docs/REGIONS.md), for the geo_region and geo_region_exclude filters. They belong to
+-- this installation: followers never read them, and loading a set again replaces that set's rows only.
+-- One row per loaded set: which version, from which file, when and by whom, and what the load decided (report).
+CREATE TABLE IF NOT EXISTS region_sets (
+    name TEXT PRIMARY KEY,
+    version TEXT NOT NULL,
+    sha256 TEXT NOT NULL,
+    verified BOOLEAN NOT NULL,  -- the file was the set's pinned one
+    loaded_from TEXT NOT NULL CONSTRAINT region_sets_loaded_from_check CHECK (loaded_from IN ('download', 'file')),
+    loaded_by INTEGER REFERENCES users(id) ON DELETE SET NULL,  -- NULL from the command line
+    loaded_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now(),
+    report JSONB NOT NULL DEFAULT '{}'::jsonb
+);
+
+-- Each region whole: its key (US-KS, US, US:midwest), its name and country, its bounding box (west > east across the
+-- antimeridian, as in GeoJSON) and its polygons.
+CREATE TABLE IF NOT EXISTS regions (
+    id SERIAL PRIMARY KEY,
+    set_name TEXT NOT NULL REFERENCES region_sets(name) ON DELETE CASCADE,
+    kind TEXT NOT NULL CONSTRAINT regions_kind_check CHECK (kind IN ('country', 'state', 'group')),
+    key TEXT NOT NULL UNIQUE,
+    name TEXT NOT NULL,
+    country_key TEXT NOT NULL,
+    country_name TEXT NOT NULL,
+    west DOUBLE PRECISION NOT NULL,
+    south DOUBLE PRECISION NOT NULL,
+    east DOUBLE PRECISION NOT NULL,
+    north DOUBLE PRECISION NOT NULL,
+    geom GEOMETRY(MultiPolygon, 4326) NOT NULL
+);
+
+-- Each region cut into pieces of at most 256 vertices: a location is tested against the few pieces around it, not
+-- against a coastline of thousands of points.
+CREATE TABLE IF NOT EXISTS region_parts (
+    region_id INTEGER NOT NULL REFERENCES regions(id) ON DELETE CASCADE,
+    geom GEOMETRY(Polygon, 4326) NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_region_parts_geom ON region_parts USING gist (geom);
+CREATE INDEX IF NOT EXISTS idx_region_parts_region ON region_parts (region_id);
+
+-- The quarter-degree cells each region touches: cell (i, j) holds the longitudes from i/4 to (i + 1)/4 and the
+-- latitudes from j/4 to (j + 1)/4. `inside`: one piece of the region covers the whole cell, so every location in it
+-- is in the region; otherwise the cell holds some of the region's border, and a location in it is tested exactly. A
+-- location in no cell of the region is outside it. Memory for the per-row test follows the region's size, never its
+-- samples.
+CREATE TABLE IF NOT EXISTS region_cells (
+    region_id INTEGER NOT NULL REFERENCES regions(id) ON DELETE CASCADE,
+    i INTEGER NOT NULL,
+    j INTEGER NOT NULL,
+    inside BOOLEAN NOT NULL,
+    PRIMARY KEY (region_id, i, j)
+);
+
+-- Up to `how_many` keys of regions close to what was written: its key or name in another case, then names that start
+-- with it, then keys and names sharing most of its letter pairs (Dice similarity of at least 0.6: 'US-KZ' finds US-KS
+-- and US-KY, 'Kanass' Kansas).
+CREATE OR REPLACE FUNCTION region_suggestions(written TEXT, how_many INTEGER DEFAULT 3)
+RETURNS TEXT[] AS $$
+    WITH typed AS (
+        SELECT lower(written) AS text,
+               ARRAY(SELECT DISTINCT substr(lower(written), i, 2) FROM generate_series(1, length(written) - 1) AS i) AS pairs
+    ), scored AS (
+        SELECT r.key, r.name, array_position(ARRAY['country', 'state', 'group'], r.kind) AS kind_order,
+               CASE WHEN lower(r.key) = t.text THEN 0
+                    WHEN lower(r.name) = t.text THEN 1
+                    WHEN starts_with(lower(r.name), t.text) THEN 2
+                    ELSE 3 END AS rank,
+               greatest(
+                   2.0 * (SELECT count(*) FROM unnest(t.pairs) AS pair WHERE strpos(lower(r.key), pair) > 0)
+                       / NULLIF(length(r.key) - 1 + cardinality(t.pairs), 0),
+                   2.0 * (SELECT count(*) FROM unnest(t.pairs) AS pair WHERE strpos(lower(r.name), pair) > 0)
+                       / NULLIF(length(r.name) - 1 + cardinality(t.pairs), 0)
+               ) AS likeness
+        FROM regions r, typed t
+    )
+    SELECT COALESCE(array_agg(key ORDER BY rank, likeness DESC, kind_order, name, key), '{}') FROM (
+        SELECT * FROM scored WHERE rank < 3 OR likeness >= 0.6
+        ORDER BY rank, likeness DESC, kind_order, name, key
+        LIMIT how_many
+    ) best
+$$ LANGUAGE sql STABLE PARALLEL SAFE;
+
+-- What a filter naming a region this server doesn't have is told (a 400 through the app's DataError handler).
+CREATE OR REPLACE FUNCTION unknown_region_message(region_key TEXT)
+RETURNS TEXT AS $$
+DECLARE
+    close TEXT;
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM regions) THEN
+        RETURN format('Unknown region %L: no boundary set is loaded on this server', region_key);
+    END IF;
+    SELECT string_agg(format('%L (%s)', r.key, r.name), ' or ' ORDER BY s.position) INTO close
+    FROM unnest(region_suggestions(region_key)) WITH ORDINALITY AS s(key, position) JOIN regions r USING (key);
+    RETURN format('Unknown region %L: the boundary set isn''t loaded on this server or has no such region', region_key)
+        || CASE WHEN close IS NULL THEN '' ELSE format(' (did you mean %s?)', close) END;
+END;
+$$ LANGUAGE plpgsql STABLE PARALLEL SAFE;
+
+-- The region a filter names, by its key: a key no loaded set has is refused (SQLSTATE 22023), never matched as
+-- nothing. It only reads, and an error raised in a parallel worker reaches the client with its SQLSTATE.
+CREATE OR REPLACE FUNCTION region_id(region_key TEXT)
+RETURNS INTEGER AS $$
+DECLARE
+    region INTEGER;
+BEGIN
+    SELECT id INTO region FROM regions WHERE key = region_key;
+    IF region IS NULL THEN
+        RAISE EXCEPTION '%', unknown_region_message(region_key) USING ERRCODE = '22023';
+    END IF;
+    RETURN region;
+END;
+$$ LANGUAGE plpgsql STABLE PARALLEL SAFE;
+
+-- One call checks every region a filter names: the filter compiler ANDs it in front of the whole filter, where it is
+-- a One-Time Filter, so a statement that reads no row is refused too.
+CREATE OR REPLACE FUNCTION require_regions(region_keys TEXT[])
+RETURNS BOOLEAN AS $$
+BEGIN
+    PERFORM region_id(region_key) FROM unnest(region_keys) AS region_key;
+    RETURN TRUE;
+END;
+$$ LANGUAGE plpgsql STABLE PARALLEL SAFE;
+
 -- Ledger of applied migrations: the 1.0.0 baseline, then the files in backend/db/migrations/
 -- (0001_..., 0002_...) that scripts/apply_migrations.sh applies to existing databases. A fresh install
 -- from this file IS current: when you add a migration, make the same change here and ADD ITS
@@ -3440,5 +3712,10 @@ INSERT INTO schema_migrations (filename) VALUES
     ('0030_object_parent_key.sql'),
     ('0031_metadata_instant.sql'),
     ('0032_datetime_index_rebuilds.sql'),
-    ('0033_access_levels.sql')
+    ('0033_access_levels.sql'),
+    ('0034_regions.sql'),
+    ('0035_field_descriptions.sql'),
+    ('0036_assistant.sql'),
+    ('0037_mcp_tokens_and_assistant_calls.sql'),
+    ('0038_assistant_working_views.sql')
 ON CONFLICT (filename) DO NOTHING;

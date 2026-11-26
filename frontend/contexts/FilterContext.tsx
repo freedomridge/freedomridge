@@ -4,7 +4,7 @@ import React, { createContext, useContext, useState, useCallback, useMemo, useEf
 import type { Feature, Polygon } from 'geojson';
 import { ComplexFilter, ViewStage } from '@/lib/api';
 import { convertSimpleFiltersToComplex, describeFilter, upgradeDraftKeys } from '@/lib/filter-utils';
-import { type DefaultView, defaultViewStages, isDefaultViewStage, opensOnDefaultView } from '@/lib/default-view';
+import { type DefaultView, defaultViewSaved, defaultViewStages, isDefaultViewStage, opensOnDefaultView } from '@/lib/default-view';
 import { type DatasetLink, type LinkSort, linkSetsFilters, openingOf, withSample, withSort } from '@/lib/links';
 import { type ExpiredSelection, expiredSelection, filterHasInSelection } from '@/lib/filter-query';
 import { lassoFilter } from '@/lib/stale-lasso';
@@ -205,7 +205,12 @@ interface FilterContextType {
     // lib/source-view.ts. Its owner or an admin can update it with the applied filters while they differ.
     sourceView: SourceView | null;
     setSourceView: (source: SourceView | null) => void;
-    openView: (view: Parameters<typeof sourceOf>[0], stages: ViewStage[]) => void;
+    // `saved`: the stages as the view holds them, when the app applies fewer (a deleted concept's left out).
+    openView: (view: Parameters<typeof sourceOf>[0], stages: ViewStage[], saved?: ViewStage[]) => void;
+    // The applied stages are as a view, a link, the default view or Back and Forward put them (openView, settleLink,
+    // resetFilters, the history), not yet changed: filters the page opened on or restored, rather than ones applied in
+    // it. The map fits a region applied, not one that came this way (components/map-panel.tsx).
+    stagesRestored: boolean;
     // Chips of applied selections that couldn't be kept across a reload or Back: shown expired, applying nothing.
     // Kept apart from viewStages, so nothing that reads the stages (the queries, saved views, links) sees them.
     expiredSelections: ExpiredSelection[];
@@ -367,13 +372,16 @@ export function withGrain(
     const fieldGrain = (f: string | undefined): Grain => (f === 'clip_obj' ? 'object' : 'image');
     const isOffGrainEmb = (f: ComplexFilter): boolean =>
         f.operator === 'embedding_polygon' && fieldGrain(f.field) !== grain;
-    // An excluded region (a map region or a lasso, excluded) keeps the rows with no location or no point on its map.
-    // Coupled like the other leaves, such a row on the partner grain (an object with no point on an image map) would
-    // vacuously let its partner through. So it is coupled as NOT (the row or its partner is inside the region).
+    // An excluded region (a map region, a named region or a lasso, excluded) keeps the rows with no location or no
+    // point on its map. Coupled like the other leaves, such a row on the partner grain (an object with no point on an
+    // image map) would vacuously let its partner through. So it is coupled as NOT (the row or its partner is inside the
+    // region).
     const isRegionExclude = (f: ComplexFilter): boolean =>
-        f.operator === 'geo_polygon_exclude' || f.operator === 'embedding_polygon_exclude';
-    // One with fewer than 3 points is no polygon and excludes nothing, as the server's own exclude does.
-    const excluded = baseFilters.filter((f) => isRegionExclude(f) && Array.isArray(f.value) && f.value.length >= 3);
+        f.operator === 'geo_polygon_exclude' || f.operator === 'geo_region_exclude' || f.operator === 'embedding_polygon_exclude';
+    // A polygon with fewer than 3 points is no polygon and excludes nothing, as the server's own exclude does. A named
+    // region's value is its key.
+    const excluded = baseFilters.filter((f) => isRegionExclude(f)
+        && (f.operator === 'geo_region_exclude' || (Array.isArray(f.value) && f.value.length >= 3)));
     const offGrainEmb = baseFilters.filter((f) => !isRegionExclude(f) && isOffGrainEmb(f));
     const rest = baseFilters.filter((f) => !isRegionExclude(f) && !isOffGrainEmb(f));
     const parts: ComplexFilter[] = [...grainPredicate(grain, pivot)];
@@ -397,7 +405,11 @@ export function withGrain(
     for (const region of excluded) {
         const inside: ComplexFilter = {
             logic: 'AND',
-            filters: [{ ...region, operator: region.operator === 'geo_polygon_exclude' ? 'geo_polygon' : 'embedding_polygon' }],
+            filters: [{
+                ...region,
+                operator: region.operator === 'geo_polygon_exclude' ? 'geo_polygon'
+                    : region.operator === 'geo_region_exclude' ? 'geo_region' : 'embedding_polygon',
+            }],
         };
         parts.push({
             logic: 'NOT',
@@ -464,9 +476,13 @@ export function FilterProvider({ children, datasetId, search, liveAddress }: { c
         if (typeof next !== 'function') setSourceView(null);
         setViewStages(next);
     }, []);
-    const openView = useCallback((view: Parameters<typeof sourceOf>[0], stages: ViewStage[]) => {
+    // The stages a view, a link, the default view or the history last put in place (stagesRestored): the applied ones,
+    // which may be fewer than the view's own (`saved`, its source).
+    const [restoredStages, setRestoredStages] = useState<ViewStage[] | null>(null);
+    const openView = useCallback((view: Parameters<typeof sourceOf>[0], stages: ViewStage[], saved: ViewStage[] = stages) => {
         setViewStages(stages);
-        setSourceView(sourceOf(view, stages));
+        setRestoredStages(stages);
+        setSourceView(sourceOf(view, saved));
     }, []);
     const [expiredSelections, setExpiredSelections] = useState<ExpiredSelection[]>(savedState?.expiredSelections ?? []);
 
@@ -851,7 +867,10 @@ export function FilterProvider({ children, datasetId, search, liveAddress }: { c
             // Suppress pushes briefly so the re-renders/refetches this restore triggers
             // don't re-push the restored state and clobber the forward history.
             suppressPushUntilRef.current = Date.now() + 600;
-            setViewStages(state.viewStages ?? []);
+            // Restored, not applied: as for a view or a link, the map doesn't move for its regions (stagesRestored).
+            const stages: ViewStage[] = state.viewStages ?? [];
+            setViewStages(stages);
+            setRestoredStages(stages);
             setExpiredSelections(state.expiredSelections ?? []);
             setBrushedIds(state.brushedIds ?? []);
             setCurrentEmbeddingRegion(state.currentEmbeddingRegion ?? null);
@@ -1061,7 +1080,8 @@ export function FilterProvider({ children, datasetId, search, liveAddress }: { c
         // Preserve draft sidebar filters and selections
         const stages = defaultViewStages(defaultView);
         setViewStages(stages);
-        setSourceView(defaultView && stages.length ? sourceOf(publicView(defaultView), stages) : null);
+        setRestoredStages(stages);
+        setSourceView(defaultView && stages.length ? sourceOf(publicView(defaultView), defaultViewSaved(defaultView)) : null);
         setExpiredSelections([]);
         setDismissedDefaultViewId(null);
     }, [defaultView]);
@@ -1083,7 +1103,7 @@ export function FilterProvider({ children, datasetId, search, liveAddress }: { c
         openedRef.current = true;
         if (!linkAppliedRef.current && defaultView && opensOnDefaultView(viewStages, dismissedDefaultViewId, defaultView, expiredSelections)) {
             replaceHistoryRef.current = true;
-            openView(publicView(defaultView), defaultViewStages(defaultView));
+            openView(publicView(defaultView), defaultViewStages(defaultView), defaultViewSaved(defaultView));
         }
         ownIfOpened();
     }, [defaultView, linkPending]); // eslint-disable-line react-hooks/exhaustive-deps -- once, with the filters this visit opened with
@@ -1098,6 +1118,7 @@ export function FilterProvider({ children, datasetId, search, liveAddress }: { c
             linkAppliedRef.current = true;
             replaceHistoryRef.current = true;
             setViewStages(stages);
+            setRestoredStages(stages);
             setSourceView(source);
             setExpiredSelections([]);
         }
@@ -1142,6 +1163,7 @@ export function FilterProvider({ children, datasetId, search, liveAddress }: { c
         sourceView,
         setSourceView,
         openView,
+        stagesRestored: viewStages === restoredStages,
         expiredSelections,
         setExpiredSelections,
         addStage,

@@ -1,12 +1,13 @@
 // What an admin's password reset, a user's own password change, or deactivating an account did to the account's API
 // tokens (POST /api/users/{id}/reset-password, POST /api/auth/change-password and PATCH /api/users/{id} with
 // is_active false answer `revoked_tokens` by scope). A reset revokes them unless the admin unticks "Also revoke their
-// API tokens"; a change only when the user ticks "Also revoke my API tokens". Follower and worker tokens are the
-// account's too: whatever used one stops working.
+// API tokens"; a change only when the user ticks "Also revoke my API tokens". Follower, worker and MCP tokens are the
+// account's too: whatever used one stops working. `mcp` is there only when there were MCP tokens.
 export interface RevokedTokens {
     full?: number;
     follower?: number;
     worker?: number;
+    mcp?: number;
 }
 
 export const RESET_PASSWORD_HINT =
@@ -27,14 +28,20 @@ const count = (n: number, one: string) => `${n} ${one}${n === 1 ? '' : 's'}`;
 function revokedMessage(done: string, none: string, revoked: RevokedTokens | undefined): string {
     const follower = revoked?.follower ?? 0;
     const worker = revoked?.worker ?? 0;
-    const total = (revoked?.full ?? 0) + follower + worker;
+    const mcp = revoked?.mcp ?? 0;
+    const total = (revoked?.full ?? 0) + follower + worker + mcp;
     if (!total) return `${done}${none}`;
-    const parts = [follower && count(follower, 'follower token'), worker && count(worker, 'worker token')].filter(Boolean);
+    const parts = [
+        follower && count(follower, 'follower token'),
+        worker && count(worker, 'worker token'),
+        mcp && count(mcp, 'MCP token'),
+    ].filter(Boolean);
     let message = `${done}, and ${count(total, 'API token')} ${total === 1 ? 'is' : 'are'} revoked`;
     if (parts.length) message += `, including ${parts.join(' and ')}`;
     message += '.';
     if (follower) message += ` Give ${follower === 1 ? 'that follower' : 'those followers'} a new token (Settings → Followers).`;
     if (worker) message += ` ${worker === 1 ? 'A worker' : 'Workers'} using ${worker === 1 ? 'it' : 'them'} stopped.`;
+    if (mcp) message += ` ${mcp === 1 ? 'An AI client' : 'AI clients'} using ${mcp === 1 ? 'it' : 'them'} can no longer connect.`;
     return message;
 }
 

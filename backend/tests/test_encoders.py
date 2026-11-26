@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
+from fastapi import HTTPException
 from PIL import Image
 
 from backend import encoders
@@ -119,3 +120,49 @@ def test_real_towers_match_full_clip_checkpoint(tmp_path, monkeypatch):
     # Each tower loaded with its own config, not the parent CLIPConfig.
     assert type(encoders._cache[str(tmp_path)][1].config) is transformers.CLIPTextConfig
     assert type(encoders._image_cache[str(tmp_path)][1].config) is transformers.CLIPVisionConfig
+
+
+async def test_a_failed_text_model_load_is_remembered_for_a_minute_and_a_loaded_one_for_good(monkeypatch):
+    """No internet for the model's first download: the load is tried once for every search inside the minute after
+    it failed (each answered the same 501 at once), and once more after it. A model that loaded is never forgotten."""
+    clock = [1000.0]
+    monkeypatch.setattr(encoders, '_now', lambda: clock[0])
+    monkeypatch.setattr(encoders, '_failed', {})
+    vector = Mock()
+    vector.tolist.return_value = [0.25, -0.5]
+    tokenizer_class = Mock()
+    tokenizer_class.from_pretrained.side_effect = OSError('could not reach the model hub')
+    monkeypatch.setitem(sys.modules, 'torch', SimpleNamespace(no_grad=nullcontext))
+    monkeypatch.setitem(
+        sys.modules,
+        'transformers',
+        SimpleNamespace(
+            CLIPTextConfig=Mock(),
+            CLIPTextModelWithProjection=Mock(
+                from_pretrained=Mock(
+                    return_value=SimpleNamespace(eval=lambda: Mock(return_value=SimpleNamespace(text_embeds=[vector]))),
+                ),
+            ),
+            CLIPTokenizer=tokenizer_class,
+        ),
+    )
+
+    async def refused() -> str:
+        with pytest.raises(HTTPException) as answer:
+            await encoders.encode_text('a tractor')
+        assert answer.value.status_code == 501
+        return answer.value.detail
+
+    first = await refused()
+    clock[0] += encoders.FAILED_LOAD_SECONDS - 1
+    assert await refused() == first and tokenizer_class.from_pretrained.call_count == 1  # remembered: not tried again
+    clock[0] += 2
+    assert await refused() == first and tokenizer_class.from_pretrained.call_count == 2  # past the minute: tried again
+    tokenizer_class.from_pretrained.side_effect = None
+    tokenizer_class.from_pretrained.return_value = Mock(return_value={'input': object()})
+    assert await refused() == first and tokenizer_class.from_pretrained.call_count == 2  # inside the new minute
+    clock[0] += encoders.FAILED_LOAD_SECONDS
+    assert await encoders.encode_text('a tractor') == [0.25, -0.5]  # it loads now
+    clock[0] += 10 * encoders.FAILED_LOAD_SECONDS
+    assert await encoders.encode_text('a tractor') == [0.25, -0.5]
+    assert tokenizer_class.from_pretrained.call_count == 3  # loaded once, and kept

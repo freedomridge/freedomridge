@@ -1,8 +1,9 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { useQuery } from '@tanstack/react-query';
-import { ViewStage, ComplexFilter, SchemaField, getDatasetCoverage, derivedFieldNames, formatFilterQuery, parseFilterQuery, FilterQueryProblem } from '@/lib/api';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { ViewStage, ComplexFilter, SchemaField, getDatasetCoverage, derivedFieldNames, formatFilterQuery, parseFilterQuery, FilterQueryProblem, listConcepts } from '@/lib/api';
 import { PlusIcon, TrashIcon, CodeIcon } from '@radix-ui/react-icons';
-import { offsetOf } from '@/lib/filter-query';
+import { conceptStage, filterHasConcept, isConceptFilter, offsetOf } from '@/lib/filter-query';
+import { conceptNames } from '@/lib/filter-utils';
 import { utcMinute } from '@/lib/datetimes';
 import { SearchableSelect } from './searchable-select';
 
@@ -46,7 +47,8 @@ function DatetimeFilterInput({ node, path, onChange, fieldDef }: {
 
 interface FilterStageEditorProps {
     stage: ViewStage;
-    onSave: (stage: ViewStage) => void;
+    // `concepts` names the concepts in a filter typed as text (lib/filter-utils.ts describeFilter).
+    onSave: (stage: ViewStage, concepts?: ReadonlyMap<number, string>) => void;
     onCancel: () => void;
     onDelete?: () => void;
     datasetId: number;
@@ -116,6 +118,7 @@ export function FilterStageEditor({ stage, onSave, onCancel, onDelete, datasetId
         : { logic: 'AND', filters: [JSON.parse(JSON.stringify(stage.filter))] };
 
     const [draftFilter, setDraftFilter] = useState<ComplexFilter>(initialState);
+    const queryClient = useQueryClient();
 
     // The dataset's fields plus its derived ones (same cached /coverage query as the grid warning).
     const { data: coverage } = useQuery({
@@ -211,7 +214,14 @@ export function FilterStageEditor({ stage, onSave, onCancel, onDelete, datasetId
                 setProblem('Type a filter, e.g. split = train');
                 return;
             }
-            onSave({ ...stage, filter: filters.length === 1 ? filters[0] : { logic: 'AND', filters } });
+            const filter = filters.length === 1 ? filters[0] : { logic: 'AND' as const, filters };
+            // A concept's score filter on its own is the Concepts panel's chip, and a concept in a larger filter is
+            // named in its label (and in the label it had). The list is the panel's; a failure leaves an ordinary chip.
+            const concepts = filterHasConcept(filter) || filterHasConcept(stage.filter)
+                ? conceptNames(await queryClient.fetchQuery({ queryKey: ['concepts', datasetId], queryFn: () => listConcepts(datasetId) }).catch(() => undefined))
+                : undefined;
+            const name = isConceptFilter(filter) ? concepts?.get(filter.value?.concept_id) : undefined;
+            onSave(name !== undefined ? conceptStage(name, filter) : { ...stage, filter }, concepts);
         } finally {
             applying.current = false;
         }
@@ -243,7 +253,7 @@ export function FilterStageEditor({ stage, onSave, onCancel, onDelete, datasetId
                         className="w-full resize-y rounded-lg border border-zinc-800 bg-zinc-900 px-3 py-2 font-mono text-xs leading-relaxed text-zinc-200 placeholder-zinc-600 outline-none focus:border-cyan-600"
                     />
                     <div className="text-[11px] text-zinc-500">
-                        = != &gt; &lt; · in (a b c) · contains · between · exists · is null · AND OR NOT ( ). Values in a list can be
+                        = != &gt; &lt; · in (a b c) · contains · between · exists · is null · concept &quot;name&quot; &gt; 0.5 · AND OR NOT ( ). Values in a list can be
                         separated by spaces or new lines, so a pasted column works.
                     </div>
                 </div>

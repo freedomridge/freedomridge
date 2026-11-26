@@ -86,6 +86,8 @@ services:
       # [PRODUCTION] Set to the real frontend origin(s). The browser must load
       # the app from one of these — CSRF and CORS both key off it.
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:?Set ALLOWED_ORIGINS to the HTTPS public origin}
+      # The address the assistant's links start with; without it, the first ALLOWED_ORIGINS entry (docs/ASSISTANT.md).
+      FRIDGE_PUBLIC_URL: ${FRIDGE_PUBLIC_URL:-}
       # Production nginx terminates TLS; development compose stays plain HTTP.
       SESSION_COOKIE_SECURE: ${SESSION_COOKIE_SECURE:-true}
       # Demo mode: enables public guest account creation on login page
@@ -104,6 +106,9 @@ services:
       FRIDGE_CACHE_MAX_BYTES: ${FRIDGE_CACHE_MAX_BYTES:-10737418240}
       # Thumbnails, crops and overlays each backend process renders at once (.env.example); empty: its CPU count.
       FRIDGE_MEDIA_RENDERS: ${FRIDGE_MEDIA_RENDERS:-}
+      # The MCP server's tool calls at once in each backend process, per user and in all (.env.example); empty: 4, 16.
+      FRIDGE_ASSISTANT_CALLS_AT_ONCE: ${FRIDGE_ASSISTANT_CALLS_AT_ONCE:-}
+      FRIDGE_ASSISTANT_CALLS_PER_PROCESS: ${FRIDGE_ASSISTANT_CALLS_PER_PROCESS:-}
       # The login throttle reads X-Real-IP only from these peers. The API is reached only
       # through nginx on the compose bridge (no host port below), so every peer here is a container.
       FRIDGE_TRUSTED_PROXIES: ${FRIDGE_TRUSTED_PROXIES:-172.16.0.0/12,10.0.0.0/8,192.168.0.0/16}

@@ -183,6 +183,50 @@ for sample in page["items"]:   # page["total"] is the dataset size
 
 Increase `offset` by `limit` until it reaches `total`.
 
+## Describe a field (edit)
+
+A field's description and unit say what it means, in the app (Dataset Settings → Fields, and on the field's name in
+the filters) and to the assistant:
+
+```python
+field = requests.patch(
+    f"{API_URL}/datasets/{dataset_id}/fields/digital_gain/description",
+    headers=headers,
+    json={"description": "Sensor gain applied before readout; higher in dark scenes.", "unit": "dB"},
+).json()
+# {"field_name": "digital_gain", "description": "Sensor gain ...", "unit": "dB",
+#  "values_private": false, "description_source": "set"}
+```
+
+- Send any of `description` (at most 1,000 characters), `unit` (at most 40) and `values_private` (true or false: the
+  field's values aren't given to the [assistant](ASSISTANT.md#keeping-a-fields-values-back)). A key left out stays as it is; `null` or `""`
+  clears a description or unit. Text is trimmed; a description may hold line breaks, and neither may hold other
+  control characters. Too long or a control character: 422.
+- A field the dataset's schema lists takes a description: its own fields, its built-in ones (`id`, `filepath`,
+  `created_at`, `last_modified_at`, `tags`, `media_type`) and label fields such as `detections.label`. Anything else
+  is a 404, a key that exists only in some samples' metadata and that nothing registered (neither the schema nor the
+  field statistics list it) included. Below edit: 403 "This needs edit access to the dataset". A dataset being
+  deleted: 409.
+- The answer, and every field of `GET /datasets/{id}/schema` and of the field-stats answers, carries `description`,
+  `unit`, `values_private` and `description_source`: `"set"` when someone wrote the description, `"default"` when the
+  server supplies one, `null` when there is none. The server describes the built-in fields and those the SDK's
+  `compute_metadata()` and `compute_metrics()` write ([list](SDK.md#field-descriptions)), by name: a field of your
+  own called `brightness` gets the metric's description until you describe it. Clearing what someone wrote brings the
+  default back. The server supplies a unit with its default descriptions where there is one (`px` for `width` and
+  `height`, `MP` for `megapixels`, `bytes` for `file_size_bytes`, `bits` for `entropy`, `%` for `salt_and_pepper`,
+  `pct_underexposed` and `pct_overexposed`), while nobody set a unit; clearing a unit someone set brings it back.
+  `description_source` speaks of the description only.
+- On a mirror, the primary's fields are described on the primary and arrive with its field settings: changing their
+  description or unit here is refused (409), and such a request changes nothing, its `values_private` included.
+  `values_private` belongs to each server: a mirror sets it on any field, the built-in ones included, and the sync
+  never resets it (see [the SDK guide](SDK.md#field-descriptions) for a field the primary removes or renames). A
+  version saves descriptions and units with the field types, and a revert restores them; the built-in and label
+  fields' descriptions aren't in a version (a revert changes `width`'s, never `created_at`'s). `values_private` is
+  never versioned, and outlives the field: a private field that is removed (cleared, emptied of its last sample, or
+  removed by a revert) stays private if it comes back. While it is gone nothing lists it (a request about it is a
+  404, as for a name the dataset never had), so its mark can only be taken off once the field exists again
+  ([details](SDK.md#field-descriptions)).
+
 ## Embeddings and the map
 
 Upload vectors you computed yourself (a list of `{sample_id, vector, field_name}`):
@@ -285,8 +329,9 @@ A link is `/datasets/<id>?<parameters>`, each optional:
 | Parameter | Meaning |
 |---|---|
 | `q=<text>` | The filters in the [filter query language](FILTER_QUERY.md), one chip per top-level `AND` part. Empty (`q=`) means no filters, which is what Copy link writes when none are applied. |
-| `f=<version>.<data>` | The filters encoded, when a chip has no text form: a map region, a lasso, picked samples, a search, a concept, a duplicate collapse. |
+| `f=<version>.<data>` | The filters encoded, when a chip has no text form: a map region, a lasso, picked samples, a search, a concept's sources, a duplicate collapse. |
 | `view=<slug>` | A saved view. The address and Copy link write it while a public view's filters are applied as it was saved. |
+| `w=<handle>` | A working view of the assistant, which it links to when the filters can't be `q=` text (below). Only read: the address and Copy link never write it. |
 | `sort=<field>`, `dir=asc` or `desc` | The grid's sort. |
 | `sample=<id>` | The sample whose view opens. |
 
@@ -295,7 +340,9 @@ write one: `/datasets/12?q=split = train AND score > 0.5` (the browser encodes t
 and `#` in a value as `%2B`, `%26` and `%23`). The link's
 filters replace the ones the browser kept for the dataset; Back doesn't return to those. The address then
 shows the page's own link to the same filters (the query as the app writes it). A link that can't be opened
-says why, and the dataset opens, with its address, as it would without the link.
+says why, and the dataset opens, with its address, as it would without the link. A link whose request fails (the
+network, the server) waits instead, saying so, with **Try again** and **Open the dataset without it**, and stays in
+the address, so a reload opens it again.
 
 An address carries what the filters name: field names, values, class names and map region coordinates (as
 text in `q=`, or in `f=`, which anyone can decode). It is kept in the browser's history, and in whatever the
@@ -326,6 +373,13 @@ selection's chip expired.
 
 An `f=` made by a version of Freedom Ridge that encodes filters differently says so, and the dataset opens
 without it.
+
+A `w=<handle>` link is the assistant's, for a view it made in a conversation that can't be written as `q=` text (too
+long for an address, or a chip with no text form). It opens for the person who had the conversation, for 30 days after
+the view was last used, on the view's filters as chips, like a `view=` link; the address then shows the page's own
+link to those filters. A filter of the view whose values can no longer be read is left out, and the page says so.
+Opened by anyone else, or after it has expired, it says so and the dataset opens without it. To share such filters,
+save a view and share that.
 
 ### Switching the live address off
 
@@ -381,7 +435,7 @@ Who may call each one: the admin role, or a [level in the dataset](AUTHENTICATIO
 |----------|--------|------|-------------|
 | `/datasets` | POST | admin | Create a dataset; `"is_global": true` makes it global at `everyone_level` (view unless given) |
 | `/datasets/{id}` | GET | view | Dataset details, with your `access_level` |
-| `/datasets/{id}` | PATCH | edit; manage for `name`, `is_global` and `everyone_level`; admin for `storage_config_id` | Update name, description, media fields, `segmentation_config`, `default_view_id`, visibility |
+| `/datasets/{id}` | PATCH | edit; manage for `name`, `is_global`, `everyone_level` and `assistant_closed`; admin for `storage_config_id` | Update name, description, media fields, `segmentation_config`, `default_view_id`, visibility, whether the [assistant](ASSISTANT.md#closing-a-dataset) may read it |
 | `/datasets/{id}` | DELETE | manage | Delete (202, server job) |
 | `/datasets/{id}/samples` | POST | edit | Add samples |
 | `/datasets/{id}/samples` | GET | view | List samples (`{"items", "total"}`) |
@@ -393,6 +447,7 @@ Who may call each one: the admin role, or a [level in the dataset](AUTHENTICATIO
 | `/datasets/{id}/samples/bulk-set` | POST | edit | Merge metadata into many samples |
 | `/datasets/{id}/samples/bulk-tag` | POST | tag for `tags` (and a mirror's `@local.tags`), edit for another field | Add or remove tags |
 | `/datasets/{id}/embeddings` | POST | edit | Upload vectors |
+| `/datasets/{id}/fields/{field}/description` | PATCH | edit | A field's description, unit and `values_private` |
 
 ## Troubleshooting
 

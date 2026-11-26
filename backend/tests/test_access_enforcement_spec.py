@@ -374,6 +374,18 @@ async def seed_user(c: Ctx) -> None:
     )
 
 
+async def seed_assistant_group(c: Ctx) -> None:
+    """A group the assistant's settings let in."""
+    await seed_group(c)
+    await c.admin('PUT', f'/api/admin/assistant/groups/{c.group}')
+
+
+async def seed_assistant_user(c: Ctx) -> None:
+    """A user with an answer of their own in the assistant's settings."""
+    await seed_user(c)
+    await c.admin('PUT', f'/api/admin/assistant/users/{c.user}', json={'allowed': True})
+
+
 async def seed_storage_config(c: Ctx) -> None:
     made = await c.admin('POST', '/api/storage/configs', json={'name': f'config-{c.d}', 'bucket_name': 'bucket'})
     c.config = made['id']
@@ -455,6 +467,48 @@ def patch_dataset(field_name: str, level: str, value: Callable[[Ctx], Any], *see
 ROUTES: list[Route] = [
     # --- datasets.py ---
     route('POST', '/api/datasets', 'admin', lambda c: Call('/api/datasets', {'name': f'created-{c.d}'})),
+    # The assistant's settings: administrators only.
+    route(
+        'PATCH',
+        '/api/admin/assistant',
+        'admin',
+        lambda c: Call('/api/admin/assistant', {'new_datasets_closed': False}),
+    ),
+    route(
+        'PUT',
+        '/api/admin/assistant/groups/{group_id}',
+        'admin',
+        lambda c: Call(f'/api/admin/assistant/groups/{c.group}'),
+        seed_group,
+    ),
+    route(
+        'DELETE',
+        '/api/admin/assistant/groups/{group_id}',
+        'admin',
+        lambda c: Call(f'/api/admin/assistant/groups/{c.group}'),
+        seed_assistant_group,
+    ),
+    route(
+        'PUT',
+        '/api/admin/assistant/users/{user_id}',
+        'admin',
+        lambda c: Call(f'/api/admin/assistant/users/{c.user}', {'allowed': True}),
+        seed_user,
+    ),
+    route(
+        'DELETE',
+        '/api/admin/assistant/users/{user_id}',
+        'admin',
+        lambda c: Call(f'/api/admin/assistant/users/{c.user}'),
+        seed_assistant_user,
+    ),
+    # Queues the boundary set's download; no runner runs it here.
+    route(
+        'POST',
+        '/api/admin/regions/load',
+        'admin',
+        lambda c: Call('/api/admin/regions/load', {'set': 'natural-earth-admin1'}),
+    ),
     patch_dataset('name', 'manage', lambda c: f'renamed-{c.d}'),
     patch_dataset('description', 'edit', lambda c: 'notes'),
     patch_dataset('media_fields', 'edit', lambda c: ['filepath']),
@@ -464,6 +518,7 @@ ROUTES: list[Route] = [
     patch_dataset('default_view_id', 'edit', lambda c: c.view, seed_others_public_view),
     patch_dataset('is_global', 'manage', lambda c: True),
     patch_dataset('everyone_level', 'manage', lambda c: 'view'),
+    patch_dataset('assistant_closed', 'manage', lambda c: True),
     patch_dataset('storage_config_id', 'admin', lambda c: c.config, seed_storage_config),
     route('PUT', D + '/class-rules/{field_name}', 'edit', lambda c: Call(f'/api/datasets/{c.d}/class-rules/label', {})),
     route('DELETE', D, 'manage', lambda c: Call(f'/api/datasets/{c.d}')),
@@ -547,6 +602,15 @@ ROUTES: list[Route] = [
         F + '/display-type',
         'edit',
         lambda c: Call(f'/api/datasets/{c.d}/fields/score/display-type', {'display_type': 'enum'}),
+    ),
+    route(
+        'PATCH',
+        F + '/description',
+        'edit',
+        lambda c: Call(
+            f'/api/datasets/{c.d}/fields/score/description',
+            {'description': 'How sure the model is.', 'unit': 'probability', 'values_private': True},
+        ),
     ),
     route(
         'POST',

@@ -16,7 +16,13 @@ from pydantic import AwareDatetime, BaseModel
 from ..access import require_dataset_access, require_level
 from ..database import db
 from ..diskspace import estimate_snapshot_bytes, require_free_space
-from ..field_registry import LOCAL_PREFIX, REQUEST_FULL_REFRESH, _value_names, lock_field_lifecycle
+from ..field_registry import (
+    LOCAL_PREFIX,
+    REQUEST_FULL_REFRESH,
+    _value_names,
+    forget_definitions,
+    lock_field_lifecycle,
+)
 from ..label_fields import DISCOVERY_TYPES, LEGACY_LABEL_FIELDS, DatasetArrayColumns, label_context
 from ..request_limits import guest_heavy
 from ..validation import clean_name
@@ -117,7 +123,8 @@ def _dataset_snapshot_sql(dataset_param: str) -> str:
             'fields', COALESCE((
                 SELECT jsonb_agg(jsonb_build_object(
                     'field_name', f.field_name, 'field_type', f.field_type,
-                    'display_type', f.display_type, 'overlay_config', f.overlay_config, 'origin', f.origin
+                    'display_type', f.display_type, 'overlay_config', f.overlay_config, 'origin', f.origin,
+                    'description', f.description, 'unit', f.unit
                 ) ORDER BY f.field_name)
                 FROM dataset_fields f WHERE f.dataset_id = d.id AND f.origin <> 'system'
             ), '[]'::jsonb)
@@ -234,34 +241,42 @@ def _media_compare_sql(snapshot='v', other='s', pair=False):
 async def _restore_field_registry(conn, dataset_id: int, version):
     """Restore declared field semantics, retaining definitions needed by non-reverted samples.
 
-    Index placement is current operational state, never restored from a snapshot.
-    Restore does not build or drop physical indexes.
+    Index placement is current operational state, never restored from a snapshot, and so is values_private.
+    Restore does not build or drop physical indexes. Descriptions and units are restored with the definitions, except
+    from a version made before fields had them: those keep the ones they have now.
     """
     snapshot = version['dataset_snapshot']
     if snapshot is not None:
         normalized = await conn.fetchval('SELECT normalize_dataset_snapshot($1::jsonb)', snapshot)
         fields = normalized['fields']
+        described = any('description' in field for field in snapshot.get('fields') or [])
         await conn.execute(
             """INSERT INTO dataset_fields
-                   (dataset_id, field_name, field_type, display_type, overlay_config, origin)
-               SELECT $1, field_name, field_type, display_type, overlay_config, origin
+                   (dataset_id, field_name, field_type, display_type, overlay_config, origin, description, unit)
+               SELECT $1, field_name, field_type, display_type, overlay_config, origin, description, unit
                FROM jsonb_to_recordset($2::jsonb) AS definitions(
-                   field_name text, field_type text, display_type text, overlay_config jsonb, origin text)
+                   field_name text, field_type text, display_type text, overlay_config jsonb, origin text,
+                   description text, unit text)
                ORDER BY field_name
                ON CONFLICT (dataset_id, field_name) DO UPDATE SET
                    field_type = EXCLUDED.field_type, display_type = EXCLUDED.display_type,
-                   overlay_config = EXCLUDED.overlay_config, origin = EXCLUDED.origin""",
+                   overlay_config = EXCLUDED.overlay_config, origin = EXCLUDED.origin,
+                   description = CASE WHEN $3 THEN EXCLUDED.description ELSE dataset_fields.description END,
+                   unit = CASE WHEN $3 THEN EXCLUDED.unit ELSE dataset_fields.unit END""",
             dataset_id,
             fields,
+            described,
         )
-        await conn.execute(
-            """DELETE FROM dataset_fields definition WHERE dataset_id = $1 AND origin = 'metadata'
+        # Definitions the version doesn't have and no sample holds go; a private field keeps its flag, for its return.
+        unheld = await conn.fetch(
+            """SELECT field_name FROM dataset_fields definition WHERE dataset_id = $1 AND origin = 'metadata'
                AND NOT (field_name = ANY($2::text[]))
                AND NOT EXISTS (SELECT 1 FROM samples WHERE samples.dataset_id = $1
                                AND samples.metadata ? definition.field_name)""",
             dataset_id,
             [field['field_name'] for field in fields],
         )
+        await forget_definitions(conn, dataset_id, [row['field_name'] for row in unheld])
     if snapshot is None or snapshot.get('field_registry_version') != 1:
         await conn.execute(
             """INSERT INTO dataset_fields (dataset_id, field_name, field_type, origin)
@@ -280,7 +295,9 @@ async def _restore_field_registry(conn, dataset_id: int, version):
                      '__probability_fields__', '__mask_overlay_fields__', '__keypoint_fields__', '__cuboid_fields__',
                      '__classification_fields__',
                      '__detection_fields__', '__polyline_fields__')
-               GROUP BY key ORDER BY key ON CONFLICT (dataset_id, field_name) DO NOTHING""",
+               GROUP BY key ORDER BY key
+               ON CONFLICT (dataset_id, field_name) DO UPDATE SET field_type = EXCLUDED.field_type, origin = 'metadata'
+               WHERE dataset_fields.origin = 'system'""",
             dataset_id,
             version['id'],
         )
@@ -1121,13 +1138,16 @@ async def _version_query(
     )
     with_clause = (
         f"WITH samples AS (SELECT v.sample_id AS id, {int(id)} AS dataset_id, v.filepath, v.metadata, v.tags, "
-        f"v.media_type, v.location, v.heading, v.created_at, v.last_modified_at, v.array_fields_snapshot{rebuilt} "
+        f"v.media_type, v.location, ST_X(v.location) AS lon, ST_Y(v.location) AS lat, v.heading, v.created_at, "
+        f"v.last_modified_at, v.array_fields_snapshot{rebuilt} "
         f"FROM version_snapshots v WHERE v.version_id = {int(version_id)}) "
     )
+    # A region filter tests each row's location: a join to the samples table would read today's locations.
     where, args, _ = build_sample_query_parts(
         id,
         filters=json.dumps(filters) if filters else None,
         array_columns=array_columns,
+        region_joins=False,
     )
     return with_clause, where, args, stored, array_columns
 

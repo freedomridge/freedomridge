@@ -38,6 +38,8 @@ class Dataset(BaseModel):
     # What a global dataset gives every signed-in user: view, tag or edit (view until a manager raises it). Not read
     # while it is private.
     everyone_level: str = 'view'
+    # The assistant may not read it (docs/ASSISTANT.md): this server's own, a mirror's too; set at manage.
+    assistant_closed: bool = False
     # GET /datasets and GET /datasets/{id} only (None elsewhere): the caller's level in the dataset, view, tag, edit or
     # manage (backend/access.py).
     access_level: Optional[str] = None

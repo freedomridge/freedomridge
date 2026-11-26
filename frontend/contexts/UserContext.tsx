@@ -14,6 +14,8 @@ interface User {
     is_active: boolean;
     is_demo_account?: boolean;
     can_share_views?: boolean;
+    // Whether this user could use each of the assistant's doors right now (docs/ASSISTANT.md).
+    assistant?: { mcp: boolean };
 }
 
 interface UserContextType {

@@ -202,6 +202,17 @@ in that same directory. Use curl with
 `--resolve` and `-k` only for that rehearsal. Normal production always uses the CA
 certificate. The HTTP redirect intentionally targets canonical HTTPS port 443.
 
+## Your own web server in front
+
+The bundled nginx sends `/api/` and `/mcp` to the backend and everything else to the frontend. If you keep your own
+reverse proxy or load balancer instead, route the same two paths to the backend (port 8000): `/mcp` is exactly that
+path, the MCP server AI clients connect to ([Assistant](ASSISTANT.md#behind-your-own-web-server)). Don't buffer its
+answers (nginx: `proxy_buffering off`): a call that runs a while is answered as a stream that sends a keepalive every
+15 seconds. Allow reads of up to 10 minutes, as for `/api/` (for `/mcp` two minutes are enough: a call stops at 60
+seconds), and request bodies of at least 256 KB. Its requests carry their token in the `Authorization` header, and a
+client's `Origin`, which the server checks: pass both through unchanged. The backend keeps nothing between requests,
+so any of several backend processes may answer any of them.
+
 ## Demo data and indexes
 
 To load the hosted-demo datasets, follow the hosted-demo path in

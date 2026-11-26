@@ -2,11 +2,12 @@
 
 import { useEffect, useMemo, useState, useCallback, useRef } from 'react';
 import Map, { Source, Layer, ScaleControl, MapRef, type MapEvent, type MapMouseEvent, type LayerProps } from 'react-map-gl/mapbox';
-import { useQuery } from '@tanstack/react-query';
-import { getMapPoints, getMapExtent, getDatasetCoverage, type ComplexFilter } from '@/lib/api';
+import { useQueries, useQuery, useQueryClient, type UseQueryResult } from '@tanstack/react-query';
+import { getMapPoints, getMapExtent, getDatasetCoverage, getRegion, type ComplexFilter, type Region } from '@/lib/api';
 import { tileBbox, viewBbox, type Bbox } from '@/lib/map-bounds';
+import { bboxCorners, newlyIncluded, outlineLines, type RegionTest } from '@/lib/regions';
 import { useRuntimeConfig } from '@/lib/runtime-config';
-import type { Feature, FeatureCollection, Point, Polygon } from 'geojson';
+import type { Feature, FeatureCollection, Geometry, Point, Polygon } from 'geojson';
 import mapboxgl, { type LngLatBounds } from 'mapbox-gl';
 import type MapboxDraw from '@mapbox/mapbox-gl-draw';
 
@@ -20,6 +21,30 @@ const DEFAULT_MAP_CONFIG = {
 };
 
 const EMPTY_FC: FeatureCollection<Point> = { type: 'FeatureCollection', features: [] };
+
+// The outlines of the named regions applied (docs/REGIONS.md), under the points, in the purple of the map's region
+// chip: an included region as a line and a light fill, an excluded one as a dashed line. Each region is two features,
+// its fill (the outline as it comes) and its line (lib/regions.ts outlineLines: no border along the antimeridian).
+const NO_REGIONS: RegionTest[] = [];
+const REGION_COLOR = '#a855f7';
+const regionFillLayer: LayerProps = {
+    id: 'region-outline-fill', type: 'fill',
+    filter: ['all', ['==', ['get', 'part'], 'fill'], ['!', ['get', 'exclude']]],
+    // No antialiasing: the pieces of a region cut at the antimeridian would show a faint seam where their edges meet.
+    paint: { 'fill-color': REGION_COLOR, 'fill-opacity': 0.08, 'fill-antialias': false },
+};
+const regionLineLayer: LayerProps = {
+    id: 'region-outline-line', type: 'line',
+    filter: ['all', ['==', ['get', 'part'], 'line'], ['!', ['get', 'exclude']]],
+    paint: { 'line-color': REGION_COLOR, 'line-width': 2, 'line-opacity': 0.9 },
+};
+const regionExcludedLineLayer: LayerProps = {
+    id: 'region-outline-line-excluded', type: 'line',
+    filter: ['all', ['==', ['get', 'part'], 'line'], ['get', 'exclude']],
+    paint: { 'line-color': REGION_COLOR, 'line-width': 2, 'line-opacity': 0.9, 'line-dasharray': [2, 2] },
+};
+// Each outline query's region, in order (useQueries keeps the combined array while none of them changes).
+const outlinesOf = (results: UseQueryResult<Region>[]) => results.map(result => result.data);
 
 // A map_points item: with an `id` it's an individual sample point; without one it's
 // a cluster bubble (cell centroid + count, and the radius in px the server sized it for).
@@ -44,6 +69,11 @@ interface Props {
     selectedIds: number[];
     config?: MapPanelConfig;
     initialPolygon?: Feature<Polygon> | null;
+    // The region chips applied (lib/regions.ts): their outlines are drawn.
+    regions?: RegionTest[];
+    // The chips came as a view, a link, the default view or Back and Forward put them (FilterContext stagesRestored):
+    // not applied here.
+    regionsRestored?: boolean;
 }
 
 export function MapPanel({
@@ -52,6 +82,8 @@ export function MapPanel({
     onSelection,
     selectedIds,
     config = DEFAULT_MAP_CONFIG,
+    regions = NO_REGIONS,
+    regionsRestored = false,
 }: Props) {
     const [mounted, setMounted] = useState(false);
     // eslint-disable-next-line react-hooks/set-state-in-effect -- Mount the browser-only map after hydration.
@@ -304,6 +336,68 @@ export function MapPanel({
         })();
         return () => { cancelled = true; };
     }, [selectedIds, datasetId]);
+
+    // The outline of each region chip (only the chips: a region inside a larger filter, an OR say, isn't outlined).
+    const outlineKeys = useMemo(() => [...new Set(regions.map(region => region.key))], [regions]);
+    const outlines = useQueries({
+        queries: outlineKeys.map(key => ({
+            queryKey: ['region-outline', key],
+            queryFn: () => getRegion(key, true),
+            staleTime: 10 * 60_000,
+            refetchOnWindowFocus: false,
+            meta: { errorHandledLocally: true },  // the region's chip shows it
+        })),
+        combine: outlinesOf,
+    });
+    const regionOutlines = useMemo(() => {
+        const features: Feature<Geometry, { key: string; exclude: boolean; part: 'fill' | 'line' }>[] = [];
+        for (const { key, exclude } of regions) {
+            const region = outlines[outlineKeys.indexOf(key)];
+            if (!region?.outline) continue;
+            // The key as the server writes it (US-KS for us-ks).
+            const properties = { key: region.key, exclude };
+            features.push({ type: 'Feature', geometry: region.outline, properties: { ...properties, part: 'fill' } });
+            features.push({ type: 'Feature', geometry: outlineLines(region.outline), properties: { ...properties, part: 'line' } });
+        }
+        return { type: 'FeatureCollection' as const, features };
+    }, [regions, outlineKeys, outlines]);
+
+    // Applying a region chip in the page (a filter card, a chip's edit) moves the map as drawing a polygon does
+    // (fitToDataInPolygon below): to the data inside it with the other filters, or with none there to the region's own
+    // box. Turning a chip around, removing one (docs/MAP_REQUIREMENTS.md #8), the chips the map mounts with, and chips
+    // that came back or in with a link, a saved view, the default view, Back or Forward (regionsRestored), whenever they
+    // arrive, don't move it, as a polygon brought back doesn't: a slow dataset answer applies the default view after the
+    // map is up.
+    const queryClient = useQueryClient();
+    const filtersRef = useRef(filters);
+    useEffect(() => { filtersRef.current = filters; }, [filters]);
+    const appliedRegionsRef = useRef(regions);
+    useEffect(() => {
+        const applied = regionsRestored ? [] : newlyIncluded(appliedRegionsRef.current, regions);
+        appliedRegionsRef.current = regions;
+        if (!applied.length || !mapRef.current) return;
+        let cancelled = false;
+        (async () => {
+            try {
+                const ext = await getMapExtent(datasetId, filtersRef.current);
+                if (cancelled) return;
+                if (mapRef.current && ext.count && ext.w != null && ext.e != null && ext.s != null && ext.n != null) {
+                    let { w, e, s, n } = ext as { w: number; e: number; s: number; n: number };
+                    if (e - w < 1e-6) { w -= 0.0005; e += 0.0005; }
+                    if (n - s < 1e-6) { s -= 0.0005; n += 0.0005; }
+                    mapRef.current.fitBounds(new mapboxgl.LngLatBounds([w, s], [e, n]), { padding: 60, maxZoom: 17, duration: 800 });
+                    return;
+                }
+            } catch { /* fall back to the region */ }
+            try {
+                const region = await queryClient.fetchQuery({
+                    queryKey: ['region', applied[0]], queryFn: () => getRegion(applied[0]), meta: { errorHandledLocally: true },
+                });
+                if (!cancelled) mapRef.current?.fitBounds(bboxCorners(region.bbox), { padding: 50, maxZoom: 17, duration: 800 });
+            } catch { /* a key this server has no region for: the chip says so */ }
+        })();
+        return () => { cancelled = true; };
+    }, [regions, regionsRestored, datasetId, queryClient]);
 
     // --- Layers ---------------------------------------------------------------
     const clusterLayer = useMemo<LayerProps>(() => ({
@@ -604,6 +698,12 @@ export function MapPanel({
                 style={{ width: '100%', height: '100%' }}
             >
                 <ScaleControl />
+                {/* Before the points, so their layers are added first: under the points. */}
+                <Source id="regions" type="geojson" data={regionOutlines}>
+                    <Layer {...regionFillLayer} />
+                    <Layer {...regionLineLayer} />
+                    <Layer {...regionExcludedLineLayer} />
+                </Source>
                 <Source id="points" type="geojson" data={geojson} promoteId="id">
                     <Layer {...clusterLayer} />
                     <Layer {...clusterCountLayer} />
@@ -611,6 +711,12 @@ export function MapPanel({
                     <Layer {...pointArrowLayer} />
                 </Source>
             </Map>)}
+            {/* The regions outlined, for screen readers and tests: one item per region drawn. */}
+            <ul className="sr-only" aria-label="Regions outlined on the map" data-testid="map-region-outlines">
+                {mapboxToken && regionOutlines.features.filter(f => f.properties.part === 'line').map(({ properties: { key, exclude } }, i) => (
+                    <li key={i} data-testid="map-region-outline">{key} {exclude ? 'excluded' : 'included'}</li>
+                ))}
+            </ul>
 
             <div className="absolute top-3 right-3 flex flex-col items-end gap-1">
                 <div className="flex gap-2">

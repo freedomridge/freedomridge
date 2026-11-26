@@ -15,7 +15,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from starlette.background import BackgroundTask
 
-from . import backups, system_status  # system_status records at import when this process started and its commit
+# system_status records at import when this process started and its commit
+from . import backups, mcp_door, system_status
 from .api_errors import CodedHTTPException
 from .colormaps import COLORMAPS
 from .crypto import assert_secure_encryption_key, warn_insecure_session_cookie
@@ -23,6 +24,9 @@ from .database import lifespan
 from .media_cache import CacheFill, read_cache, write_cache
 from .request_limits import RequestLimitsMiddleware
 from .routers import (
+    assistant_calls,
+    assistant_settings,
+    assistant_views,
     auth,
     backup_settings,
     compute_launcher,
@@ -36,6 +40,7 @@ from .routers import (
     jobs,
     primaries,
     quality,
+    regions,
     sampling,
     schedules,
     search,
@@ -169,6 +174,17 @@ async def csrf_origin_guard(request: Request, call_next):
     return await call_next(request)
 
 
+# --- The MCP server at /mcp (backend/mcp_door.py) -------------------------------
+# Added last, so it is the outermost middleware: /mcp's Origin check (against the same ALLOWED_ORIGINS) comes before
+# anything else, and neither CORS nor the cookie CSRF guard above touches /mcp, which grants a web page nothing and
+# reads no cookie. Its answers still go through the version header and the request limits (guest budgets).
+app.add_middleware(
+    mcp_door.McpDoor,
+    allowed_origins=_ALLOWED_ORIGINS,
+    served=VersionHeaderMiddleware(RequestLimitsMiddleware(mcp_door.endpoint)),
+)
+
+
 @app.exception_handler(RequestValidationError)
 async def validation_error_handler(request: Request, exc: RequestValidationError):
     """Report invalid values without echoing non-JSON inputs such as NaN or Infinity."""
@@ -269,6 +285,10 @@ app.include_router(workers.router, prefix="/api")
 app.include_router(followers.router, prefix="/api")
 app.include_router(primaries.router, prefix="/api")
 app.include_router(compute_launcher.router, prefix="/api")
+app.include_router(assistant_calls.router, prefix="/api")
+app.include_router(regions.router, prefix="/api")
+app.include_router(assistant_settings.router, prefix="/api")
+app.include_router(assistant_views.router, prefix="/api")
 
 
 @app.get("/api/health")

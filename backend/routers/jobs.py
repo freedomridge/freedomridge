@@ -15,6 +15,7 @@ from starlette.datastructures import State
 
 from ..access import (
     MANAGE,
+    AssistantClosed,
     Level,
     LevelRefused,
     check_dataset_access,
@@ -23,6 +24,7 @@ from ..access import (
     level_refusal,
     missing_unless_allowed,
 )
+from ..assistant.identity import assistant_door
 from ..database import db
 from ..index_actions import public_message
 from ..job_queue import JOB_TABLE, CancelRefused, QueueBusy, cancel_job
@@ -175,13 +177,15 @@ def _can_cancel(job, user: dict, level: Optional[int]) -> bool:
 async def _level_in(dataset_id: int, user: dict, state: Any) -> Optional[int]:
     """The caller's level in the dataset: the highest check_dataset_access grants them, from the one lookup it keeps
     on `state`. None: the dataset is gone (a deleted dataset's jobs stay readable to who started them)."""
-    if user['role'] == 'admin':
+    if user['role'] == 'admin' and not assistant_door(user):
         return MANAGE
     levels: tuple[Level, ...] = ('manage', 'edit', 'tag')
     for level in levels:
         try:
             await check_dataset_access(dataset_id, user, level, state)
             return level_number(level)
+        except AssistantClosed:
+            raise
         except LevelRefused:
             continue
         except HTTPException as error:
@@ -287,6 +291,8 @@ async def _authorized_job(job_id: UUID, user: dict):
     if job['dataset_id'] is None:
         if user['role'] != 'admin':
             raise HTTPException(status_code=403, detail='Only administrators can access global jobs')
+        if assistant_door(user):  # it may name datasets closed to the assistant: as a job that doesn't exist
+            raise HTTPException(status_code=404, detail='Job not found')
     else:
         # A job of a dataset the caller can't open answers as a missing one (a 403 said it exists). A deleted
         # dataset's jobs stay readable to whoever started them, and to administrators.

@@ -168,7 +168,10 @@ up from the change log when it's back. Images the primary serves (**Serve images
   change to them with "read-only mirror"; only the sync writes them. A dataset page shows a "Mirror of <host>"
   badge, and tagging is off.
 - **This instance's own:** vector fields only it has (patch vectors imported here, say) and their maps,
-  statistics, indexes (`is_promoted`), concepts, access grants, storage, and views made here. This instance's own
+  statistics, indexes (`is_promoted`), each field's private flag (`values_private`, any field, built-in ones
+  included; the sync never resets it), concepts, access grants, storage, views made here, and whether the dataset is
+  closed to the [assistant](ASSISTANT.md) (`assistant_closed`). A field's description and unit are the primary's.
+  This instance's own
   vector fields can be deleted here (`POST /api/datasets/{id}/embeddings/{field}/delete`); the primary's can't. If the
   primary later sends a vector or hash field of the same name as one only this instance had, the primary's replaces
   it, all of it at once, with this instance's map of it: none of this instance's values stay beside the primary's.

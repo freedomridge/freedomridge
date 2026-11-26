@@ -360,8 +360,9 @@ class Client:
             name: Human-readable label for the token.
             expires_days: Days until expiry (default 90). Pass ``None`` for the
                 server default.
-            scope: ``"full"`` (default), or ``"worker"`` for a compute worker
-                (``python -m fridge.worker``): only the worker endpoints accept it.
+            scope: ``"full"`` (default), ``"worker"`` for a compute worker
+                (``python -m fridge.worker``): only the worker endpoints accept it, or
+                ``"mcp"`` for an AI client: only the MCP server at /mcp accepts it.
 
         Returns:
             dict with ``id``, ``name``, ``expires_at`` and ``token`` — the
@@ -1844,6 +1845,21 @@ class Client:
         resp = self.session.patch(
             f"{self.base_url}/datasets/{dataset_id}/fields/{field_name}/type",
             json={"field_type": field_type},
+        )
+        _raise_for_status(resp)
+        return resp.json()
+
+    def set_field_description(self, dataset_id, field_name, description=None, unit=None) -> dict:
+        """Say what a field means: its description (at most 1,000 characters) and unit (at most 40). Needs edit.
+
+        Only the arguments given are changed; ``""`` clears one, and a field the server describes by default gets
+        that description back. Returns the field's ``description``, ``unit``, ``values_private`` and
+        ``description_source`` (``"set"``, ``"default"`` or None), as the schema shows them.
+        """
+        body = {key: value for key, value in (("description", description), ("unit", unit)) if value is not None}
+        resp = self.session.patch(
+            f"{self.base_url}/datasets/{dataset_id}/fields/{quote(field_name, safe='')}/description",
+            json=body,
         )
         _raise_for_status(resp)
         return resp.json()

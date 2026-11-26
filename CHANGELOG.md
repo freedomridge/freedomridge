@@ -4,6 +4,160 @@ Freedom Ridge has one version for the server, the web app and the Python SDK (th
 file), following [Semantic Versioning](https://semver.org). A release lists **upgrade notes** when
 it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
 
+## Unreleased
+
+This release adds an AI assistant: Claude Code and other MCP clients answer questions about a server's datasets
+through thirteen read-only tools at `/mcp`, reading as the person using them. It is off until an administrator
+switches it on. Also new: named regions as a filter, a text form for concept filters, and a description and unit for
+each field. Five migrations, none of which touches a sample.
+
+### Upgrade notes
+
+- Five database migrations, `0034_regions.sql` to `0038_assistant_working_views.sql`, and changed database functions,
+  applied with `scripts/apply_migrations.sh` (step 4 of [Upgrading](docs/UPGRADING.md)). They add empty tables and
+  columns and touch no rows.
+- The assistant ships off, and an upgraded server keeps it off; existing datasets stay open to it once it is on.
+- **What switching it on means:** the server calls no AI service and needs no key, but each person you let in can have
+  their own AI client read what they can already see in their datasets and send it to that client's AI service
+  (Anthropic for Claude Code). Who may use it, closing a dataset and keeping a field's values back narrow it; it never
+  writes, deletes or shares ([docs/ASSISTANT.md](docs/ASSISTANT.md#what-switching-it-on-means)).
+- Before switching it on, set `FRIDGE_PUBLIC_URL` in `.env` to the server's public address (`.env.example`; the
+  production Compose file passes it on): the assistant's links start with it. Without it they start with the first
+  `ALLOWED_ORIGINS` entry, which must then be the public HTTPS origin.
+- The bundled nginx routes `/mcp` to the backend, unbuffered. If you keep your own web server in front, route it too
+  ([Docker deployment](docs/DOCKER_DEPLOYMENT.md#your-own-web-server-in-front)).
+- The server has a new dependency, the official MCP SDK (`mcp` 2.3), in the images.
+
+### Added
+
+- **An AI assistant, through an MCP server at `/mcp`** ([docs/ASSISTANT.md](docs/ASSISTANT.md)).
+  - **What it reads.** Its tools call the API in process as the person using it, so it sees what they can open, at
+    their level, and changes nothing. It speaks the Model Context Protocol (revisions 2026-07-28, 2025-11-25 and
+    2025-06-18, streamable HTTP) and keeps nothing between requests, so any backend process answers any request.
+  - **Who may use it.** It is off on every server until an administrator switches the MCP server on in the new
+    **Settings → Assistant**, which also says who may use it: by role (as shipped, administrators only), by group,
+    and by a person's own answer, which decides first; a demo account never may (`GET`/`PATCH
+    /api/admin/assistant`, `PUT`/`DELETE /api/admin/assistant/groups/{id}` and `.../users/{id}`). `GET /api/auth/me`
+    says whether its user could use it now. Each request checks that afresh (403, saying why).
+  - **What it may not read.** A dataset's manager can close it to the assistant in Dataset Settings → Access
+    (`assistant_closed` on `PATCH /api/datasets/{id}`, carried by every answer that describes a dataset): its tools
+    then refuse it however they come to it and leave it out of lists, and nothing changes outside the assistant.
+    **New datasets start closed to the assistant** makes datasets created afterwards closed. Someone with edit can
+    tick **Keep this field's values from the assistant** under a field in Dataset Settings → Fields: a tool never gets
+    one of its values, and may not compare it, range it, sort by it or summarise it (the API refuses such a request
+    made for a tool, with words that say what works instead). **The assistant may read samples' fields** (off as
+    shipped) decides whether it reads samples' own fields.
+  - **Connecting.** An AI client opens `/mcp` with an **MCP token**, a new kind on Settings → API Tokens
+    (`"scope": "mcp"`), offered to a person who may use the assistant; after making one the page shows the address,
+    the header and Claude Code's `claude mcp add` command. An MCP token opens `/mcp` and nothing else: every other
+    route refuses it as a token that doesn't exist, and `/mcp` takes no other token and no browser session. A request
+    from another origin is refused.
+  - **The tools.** `list_datasets` and `describe_dataset` (a dataset's samples and object rows, and its fields with
+    their meaning, type, counts, ranges and examples of their values, from the statistics the server keeps,
+    `complete: false` where they aren't up to date). `make_view` and `refine_view` keep each step of a conversation as
+    a working view (a handle, its person's only, kept 30 days after its last use) with its exact count and a link that
+    opens it in the app: a `?q=` link when it can be written as text, else a `?w=` link for the person.
+    `field_values` counts a field's values in a view and keeps the whole list for filtering by it (up to 10,000
+    values) and for the person's CSV download; `field_summary` gives a number's or a date's range, quantiles and
+    histogram, or a text field's commonest values; `get_samples` gives a page of samples with their links. Every
+    number is over the view's images, never its object rows, as the dataset's page shows them. `find_place` gives the
+    regions a name could mean, each with the filter text that keeps its samples; `list_concepts` and
+    `concept_preview` say exactly how many of a view's images a concept's cut keeps or removes, with the images
+    nearest the cut for a whole dataset; `search_similar` finds the images of a view most like some words or samples,
+    as a working view whose last stage can be turned around to remove them; `list_saved_views` and `open_saved_view`
+    open a saved view as a working view, its stages worded by the server and its link the view's own.
+  - **Limits.** Each server process runs at most 4 tool calls of one person at once and 16 in all
+    (`FRIDGE_ASSISTANT_CALLS_AT_ONCE`, `FRIDGE_ASSISTANT_CALLS_PER_PROCESS`; the next is answered "busy" at once), a
+    call at most 60 seconds, after which its work is cancelled, and a request of at most 256 KB. Every statement run
+    for a tool has a 45-second limit, so a slow count answers `too_slow`. One person keeps at most 2,000 views and
+    500 lists, one view at most 50 stages and 50,000 list values. Filter text is at most 20,000 characters, and an
+    error's message is cut to 2,000, so every answer stays small whatever its arguments.
+  - **The call log.** Every tool call is logged (who, tool, dataset, when, how long, the outcome; never the arguments
+    or the result) for 30 days: administrators read it under Settings → Assistant, **Recent calls**, and at
+    `GET /api/admin/assistant/calls`.
+  - **New routes for the person:** `GET /api/assistant/views/{handle}` and `GET /api/assistant/lists/{handle}/csv` (a
+    value a spreadsheet would run as a formula is written with a leading apostrophe). **`w=` links** open a working
+    view in the app: `/datasets/<id>?w=<handle>` opens its filters as chips, as a `view=` link does, for the person
+    whose conversation made it; the address then shows the page's own `q=` or `f=` link, and Copy link never writes
+    `w=`. Anyone else, an expired or unknown handle, or a view of another dataset is told why, and the dataset opens
+    without those filters ([DATASET_MANAGEMENT.md](docs/DATASET_MANAGEMENT.md#links-to-a-filter-a-view-or-a-sample)).
+  - **Along the way:** asked with `?stale=true`, each field of `GET /api/datasets/{id}/schema` that the statistics
+    measure carries `stats_stale` (changes to the samples wait to be counted for it). The aggregate route takes
+    `distinct_count`, orders ties by value, and reads a datetime as seconds since 1970 in its numeric aggregations.
+    `GET /api/views/{slug}` answers a private view its caller may not see as missing before anything else, as it
+    always did for a person. Migrations `0036_assistant.sql` (three small tables and `datasets.assistant_closed`,
+    false on every existing dataset), `0037_mcp_tokens_and_assistant_calls.sql` (the token kind and the empty log
+    table) and `0038_assistant_working_views.sql` (two tables and `assistant_settings.sample_fields`).
+- **Named regions, and a filter for the samples in one** ([docs/REGIONS.md](docs/REGIONS.md)). An administrator loads
+  Natural Earth's 1:10m states and provinces (version 5.1.1, public domain) on Settings → System status, which shows
+  what is loaded, or with `POST /api/admin/regions/load`, a background download checked against a pinned SHA-256, or
+  on a server with no internet with `python -m backend.regions load <file> --set natural-earth-admin1`. That gives 251
+  countries, 4,596 states or provinces and 313 groups of them, keyed by ISO code (`US-KS`, `US`) or by country and
+  group (`US:midwest`). `location within "US-KS"` then keeps the samples located in Kansas and
+  `location not within "US-KS"` removes them, in filter text, links, the SDK's `dataset.query()` and the API
+  (`geo_region`, `geo_region_exclude`), with islands and holes exact. The text takes a name too
+  (`location within Kansas`); one that several regions share, or a region the server doesn't have, is a mistake with
+  suggestions, never a filter that matches nothing. `GET /api/regions?search=` finds regions by name, and
+  `GET /api/regions/{key}` gives one's bounding box and an outline to draw. In the app a region filter is a chip that
+  names the region ("In Kansas, United States of America"), however it came (typed text, a link, a saved view), and a
+  click turns it into "Not in Kansas" and back. While it is applied the map outlines the region, dashed when excluded,
+  across the antimeridian too, and applying one moves the map to the samples inside as drawing a polygon does. Views
+  with region chips are written as `?q=` links. Migration `0034_regions.sql` adds the empty region tables.
+- **A concept filter has a text form**, so a view that keeps or hides samples by a concept's score is a readable
+  `?q=` link and can be typed in a filter card's Query box or `dataset.query()`: `concept "equipment" > 0.62` keeps
+  the samples whose score passes (`>`, `>=`, `<` or `<=`), and `not concept "equipment" > 0.62` hides them, as the
+  Concepts panel's show only and exclude do. Without a comparison, `concept "equipment"` takes the concept's saved
+  threshold. Copy link and the address now write such views as `q=` instead of the encoded `f=`; a concept part opens
+  as the panel's chip, and old `f=` links keep opening. `concept` is a keyword only before a concept's name, so a
+  field named concept is written as before. An unknown concept name is an error that suggests the close names, so a
+  link naming a deleted concept says so ([filter query language](docs/FILTER_QUERY.md#concept-scores)). A saved
+  view's stage that is one concept test, such as one `create_view(query=...)` saves, opens as the panel's chip too.
+- **A description and a unit for each field** ([SDK](docs/SDK.md#field-descriptions),
+  [REST](docs/DATASET_MANAGEMENT.md#describe-a-field-edit)). Someone with edit in a dataset says what a field means
+  and its unit under Dataset Settings → Fields, with `dataset.set_field_description(field, description, unit)`, or
+  with `PATCH /api/datasets/{id}/fields/{field}/description`. The filter sidebar shows a field's description on its
+  name, on hover or keyboard focus, and every field of the schema and field-stats answers carries `description`,
+  `unit`, `description_source` (`"set"`, `"default"` or null) and `values_private`. The server describes the fields
+  every dataset has and those `compute_metadata()` and `compute_metrics()` write (brightness, blurriness, entropy and
+  the rest, each as it is computed), until someone writes their own. A mirror takes its primary's descriptions with
+  its field settings, and a version saves them with the field types. `values_private` marks a field whose values
+  aren't given to the assistant (above). It is each server's own, never versioned or synced, and outlives the field:
+  a private field that goes and comes back is still private. Migration `0035_field_descriptions.sql` adds three
+  columns to `dataset_fields` and touches no rows. A follower still on 2.13 receives the primary's described built-in
+  fields as rows it ignores; each new one queues one pass of statistics there that finds nothing to measure.
+
+### Fixed
+
+- **A link whose request fails is kept, not lost.** Opening a `q=`, `view=` or `w=` link, a request the browser
+  dropped is asked again (up to three times), and one that still fails (the network, a server error) no longer opens
+  the dataset without the link and rewrites the address: the page says so, with **Try again** and **Open the dataset
+  without it**, and the link stays in the address, so a reload opens it again. A link that is refused (a view that
+  doesn't exist, text the dataset can't take) is told as before.
+- **A number too large for a double in filter text is an error, not a 500.** `score > 1e999` (and the same in `in`,
+  `between` or a concept's threshold) parsed to infinity, which the parse route then failed to send. It is now
+  `'1e999' is out of range for a number`, with its line and column. A concept filter sent as JSON with a threshold
+  that isn't a number a double can hold (a 400-digit integer, text, a list) was a 500 too, and is now a 400; so is
+  one of infinity or NaN, which JSON readers accept and which kept every sample or none.
+- **A filter naming a concept that isn't the dataset's is refused, not silently all or nothing.** A concept filter
+  whose concept was deleted, never existed, or belongs to another dataset kept every sample (exclude) or none (show
+  only), with nothing said; value suggestions (autocomplete) dropped it, and a bulk edit was accepted and failed
+  later. Every reader of filters now answers 400, `Concept 12 doesn't exist; it may have been deleted` (`... doesn't
+  exist in this dataset; ...` for another dataset's), and a bulk tag, set or delete naming one is refused when it is
+  submitted, with nothing queued; another dataset's concept is refused this way even while it is being rescored. This
+  adds the `require_dataset_concepts` database function and changes `require_concept_scores`, which
+  `scripts/apply_migrations.sh` applies in the standard upgrade steps. An `f=` link, a saved view or the default view
+  holding such a stage opens without it and says so (the default view once in each browser, until its filters
+  change), and a saved view that lost one offers **Update this view**. Filters the browser kept from an earlier visit
+  still hold such a stage, and the grid then shows the server's message until its chip is removed.
+- **A search by words that can't load the text model says so (501), not 500.** On a server with no internet for
+  the model's first download, the app's search by words, a text concept, and the assistant's `search_similar` answer
+  that the text model could not be loaded and that a search by samples still works; the details go to the log. A
+  failed load is remembered for a minute in each process, so searches in that minute don't each try it again.
+- **Bad filter values answer 400, not 500, on three sample reads.** The grid's page asked for without its count, a
+  page of chosen fields (`samples/query` with `fields`) and the GET sample list caught every query error as a 500
+  "Internal query error". A data error (any class-22 error: a value that can't be cast, a number out of range, a
+  concept that isn't the dataset's) now answers 400 "Invalid input: …", as the other reads do.
+
 ## 2.13.2 (2026-11-18)
 
 2.13.2 updates the production nginx to 1.31.9 for the nginx advisories of 18 November 2026. No migrations: the

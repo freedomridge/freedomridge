@@ -60,7 +60,14 @@ def test_the_schema_lists_the_field_and_its_default_rule_is_set_through_the_api(
         assert discovered == ['probs']
         # The sidebar's fields list it as an overlay of its own.
         fields = await datasets._get_dataset_field_stats_impl(1, None)
-        assert {'name': 'probs', 'type': 'class_probabilities', 'config': None} in fields
+        description = ('description', 'unit', 'values_private', 'description_source')  # every field's (descriptions)
+        assert {
+            'name': 'probs',
+            'type': 'class_probabilities',
+            'config': None,
+            **dict.fromkeys(description, None),
+            'values_private': False,  # nothing set, no default
+        } in fields
         assert [field['name'] for field in fields].count('probs') == 1
 
         # A writer sets the default; it's checked, stored in segmentation_config, and null removes it.

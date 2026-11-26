@@ -8,6 +8,7 @@ import signal
 from datetime import datetime, timedelta
 
 from . import (
+    assistant_calls,
     auth_cleanup,
     backups,
     bulk_jobs,
@@ -25,6 +26,7 @@ from . import (
     map_placement,
     map_refit,
     patch_import,
+    regions,
     schema_check,
     statistics,
 )
@@ -259,6 +261,9 @@ async def run_service(dsn=DATABASE_URL):
     async def handle_patch_import(job):
         return await patch_import.handler(pool)(job)
 
+    async def handle_region_load(job):
+        return await regions.handler(pool)(job)
+
     async def handle_follower_sync(job):
         return await follower_sync.handler(pool)(job)
 
@@ -292,6 +297,7 @@ async def run_service(dsn=DATABASE_URL):
         map_placement.KIND: handle_map_place,
         index_advisor.KIND: handle_index_review,
         patch_import.KIND: handle_patch_import,
+        regions.KIND: handle_region_load,
         follower_sync.KIND: handle_follower_sync,
         index_actions.DROP_KIND: handle_index_drop,
         index_actions.RESTORE_KIND: handle_index_restore,
@@ -316,6 +322,7 @@ async def run_service(dsn=DATABASE_URL):
                 map_placement.KIND: map_placement.POLICY,
                 index_advisor.KIND: index_advisor.POLICY,
                 patch_import.KIND: patch_import.POLICY,
+                regions.KIND: regions.POLICY,
                 follower_sync.KIND: follower_sync.POLICY,
                 index_actions.DROP_KIND: index_actions.POLICY,
                 index_actions.RESTORE_KIND: index_actions.POLICY,
@@ -378,6 +385,7 @@ async def run_service(dsn=DATABASE_URL):
             searches = asyncio.create_task(follower_search.serve(pool, stopping))
             schedules = [
                 (lambda: auth_cleanup.scheduled_cleanup(pool), 300, 'Demo account and session cleanup', False),
+                (lambda: assistant_calls.prune(pool), 3600, 'Assistant call log cleanup', False),
                 (lambda: schedule_cleanup(pool, interval), min(interval, 5), 'Selection cleanup', False),
                 (lambda: statistics.schedule_statistics(pool), stats_interval, 'Statistics', True),
                 (dispatch_concepts, 1, 'Concept work delivery', True),

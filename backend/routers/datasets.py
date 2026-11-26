@@ -13,7 +13,7 @@ import uuid
 from contextlib import asynccontextmanager, suppress
 from fractions import Fraction
 from functools import partial
-from typing import Any, Callable, Deque, Dict, List, Literal, Optional, cast
+from typing import Any, Callable, Collection, Deque, Dict, List, Literal, NamedTuple, Optional, cast
 
 import anyio
 import asyncpg
@@ -34,11 +34,22 @@ from backend.datetimes import (
     utc_text,
     window_sql,
 )
+from backend.field_descriptions import (
+    BUILT_IN_FIELDS,
+    DESCRIPTION_LIMIT,
+    UNIT_LIMIT,
+    clean_text,
+    described,
+)
+from backend.field_descriptions import (
+    DESCRIBED_SQL as _DESCRIBED_SQL,
+)
 from backend.field_registry import (
     LOCAL_PREFIX,
     REQUEST_FULL_REFRESH,
     cached_distinct_values,
     field_stats,
+    forget_definitions,
     invalidate_values,
     lock_field_lifecycle,
     presentation_type,
@@ -46,6 +57,7 @@ from backend.field_registry import (
     register_fields,
     validate_metadata,
 )
+from backend.filter_query import canonical_region_key
 from backend.label_fields import (
     DISCOVERY_TYPES,
     LEGACY_GEOMETRY_FIELDS,
@@ -66,6 +78,7 @@ from .. import (
     job_queue,
     job_wait,
     local_writes,
+    regions,
     stale_lassos,
     statistics,
     unlinked_objects,
@@ -83,6 +96,8 @@ from ..access import (
     require_dataset_access,
     require_level,
 )
+from ..assistant import guard as assistant_guard
+from ..assistant.rule import NEW_DATASET_CLOSED_SQL
 from ..database import db
 from ..diskspace import INGEST_ROW_BYTES, require_free_space
 from ..models import Dataset, Sample
@@ -241,6 +256,7 @@ class DatasetUpdate(BaseModel):
     is_global: Optional[bool] = None
     default_view_id: Optional[int] = None
     everyone_level: Optional[EveryoneLevel] = None  # what a global dataset gives every signed-in user
+    assistant_closed: Optional[bool] = None  # the assistant may not read it (docs/ASSISTANT.md); manage
 
 
 # Columns selected when returning a Dataset model. Centralised so list/get/create/update
@@ -248,7 +264,7 @@ class DatasetUpdate(BaseModel):
 _DATASET_SELECT = (
     "id, name, description, media_fields, grid_media_field, modal_media_field, "
     "segmentation_config, storage_config_id, owner_id, is_global, created_at, deleting, deletion_job_id, "
-    "default_view_id, everyone_level, "
+    "default_view_id, everyone_level, assistant_closed, "
     # A mirror of a dataset on another instance (docs/FOLLOWERS.md): read-only here.
     "(SELECT jsonb_build_object('state', m.state, 'primary_url', l.url, 'origin_dataset_id', m.origin_dataset_id, "
     "'tags', m.tags, 'views', m.views, 'concept_views', m.concept_views, "
@@ -294,9 +310,11 @@ async def create_dataset(dataset: DatasetCreate, user: dict = Depends(require_ro
     dataset.name = await _clean_dataset_name(dataset.name)
     if dataset.storage_config_id is not None:
         await _require_storage_config_serves(dataset.storage_config_id, None)
+    # Closed to the assistant while Settings → Assistant says new datasets start closed.
     query = f"""
-        INSERT INTO datasets (name, description, media_fields, storage_config_id, owner_id, is_global, everyone_level)
-        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        INSERT INTO datasets (name, description, media_fields, storage_config_id, owner_id, is_global, everyone_level,
+                              assistant_closed)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, {NEW_DATASET_CLOSED_SQL})
         RETURNING {_DATASET_SELECT}
     """
     deadline, pause = _time.monotonic() + _PARTITION_RETRY_SECONDS, 0.05
@@ -470,7 +488,7 @@ async def _sidebar_expands_all(id: int) -> bool:
 
 
 @checks_level(
-    'edit; manage for name, is_global and everyone_level; an administrator for storage_config_id',
+    'edit; manage for name, is_global, everyone_level and assistant_closed; an administrator for storage_config_id',
     while_deleting='the database refuses its update while the dataset is deleted (409, the same answer)',
 )
 async def _dataset_update_level(
@@ -480,8 +498,11 @@ async def _dataset_update_level(
     user: dict = Depends(get_current_user),
 ) -> dict:
     """update_dataset's caller: the highest level the fields sent need. Display settings are edit; the name and who
-    sees the dataset, manage; its storage config, a server credential, stays an administrator's."""
-    manage = any(getattr(dataset, name) is not None for name in ('name', 'is_global', 'everyone_level'))
+    sees the dataset and whether the assistant may read it, manage; its storage config, a server credential, stays an
+    administrator's."""
+    manage = any(
+        getattr(dataset, name) is not None for name in ('name', 'is_global', 'everyone_level', 'assistant_closed')
+    )
     await check_dataset_access(id, user, 'manage' if manage else 'edit', http_request.state)
     if 'storage_config_id' in dataset.model_fields_set and user['role'] != 'admin':
         raise HTTPException(status_code=403, detail="Only an administrator can change a dataset's storage config")
@@ -564,6 +585,12 @@ async def update_dataset(id: int, dataset: DatasetUpdate, user: dict = Depends(_
     if dataset.everyone_level is not None:
         fields.append(f"everyone_level = ${idx}")
         values.append(level_number(dataset.everyone_level))
+        idx += 1
+
+    # This server's own, on a mirror too: the sync never writes it, and log_dataset_settings logs nothing for it.
+    if dataset.assistant_closed is not None:
+        fields.append(f"assistant_closed = ${idx}")
+        values.append(dataset.assistant_closed)
         idx += 1
 
     # Nullable like storage_config_id: null removes the default view.
@@ -906,8 +933,10 @@ async def _check_facet_request(id: int, filter_obj: Optional[Dict[str, Any]]) ->
             dataset_id=id,
             array_columns=await get_dataset_array_columns(id),
         )
-        # Before a stream starts, so the request can still answer 409 (as the impl checks for itself).
-        await require_ready_concepts(filter_obj)
+        # Before a stream starts, so the request can still answer 409 (as the impl checks for itself), or 400 for a
+        # concept that isn't the dataset's or a region this server doesn't have.
+        await require_ready_concepts(filter_obj, id)
+        await require_known_regions(filter_obj)
 
 
 async def _stream_field_facets(
@@ -1447,8 +1476,8 @@ async def _facet_query(coro, budget_s: Optional[float]) -> tuple[str, Any]:
         return 'exact', await (coro if budget_s is None else asyncio.wait_for(coro, timeout=budget_s))
     except asyncio.TimeoutError:
         return 'out_of_budget', None
-    except asyncpg.ObjectNotInPrerequisiteStateError:
-        raise  # a refusal (a concept being rescored): the request's 409
+    except (asyncpg.ObjectNotInPrerequisiteStateError, asyncpg.InvalidParameterValueError):
+        raise  # a refusal (a concept being rescored: 409; one that isn't the dataset's: 400)
     except asyncpg.PostgresError:
         return 'cached', None
 
@@ -1471,8 +1500,8 @@ async def _safe_filter_query(coro, *, budget_s: Optional[float] = None):
         if budget_s is None:
             return await coro
         return await asyncio.wait_for(coro, timeout=budget_s)
-    except asyncpg.ObjectNotInPrerequisiteStateError:
-        raise  # a refusal (concept being rescored), not a slow query to fall back from
+    except (asyncpg.ObjectNotInPrerequisiteStateError, asyncpg.InvalidParameterValueError):
+        raise  # a refusal (a concept being rescored, or not the dataset's), not a slow query to fall back from
     except (asyncpg.PostgresError, asyncio.TimeoutError):
         return None
 
@@ -1523,6 +1552,8 @@ async def _filtered_set_is_broad(
         numeric_indexed_fields=await get_promoted_numeric_fields(dataset_id),
         dataset_id=dataset_id,
         array_columns=await get_dataset_array_columns(dataset_id),
+        # It stops after a few rows: an excluded region tested row by row, not read whole first.
+        region_joins=False,
     )
     if not f_sql or f_sql == "TRUE":
         return False
@@ -1692,8 +1723,10 @@ async def _get_dataset_field_stats_impl(
     if not dataset_check:
         raise HTTPException(status_code=404, detail="Dataset not found")
     # Filtered sidebar values fall back to cached ones when a sub-query fails; a concept whose
-    # scores are being rebuilt must refuse (409) instead of quietly showing unfiltered values.
-    await require_ready_concepts(filter_obj)
+    # scores are being rebuilt must refuse (409) instead of quietly showing unfiltered values, and one that isn't the
+    # dataset's or a region this server doesn't have 400.
+    await require_ready_concepts(filter_obj, id)
+    await require_known_regions(filter_obj)
 
     # Best-effort timeout per filter sub-query in lightning_mode; off in
     # non-lightning mode where the user has explicitly opted into waiting
@@ -1701,6 +1734,7 @@ async def _get_dataset_field_stats_impl(
     filter_budget_s = _LIGHTNING_FIELD_STATS_BUDGET_S if lightning_mode else None
 
     stats = await field_stats(db, id)
+    descriptions: Dict[str, Any] = {}  # what was written about each field, read with the overlay configs below
 
     # Selectivity gate (lightning_mode only). Decide ONCE whether the active filter is selective
     # enough that a per-field faceted recompute (one filtered scan PER field, fanned out across the
@@ -1746,6 +1780,7 @@ async def _get_dataset_field_stats_impl(
         entry.setdefault('provenance', 'cached')
         if emit is not None and entry['name'] not in emitted:
             emitted.add(entry['name'])
+            entry.update(described(entry['name'], descriptions.get(entry['name'])))
             emit(entry)
 
     async def run_facet_job(entry: Dict[str, Any], job) -> None:
@@ -1892,8 +1927,8 @@ async def _get_dataset_field_stats_impl(
                 *args,
             )
             return [r['label'] for r in rows if r['label']]
-        except asyncpg.ObjectNotInPrerequisiteStateError:
-            raise  # a refusal (concept being rescored) is a 409, not an empty label list
+        except (asyncpg.ObjectNotInPrerequisiteStateError, asyncpg.InvalidParameterValueError):
+            raise  # a refusal (a concept being rescored, or not the dataset's) is a 409 or 400, not an empty label list
         except Exception as e:
             print(f"[field-stats] Error computing filtered {json_field} labels: {e}")
             return []
@@ -1933,8 +1968,8 @@ async def _get_dataset_field_stats_impl(
                 *args,
             )
             return [r['label'] for r in rows if r['label']]
-        except asyncpg.ObjectNotInPrerequisiteStateError:
-            raise  # a refusal (concept being rescored) is a 409, not an empty label list
+        except (asyncpg.ObjectNotInPrerequisiteStateError, asyncpg.InvalidParameterValueError):
+            raise  # a refusal (a concept being rescored, or not the dataset's) is a 409 or 400, not an empty label list
         except Exception as e:
             print(f"[field-stats] Error computing filtered segmentation labels: {e}")
             return []
@@ -2205,8 +2240,12 @@ async def _get_dataset_field_stats_impl(
     # can render toggle rows without trying to build a filter UI.
     # Per-field overlay config (UI-set colormap/range/opacity), surfaced with the field so
     # the renderers (modal canvas + grid composite URL) can apply it.
+    # Read with what was written about each field (field_descriptions), which every entry carries: no query of its
+    # own on this request, which lightning mode keeps short. Before any entry is final (finish).
     _cfg_rows = await db.fetch(
-        "SELECT field_name, overlay_config FROM dataset_fields WHERE dataset_id = $1 AND overlay_config IS NOT NULL",
+        """SELECT field_name, overlay_config, description, unit, values_private FROM dataset_fields
+           WHERE dataset_id = $1
+             AND (overlay_config IS NOT NULL OR description IS NOT NULL OR unit IS NOT NULL OR values_private)""",
         id,
     )
     _overlay_cfgs = {
@@ -2214,7 +2253,9 @@ async def _get_dataset_field_stats_impl(
             json.loads(r['overlay_config']) if isinstance(r['overlay_config'], str) else r['overlay_config']
         )
         for r in _cfg_rows
+        if r['overlay_config'] is not None
     }
+    descriptions.update((r['field_name'], r) for r in _cfg_rows if r['description'] or r['unit'] or r['values_private'])
     for heatmap_field in heatmap_fields:
         schema.append(
             {
@@ -2651,6 +2692,7 @@ async def _get_dataset_field_stats_impl(
                 # order.
                 field['sortable'] = False
             _finite_bounds(field)
+            field.update(described(field['name'], descriptions.get(field['name'])))
             deduped.append(field)
             if emit is not None and name not in emitted:
                 emitted.add(name)
@@ -2983,11 +3025,7 @@ async def promote_field(
         raise HTTPException(status_code=404, detail="Dataset not found")
 
     # Check if already promoted
-    existing = await db.fetchrow(
-        "SELECT id, is_promoted, field_type FROM dataset_fields WHERE dataset_id = $1 AND field_name = $2",
-        id,
-        field_name,
-    )
+    existing = await _definition(db, id, field_name, 'id, is_promoted, field_type')
 
     if existing and existing['is_promoted']:
         return {"message": f"Field {field_name} is already promoted"}
@@ -3082,11 +3120,7 @@ async def set_field_type(
     async with db.pool.acquire() as conn:
         async with conn.transaction():
             await lock_field_lifecycle(conn, id, exclusive=True)
-            current = await conn.fetchrow(
-                'SELECT field_type, origin, is_promoted FROM dataset_fields WHERE dataset_id = $1 AND field_name = $2',
-                id,
-                field_name,
-            )
+            current = await _definition(conn, id, field_name, 'field_type, origin, is_promoted')
             if current is None:
                 raise HTTPException(status_code=404, detail='Field not found')
             if current['origin'] != 'metadata':
@@ -3135,11 +3169,7 @@ async def set_field_display_type(
     async with db.pool.acquire() as conn:
         async with conn.transaction():
             await lock_field_lifecycle(conn, id)
-            stat = await conn.fetchrow(
-                "SELECT field_type FROM dataset_fields WHERE dataset_id = $1 AND field_name = $2",
-                id,
-                field_name,
-            )
+            stat = await _definition(conn, id, field_name, 'field_type')
             if not stat:
                 raise HTTPException(status_code=404, detail=f"Field '{field_name}' has no definition in this dataset")
             await conn.execute(
@@ -3161,6 +3191,127 @@ async def set_field_display_type(
         unique_values = [row['val'] for row in rows[:100]]
 
     return {"message": f"Display type for {field_name} set to {request.display_type}", "unique_values": unique_values}
+
+
+class FieldDescriptionRequest(BaseModel):
+    """Any of the three: a key left out stays as it is; null or "" clears a description or a unit."""
+
+    description: Optional[str] = None
+    unit: Optional[str] = None
+    values_private: bool = False
+
+    @field_validator('description')
+    @classmethod
+    def _description(cls, value: Optional[str]) -> Optional[str]:
+        return clean_text(value, DESCRIPTION_LIMIT, 'A description', line_breaks=True)
+
+    @field_validator('unit')
+    @classmethod
+    def _unit(cls, value: Optional[str]) -> Optional[str]:
+        return clean_text(value, UNIT_LIMIT, 'A unit', line_breaks=False)
+
+
+async def _listed_without_row(connection: Any, dataset_id: int, field_name: str) -> bool:
+    """A field the schema lists though no definition of its own does: a built-in (id, tags, ...), or a label field
+    (detections.label), by field_stats' own rule. `__` names are the statistics' own caches."""
+    if field_name in BUILT_IN_FIELDS:
+        return True
+    return not field_name.startswith('__') and any(
+        stat['field_name'] == field_name and stat['origin'] == 'system'
+        for stat in await field_stats(connection, dataset_id)
+    )
+
+
+# What tells a kept private flag (forget_definitions) from a definition: read with whatever a caller reads.
+_KEPT_FLAG_COLUMNS = ('origin', 'field_type', 'is_promoted', 'display_type', 'overlay_config', 'description', 'unit')
+
+
+# _kept_flag in SQL, over a dataset_fields row.
+_KEPT_FLAG_SQL = (
+    "origin = 'system' AND field_type = 'unknown' AND NOT COALESCE(is_promoted, FALSE) AND display_type IS NULL "
+    'AND overlay_config IS NULL AND description IS NULL AND unit IS NULL'
+)
+
+
+def _kept_flag(row: Any) -> bool:
+    """A 'system' row holding nothing but a private flag kept when its field went (forget_definitions)."""
+    return (
+        row is not None
+        and row['origin'] == 'system'
+        and row['field_type'] == 'unknown'
+        and not row['is_promoted']
+        and all(row[key] is None for key in ('display_type', 'overlay_config', 'description', 'unit'))
+    )
+
+
+async def _definition(connection: Any, dataset_id: int, field_name: str, columns: str = '*') -> Any:
+    """A field's definition (its dataset_fields row: `columns`, and what _kept_flag needs, in the one read the caller
+    made before), or None as for a name with no row at all: a kept private flag, for a name the schema doesn't list,
+    is no field. A name the schema lists (a built-in, a label field) keeps its row; only for a kept flag is that
+    listing read."""
+    if columns != '*':
+        named = [column.strip() for column in columns.split(',')]
+        columns = ', '.join(named + [column for column in _KEPT_FLAG_COLUMNS if column not in named])
+    row = await connection.fetchrow(
+        f'SELECT {columns} FROM dataset_fields WHERE dataset_id = $1 AND field_name = $2',
+        dataset_id,
+        field_name,
+    )
+    if _kept_flag(row) and not await _listed_without_row(connection, dataset_id, field_name):
+        return None
+    return row
+
+
+@router.patch('/datasets/{id}/fields/{field_name}/description', dependencies=[Depends(require_dataset_access)])
+async def set_field_description(
+    id: int,
+    field_name: str,
+    request: FieldDescriptionRequest,
+    user: dict = Depends(require_level('edit')),
+):
+    """What a field means: its description and unit, and whether its values are kept from the assistant
+    (values_private). Answers the field's values as the schema shows them, a default description included.
+
+    On a mirror, the primary's fields take their description and unit from the primary: changing them here is
+    refused (409), as changing their type is. values_private belongs to each instance.
+
+    A field the schema lists takes these; anything else is a 404, a private flag kept on a field that went
+    (field_registry.forget_definitions) included."""
+    sent = request.model_fields_set & {'description', 'unit', 'values_private'}
+    assert db.pool is not None
+    async with db.pool.acquire() as conn, conn.transaction():
+        await lock_field_lifecycle(conn, id)
+        query = (
+            'SELECT origin, description, unit, values_private FROM dataset_fields '
+            'WHERE dataset_id = $1 AND field_name = $2'
+        )
+        current = await conn.fetchrow(query + ' FOR UPDATE', id, field_name)
+        if (current is None or current['origin'] == 'system') and not await _listed_without_row(conn, id, field_name):
+            raise HTTPException(status_code=404, detail=f"Field '{field_name}' is not a field of this dataset")
+        if current is None:
+            if all(getattr(request, key) in (None, False) for key in sent):
+                return {'field_name': field_name, **described(field_name, None)}  # nothing to write
+            # Its row holds what is written about it; the registry's readers pass over origin 'system' rows.
+            await conn.execute(
+                "INSERT INTO dataset_fields (dataset_id, field_name, field_type, origin) VALUES ($1, $2, 'unknown', "
+                "'system') ON CONFLICT (dataset_id, field_name) DO NOTHING",
+                id,
+                field_name,
+            )
+            current = await conn.fetchrow(query + ' FOR UPDATE', id, field_name)
+        stored = {key: current[key] for key in ('description', 'unit', 'values_private')}
+        values = {key: getattr(request, key) if key in sent else stored[key] for key in stored}
+        if values != stored:
+            await conn.execute(
+                'UPDATE dataset_fields SET description = $3, unit = $4, values_private = $5 '
+                'WHERE dataset_id = $1 AND field_name = $2',
+                id,
+                field_name,
+                values['description'],
+                values['unit'],
+                values['values_private'],
+            )
+    return {'field_name': field_name, **described(field_name, values)}
 
 
 class AutocompleteRequest(BaseModel):
@@ -3221,6 +3372,8 @@ async def _autocomplete_impl(id: int, field_name: str, q: str, limit: int, filte
                 )
                 if sql and sql != "TRUE":
                     conditions.append(sql)
+        except HTTPException:
+            raise  # a filter that can't be read is refused (400), never dropped from the values it scopes
         except Exception as e:
             print(f"Autocomplete filter error: {e}")
 
@@ -3348,13 +3501,15 @@ def _remove_field_from_filter(filter_obj: dict, field_name: str) -> Optional[dic
 
 @router.get("/datasets/{id}/schema", dependencies=[Depends(require_dataset_access)])
 @guest_heavy
-async def get_dataset_schema(id: int, filters: Optional[str] = None, lightning_mode: bool = True):
+async def get_dataset_schema(id: int, filters: Optional[str] = None, lightning_mode: bool = True, stale: bool = False):
     """
     Get schema with stats.
     Optimization: Use cached stats for global min/max.
     Only re-calculate if absolutely necessary (which is rarely for schema).
+    With `stale`, each measured field also says whether changes to the samples wait to be counted for it
+    (`stats_stale`, statistics.stale_fields): asked by the assistant, not by the app's page loads.
     """
-    schema = []
+    schema: List[Dict[str, Any]] = []
 
     args = [id]
 
@@ -3480,8 +3635,13 @@ async def get_dataset_schema(id: int, filters: Optional[str] = None, lightning_m
     # 5. filepath + additional media fields
     schema.append({"name": "filepath", "type": "filepath"})
 
-    # Get dataset's media_fields so we can tag them as "filepath" type in the schema
-    dataset_row = await db.fetchrow("SELECT media_fields FROM datasets WHERE id = $1", id)
+    # Get dataset's media_fields so we can tag them as "filepath" type in the schema, and what was written about its
+    # fields (field_descriptions) in the same read: no query of its own.
+    dataset_row = await db.fetchrow(
+        f"SELECT media_fields, {_DESCRIBED_SQL} AS described FROM datasets WHERE id = $1",
+        id,
+    )
+    descriptions = (dataset_row['described'] if dataset_row else None) or {}
     dataset_media_fields = (
         set(dataset_row['media_fields']) if dataset_row and dataset_row['media_fields'] else {'filepath'}
     )
@@ -3490,6 +3650,7 @@ async def get_dataset_schema(id: int, filters: Optional[str] = None, lightning_m
 
     # --- Metadata Fields ---
     cached_stats = await field_stats(db, id)
+    is_stale = await statistics.stale_fields(db, id) if stale else None
     vector_types = {}
     for cache in ('__polyline_fields__', '__keypoint_fields__', '__detection_fields__', '__cuboid_fields__'):
         for stat in cached_stats:
@@ -3517,6 +3678,9 @@ async def get_dataset_schema(id: int, filters: Optional[str] = None, lightning_m
             "stats_pending": stat.get('stats_pending', False),
             "values_complete": stat.get('values_complete', False),
         }
+        if is_stale is not None:
+            # Changes the statistics haven't counted yet: its numbers are behind the samples (statistics.stale_fields).
+            field_info['stats_stale'] = is_stale(stat['field_name'])
 
         # Media fields get filepath type — skip number/enum enrichment
         if is_media_field:
@@ -3595,6 +3759,7 @@ async def get_dataset_schema(id: int, filters: Optional[str] = None, lightning_m
         name = field.get('name')
         if name not in seen:
             seen.add(name)
+            field.update(described(field['name'], descriptions.get(field['name'])))
             deduped.append(field)
     return deduped
 
@@ -4353,6 +4518,8 @@ _CROSSGRAIN_SKIP_OPS = {
     'geo_polygon',
     'geo_polygon_exclude',
     'geo_near',
+    'geo_region',
+    'geo_region_exclude',
     'collapse_duplicates',
     'cg_self',
     'parent_matches',
@@ -4503,12 +4670,91 @@ def _filter_concept_ids(node: Any) -> set:
     return found
 
 
-async def require_ready_concepts(filter_obj: Any) -> None:
+async def require_ready_concepts(filter_obj: Any, dataset_id: Optional[int] = None) -> None:
     """409 (SQLSTATE 55000) for a concept whose definition changed and whose scoring job has not
-    finished; the same guard every concept filter query runs once."""
+    finished, and 400 (22023) for one that doesn't exist or, given `dataset_id`, isn't that dataset's;
+    the same guards every concept filter query runs once."""
     concept_ids = sorted(_filter_concept_ids(filter_obj))
     if concept_ids:
+        if dataset_id is not None:
+            await require_known_concepts(filter_obj, dataset_id)
         await db.fetchval('SELECT require_concept_scores($1::int[])', concept_ids)
+
+
+async def require_known_concepts(filter_obj: Any, dataset_id: int) -> None:
+    """400 (22023) for a concept the filter names that isn't the dataset's: deleted, never made, or another
+    dataset's. For a request whose compiled filter runs later (a bulk edit, refused when it is submitted). Existence
+    and ownership only: a concept being rescored is refused (409) when the filter is read."""
+    concept_ids = sorted(_filter_concept_ids(filter_obj))
+    if concept_ids:
+        await db.fetchval('SELECT require_dataset_concepts($1::int[], $2::int)', concept_ids, dataset_id)
+
+
+_REGION_OPS = ('geo_region', 'geo_region_exclude')
+
+
+def _filter_region_keys(node: Any) -> set:
+    """The region keys a filter tree's geo_region / geo_region_exclude leaves name, as stored (canonical), including
+    cross-grain sub-filters."""
+    found: set = set()
+    if not isinstance(node, dict):
+        return found
+    value = node.get('value')
+    if str(node.get('operator', '')).lower() in _REGION_OPS and isinstance(value, str):
+        found.add(canonical_region_key(value))
+    for child in [*(node.get('filters') or []), value]:
+        found |= _filter_region_keys(child)
+    return found
+
+
+async def require_known_regions(filter_obj: Any) -> None:
+    """400 for a region key no loaded boundary set has, before a request whose filter queries fall back to cached
+    values on an error (the sidebar), or whose compiled filter runs later (a bulk job). A compiled filter checks its
+    keys itself (parse_filter_node)."""
+    keys = sorted(_filter_region_keys(filter_obj))
+    if keys:
+        await db.fetchval('SELECT require_regions($1::text[])', keys)
+
+
+def _is_region_exclude(node: Any) -> bool:
+    return isinstance(node, dict) and str(node.get('operator', '')).lower() == 'geo_region_exclude'
+
+
+def _top_region_excludes(node: Dict[str, Any]) -> tuple[Dict[str, Any], list]:
+    """The geo_region_exclude leaves ANDed at the top of a filter, and the filter without them."""
+    if _is_region_exclude(node):
+        return {'logic': 'AND', 'filters': []}, [node]
+    if ('logic' in node or 'filters' in node) and str(node.get('logic', 'AND')).upper() == 'AND':
+        children = node.get('filters') or []
+        leaves = [child for child in children if _is_region_exclude(child)]
+        if leaves:
+            return {**node, 'filters': [child for child in children if not _is_region_exclude(child)]}, leaves
+    return node, []
+
+
+def _region_leaf(
+    node: Dict[str, Any],
+    args: List[Any],
+    arg_idx: int,
+    join: Optional[tuple[str, Optional[int]]] = None,
+) -> tuple[str, int]:
+    """A geo_region / geo_region_exclude leaf: its value is a region's key (backend/regions.py), in any case. A key
+    no loaded set has is a 400, never a filter that matches nothing. Exclude removes what is inside and keeps
+    everything else, samples with no location included, as geo_polygon_exclude does. `join` (the id column and the
+    dataset) tests an exclude ANDed at the top of a statement on the samples table as an anti-join from the region's
+    pieces; any other leaf tests the row's own location."""
+    op, field, val = str(node.get('operator')).lower(), node.get('field'), node.get('value')
+    if field != 'location':
+        raise HTTPException(status_code=400, detail=f"{op} applies to the field 'location', not {field!r}")
+    if not isinstance(val, str) or not val.strip():
+        raise HTTPException(status_code=400, detail=f'{op} takes a region key, such as "US-KS"')
+    args.append(canonical_region_key(val))
+    key = f'${arg_idx}'
+    if join is not None:
+        inside = regions.joined_inside_sql(key, *join)
+        return (f'NOT {inside}' if op == 'geo_region_exclude' else inside), arg_idx + 1
+    inside = regions.row_inside_sql(key)
+    return (f'(location IS NULL OR NOT {inside})' if op == 'geo_region_exclude' else inside), arg_idx + 1
 
 
 # The `field_mapping` every caller that queries `FROM samples s JOIN ...` must pass.
@@ -4570,6 +4816,8 @@ def parse_filter_node(
     numeric_indexed_fields: Optional[set] = None,
     dataset_id: Optional[int] = None,
     array_columns: Optional[set] = None,
+    *,
+    region_joins: bool = True,
 ) -> tuple[str, int]:
     """
     Compiles a whole filter tree for a statement's WHERE and returns (sql_snippet, next_arg_idx).
@@ -4583,8 +4831,26 @@ def parse_filter_node(
     ANDed into the WHERE it is a One-Time Filter on the unchanged parallel plan; inside each concept
     EXISTS it can become a per-row join filter and change the query plan.
     The compiler collects the ids where it compiles each score read, so no read goes unguarded.
+    With `dataset_id`, a One-Time Filter in front of it refuses (400) a concept that isn't that dataset's: another
+    dataset's concept scores none of its samples, so its test would keep every sample or none. It runs first, so a
+    concept of another dataset that is being rescored gets that 400, not readiness's 409 naming the concept.
+
+    A filter naming regions starts with one check of their keys in the same way: a key no loaded boundary set has
+    refuses the statement (400) even when it reads no row. Each region leaf checks its own key too (region_id).
+    A region leaf tests each row's location (through the location index, then the region's cells). With
+    `region_joins`, a geo_region_exclude ANDed at the top of the filter is an anti-join from the region's pieces to
+    the samples table instead, whose cost follows the samples inside, not the dataset (2M samples, Kansas excluded:
+    0.28 s against 0.95 s; docs/REGIONS.md). Without it: a version's rows (a CTE no index serves) and a statement over
+    a few given ids (a bulk job's unit).
     """
+    # A request made for the assistant may test a private field only for presence and by the tokens it was given,
+    # which open here (assistant/guard.py); anything else is refused before a statement is built.
+    node = assistant_guard.filters(node, dataset_id)
     concept_ids: set = set()
+    region_keys = _filter_region_keys(node)
+    joined: list = []
+    if region_keys and region_joins:
+        node, joined = _top_region_excludes(node)
     sql, arg_idx = _compile_filter_node(
         node,
         args,
@@ -4595,10 +4861,27 @@ def parse_filter_node(
         array_columns=array_columns,
         concepts=concept_ids,
     )
+    for leaf in joined:
+        region_sql, arg_idx = _region_leaf(
+            leaf,
+            args,
+            arg_idx,
+            join=((field_mapping or {}).get('id', 'samples.id'), dataset_id),
+        )
+        sql = f"({sql}) AND {region_sql}"
+    if region_keys:
+        args.append(sorted(region_keys))
+        sql, arg_idx = f"((SELECT require_regions(${arg_idx}::text[])) AND ({sql}))", arg_idx + 1
     if not concept_ids:
         return sql, arg_idx
     args.append(sorted(concept_ids))
-    return f"((SELECT require_concept_scores(${arg_idx}::int[])) AND ({sql}))", arg_idx + 1
+    guard = f"(SELECT require_concept_scores(${arg_idx}::int[]))"
+    if dataset_id is None:
+        return f"({guard} AND ({sql}))", arg_idx + 1
+    # Ownership first: the InitPlans run left to right, and readiness's 409 would name another dataset's concept.
+    args.append(int(dataset_id))
+    owned = f"(SELECT require_dataset_concepts(${arg_idx}::int[], ${arg_idx + 1}::int))"
+    return f"({owned} AND {guard} AND ({sql}))", arg_idx + 2
 
 
 def _compile_filter_node(
@@ -4680,6 +4963,10 @@ def _compile_filter_node(
         op = node.get('operator', '=').lower()
         val = node.get('value')
 
+        # A private field's test whose token didn't open (assistant/guard.py): it matches nothing.
+        if op == assistant_guard.NOTHING:
+            return "FALSE", arg_idx
+
         # "Collapse duplicates" toggle: hide non-representative perceptual-hash dupes.
         # `value` is the hash_config (a hash field_name, or '_all').
         # Dispatched before field validation since `field` is just a sentinel here.
@@ -4728,9 +5015,17 @@ def _compile_filter_node(
             cmp = str(cfg.get('op', '>'))
             if cmp not in ('>', '>=', '<', '<='):
                 raise HTTPException(status_code=400, detail=f"Invalid concept threshold op: {cmp!r}")
+            # JSON reads 1e999, Infinity and NaN too: a threshold that isn't a finite number is refused, as text refuses
+            # it (in Postgres a `< NaN` test would keep every sample).
+            try:
+                threshold = float(cfg.get('threshold', 0.5))
+            except (TypeError, ValueError, OverflowError):
+                threshold = math.nan
+            if not math.isfinite(threshold):
+                raise HTTPException(status_code=400, detail="Invalid concept threshold: it must be a finite number")
             id_col = (field_mapping or {}).get('id', 'id')
             args.append(int(cid))
-            args.append(float(cfg.get('threshold', 0.5)))
+            args.append(threshold)
             concepts.add(int(cid))
             # No guard in here: parse_filter_node puts one for every concept in front of the whole filter.
             inner = (
@@ -5300,6 +5595,9 @@ def _compile_filter_node(
                 )
             return f"ST_Within(location, ST_GeomFromText(${arg_idx}, 4326))", arg_idx + 1
 
+        elif op in _REGION_OPS:
+            return _region_leaf(node, args, arg_idx)
+
         elif op == 'geo_near':
             # val = {"point": [lon, lat], "max_distance": meters}. Distance is on
             # the geography type so max_distance is in metres; uses the spatial index.
@@ -5407,6 +5705,8 @@ def build_sample_query_parts(
     filters: Optional[str] = None,
     array_columns: Optional[set] = None,
     numeric_indexed_fields: Optional[set] = None,
+    *,
+    region_joins: bool = True,
 ) -> tuple[str, list[Any], int]:
     """
     Builds the WHERE clause and arguments for sample queries.
@@ -5444,6 +5744,7 @@ def build_sample_query_parts(
                     numeric_indexed_fields,
                     dataset_id,
                     array_columns=array_columns,
+                    region_joins=region_joins,
                 )
                 conditions.append(sql)
         except HTTPException:
@@ -5582,8 +5883,10 @@ async def set_overlay_config(
     async with db.pool.acquire() as conn:
         async with conn.transaction():
             await lock_field_lifecycle(conn, id)
+            # A kept private flag (_kept_flag) is no field: 404, as for a name with no row, in the one write.
             status = await conn.execute(
-                "UPDATE dataset_fields SET overlay_config = $3::jsonb WHERE dataset_id = $1 AND field_name = $2",
+                "UPDATE dataset_fields SET overlay_config = $3::jsonb WHERE dataset_id = $1 AND field_name = $2 "
+                f"AND NOT ({_KEPT_FLAG_SQL})",
                 id,
                 field,
                 cfg or None,
@@ -5955,6 +6258,7 @@ async def list_samples_post(id: int, request: SamplesRequest):
     layout of its map, the answer names those maps (`stale_lassos`): it may select different samples now. The SDK
     warns; the app's chip already does.
     """
+    assistant_guard.sort(request.sort_by)
     # Index advisor telemetry (backend/field_usage.py): an in-memory count, never a failure or a wait.
     with field_usage.measure(id, _grid_usage(request.filters, request.sort_by)):
         answer = await _list_samples_post(id, request)
@@ -5986,6 +6290,8 @@ async def _list_samples_post(id: int, request: SamplesRequest):
 
     if request.filters:
         nif = await get_promoted_numeric_fields(id)
+        # A page stops after its rows: an excluded region is tested row by row there, never read whole first (the
+        # joined form sorted every sample inside before the first row). The count below joins it.
         sql, arg_idx = parse_filter_node(
             request.filters,
             args,
@@ -5994,6 +6300,7 @@ async def _list_samples_post(id: int, request: SamplesRequest):
             nif,
             id,
             array_columns=await get_dataset_array_columns(id),
+            region_joins=False,
         )
         conditions.append(sql)
 
@@ -6039,10 +6346,27 @@ async def _list_samples_post(id: int, request: SamplesRequest):
     # Count query (skip when SDK says so)
     total = -1
     if not request.skip_count:
-        count_query = f"SELECT count(*) FROM samples {indexed_where_clause}"
+        count_query, count_args = f"SELECT count(*) FROM samples {indexed_where_clause}", args
+        if request.filters and _top_region_excludes(request.filters)[1]:
+            # A count reads every row: an excluded region is an anti-join from its pieces there (parse_filter_node).
+            count_args = [id]
+            joined, next_idx = parse_filter_node(
+                request.filters,
+                count_args,
+                2,
+                None,
+                nif,
+                id,
+                array_columns=await get_dataset_array_columns(id),
+            )
+            counted = [_sample_dataset_condition(id), joined]
+            if request.after_id is not None and not request.order_by_ids:
+                counted.append(f"id > ${next_idx}")
+                count_args.append(request.after_id)
+            count_query = f"SELECT count(*) FROM samples WHERE {' AND '.join(counted)}"
         # asyncpg's fetchval uses a one-row portal, which suppresses parallel
         # execution. This aggregate returns one row even with an unlimited portal.
-        total = (await db.fetch(count_query, *args))[0][0]
+        total = (await db.fetch(count_query, *count_args))[0][0]
 
     # See _filter_first_id_order: don't let the planner walk the pkey through a
     # selective filter's non-matches. sample_count from the ingest-maintained stats
@@ -6183,8 +6507,10 @@ async def _list_samples_post(id: int, request: SamplesRequest):
             query_params = args + select_args + [request.limit, request.offset]
         try:
             rows = await db.fetch(query, *query_params)
-        except asyncpg.ObjectNotInPrerequisiteStateError:
-            raise  # 409 (app handler): a deleting dataset, a concept being rescored, or a lasso on a re-fitted map
+        except (asyncpg.ObjectNotInPrerequisiteStateError, asyncpg.DataError):
+            # 409 (app handler): a deleting dataset, a concept being rescored, or a lasso on a re-fitted map; 400: bad
+            # input, such as a concept that isn't the dataset's.
+            raise
         except Exception as e:
             # Log the SQL/error server-side; never return them to the client
             # (schema/traceback disclosure, and it amplifies injection probing).
@@ -6227,8 +6553,10 @@ async def _list_samples_post(id: int, request: SamplesRequest):
 
     try:
         rows = await db.fetch(query, *query_args)
-    except asyncpg.ObjectNotInPrerequisiteStateError:
-        raise  # 409 (app handler): a deleting dataset, a concept being rescored, or a lasso on a re-fitted map
+    except (asyncpg.ObjectNotInPrerequisiteStateError, asyncpg.DataError):
+        # 409 (app handler): a deleting dataset, a concept being rescored, or a lasso on a re-fitted map; 400: bad
+        # input, such as a concept that isn't the dataset's.
+        raise
     except Exception:
         import traceback
 
@@ -6439,8 +6767,10 @@ async def _list_samples(
 
     try:
         rows = await db.fetch(query, *query_args)
-    except asyncpg.ObjectNotInPrerequisiteStateError:
-        raise  # 409 (app handler): a deleting dataset, a concept being rescored, or a lasso on a re-fitted map
+    except (asyncpg.ObjectNotInPrerequisiteStateError, asyncpg.DataError):
+        # 409 (app handler): a deleting dataset, a concept being rescored, or a lasso on a re-fitted map; 400: bad
+        # input, such as a concept that isn't the dataset's.
+        raise
     except Exception:
         import traceback
 
@@ -6541,6 +6871,7 @@ async def _histogram(
     sample_ids: Optional[List[int]] = None,
 ):
     """The histogram of the filtered set, or only of the rows in `sample_ids` (the preview)."""
+    assistant_guard.histogram(field)
     # `field` is interpolated into the value expression below; reject unsafe names. A mirror's own field
     # (`@local.<name>`) is read from local_metadata (or the local_tags array), never metadata.
     try:
@@ -6907,6 +7238,7 @@ async def _histogram_preview(
         filters=filters,
         array_columns=await get_dataset_array_columns(id),
         numeric_indexed_fields=await get_promoted_numeric_fields(id) if filters else None,
+        region_joins=False,  # a few thousand drawn rows: each tested, no region read whole
     )
     # Look the drawn rows up by primary key first, then filter them. The OFFSET 0 fence keeps the
     # planner from scanning a broad filter index and testing every matching row against the draws. Aliased
@@ -8342,35 +8674,40 @@ def _refuse_local_field_operation(*names: str) -> None:
         )
 
 
+class _FieldTarget(NamedTuple):
+    had_values: bool  # it already holds values (and overwrite allowed)
+    placeholder: Any  # a 'system' row there, which the field takes over (_land_on_placeholder); None without one
+
+
 async def _check_field_target(
     dataset_id: int,
     field_name: str,
     new_name: str,
     overwrite: bool,
     connection=None,
-) -> bool:
-    """Validate a rename/clone target; True when it already holds values (and overwrite allowed)."""
+) -> _FieldTarget:
+    """Validate a rename/clone target, and read what a placeholder there holds in the same read."""
     _refuse_local_field_operation(field_name, new_name)
     _validate_field_name(field_name)
     _validate_field_name(new_name)
     if new_name == field_name:
         raise HTTPException(status_code=400, detail="new_name is the field's current name")
     connection = connection or db
-    source = await connection.fetchrow(
-        'SELECT origin FROM dataset_fields WHERE dataset_id = $1 AND field_name = $2',
-        dataset_id,
-        field_name,
-    )
+    source = await _definition(connection, dataset_id, field_name, 'origin')
     if source is None:
         raise HTTPException(status_code=404, detail=f"Field '{field_name}' is not registered")
     if source['origin'] != 'metadata':
         raise HTTPException(status_code=400, detail='Rename and clone require a metadata field')
-    target_origin = await connection.fetchval(
-        'SELECT origin FROM dataset_fields WHERE dataset_id = $1 AND field_name = $2',
+    target = await connection.fetchrow(
+        'SELECT origin, description, unit, values_private FROM dataset_fields '
+        'WHERE dataset_id = $1 AND field_name = $2',
         dataset_id,
         new_name,
     )
-    if target_origin is not None and target_origin != 'metadata':
+    target_origin = target['origin'] if target is not None else None
+    # A 'system' row there (a built-in's description, a flag kept when a field went) is a placeholder the field takes
+    # over (_land_on_placeholder), as a newly registered one does.
+    if target_origin is not None and target_origin not in ('metadata', 'system'):
         raise HTTPException(status_code=409, detail='Cannot replace a native or system field with metadata')
     taken = await connection.fetchval(
         "SELECT EXISTS (SELECT 1 FROM samples WHERE dataset_id = $1 AND metadata ? $2)",
@@ -8390,7 +8727,22 @@ async def _check_field_target(
         # Its index casts the OLD values' type (e.g. ::float); writing the new values through it
         # can fail half-way. Demoting first makes the overwrite a plain data change.
         raise HTTPException(status_code=409, detail=f"Field '{new_name}' is promoted (indexed); demote it first")
-    return bool(taken)
+    return _FieldTarget(bool(taken), target if target_origin == 'system' else None)
+
+
+async def _land_on_placeholder(connection, dataset_id: int, name: str, placeholder) -> None:
+    """The field now named `name` keeps what the placeholder held where it brings nothing itself: its description and
+    unit, and a private flag (either one's makes it private)."""
+    if placeholder is not None:
+        await connection.execute(
+            'UPDATE dataset_fields SET description = COALESCE(description, $3), unit = COALESCE(unit, $4), '
+            'values_private = values_private OR $5 WHERE dataset_id = $1 AND field_name = $2',
+            dataset_id,
+            name,
+            placeholder['description'],
+            placeholder['unit'],
+            placeholder['values_private'],
+        )
 
 
 @asynccontextmanager
@@ -8479,7 +8831,13 @@ async def rename_field(
     async with db.pool.acquire() as conn, _field_index_operation(conn, id, index_ddl=promoted or rebuilding):
         async with conn.transaction():
             await lock_field_lifecycle(conn, id, exclusive=True)
-            target_had_values = await _check_field_target(id, field_name, request.new_name, request.overwrite, conn)
+            target_had_values, placeholder = await _check_field_target(
+                id,
+                field_name,
+                request.new_name,
+                request.overwrite,
+                conn,
+            )
             was_promoted = bool(
                 await conn.fetchval(
                     'SELECT is_promoted FROM dataset_fields WHERE dataset_id = $1 AND field_name = $2',
@@ -8511,6 +8869,7 @@ async def rename_field(
                 field_name,
                 request.new_name,
             )
+            await _land_on_placeholder(conn, id, request.new_name, placeholder)
             await conn.execute(
                 "DELETE FROM dataset_field_stats WHERE dataset_id = $1 AND field_name = $2",
                 id,
@@ -8567,7 +8926,13 @@ async def clone_field(
     async with db.pool.acquire() as conn:
         async with conn.transaction():
             await lock_field_lifecycle(conn, id, exclusive=True, wait=False)
-            target_had_values = await _check_field_target(id, field_name, request.new_name, request.overwrite, conn)
+            target_had_values, placeholder = await _check_field_target(
+                id,
+                field_name,
+                request.new_name,
+                request.overwrite,
+                conn,
+            )
             status = await conn.execute(
                 """
                 UPDATE samples
@@ -8586,14 +8951,17 @@ async def clone_field(
             await conn.execute(
                 """
                 INSERT INTO dataset_fields
-                    (dataset_id, field_name, field_type, display_type, is_promoted, origin, overlay_config)
-                SELECT dataset_id, $3, field_type, display_type, FALSE, origin, overlay_config FROM dataset_fields
-                WHERE dataset_id = $1 AND field_name = $2
+                    (dataset_id, field_name, field_type, display_type, is_promoted, origin, overlay_config,
+                     description, unit, values_private)
+                SELECT dataset_id, $3, field_type, display_type, FALSE, origin, overlay_config,
+                       description, unit, values_private
+                FROM dataset_fields WHERE dataset_id = $1 AND field_name = $2
                 """,
                 id,
                 field_name,
                 request.new_name,
             )
+            await _land_on_placeholder(conn, id, request.new_name, placeholder)
             await conn.execute(
                 "DELETE FROM dataset_field_stats WHERE dataset_id = $1 AND field_name = $2",
                 id,
@@ -8644,11 +9012,7 @@ async def clear_field(
     async with db.pool.acquire() as conn, _field_index_operation(conn, id, index_ddl=promoted or rebuilding):
         async with conn.transaction():
             await lock_field_lifecycle(conn, id, exclusive=True)
-            registration = await conn.fetchrow(
-                'SELECT origin, is_promoted FROM dataset_fields WHERE dataset_id = $1 AND field_name = $2',
-                id,
-                field_name,
-            )
+            registration = await _definition(conn, id, field_name, 'origin, is_promoted')
             if registration is not None and registration['is_promoted'] and not promoted:
                 raise HTTPException(status_code=409, detail='The field was just indexed; retry')
             # Clearing only removes metadata keys; for a native column it would just delete the registration,
@@ -8661,7 +9025,7 @@ async def clear_field(
                 id,
                 field_name,
             )
-            await conn.execute("DELETE FROM dataset_fields WHERE dataset_id = $1 AND field_name = $2", id, field_name)
+            await forget_definitions(conn, id, [field_name])  # a private field keeps its flag, for its return
             await conn.execute(
                 "DELETE FROM dataset_field_stats WHERE dataset_id = $1 AND field_name = $2",
                 id,
@@ -8676,7 +9040,7 @@ async def clear_field(
 
 class AggregationSpec(BaseModel):
     field: str
-    op: str  # count|sum|mean|std|min|max|bounds|quantiles|count_values|distinct|values
+    op: str  # count|sum|mean|std|min|max|bounds|quantiles|count_values|distinct|distinct_count|values
     quantiles: Optional[List[float]] = None  # for op="quantiles" (default [.25,.5,.75])
     limit: Optional[int] = None  # cap for count_values/distinct/values; None = uncapped
 
@@ -8684,6 +9048,11 @@ class AggregationSpec(BaseModel):
 class AggregateRequest(BaseModel):
     aggregations: List[AggregationSpec]
     filters: Optional[Dict[str, Any]] = None
+
+
+# count_values' ties: a value that reads as a number in its number's order (2 before 10), then the rest by text.
+_NUMBER_TEXT = r"'^\s*[-+]?([0-9]+\.?[0-9]*|\.[0-9]+)([eE][-+]?[0-9]+)?\s*$'"
+_TIE_ORDER = f"CASE WHEN v ~ {_NUMBER_TEXT} THEN v::numeric END NULLS LAST, v"
 
 
 def _agg_value_expr(field: str, array_columns: Optional[set] = None) -> str:
@@ -8718,17 +9087,23 @@ def _agg_value_expr(field: str, array_columns: Optional[set] = None) -> str:
     return f"metadata->>'{field}'"
 
 
-def _agg_numeric_expr(field: str) -> str:
+def _agg_numeric_expr(field: str, datetime_fields: Collection[str] = ()) -> str:
     """SQL expression yielding a float for numeric aggregations.
 
     Non-numeric / unparseable metadata values become NULL (skipped by the
     aggregates), so a single bad value can't 500 the whole query — same
-    regex guard get_histogram uses.
+    regex guard get_histogram uses. A datetime field (`datetime_fields`, and the
+    native created_at and last_modified_at) gives its instant as seconds since
+    1970 UTC, by the rule in backend/datetimes.py: text that isn't a datetime is NULL.
     """
     if field == 'id':
         return "id::double precision"
+    if field in _NATIVE_TIMESTAMPS:
+        return f"EXTRACT(EPOCH FROM {field})::double precision"
     _validate_field_name(field)
     col = f"metadata->>'{field}'"
+    if field in datetime_fields:
+        return f"EXTRACT(EPOCH FROM {instant_sql(col)})::double precision"
     return f"CASE WHEN ({col}) ~ '^[-+]?\\d+(\\.\\d+)?([eE][+-]?\\d+)?$' THEN ({col})::double precision ELSE NULL END"
 
 
@@ -8738,10 +9113,13 @@ async def aggregate(id: int, request: AggregateRequest):
     """Run one or more aggregations over the (optionally filtered) dataset in one request.
 
     Each entry is {field, op, ...}. Numeric ops: count, sum, mean, std, min, max,
-    bounds, quantiles. Categorical/any ops: count_values, distinct, values
-    (exact and uncapped unless `limit` is given). Returns {"results": [...]}, one
-    per aggregation, in order.
+    bounds, quantiles; on a datetime field, its instants as seconds since 1970 UTC.
+    Categorical/any ops: count_values (commonest first, ties by value), distinct,
+    distinct_count (how many distinct values), values (exact and uncapped unless
+    `limit` is given). Returns {"results": [...]}, one per aggregation, in order.
     """
+    for spec in request.aggregations:
+        assistant_guard.aggregation(spec.field, spec.op)
     filters_json = json.dumps(request.filters) if request.filters else None
     where_clause, base_args, _ = build_sample_query_parts(
         id,
@@ -8767,6 +9145,8 @@ async def run_aggregations(
     context for those rows (a version's own fields); by default the dataset's current one.
     """
     results = []
+    columns = array_columns if array_columns is not None else await get_dataset_array_columns(id)
+    datetime_fields = getattr(columns, 'datetime_fields', ())
     for spec in aggregations:
         op, field = spec.op, spec.field
 
@@ -8777,7 +9157,7 @@ async def run_aggregations(
         elif op in ("sum", "mean", "std", "min", "max", "bounds"):
             # The numeric expr already NULLs non-numeric values, so no null guard
             # is needed (aggregates skip NULL).
-            expr = _agg_numeric_expr(field)
+            expr = _agg_numeric_expr(field, datetime_fields)
             if op == "bounds":
                 r = await db.fetchrow(
                     f"{with_clause}SELECT min({expr}) AS mn, max({expr}) AS mx FROM samples {where_clause}",
@@ -8796,7 +9176,7 @@ async def run_aggregations(
 
         elif op == "quantiles":
             qs = spec.quantiles or [0.25, 0.5, 0.75]
-            expr = _agg_numeric_expr(field)
+            expr = _agg_numeric_expr(field, datetime_fields)
             args = list(base_args) + [qs]
             r = await db.fetchval(
                 f"{with_clause}SELECT percentile_cont(${len(args)}::double precision[]) "
@@ -8805,8 +9185,7 @@ async def run_aggregations(
             )
             results.append({"op": op, "field": field, "quantiles": qs, "value": [float(x) for x in r] if r else []})
 
-        elif op in ("count_values", "distinct", "values"):
-            columns = array_columns if array_columns is not None else await get_dataset_array_columns(id)
+        elif op in ("count_values", "distinct", "distinct_count", "values"):
             value_expr = _agg_value_expr(field, array_columns=columns)
             # A datetime field's values in instant order (backend/datetimes.py), those without one last, then by text.
             datetime_field = field in getattr(columns, 'datetime_fields', ())
@@ -8830,12 +9209,19 @@ async def run_aggregations(
                 rows = await db.fetch(
                     f"{with_clause}SELECT v AS value, count(*) AS count FROM "
                     f"(SELECT {value_expr} AS v FROM samples {where_clause}) sub "
-                    f"WHERE v IS NOT NULL GROUP BY v ORDER BY count DESC{limit_sql}",
+                    f"WHERE v IS NOT NULL GROUP BY v ORDER BY count DESC, {_TIE_ORDER}{limit_sql}",
                     *args,
                 )
                 results.append(
                     {"op": op, "field": field, "value": [{"value": r['value'], "count": r['count']} for r in rows]},
                 )
+            elif op == "distinct_count":  # how many distinct values, without listing them
+                n = await db.fetchval(
+                    f"{with_clause}SELECT count(DISTINCT v) FROM "
+                    f"(SELECT {value_expr} AS v FROM samples {where_clause}{fence}) sub WHERE v IS NOT NULL",
+                    *base_args,
+                )
+                results.append({"op": op, "field": field, "value": int(n or 0)})
             elif op == "distinct":
                 rows = await db.fetch(
                     f"{with_clause}SELECT value FROM (SELECT DISTINCT v AS value FROM "

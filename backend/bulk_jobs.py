@@ -11,6 +11,7 @@ from .api_errors import CodedHTTPException
 from .diskspace import INGEST_ROW_BYTES, require_free_space
 from .field_registry import (
     LOCAL_PREFIX,
+    forget_definitions,
     invalidate_values,
     lock_field_lifecycle,
     prune_fields,
@@ -132,8 +133,12 @@ async def submit(pool, dataset_id, user_id, operation, payload):
     tokens = selection_tokens(payload.get('filters'))
     if payload.get('selection_token'):
         tokens.add(payload['selection_token'])
+    # A concept that isn't the dataset's is refused now, not when the first unit runs.
+    await datasets.require_known_concepts(payload.get('filters'), dataset_id)
     # Freeze the validated expression and catalog interpretation, not a mutable saved view ID.
     # The dataset ID scopes cross-grain subqueries exactly as the grid's own query does.
+    # A region this server doesn't have is refused now, not when the first unit runs.
+    await datasets.require_known_regions(payload.get('filters'))
     args: list = []
     predicate, _ = (
         datasets.parse_filter_node(
@@ -144,6 +149,8 @@ async def submit(pool, dataset_id, user_id, operation, payload):
             None,
             dataset_id,
             array_columns=await datasets.get_dataset_array_columns(dataset_id),
+            # Each unit tests its few samples: a region joined to the samples table would be read whole per unit.
+            region_joins=False,
         )
         if payload.get('filters')
         else ('TRUE', 1)
@@ -179,11 +186,7 @@ async def submit(pool, dataset_id, user_id, operation, payload):
                 await connection.execute('SET LOCAL enable_seqscan=off')
                 field = payload['field_name']
                 datasets._validate_field_name(field)
-                source = await connection.fetchrow(
-                    'SELECT * FROM dataset_fields WHERE dataset_id=$1 AND field_name=$2',
-                    dataset_id,
-                    field,
-                )
+                source = await datasets._definition(connection, dataset_id, field)
                 if source is not None and source['origin'] != 'metadata':
                     raise HTTPException(400, 'Field operations require a metadata field')
                 if source is not None and source['is_promoted']:
@@ -209,11 +212,23 @@ async def submit(pool, dataset_id, user_id, operation, payload):
                     )
                     await connection.execute(
                         """INSERT INTO dataset_fields
-                           (dataset_id,field_name,field_type,display_type,origin,overlay_config)
-                           SELECT dataset_id,$3,field_type,display_type,origin,overlay_config FROM dataset_fields
+                           (dataset_id,field_name,field_type,display_type,origin,overlay_config,description,unit,
+                            values_private)
+                           SELECT dataset_id,$3,field_type,display_type,origin,overlay_config,description,unit,
+                                  values_private
+                           FROM dataset_fields
                            WHERE dataset_id=$1 AND field_name=$2 ON CONFLICT(dataset_id,field_name) DO UPDATE
                            SET field_type=EXCLUDED.field_type,display_type=EXCLUDED.display_type,
-                               overlay_config=EXCLUDED.overlay_config""",
+                               overlay_config=EXCLUDED.overlay_config,origin=EXCLUDED.origin,
+                               -- a 'system' row there (a built-in's description, a flag kept when a field went)
+                               -- is taken over: what it says stays where the field brings nothing
+                               description=CASE WHEN dataset_fields.origin='system'
+                                   THEN COALESCE(EXCLUDED.description,dataset_fields.description)
+                                   ELSE EXCLUDED.description END,
+                               unit=CASE WHEN dataset_fields.origin='system'
+                                   THEN COALESCE(EXCLUDED.unit,dataset_fields.unit) ELSE EXCLUDED.unit END,
+                               values_private=EXCLUDED.values_private
+                                   OR (dataset_fields.origin='system' AND dataset_fields.values_private)""",
                         dataset_id,
                         field,
                         payload['new_name'],
@@ -634,12 +649,16 @@ def handler(pool):
                             job['dataset_id'],
                             names[index],
                         )
-                        if not present:
+                        if not present and request['operation'] == 'clear':
+                            # A private field keeps its flag, for when the field comes back.
+                            await forget_definitions(connection, job['dataset_id'], [names[index]])
+                        elif not present:  # renamed: its definition, flag included, went with it
                             await connection.execute(
                                 'DELETE FROM dataset_fields WHERE dataset_id=$1 AND field_name=$2',
                                 job['dataset_id'],
                                 names[index],
                             )
+                        if not present:
                             await connection.execute(
                                 'DELETE FROM dataset_field_stats WHERE dataset_id=$1 AND field_name=$2',
                                 job['dataset_id'],

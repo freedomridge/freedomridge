@@ -8,6 +8,10 @@ for the certificate and environment setup before starting production.
 | Production | `https://YOUR_DOMAIN` | `https://YOUR_DOMAIN/api` | nginx 443; 80 for ACME/redirect |
 | Local development | `http://localhost:3000` | `http://localhost:8000/api` | PostgreSQL 5432 from `docker-compose.yml`, on all interfaces unless `FRIDGE_DB_PORT=127.0.0.1:5432`; 8000 and 3000 belong to the backend and frontend processes you start |
 
+AI clients connect to the MCP server at `https://YOUR_DOMAIN/mcp` in production, and at
+`http://localhost:8000/mcp` (or through the frontend, `http://localhost:3000/mcp`) in development; see
+[Assistant](ASSISTANT.md#connecting-an-ai-client).
+
 Production backend, frontend and PostgreSQL have no host port mappings. Bare IPs
 and unknown Hosts are rejected; use the configured DNS hostname. Local sample
 media uses authenticated `/api/samples/ID/media`; S3 media also passes through the

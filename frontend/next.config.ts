@@ -56,6 +56,13 @@ const nextConfig = {
         source: '/api/:path*',
         destination: `${backend}/api/:path*`,
       },
+      // The MCP server for AI clients (backend/mcp_door.py). The token page tells a client to connect to this
+      // origin's /mcp: nginx routes it in production, and without nginx in front (development, `next start`)
+      // this passes it on. No page of the app calls it.
+      {
+        source: '/mcp',
+        destination: `${backend}/mcp`,
+      },
       // /media and /files dev rewrites were removed alongside the backend
       // routes they targeted (unauthenticated file serving). All media now
       // flows through /api/samples/{id}/media, covered by the /api rewrite.

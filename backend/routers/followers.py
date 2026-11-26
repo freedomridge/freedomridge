@@ -803,7 +803,8 @@ async def follower_coordinates(dataset_id: int, request: BlockRequest, follower:
 
 @router.get('/follower/datasets/{dataset_id}/state')
 async def follower_state(dataset_id: int, follower: dict = Depends(current_follower)):
-    """The dataset's settings, field registry and shared views, for a mirror."""
+    """The dataset's settings, field registry (with each field's description and unit) and shared views, for a
+    mirror. values_private stays here: each instance decides it."""
     await subscription(db, follower, dataset_id)
     dataset = await db.fetchrow(
         """SELECT id, name, description, media_fields, grid_media_field, modal_media_field, segmentation_config,
@@ -811,7 +812,7 @@ async def follower_state(dataset_id: int, follower: dict = Depends(current_follo
         dataset_id,
     )
     fields = await db.fetch(
-        """SELECT field_name, field_type, origin, is_promoted, display_type, overlay_config
+        """SELECT field_name, field_type, origin, is_promoted, display_type, overlay_config, description, unit
            FROM dataset_fields WHERE dataset_id = $1 ORDER BY field_name""",
         dataset_id,
     )

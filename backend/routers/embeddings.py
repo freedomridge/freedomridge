@@ -989,7 +989,8 @@ def _scatter_rejections(node, args):
     # scopes every source to the requested dataset/field and excludes missing coords.
     rejected = ' UNION '.join(sources)
     if concept_ids:
-        # One guard for every concept, outside the sources (as parse_filter_node places it).
+        # One guard for every concept, outside the sources (as parse_filter_node places it). That they are the
+        # dataset's is checked before the statement runs (_query_broad_exclusions).
         args.append(sorted(concept_ids))
         rejected = f"SELECT id FROM ({rejected}) _rejected WHERE (SELECT require_concept_scores(${len(args)}::int[]))"
     return rejected, has_tags, probed
@@ -1009,6 +1010,10 @@ async def _query_broad_exclusions(dataset_id, request):
     if compiled is None:
         return None
     rejected, has_tags, probed = compiled
+    # The concepts are the dataset's (a 400), before the statement's readiness guard could name another dataset's.
+    from .datasets import require_known_concepts
+
+    await require_known_concepts(request.filters, dataset_id)
     pct = max(0, min(100, request.sample_pct))
     # Admission: a bounded index-only count of each probed source, before any probe runs. The
     # sum bounds the probes (overlaps count twice, which only makes the bound stricter). Over

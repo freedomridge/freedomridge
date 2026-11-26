@@ -28,6 +28,7 @@ const NAMES: Record<string, string> = {
     index_review: 'Reviewing indexes',
     index_drop: 'Removing an index',
     index_restore: 'Restoring an index',
+    region_load: 'Loading region boundaries',
 };
 
 // Jobs whose end changes what the page shows: their completion refreshes the dataset's views,
