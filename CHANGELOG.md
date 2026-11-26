@@ -320,6 +320,15 @@ on; the others touch no sample.
   180 (the United States, Europe and Australia; the United States and China), gets the box and the view it always
   got. A program that reads this route should expect `w` greater than `e`
   ([MAP_REQUIREMENTS.md](docs/MAP_REQUIREMENTS.md)).
+- **A polygon drawn on the map across longitude 180 holds the samples on both sides**, and one drawn on a repeated
+  copy of the world the samples under it: they held only those west of the line, or none. A `geo_polygon` whose
+  longitudes all lie from -180 to 180 selects what it did; one wider than 60 turns of the globe is refused (400). A
+  value that is not a list of `[longitude, latitude]` points (text, a GeoJSON object, an entry that is no point, a
+  coordinate that is no finite number) is refused with a 400 that says what the filter takes: it ended in a server
+  error, and an object silently kept every sample. A ring of fewer than three points, such as three equal points, is
+  no polygon and keeps every sample, as `null` and a list of fewer than three points do, instead of a server error. A
+  coordinate may be text that reads as a number. A mirror on an older version reads a relayed polygon the old way
+  until it is upgraded.
 - **A number too large for a double in filter text is an error, not a 500.** `score > 1e999` (and the same in `in`,
   `between` or a concept's threshold) parsed to infinity, which the parse route then failed to send. It is now
   `'1e999' is out of range for a number`, with its line and column. A concept filter sent as JSON with a threshold

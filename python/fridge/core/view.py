@@ -202,7 +202,12 @@ def geo_near(point, max_distance, field: str = "location") -> 'Condition':
 
 
 def geo_within(polygon, field: str = "location") -> 'Condition':
-    """Match samples whose location falls within ``polygon`` (a list of ``[lon, lat]`` points)."""
+    """Match samples whose location falls within ``polygon`` (a list of ``[lon, lat]`` points).
+
+    Longitudes past 180 or below -180 make a shape across the antimeridian: ``[[176, -20], [183, -20], [183, -15],
+    [176, -15]]`` holds samples at 177.4 and at -178.2. A polygon within -180 to 180 is read as before. A GeoJSON
+    polygon is not a list of points and is refused: pass its ring, ``polygon["coordinates"][0]``.
+    """
     return Condition(field, "geo_polygon", [list(p) for p in polygon])
 
 

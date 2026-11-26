@@ -1510,7 +1510,17 @@ s = dataset.samples
 
 near = s[geo_near([-122.42, 37.77], max_distance=5000)]   # within 5 km (metres)
 region = s[geo_within([[-122.5, 37.7], [-122.35, 37.7], [-122.35, 37.82], [-122.5, 37.82]])]
+fiji = s[geo_within([[176, -20], [183, -20], [183, -15], [176, -15]])]  # across the antimeridian
 ```
+
+A polygon's points are in one frame, as the map draws them: longitudes past 180 or below -180 make a shape across the
+antimeridian. A sample is inside when its location, moved east or west by whole turns of 360 degrees, lies inside the
+shape, so 176 to 183 holds samples at 177.4 and at -178.2, and the same shape one turn on (536 to 543) holds the same
+samples. A polygon whose longitudes all lie from -180 to 180 is read as before: points at 170 and -170 make the shape
+through longitude 0. One wider than 60 turns of the globe is refused. A coordinate may be text that reads as a
+number. A value that is not a list of points is refused with a 400 that says what the filter takes, a GeoJSON polygon
+object included (pass its ring, `polygon["coordinates"][0]`); `null`, fewer than three points, or three points of
+which the last is the first again, are no polygon and keep every sample.
 
 ---
 
@@ -2260,7 +2270,7 @@ and `dataset.samples[...]` all produce them.
 | `contains` | Case-insensitive substring on text; membership on array fields | `{"field": "filename", "operator": "contains", "value": "cat"}` |
 | `exists` / `not_exists` | The metadata key is present / absent | `{"field": "reviewed", "operator": "exists"}` |
 | `is_null` / `is_not_null` | The value is null or missing / has a value | `{"field": "score", "operator": "is_null"}` |
-| `geo_polygon` | Location inside a polygon given as a list of `[lon, lat]` points (not a GeoJSON object) | `{"field": "location", "operator": "geo_polygon", "value": [[-122.5, 37.7], [-122.35, 37.7], [-122.35, 37.82], [-122.5, 37.82]]}` |
+| `geo_polygon` | Location inside a polygon given as a list of `[lon, lat]` points (not a GeoJSON object). Longitudes past 180 or below -180 make a shape across the antimeridian (176 to 183 holds 177.4 and -178.2); a polygon within -180 to 180 is read as before. A value that is not a list of points, a GeoJSON object included, is refused (400) ([Geospatial filtering](#geospatial-filtering)) | `{"field": "location", "operator": "geo_polygon", "value": [[-122.5, 37.7], [-122.35, 37.7], [-122.35, 37.82], [-122.5, 37.82]]}` |
 | `geo_near` | Location within `max_distance` metres of a point | `{"field": "location", "operator": "geo_near", "value": {"point": [-122.42, 37.77], "max_distance": 5000}}` |
 | `geo_region` / `geo_region_exclude` | Location inside a loaded region (a country, a state or province, or a group of them, by its key: [REGIONS.md](REGIONS.md)) / every other sample, those with no location included | `{"field": "location", "operator": "geo_region", "value": "US-KS"}` |
 
@@ -2413,8 +2423,8 @@ in_sf = dataset.samples[geo_within(san_francisco)]
 print(f"Found {in_sf.count()} samples in San Francisco")
 
 # The same filter as a raw dict. The value is the point list, NOT a GeoJSON
-# Polygon object: a GeoJSON dict is read as "fewer than 3 points" and silently
-# matches every sample.
+# Polygon object: a GeoJSON dict is refused (400); pass its ring,
+# polygon["coordinates"][0].
 result = dataset.client.query_samples(dataset.id, filters={
     "logic": "AND",
     "filters": [{"field": "location", "operator": "geo_polygon", "value": san_francisco}],

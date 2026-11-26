@@ -127,6 +127,23 @@ polygon.") Note this is about the map's drawn polygon — it does NOT override #
 (selecting samples in the grid DOES fit the map). Drawing a polygon may fit to that
 polygon; deleting it must not move the map.
 
+**A polygon drawn across the antimeridian.** The draw tool sends a polygon's points in the view's frame, so one drawn
+across the antimeridian has longitudes past 180 (176 to 183 over Fiji), and one drawn on a repeated world copy has
+them a whole turn on (370 to 380 over 10 to 20). The server wrote them into one polygon as they came and tested each
+sample's own longitude against it: a sample at -178.2 was never inside 176 to 183, so the grid, its count, the map and
+the fit after the drawing (`/map_extent` with the polygon) had only the samples west of the line, and a polygon on
+another world copy had none. A sample is inside when its location, moved east or west by whole turns of 360 degrees,
+lies inside the shape: `_polygon_across_leaf` tests each copy of the shape moved by whole turns that overlaps -180 to
+180, so 176 to 183 holds 177.4 and -178.2, and the same shape one turn on (536 to 543) holds the same samples. Only a
+longitude outside -180 to 180 says "across": a polygon whose longitudes all lie from -180 to 180 runs the same SQL as
+before, and one with points at 170 and -170 stays the shape through longitude 0, as every polygon saved in a view, a
+link or a script is read. The exclude chip removes exactly what the include holds and keeps the samples with no
+location. Each copy is a search of the location index: on a million samples a count in a crossing polygon took
+0.87 ms against 0.79 in one the same size that doesn't cross, and 46 against 45 ms for one 30 by 50 degrees (excluded:
+101 against 92, and 103 against 94 ms). A polygon wider than 60 turns of the globe is refused (400), wider than the
+map's view at its least zoom on a 7,680 px panel. Tests: `backend/tests/test_polygon_across_leaf.py`,
+`backend/tests/test_polygon_across_180_spec.py`, `e2e/polygon-across-180.spec.ts`.
+
 ## 9. Loading indicator (initial AND background loads)
 
 Show a spinner / loading state while map data loads. Never a blank map with no feedback

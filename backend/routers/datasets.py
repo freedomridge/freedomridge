@@ -4911,6 +4911,139 @@ def _region_leaf(
     return (f'(location IS NULL OR NOT {inside})' if op == 'geo_region_exclude' else inside), arg_idx + 1
 
 
+# The widest polygon across the antimeridian a filter takes, in turns of the globe (_polygon_across_leaf). It is tested
+# on one copy per turn it spans, and one more, each a search of the location index: the copies of a polygon trillions
+# of turns wide would never finish being written, so a wider one is refused (400). The limit is for the server's
+# safety, and its size is what one view of the map can hold: at mapbox-gl's least zoom (-2) a world is 128 px wide, so a
+# panel 7,680 px wide shows 60 of them. (The map can be panned while a polygon is drawn, so a wider one can be drawn.)
+_POLYGON_MAX_TURNS = 60
+
+
+def _shown(value: Any) -> str:
+    """A value of a request, as JSON and at most 40 characters, for an error message."""
+    try:
+        text = json.dumps(value)
+    except (TypeError, ValueError):
+        text = repr(value)
+    return text if len(text) <= 40 else text[:39] + '…'
+
+
+def _polygon_coordinate(takes: str, entry: int, value: Any) -> float:
+    """A coordinate of a geo_polygon point: a finite number, or text that reads as one (read as that number)."""
+    number = None
+    if isinstance(value, (int, float, str)) and not isinstance(value, bool):
+        with suppress(ValueError, OverflowError):  # text that is no number; an integer too large for a double
+            number = float(value)
+    if number is None or not math.isfinite(number):
+        raise HTTPException(
+            status_code=400,
+            detail=f'{takes}, each coordinate a finite number: {_shown(value)} in entry {entry} is not one',
+        )
+    return number
+
+
+def _polygon_points(op: str, value: Any) -> Optional[List[tuple[float, float]]]:
+    """The [longitude, latitude] points of a geo_polygon / geo_polygon_exclude value, or None for a value that is no
+    polygon, which keeps every sample (the exclude too): `null`, a list of fewer than three entries, and a ring of
+    fewer than three points once its closing point (a last point equal to the first) is set aside. A point's first two
+    entries are its longitude and latitude, further entries are ignored, and a coordinate is a number or text that
+    reads as one. Any other value is refused (400) with what the operator takes: a value that is not a list (text, an
+    object such as a GeoJSON polygon, which used to keep every sample), an entry that is not a point, and a coordinate
+    that is not a finite number. They used to end in an unhandled error."""
+    if value is None:
+        return None
+    takes = f'{op} takes a list of [longitude, latitude] points'
+    if not isinstance(value, (list, tuple)):
+        raise HTTPException(status_code=400, detail=f'{takes}, not {_shown(value)}')
+    if len(value) < 3:
+        return None
+    points: List[tuple[float, float]] = []
+    for entry, point in enumerate(value, start=1):
+        if not isinstance(point, (list, tuple)) or len(point) < 2:
+            raise HTTPException(status_code=400, detail=f'{takes}: entry {entry}, {_shown(point)}, is not a point')
+        points.append((_polygon_coordinate(takes, entry, point[0]), _polygon_coordinate(takes, entry, point[1])))
+    if len(points) - (points[0] == points[-1]) < 3:
+        return None
+    return points
+
+
+def _wkt_point(sent: Any, point: tuple[float, float]) -> str:
+    """A point of a polygon within -180 to 180 in its WKT: each number written as it was sent, as it always was, and a
+    coordinate sent as text written as the number it reads as."""
+    return ' '.join(
+        f'{value}' if isinstance(value, (int, float)) else repr(number) for value, number in zip(sent, point)
+    )
+
+
+def _polygon_across_leaf(
+    op: str,
+    points: List[tuple[float, float]],
+    args: List[Any],
+    arg_idx: int,
+) -> Optional[tuple[str, int]]:
+    """A geo_polygon / geo_polygon_exclude leaf whose longitudes run past 180 or below -180, as (sql, next_arg_idx), or
+    None for any other polygon, which compiles to the statement it always did. `points` are the value's
+    (_polygon_points).
+
+    A polygon is a shape as it was drawn, its points in one frame: the map sends a shape drawn across the antimeridian
+    with longitudes past 180 (176 to 183). A sample is inside when its location, moved east or west by whole turns of
+    360 degrees, lies inside the shape: when it lies inside one of the shape's copies moved by whole turns, so each copy
+    whose longitudes overlap -180 to 180 is tested (176 to 183 and -184 to -177). A polygon wholly on another copy of
+    the world (536 to 543) holds what the same shape on the first copy holds, and one 360 degrees wide or more is tested
+    on each copy it needs. Only a longitude outside -180 to 180 says "across": a polygon with points at 170 and -170
+    stays the shape through longitude 0 it always was, as every polygon saved in a view, a link or a script is read.
+
+    A shape on one copy only (370 to 380) is the statement a polygon within -180 to 180 makes, on that copy. Of two or
+    more, the include tests each on its own, each a search of the location index (a BitmapOr): about two searches where
+    a polygon that doesn't cross costs one. The exclude, which no index serves, removes exactly what the include holds
+    and keeps samples with no location. Of a shape narrower than 360 degrees, whose two copies are apart, it tests them
+    as one MULTIPOLYGON, one test a sample as for any polygon, behind a test of the copies' boxes, so PostgreSQL counts
+    on the samples in the copies and not the band between them. On a million samples, the plain NOT of the include's
+    two tests, or the MULTIPOLYGON alone, made it plan the grid's first page in parallel: 13 to 15 ms instead of 0.3.
+    Wider copies overlap or touch, which makes no valid MULTIPOLYGON: the exclude of a wider shape is the include's
+    test, negated."""
+    ring = list(points)
+    west, east = min(lon for lon, _ in ring), max(lon for lon, _ in ring)
+    if west >= -180.0 and east <= 180.0:
+        return None
+    if east - west > _POLYGON_MAX_TURNS * 360.0:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f'A geo_polygon may be at most {_POLYGON_MAX_TURNS * 360:,} degrees of longitude wide '
+                f'({_POLYGON_MAX_TURNS} turns of the globe)'
+            ),
+        )
+    if ring[0] != ring[-1]:
+        ring.append(ring[0])  # an open ring is closed, as for any polygon
+    # Moved west by k turns, a copy overlaps -180 to 180 for k past (west - 180) / 360 and short of (east + 180) / 360.
+    # A whole number of turns is subtracted exactly in double precision, for longitudes below 2**53 degrees.
+    first = math.floor((west - 180.0) / 360.0) + 1
+    last = math.ceil((east + 180.0) / 360.0) - 1
+    copies = [
+        '((' + ', '.join(f'{lon - 360.0 * k!r} {lat!r}' for lon, lat in ring) + '))' for k in range(first, last + 1)
+    ]
+    if not copies:  # no width, on the antimeridian of another world copy (540): nothing is inside it
+        return ('TRUE' if op == 'geo_polygon_exclude' else 'FALSE'), arg_idx
+    exclude = op == 'geo_polygon_exclude'
+    if len(copies) == 1:
+        args.append(f'POLYGON{copies[0]}')
+        within = f"ST_Within(location, ST_GeomFromText(${arg_idx}, 4326))"
+        return (f"(location IS NULL OR NOT {within})" if exclude else within), arg_idx + 1
+    tests, boxes = [], []
+    for copy in copies:
+        args.append(f'POLYGON{copy}')
+        tests.append(f"ST_Within(location, ST_GeomFromText(${arg_idx}, 4326))")
+        boxes.append(f"location && ST_GeomFromText(${arg_idx}, 4326)")
+        arg_idx += 1
+    if exclude and east - west < 360.0:
+        args.append(f"MULTIPOLYGON({', '.join(copies)})")
+        whole = f"ST_Within(location, ST_GeomFromText(${arg_idx}, 4326))"
+        return f"(location IS NULL OR NOT ({' OR '.join(boxes)}) OR NOT {whole})", arg_idx + 1
+    inside = f"({' OR '.join(tests)})"
+    return (f"(location IS NULL OR NOT {inside})" if exclude else inside), arg_idx
+
+
 # The `field_mapping` every caller that queries `FROM samples s JOIN ...` must pass.
 #
 # parse_filter_node emits native columns BARE (`id`, `created_at`, ...) unless field_mapping
@@ -5745,13 +5878,20 @@ def _compile_filter_node(
             return f"NOT ({json_source} ? ${arg_idx})", arg_idx + 1
 
         elif op in ('geo_polygon', 'geo_polygon_exclude'):
-            # val is list of [lon, lat] points
-            if not val or len(val) < 3:
+            # val is a list of [lon, lat] points; no polygon keeps every sample, a malformed value is a 400.
+            points = _polygon_points(op, val)
+            if points is None:
                 return "TRUE", arg_idx
 
-            coords = ", ".join([f"{p[0]} {p[1]}" for p in val])
-            if val[0] != val[-1]:
-                coords += f", {val[0][0]} {val[0][1]}"
+            # A polygon across the antimeridian (a longitude past 180 or below -180) is tested on its copies.
+            across = _polygon_across_leaf(op, points, args, arg_idx)
+            if across is not None:
+                return across
+
+            sent = cast('List[Any]', val)  # a list of points: _polygon_points read it
+            coords = ", ".join(_wkt_point(p, point) for p, point in zip(sent, points))
+            if sent[0] != sent[-1]:
+                coords += f", {_wkt_point(sent[0], points[0])}"
 
             wkt = f"POLYGON(({coords}))"
             args.append(wkt)
