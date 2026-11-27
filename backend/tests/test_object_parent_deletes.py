@@ -16,6 +16,7 @@ from backend import bulk_jobs, dataset_deletion, index_advisor, main
 from backend.routers import datasets, versions
 from backend.tests import test_bulk_jobs, test_dataset_deletion
 from backend.tests import test_field_registry_postgres as registry_helpers
+from backend.tests.test_job_runner import make_worker
 from backend.tests.test_object_parent_column import add, column, ids
 
 registry_database = registry_helpers.registry_database
@@ -194,18 +195,19 @@ def test_a_dataset_s_deletion_deletes_objects_before_their_images_within_its_bud
     pass of their own, so no unit's delete of an image cascades past the unit's rows, bytes and time."""
 
     async def scenario(database):
-        await database.execute(
-            """INSERT INTO samples (id, dataset_id, filepath, media_type, metadata)
-               VALUES (1, 2, 'big.jpg', 'image', '{}');
-               SELECT setval('samples_id_seq', 1);
-               INSERT INTO samples (dataset_id, filepath, media_type, metadata)
-               SELECT 2, 'big.jpg#' || g, 'object', '{"parent_id": 1}' FROM generate_series(1, 5000) g;
-               INSERT INTO embeddings (dataset_id, sample_id, field_name, vector)
-               SELECT 2, s.id, f, '[1,0]' FROM samples s,
-                      unnest(ARRAY['clip_obj', 'clip_patch_2x2_r0c0', 'clip_patch_2x2_r0c1', 'clip_patch_2x2_r1c0',
-                                   'clip_patch_2x2_r1c1']) f
-                WHERE s.dataset_id = 2""",
-        )
+        async with registry_helpers.bulk_setup(database) as connection:
+            await connection.execute(
+                """INSERT INTO samples (id, dataset_id, filepath, media_type, metadata)
+                   VALUES (1, 2, 'big.jpg', 'image', '{}');
+                   SELECT setval('samples_id_seq', 1);
+                   INSERT INTO samples (dataset_id, filepath, media_type, metadata)
+                   SELECT 2, 'big.jpg#' || g, 'object', '{"parent_id": 1}' FROM generate_series(1, 5000) g;
+                   INSERT INTO embeddings (dataset_id, sample_id, field_name, vector)
+                   SELECT 2, s.id, f, '[1,0]' FROM samples s,
+                          unnest(ARRAY['clip_obj', 'clip_patch_2x2_r0c0', 'clip_patch_2x2_r0c1', 'clip_patch_2x2_r1c0',
+                                       'clip_patch_2x2_r1c1']) f
+                    WHERE s.dataset_id = 2""",
+            )
         assert await database.fetchval('SELECT count(*) FROM samples WHERE dataset_id = 2 AND parent_id = 1') == 5000
         await datasets.delete_dataset(2, USER)
         current = await test_dataset_deletion.claim(database)
@@ -354,14 +356,29 @@ def test_a_large_delete_of_images_deletes_and_logs_every_object(registry_databas
         assert await database.fetchval('SELECT count(parent_id) FROM samples') == 110000
         await forget(database)
         began = time.monotonic()
-        test_bulk_jobs.submitted(
+        job_id = test_bulk_jobs.submitted(
             await datasets.bulk_delete_samples(
                 1,
                 datasets.BulkTargetRequest(filters={'field': 'id', 'operator': '<=', 'value': 10000}),
                 USER,
             ),
         )
-        job = await test_bulk_jobs.finish(database)
+        # Run by a runner slot, as the server runs it: a unit whose publication runs out of its time budget on a loaded
+        # machine is put back as a failure, and its next attempt takes half the batch (bulk_jobs.handler).
+        worker = await make_worker(
+            database,
+            {bulk_jobs.KIND: bulk_jobs.handler(database.pool)},
+            policies={bulk_jobs.KIND: bulk_jobs.POLICY},
+        )
+        for _ in range(10000):
+            job = await database.fetchrow('SELECT * FROM jobs WHERE id = $1', job_id)
+            if job['state'] not in ('queued', 'running'):
+                break
+            if not await worker.run_once():
+                await asyncio.sleep(0.1)  # put back, and not yet to be claimed again
+        else:
+            pytest.fail('Bulk operation did not finish')
+        assert job['state'] == 'succeeded', dict(job)
         bulk = time.monotonic() - began
         assert (job['result']['deleted_count'], job['result']['objects_deleted']) == (10000, 100000)
         began = time.monotonic()

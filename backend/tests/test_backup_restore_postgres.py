@@ -141,5 +141,5 @@ def test_dump_requires_empty_target_then_restores_and_migrates(tmp_path, restore
     backup.restore(str(path))
     assert sql(target, "SELECT count(*) FROM datasets WHERE name = 'restored-dataset'") == '1'
     assert sql(target, 'SELECT count(*) FROM backup_schedule') == '1'
-    assert sql(target, "SELECT count(*) FROM schema_migrations WHERE filename = '0000_baseline.sql'") == '1'
+    assert sql(target, "SELECT count(*) FROM schema_migrations WHERE filename = 'baseline_2.14.0.sql'") == '1'
     assert 'record_stats_work' in sql(target, "SELECT prosrc FROM pg_proc WHERE proname = 'mark_dataset_stats_stale'")

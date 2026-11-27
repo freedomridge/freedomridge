@@ -17,15 +17,10 @@ from examples._shared.importer import parser as common_parser  # noqa: E402
 
 TAXONOMY = ("kingdom", "phylum", "class", "order", "family", "genus")
 FIELD_TYPES = {
-    **dict.fromkeys(
-        (*TAXONOMY, "common_name", "specific_epithet", "supercategory", "image_dir_name"),
-        "string",
-    ),
-    **dict.fromkeys(("image_id", "annotation_id", "category_id", "width", "height", "license_id"), "number"),
-    **dict.fromkeys(("file_name", "license", "license_url", "rights_holder", "attribution"), "string"),
+    **dict.fromkeys((*TAXONOMY, "common_name", "specific_epithet", "supercategory", "scientific_name"), "string"),
+    **dict.fromkeys(("image_id", "width", "height"), "number"),
+    **dict.fromkeys(("license", "license_url", "attribution"), "string"),
     "date": "datetime",
-    "latitude": "number",
-    "longitude": "number",
     "location_uncertainty": "number",
     "species": "object",
 }
@@ -133,25 +128,25 @@ def select_licenses(value, licenses):
     return selected
 
 
-def map_image(image, annotation, category, license_info, root):
+def map_image(image, category, license_info, root):
     location = coordinates(image.get("latitude"), image.get("longitude"))
     if location is None:
         return None
     path = (root / image["file_name"]).resolve()
     if not path.is_relative_to(root.resolve()):
         raise ValueError(f"Image path escapes data root: {image['file_name']}")
-    metadata = {k: v for k, v in image.items() if k not in ("id", "license")}
-    metadata.update({k: v for k, v in category.items() if k not in ("id", "name")})
+    # One field per fact, under Freedom Ridge's names. Not copied: the file's name and folder (the sample's filepath),
+    # its latitude and longitude (the sample's location), the annotation's and category's numbers, the license number
+    # and the rights holder (named in the attribution).
+    metadata = {k: v for k, v in category.items() if k not in ("id", "name", "image_dir_name")}
+    metadata.update({k: image[k] for k in ("width", "height", "location_uncertainty") if k in image})
     metadata.update(
         image_id=image["id"],
-        annotation_id=annotation["id"],
-        category_id=category["id"],
         species=Classification(category["name"], id=f"inat-{image['id']}"),
-        scientific_name=category["name"],  # the plain string: exact filter + typeahead in the sidebar
+        # The species' name again, as a plain string: a single classification's label can't be filtered for an exact
+        # value or typed ahead in the sidebar, a string can.
+        scientific_name=category["name"],
         date=utc_datetime(image.get("date")),
-        latitude=location[1],
-        longitude=location[0],
-        license_id=image["license"],
         license=license_info["name"],
         license_url=license_info["url"],
         attribution=f"{image.get('rights_holder') or 'Unknown rights holder'}; iNaturalist 2021; {license_info['url']}",
@@ -180,7 +175,7 @@ def iter_samples(root, limit, license_selection, counts):
             counts["license_excluded"] += 1
             continue
         annotation = annotations[image["id"]]
-        sample = map_image(image, annotation, categories[annotation["category_id"]], licenses[image["license"]], root)
+        sample = map_image(image, categories[annotation["category_id"]], licenses[image["license"]], root)
         if not Path(sample.filepath).is_file():
             counts["missing_image"] += 1
             continue

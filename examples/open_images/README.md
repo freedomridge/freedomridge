@@ -35,10 +35,9 @@ creator; retain those individual credits and original links.
 Suggested attribution: “Open Images V7 validation. Photographs © their respective
 creators under the license linked on each image. Annotations: Google Open Images,
 CC BY 4.0; captions: Localized Narratives, CC BY 4.0. Freedom Ridge applies the
-provided image rotation and generates CLIP embeddings.” For each image display
-`Title` by `Author`, linked to `OriginalLandingURL`/`OriginalURL`, and `License`.
-`AuthorProfileURL` is retained as well. Rotated JPEG derivatives are marked by
-`rotation_applied` and retain their original source filepath and attribution.
+provided image rotation and generates CLIP embeddings.” For each image display its
+`attribution` (“Title” by Author), linked to `source_url` (the photo's page), and its `license`
+(`license_url`). A rotated image (`rotation` other than 0) is a derived JPEG with the same attribution.
 
 These are the **exact download URLs from `examples/download_demo_data.py`**. The importer
 never downloads, extracts or modifies them:
@@ -98,22 +97,23 @@ rerun deliberately leaves already imported samples unchanged.
 
 | Source | Freedom Ridge fields |
 |---|---|
-| Bounding boxes | `detections`: named `Detection` labels, normalized XYWH; all five flags (`IsOccluded`, `IsTruncated`, `IsGroupOf`, `IsDepiction`, `IsInside`) retained as integers, with Source/Confidence and MID |
+| Bounding boxes | `detections`: `Detection` labels named by class, normalized XYWH, with `confidence`, `source` and the five flags as booleans: `is_occluded`, `is_truncated`, `is_group_of`, `is_depiction`, `is_inside` (the CSV's -1, "unknown", is no value) |
 | Both verified image-label CSVs | `positive_labels`: positive classifications; `negative_classes`: plain filterable strings. `verified_absent` retains class/source provenance without classification-shaped `label` keys. Repeated verification records across CSVs are retained, never silently deduplicated |
-| V7 point labels | `points`: one named `Keypoint` per row, including **yes, no and unsure**; coordinates, EstimatedYesNo, Source, votes, TextLabel and original MID retained |
-| Instance masks | `instance_mask_000`, etc.: independent full-frame `Segmentation` overlays pointing to indexed local PNGs; `mask_instances`: matching detection IDs, BoxID, PredictedIoU, Clicks and mask field. No compositing that loses overlaps |
-| Visual relationships | `relationships`: one union-box `Detection` per relation, labeled with the predicate, with subject/object names and their separate rotated boxes and original MIDs |
-| Localized Narratives | `captions` text list, searchable `caption_text`, and `narratives` plain caption strings; mouse traces, timed captions and voice links discarded before indexing |
-| Image metadata | All metadata CSV columns retained, including OriginalURL, OriginalLandingURL, AuthorProfileURL, Author, License, Title, OriginalMD5/OriginalSize, Thumbnail300KURL; Rotation numeric, blank interpreted as 0 |
+| V7 point labels | `points`: one `Keypoint` per row named by class, including **yes, no and unsure**: `answer` (yes, no or unsure), `source`, `yes_votes`, `no_votes`, `unsure_votes` |
+| Instance masks | `instance_mask_000`, etc.: independent full-frame `Segmentation` overlays pointing to indexed local PNGs; `mask_instances`: matching detection IDs, box ID, `predicted_iou`, `clicks` and mask field. No compositing that loses overlaps |
+| Visual relationships | `relationships`: one union-box `Detection` per relation, labeled with the predicate, with subject/object names and their separate rotated boxes |
+| Localized Narratives | `captions`: one searchable text, a narrative per line; mouse traces, timed captions and voice links discarded before indexing |
+| Image metadata | `image_id`, `split`, `rotation` (degrees, blank read as 0), `width`, `height`; of the image list's other columns only the credit is kept: `attribution`, `license`, `license_url`, `source_url` |
 | Rotation | Apply the metadata angle counterclockwise to source JPEG pixels before embedding; quality-95 rotated JPEGs are persisted under `--data-root/derived`. Boxes, points, relationship boxes and mask PNGs are transformed by the same angle |
 | Class names/hierarchy | Both description files accept headers or no header; `Subcategory` ancestors include transitive parents. `Part` is not treated as an is-a parent |
 | Facets | Native indexed arrays: `class_names`, `parent_classes`, `negative_parent_classes`, `positive_classes`, `negative_classes`, `point_classes`, `point_states`, `mask_classes`, `relationship_predicates` |
 | Embeddings | Normalized inline CLIP vectors in `clip` by default, with the matching model registered |
 
-Label IDs use source file/row identities (BoxID where supplied). Source attributes
-are stored once, directly on each label for filtering. Coordinates use the
-displayed frame; the original files retain raw coordinates. Narrative mouse,
-voice and timing data are omitted. Author and Title are HTML-unescaped.
+Label IDs use source file/row identities: a detection's `id` is `box-<row>` of the box CSV, a mask's is
+its BoxID (also in `mask_instances`). Each fact is stored once, directly on
+each label for filtering, under Freedom Ridge's names; classes go by their names, and Google's class
+codes (`/m/...`) are not kept. Coordinates use the displayed frame; the original files retain raw
+coordinates. Narrative mouse, voice and timing data are omitted. Author and Title are HTML-unescaped.
 Negative hierarchy facets stay separate from positive classes. The official v6
 attribute names are bundled, and an optional local
 `annotations/oidv6-attributes-description.csv` can override them.
@@ -173,8 +173,8 @@ Filter examples with an authenticated SDK `client` and dataset `ds`:
 ```python
 client.query_samples(ds._id, filters={"field": "parent_classes", "operator": "contains", "value": "Animal"})
 client.query_samples(ds._id, filters={"field": "negative_classes", "operator": "contains", "value": "Dog"})
-client.query_samples(ds._id, filters={"field": "Author", "operator": "contains", "value": "Smith"})
-client.query_samples(ds._id, filters={"field": "caption_text", "operator": "contains", "value": "street"})
+client.query_samples(ds._id, filters={"field": "attribution", "operator": "contains", "value": "Smith"})
+client.query_samples(ds._id, filters={"field": "captions", "operator": "contains", "value": "street"})
 client.query_samples(
     ds._id,
     filters={
@@ -184,7 +184,7 @@ client.query_samples(
             "logic": "AND",
             "filters": [
                 {"field": "label", "operator": "=", "value": "Person"},
-                {"field": "IsOccluded", "operator": "=", "value": 1},
+                {"field": "is_occluded", "operator": "=", "value": True},
             ],
         },
     },
@@ -193,11 +193,11 @@ client.query_samples(
 
 ## Object and patch views
 
-Every detection, including `IsGroupOf` regions, creates an object row **inside
+Every detection, including group-of regions, creates an object row **inside
 the same dataset**. Each crop JPEG has a stable local path under
 `derived/objects/<ImageID>/<box-id>.jpg`. Objects explicitly use `media_type=object`,
-parent IDs, normalized `crop_bbox` in the rotated displayed frame, `label`, source
-attributes, `[label]` tags, and filterable `is_group_of`. Their CLIP field is
+parent IDs, normalized `crop_bbox` in the rotated displayed frame, `label` and the
+box's fields (`is_group_of` and the other flags, `source`, `confidence`); no tags. Their CLIP field is
 exactly `clip_obj`, with its own UMAP. No sibling dataset is needed.
 See [OBJECT_PATCH_VIEW.md](../../docs/OBJECT_PATCH_VIEW.md).
 

@@ -82,7 +82,7 @@ print(response.json())  # {"message": ..., "ids": [new sample ids], ...}
 |------|-------------------|----------|
 | `"error"` (default) | left unchanged | **409**, but new samples in the same request **are committed**; the body has `ids` for them and an `existing` filepath-to-id map |
 | `"skip"` | left unchanged | 200; `ids` lists only the new samples, `skipped` counts the rest |
-| `"update"` | metadata, location and array fields replaced; tags merged, or replaced with `"replace_tags": true` | 200 |
+| `"update"` | metadata and location replaced; a list field (`array_fields`) the sample names takes the list sent, or is unset by `null`, and one it leaves out is kept; tags merged, or replaced with `"replace_tags": true` | 200 |
 
 Use `"skip"` for a script you may re-run. Send smaller batches if you get HTTP 413
 (the shipped nginx allows 100 MB on this route).
@@ -99,7 +99,7 @@ Use `"skip"` for a script you may re-run. Send smaller batches if you get HTTP 4
 | `heading` | Compass heading in degrees. A sample read back with `samples/query` carries it inside `location`, or, when it has no location, as `heading` beside it. |
 | `embeddings` | `{field_name: [floats]}`. A field name's dimension is fixed server-wide by its first vectors. |
 | `hashes` | `{name: "hex string"}`, for example `{"phash_8": "c3a1..."}`. |
-| `array_fields` | `{field_name: [strings]}` for array fields created on the dataset. |
+| `array_fields` | `{field_name: [strings]}` for list fields created on the dataset (`create_array_field`); `null`, or the field left out, is never set, and `[]` the empty list ([SDK.md](SDK.md#list-fields-in-a-column-of-their-own)). |
 
 ### Dates and times
 

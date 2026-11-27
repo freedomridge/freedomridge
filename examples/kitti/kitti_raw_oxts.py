@@ -114,7 +114,9 @@ def parse_oxts(text, timestamp):
     captured = datetime.strptime(match[1], '%Y-%m-%d %H:%M:%S').replace(
         microsecond=int((match[2] or '').ljust(6, '0')[:6]),
     )
-    # The raw text has no zone. Keep it losslessly and expose this interpretation.
+    # The raw text has no zone: it is Europe/Berlin local time (CEST in the recording months, corroborated by the sun's
+    # position), so captured_at carries that offset. It keeps microseconds; the raw text's nanoseconds are below a
+    # 10 Hz frame's interval.
     captured = captured.replace(tzinfo=ZoneInfo('Europe/Berlin'))
     return {
         'location': (lon, lat),
@@ -122,8 +124,6 @@ def parse_oxts(text, timestamp):
         'altitude_m': altitude,
         'speed_kmh': math.hypot(north, east) * 3.6,
         'captured_at': captured.isoformat(),
-        'oxts_timestamp_raw': raw_timestamp + ' (Europe/Berlin local)',
-        'timestamp_timezone': 'Europe/Berlin (CEST; corroborated by sun position)',
     }
 
 

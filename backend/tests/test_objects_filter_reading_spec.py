@@ -38,8 +38,10 @@ Where the contract leaves a point open, these tests read it this way, and stay a
 - `is null` and `not exists` are read for the row as a whole, alone or beside other tests (rules 2.5 and 2.6, made
   exact); `is not null` and `exists` are showing tests (rule 2.1). `exists` and `not exists` ask for the key, as today
   (a JSON null under the key counts as there); `is null` and `is not null` for the value.
-- A place test (`geo_polygon`, `geo_region`) is not a comparison (section "Words" lists none): a NOT around one, and
-  an exclusion, keep the rows with no location, as 2.8 says.
+- A place test (`geo_polygon`, `geo_region`) compares the row's location: a NOT around one, and an exclusion, show
+  only the rows that have a location, the row as a whole (the later contract g7, one rule everywhere, rule 1.6; its
+  rule 1.5 and 1.1 likewise rewrote the 2.8 pins of `tags not in`, a dataset without objects and a filter sent without
+  the wrapping, below).
 - Rule 2.11 ("nothing is stored") is tested by what it promises: a field that only images had is read on an object
   from the moment an object holds it, before and after the field statistics are counted.
 - Rule 2.9: the page's form (page_filter) and the assistant's own (backend/assistant/grain.py, through make_view and
@@ -328,7 +330,8 @@ def card(parts: list[dict[str, Any]]) -> dict[str, Any]:
 COMPARISONS = {'=', '!=', 'in', 'not in', '<', '<=', '>', '>=', 'between', 'contains'}
 CONCEPT_TESTS = {'concept_select', 'concept_exclude'}
 SHOW_OF = {'!=': '=', 'not in': 'in', 'concept_exclude': 'concept_select'}  # rule 2.4: each is the NOT of its show
-PLACE_EXCLUDES = {'geo_polygon_exclude': 'geo_polygon'}  # an exclusion: NOT (inside), keeping rows with no location
+PLACE_EXCLUDES = {'geo_polygon_exclude': 'geo_polygon'}  # an exclusion: NOT (inside), which needs a location (g7, 1.6)
+PLACE_TESTS = {'geo_polygon'}  # a place test compares the row's location
 # Rules 2.5 and 2.6: `is null` (no value) and `not exists` (no key) are read for the row as a whole; `is not null`
 # and `exists` are showing tests. A JSON null is no value, but its key is there.
 ABSENCE, SHOWING_PRESENCE = {'is_null', 'not_exists'}, {'is_not_null', 'exists'}
@@ -369,7 +372,7 @@ class Reading:
     the grid does not show the row for X. Rule 2.4: `!=`, `not in` and a concept's exclude are the NOT of their show.
     Rules 2.5 and 2.6: `is null` and `not exists` are read for the row as a whole, `is not null` and `exists` as
     showing tests; `exists` asks for the key. Rule 2.7: a row with no partner has its own values only.
-    An excluded place is NOT (inside), with no field to have (2.8)."""
+    An excluded place is NOT (inside), and a place test needs a location like a comparison its field (g7, rule 1.6)."""
 
     def __init__(self, rows: dict[str, Row], concepts: Optional[dict[int, str]] = None):
         self.rows = rows
@@ -406,7 +409,7 @@ class Reading:
         """The comparisons inside a node (each standing for its field)."""
         if 'filters' in node or 'logic' in node:
             return [leaf for part in node.get('filters') or [] for leaf in self.compared(part)]
-        return [node] if node['operator'] in COMPARISONS | CONCEPT_TESTS else []
+        return [node] if node['operator'] in COMPARISONS | CONCEPT_TESTS | PLACE_TESTS else []
 
     def met(
         self,
@@ -476,18 +479,24 @@ class Reading:
 
     def each_row(self, node: dict[str, Any], names: Any) -> set[str]:
         """Each row on its own values, as a dataset without objects and a filter sent without the wrapping are read
-        (2.8): a negation is the complement of its show, so it keeps the rows with no value."""
+        (2.8), by the later contract's one rule (g7, rules 1.1 to 1.3): a negation shows a row that has a value for
+        every field it compares and that its show doesn't show."""
+
+        def has_every(row: Row, part: dict[str, Any]) -> bool:
+            return all(self.has(row, item) for item in self.compared(part))
 
         def keeps(row: Row, part: dict[str, Any]) -> bool:
             if 'filters' in part or 'logic' in part:
                 logic = str(part.get('logic', 'AND')).upper()
-                found = [keeps(row, item) for item in part.get('filters') or []]
                 if logic == 'NOT':
-                    return not all(found)
+                    inside_not = {'logic': 'AND', 'filters': part.get('filters') or []}
+                    return has_every(row, inside_not) and not keeps(row, inside_not)
+                found = [keeps(row, item) for item in part.get('filters') or []]
                 return all(found) if logic == 'AND' else any(found)
             operator = part['operator']
             if operator in SHOW_OF:
-                return not keeps(row, {**part, 'operator': SHOW_OF[operator]})
+                show = {**part, 'operator': SHOW_OF[operator]}
+                return self.has(row, show) and not keeps(row, show)
             if operator == 'is_null':
                 return not self.has(row, part)
             if operator == 'is_not_null':
@@ -937,23 +946,27 @@ def test_rule_2_7_an_object_with_no_image_and_an_image_with_no_objects_have_only
 # --- 2.8: what must not change (each a pin, passing on main), and what changes for places ---
 
 
-def test_rule_2_8_pin_a_dataset_without_objects_reads_each_row_on_its_own_values_as_today(regions_world):
+def test_rule_2_8_a_dataset_without_objects_reads_each_row_on_its_own_values_by_the_one_rule(regions_world):
+    """Rewritten for the later contract (g7, one rule everywhere, rules 1.1 to 1.3): each row is still read on its own
+    values, and a negation no longer shows the images with no value."""
+
     async def scenario(r):
         planted = await plant(r, PLAIN, PLAIN_ROWS)
         reading = planted.reading()
-        # Hand-checked: a negation keeps the images with no value too, here.
-        assert reading.each_row(leaf('colour', '!=', 'red'), PLAIN_ROWS) == {'img-3', 'img-4', 'img-6'}
+        # Hand-checked: img-4 has no colour, so a negation of colour leaves it out here too.
+        assert reading.each_row(leaf('colour', '!=', 'red'), PLAIN_ROWS) == {'img-3', 'img-6'}
         for text in (
+            # Asked first, as main answers them: the shows and the absence tests.
+            'colour = "red" AND source = "tractor"',
+            'colour is null',
+            'source is null',
+            f'concept "scene" > {CUT}',
             'colour != "red"',
             'NOT (colour = "red")',
             'colour not in ("red")',
             'NOT (colour = "red" AND source = "drone")',
             'source != "drone"',
-            'colour = "red" AND source = "tractor"',
-            'colour is null',
-            'source is null',
             f'not concept "scene" > {CUT}',
-            f'concept "scene" > {CUT}',
         ):
             stage = card(await parts_of(r, planted, text))
             want = reading.each_row(stage, PLAIN_ROWS)
@@ -1077,57 +1090,69 @@ def test_rule_2_8_the_row_a_hiding_test_of_a_built_in_field_names_is_not_shown_w
     regions_world(scenario)
 
 
-def test_rule_2_8_pin_tags_not_in_keeps_the_rows_with_no_tags_and_is_answered_by_the_row_of_the_grid(regions_world):
+def test_rule_2_8_tags_not_in_needs_a_tag_on_the_row_of_the_grid(regions_world):
+    """Rewritten for the later contract (g7, one rule everywhere, rule 1.5): `tags not in` is still answered by the row
+    of the grid, and that row needs at least one tag, none of them named. Here only img-1 (`seen`), img-2 and car-3
+    (`rejected`) have tags."""
+
     async def scenario(r):
         planted = await plant(r, FULL, FULL_ROWS)
-        images = {name for name, row in FULL_ROWS.items() if not row.is_object}
-        objects = {name for name, row in FULL_ROWS.items() if row.is_object}
-        # img-2 is rejected, and car-3: img-3 stays (its car aside), truck-2 stays (its image aside).
-        assert await shown(r, planted, 'image', 'tags not in ("rejected")') == images - {'img-2'}
-        assert await shown(r, planted, 'object', 'tags not in ("rejected")') == objects - {'car-3'}
-        assert await shown(r, planted, 'image', 'tags not in ("rejected", "seen")') == images - {'img-1', 'img-2'}
+        # Asked first, as main answers it: the show, met by the row or its partner (img-3's car is rejected).
+        assert await shown(r, planted, 'image', 'tags in ("rejected")') == {'img-2', 'img-3'}
+        # img-2 is rejected; img-3 and the other images have no tags (car-3's aside). No object has a tag but car-3.
+        assert await shown(r, planted, 'image', 'tags not in ("rejected")') == {'img-1'}
+        assert await shown(r, planted, 'object', 'tags not in ("rejected")') == set()
+        assert await shown(r, planted, 'image', 'tags not in ("rejected", "seen")') == set()
 
     regions_world(scenario)
 
 
 EXCLUDED_SQUARE = leaf('location', 'geo_polygon_exclude', SQUARE)
-OUTSIDE_IMAGES = {'img-2', 'img-5', 'img-6'}  # not inside, and no object inside (img-3's car is; img-6 has no point)
-OUTSIDE_OBJECTS = {'truck-2', 'part-6'}  # not inside, and its image not inside (`loose` is inside)
+# A location on the row as a whole, and none inside (g7, rule 1.6): img-3's car is inside; img-6 and its object have
+# no location, nor has part-6 and its image; `loose` is inside.
+OUTSIDE_IMAGES = {'img-2', 'img-5'}
+OUTSIDE_OBJECTS = {'truck-2'}
 
 
-def test_rule_2_8_pin_an_excluded_place_keeps_the_rows_with_no_location_on_both_grids(regions_world):
+def test_rule_2_8_an_excluded_place_shows_only_the_rows_that_have_a_location_on_both_grids(regions_world):
+    """Rewritten for the later contract (g7, one rule everywhere, rule 1.6): the rows with no location, the row as a
+    whole, are no longer shown. A polygon of two points is still no filter."""
+
     async def scenario(r):
         planted = await plant(r, FULL, FULL_ROWS)
         reading = planted.reading()
         assert reading.images(both(EXCLUDED_SQUARE)) == OUTSIDE_IMAGES
         assert reading.objects(both(EXCLUDED_SQUARE)) == OUTSIDE_OBJECTS
+        # Asked first, as main answers it: a polygon of two points is no polygon and excludes nothing.
+        everything = {name for name, row in FULL_ROWS.items() if not row.is_object}
+        no_polygon = leaf('location', 'geo_polygon_exclude', SQUARE[:2])
+        assert await shown(r, planted, 'image', no_polygon) == everything
         for name, stage in (
             ('the exclusion', EXCLUDED_SQUARE),
             ("the exclusion as a filter card's Builder tab saves it", both(EXCLUDED_SQUARE)),
         ):
             assert await shown(r, planted, 'image', stage) == OUTSIDE_IMAGES, name
             assert await shown(r, planted, 'object', stage) == OUTSIDE_OBJECTS, name
-        # A polygon of two points is no polygon and excludes nothing.
-        everything = {name for name, row in FULL_ROWS.items() if not row.is_object}
-        no_polygon = leaf('location', 'geo_polygon_exclude', SQUARE[:2])
-        assert await shown(r, planted, 'image', no_polygon) == everything
 
     regions_world(scenario)
 
 
 def test_rule_2_8_a_not_around_a_place_an_exclusion_in_an_or_or_in_a_card_shows_what_the_exclusion_shows(regions_world):
     """What changes for places (2.8): each of these shows the rows the exclusion standing alone shows, on both
-    grids. The card holds the exclusion beside a test of the objects."""
+    grids. The card holds the exclusion beside a test of the objects. Rewritten for the later contract (g7, one rule
+    everywhere, rule 1.6): the exclusion standing alone no longer shows img-6 and part-6, which have no location, the
+    row as a whole; the place itself, which main answers alike, is asked first."""
 
     async def scenario(r):
         planted = await plant(r, FULL, FULL_ROWS)
         place = leaf('location', 'geo_polygon', SQUARE)
         vehicle = leaf('label', 'in', ['car', 'truck'])
         never = leaf('plot', '=', 'no-such-plot')
-        # Asked first, as main answers it: the exclusion standing alone.
-        assert await shown(r, planted, 'image', EXCLUDED_SQUARE) == OUTSIDE_IMAGES
-        assert await shown(r, planted, 'object', EXCLUDED_SQUARE) == OUTSIDE_OBJECTS
+        # Asked first, as main answers it: the place.
+        assert await shown(r, planted, 'image', place) == {'img-1', 'img-3', 'img-4'}
+        assert await shown(r, planted, 'object', place) == {'car-1', 'truck-1', 'car-3', 'car-4', 'loose'}
         for name, stage, images, objects in (
+            ('the exclusion standing alone', EXCLUDED_SQUARE, OUTSIDE_IMAGES, OUTSIDE_OBJECTS),
             ('NOT around the place', negated(place), OUTSIDE_IMAGES, OUTSIDE_OBJECTS),
             ('NOT around the place, in a group', negated(both(place)), OUTSIDE_IMAGES, OUTSIDE_OBJECTS),
             ('the exclusion inside an OR', either(EXCLUDED_SQUARE, never), OUTSIDE_IMAGES, OUTSIDE_OBJECTS),
@@ -1144,14 +1169,20 @@ def test_rule_2_8_a_not_around_a_place_an_exclusion_in_an_or_or_in_a_card_shows_
     regions_world(scenario)
 
 
-def test_rule_2_8_pin_a_filter_sent_without_the_wrapping_reads_each_row_on_its_own_values(regions_world):
+def test_rule_2_8_a_filter_sent_without_the_wrapping_reads_each_row_on_its_own_values_by_the_one_rule(regions_world):
     """As the SDK sends a filter: samples/query with the filter itself, images and objects alike, each row on its own
-    values (a negation keeps the rows with no value)."""
+    values. Rewritten for the later contract (g7, one rule everywhere, rules 1.1 and 1.2): a negation no longer shows
+    the rows with no value. The filters main answers alike come first."""
 
     async def scenario(r):
         planted = await plant(r, FULL, FULL_ROWS)
         reading = planted.reading()
         assert reading.each_row(both(leaf('colour', '=', 'red'), leaf('label', '=', 'car')), FULL_ROWS) == set()
+        # Hand-checked: the objects have no colour; no row has both a colour and a label.
+        assert reading.each_row(leaf('colour', '!=', 'red'), FULL_ROWS) == {'img-3', 'img-6'}
+        assert (
+            reading.each_row(negated(both(leaf('colour', '=', 'red'), leaf('label', '=', 'car'))), FULL_ROWS) == set()
+        )
         for text in (
             'colour = "red" AND label = "car"',
             'label = "car"',

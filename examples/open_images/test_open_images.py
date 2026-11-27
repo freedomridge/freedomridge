@@ -21,6 +21,8 @@ from examples.open_images.ingest import (  # noqa: E402  # noqa: E402
     NARRATIVES,
     build_index,
     build_parser,
+    flag,
+    license_name,
     map_sample,
     rotate_bbox,
     rotate_point,
@@ -53,6 +55,7 @@ def oi(tmp_path):
         'ImageID': 'a',
         'Rotation': '90.0',
         'OriginalURL': 'https://example.org/a.jpg',
+        'OriginalLandingURL': 'https://example.org/photos/a',
         'Author': 'Photographer',
         'License': 'https://creativecommons.org/licenses/by/2.0/',
         'Title': 'A café',
@@ -205,16 +208,27 @@ def test_all_annotations_and_rotation(oi, tmp_path):
         assert sample.filepath.endswith('/open_images/a-r90.jpg')
         assert map_sample(oi, row, index, names, ancestors, assets, True) == sample.filepath
         m = sample.metadata
-        assert m['Rotation'] == 90 and m['rotation_applied']
-        assert (m['Author'], m['Title']) == ('Photographer', 'A café')
-        assert m['OriginalURL'].startswith('https://') and 'creativecommons' in m['License']
+        assert m['rotation'] == 90
+        # The image list's columns become the photo's credit; the rest of them aren't copied.
+        assert m['attribution'] == '“A café” by Photographer'
+        assert (m['license'], m['license_url']) == ('CC BY 2.0', 'https://creativecommons.org/licenses/by/2.0/')
+        assert m['source_url'] == 'https://example.org/photos/a'
+        assert not {'ImageID', 'Rotation', 'rotation_applied', 'OriginalURL', 'Author', 'Title', 'License'} & m.keys()
+        assert not {'source_filepath', 'narratives', 'caption_text', 'IsGroupOf_count', 'is_group_of_count'} & m.keys()
+        assert sample.tags == []
         assert len(m['detections']) == 1
         assert m['detections'][0]['bbox'] == pytest.approx([0.2, 0.3, 0.6, 0.6])
-        assert m['detections'][0]['IsGroupOf'] == 1
+        # Flags are booleans under Freedom Ridge's names, the class goes by its name (no class code).
+        detection = m['detections'][0]
+        assert (detection['is_group_of'], detection['is_truncated'], detection['source']) == (True, False, 'xclick')
+        assert not {'IsGroupOf', 'IsOccluded', 'LabelName', 'Source', 'box_id'} & detection.keys()
         assert len(m['positive_labels']) == 2 and len(m['verified_absent']) == 1
+        assert m['verified_absent'][0] == {'class': 'Cat', 'source': 'verification'}
+        assert 'LabelName' not in m['positive_labels'][0] and 'annotation_file' not in m['positive_labels'][0]
         assert sample.array_fields['negative_classes'] == ['Cat'] and 'negative_labels' not in m
-        assert {p['EstimatedYesNo'] for p in m['points']} == {'yes', 'no', 'unsure'}
-        assert m['points'][0]['YesVotes'] == 2
+        assert {p['answer'] for p in m['points']} == {'yes', 'no', 'unsure'}
+        assert m['points'][0]['yes_votes'] == 2
+        assert not {'Label', 'EstimatedYesNo', 'YesVotes', 'TextLabel'} & m['points'][0].keys()
         assert m['points'][0]['points'] == [[0.4, 0.7]]
         assert m['mask_count'] == 2
         assert m['instance_mask_000']['maskPath'].endswith('a/mask-b1-r90.png')
@@ -225,9 +239,9 @@ def test_all_annotations_and_rotation(oi, tmp_path):
         relation = m['relationships'][0]
         assert relation['label'] == 'near' and relation['bbox'] == pytest.approx([0.2, 0.2, 0.7, 0.7])
         assert (relation['subject'], relation['object']) == ('Dog', 'Cat')
+        assert not {'LabelName1', 'LabelName2'} & relation.keys()
         assert sample.array_fields['parent_classes'] == ['Animal, living', 'Entity']
-        assert len(m['captions']) == 2 and 'dog' in m['caption_text']
-        assert all('traces' not in n and 'timed_caption' not in n for n in m['narratives'])
+        assert m['captions'] == 'A dog and a cat 0.\nA dog and a cat 1.'
         assert json.loads(json.dumps(sample.to_dict()))['metadata']['mask_count'] == 2
 
 
@@ -297,7 +311,7 @@ def test_unannotated_images_and_optional_attribute_names(oi):
         )
         image.close()
         assert sample.filepath == str(oi / 'validation/b.jpg')
-        assert sample.metadata['detections'] == [] and sample.metadata['captions'] == []
+        assert sample.metadata['detections'] == [] and sample.metadata['captions'] == ''
         assert sample.array_fields['parent_classes'] == []
 
 
@@ -313,3 +327,11 @@ def test_unannotated_images_and_optional_attribute_names(oi):
 def test_all_rotation_frames(angle, point, box):
     assert rotate_point([0.1, 0.2], angle) == pytest.approx(point)
     assert rotate_bbox([0.1, 0.2, 0.3, 0.4], angle) == pytest.approx(box)
+
+
+def test_flags_and_license_names():
+    # The box CSV writes -1 where a flag is unknown: that is no value, not true.
+    assert (flag('1'), flag('0'), flag('-1')) == (True, False, None)
+    assert license_name('https://creativecommons.org/licenses/by/2.0/') == 'CC BY 2.0'
+    assert license_name('https://creativecommons.org/licenses/by-sa/4.0') == 'CC BY-SA 4.0'
+    assert license_name('https://example.org/terms') == 'https://example.org/terms'

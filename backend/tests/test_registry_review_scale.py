@@ -8,7 +8,7 @@ import pytest
 from backend.field_registry import cached_distinct_values
 from backend.routers import datasets
 from backend.tests.statistics_helpers import run_refresh
-from backend.tests.test_field_registry_postgres import USER, ingest, registry_database
+from backend.tests.test_field_registry_postgres import USER, bulk_setup, ingest, registry_database
 
 __all__ = ['registry_database']
 pytestmark = pytest.mark.skipif(
@@ -21,12 +21,13 @@ def test_large_source_dataset_keeps_exact_categorical_selection(registry_databas
     async def scenario(database):
         await database.execute("""INSERT INTO dataset_fields(dataset_id, field_name, field_type)
             VALUES (1, 'color', 'string')""")
-        await database.execute('ALTER TABLE samples DISABLE TRIGGER USER')
-        await database.execute("""INSERT INTO samples (dataset_id, filepath, media_type, metadata)
+        async with bulk_setup(database) as connection:
+            await connection.execute('ALTER TABLE samples DISABLE TRIGGER USER')
+            await connection.execute("""INSERT INTO samples (dataset_id, filepath, media_type, metadata)
             SELECT 1, 'scale-' || position || '.jpg', 'image',
                    jsonb_build_object('color', (ARRAY['red', 'reddish', 'infrared', 'blue', 'green'])[position % 5 + 1])
             FROM generate_series(1, 111000) position""")
-        await database.execute('ALTER TABLE samples ENABLE TRIGGER USER')
+            await connection.execute('ALTER TABLE samples ENABLE TRIGGER USER')
         await database.execute('UPDATE datasets SET stats_need_refresh = TRUE WHERE id = 1')
         refreshed = await run_refresh(database)
         assert all(row['error'] is None for row in refreshed)

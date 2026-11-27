@@ -93,10 +93,13 @@ def test_similarity_view_count_applies_skip_and_limit(build, expected):
         sample.id = index + 1
         sample.distance = index / 10
         samples.append(sample)
-    view = build(SimilarityResultView(samples, _Ds(_Recorder({}))))
+    session = _Recorder({})
+    view = build(SimilarityResultView(samples, _Ds(session)))
     assert view.count() == expected
     assert len(view) == expected
     assert len(view.to_list()) == expected
+    # Without a filter a similarity result asks the server nothing (contract g7, 2.2: only a filter is asked).
+    assert session.sent == []
 
 
 def _concept_client():

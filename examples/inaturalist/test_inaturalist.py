@@ -98,17 +98,20 @@ def test_stream_join_mapping_and_counts(coco):
     assert counts == {"rows": 5, "missing_coordinates": 2, "missing_image": 1, "selected": 2}
     sample = samples[0]
     assert sample.location == (0, 0)
-    assert sample.metadata["annotation_id"] == 100  # Join by ID, not array position.
-    assert sample.metadata["category_id"] == 42
+    assert sample.metadata["image_id"] == 0
     assert sample.metadata["species"]["label"] == "Lumbricus terrestris"
     # R-1: the plain name stays filterable alongside the overlay classification
     assert sample.metadata["scientific_name"] == "Lumbricus terrestris"
     assert all(sample.metadata[key] for key in (*inat.TAXONOMY, "species", "common_name"))
     assert sample.metadata["date"] == datetime(2020, 6, 2, 23, 2, 3, tzinfo=timezone.utc)
     assert sample.to_dict()["metadata"]["date"] == "2020-06-02T23:02:03+00:00"
-    assert sample.metadata["license_id"] == 0
-    assert sample.metadata["rights_holder"] in sample.metadata["attribution"]
+    assert sample.metadata["license"] and sample.metadata["license_url"] in sample.metadata["attribution"]
+    assert "A photographer" in sample.metadata["attribution"]
     assert sample.metadata["location_uncertainty"] is None
+    # One field per fact: the location, the file, the source's numbers and the rights holder aren't repeated.
+    repeated = {"latitude", "longitude", "file_name", "image_dir_name", "annotation_id", "category_id", "license_id"}
+    assert not repeated & sample.metadata.keys()
+    assert "rights_holder" not in sample.metadata
 
 
 def test_license_selection_and_limit(coco):
@@ -131,7 +134,7 @@ def test_bad_json_and_path(coco):
         list(inat.iter_coco_array(root / "bad.json", "images", chunk_size=2))
     data["images"][0]["file_name"] = "../outside.jpg"
     with pytest.raises(ValueError, match="escapes"):
-        inat.map_image(data["images"][0], data["annotations"][-1], data["categories"][0], data["licenses"][0], root)
+        inat.map_image(data["images"][0], data["categories"][0], data["licenses"][0], root)
 
 
 @pytest.mark.parametrize("lat,lon", [(None, 2), ("NaN", 2), (0, "inf"), (91, 0), (0, -181)])

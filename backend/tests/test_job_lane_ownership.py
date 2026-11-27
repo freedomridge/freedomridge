@@ -199,12 +199,13 @@ def test_database_rejects_a_second_lane_owner_even_without_a_live_lease(registry
 
 def test_large_history_and_blocked_backlog_do_not_hide_ready_work(registry_database):
     async def scenario(database):
-        await database.execute(
-            """INSERT INTO jobs(id,kind,state,finished_at)
-               SELECT md5('history-'||number::text)::uuid,'history','cancelled',clock_timestamp()
-               FROM generate_series(1,100000) AS number;
-               UPDATE job_controls SET cancel_requested=TRUE""",
-        )
+        async with registry_helpers.bulk_setup(database) as connection:
+            await connection.execute(
+                """INSERT INTO jobs(id,kind,state,finished_at)
+                   SELECT md5('history-'||number::text)::uuid,'history','cancelled',clock_timestamp()
+                   FROM generate_series(1,100000) AS number;
+                   UPDATE job_controls SET cancel_requested=TRUE""",
+            )
         owner = await job_queue.enqueue_job(database.pool, 'owner', dataset_id=1)
         active = await claimed(database.pool, 'owner')
         await job_queue.defer_job(database.pool, owner['id'], active['lease_token'], {}, delay_seconds=300)

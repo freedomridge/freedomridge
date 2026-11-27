@@ -180,11 +180,12 @@ def test_active_read_uses_dataset_indexes_not_terminal_history(registry_database
     async def scenario(database):
         monkeypatch.setattr(jobs, 'db', database)
         monkeypatch.setattr(access, 'db', database)
-        await database.execute("""INSERT INTO jobs(id,kind,dataset_id,state)
-            SELECT gen_random_uuid(),'old_work',1,'succeeded' FROM generate_series(1,100000)""")
-        await database.execute("""INSERT INTO jobs(id,kind,dataset_id)
-            SELECT gen_random_uuid(),'other_dataset',2 FROM generate_series(1,2000)""")
-        await database.execute('INSERT INTO job_controls(job_id) SELECT id FROM jobs ON CONFLICT DO NOTHING')
+        async with test_field_registry_postgres.bulk_setup(database) as connection:
+            await connection.execute("""INSERT INTO jobs(id,kind,dataset_id,state)
+                SELECT gen_random_uuid(),'old_work',1,'succeeded' FROM generate_series(1,100000)""")
+            await connection.execute("""INSERT INTO jobs(id,kind,dataset_id)
+                SELECT gen_random_uuid(),'other_dataset',2 FROM generate_series(1,2000)""")
+            await connection.execute('INSERT INTO job_controls(job_id) SELECT id FROM jobs ON CONFLICT DO NOTHING')
         await job_queue.enqueue_job(database.pool, 'umap_fit', dataset_id=1, placement='compute')
         await job_queue.enqueue_job(database.pool, 'statistics', dataset_id=1, lane='maintenance')
         assert await job_queue.claim_job(database.pool, 'remote', placements=['compute']) is not None

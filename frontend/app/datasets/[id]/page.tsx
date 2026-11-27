@@ -47,7 +47,7 @@ import type { GridMore } from '@/components/dataset-grid';
 import { SparseSamplePanel } from '@/components/sparse-sample-panel';
 import { ExportDialog } from '@/components/export-dialog';
 import { PanelType } from '@/components/panel-content';
-import { FilterProvider, useFilters, withGrain, type AddressState, type Grain } from '@/contexts/FilterContext';
+import { FilterProvider, sidebarView, useFilters, withGrain, type AddressState, type Grain } from '@/contexts/FilterContext';
 import { useUser } from '@/contexts/UserContext';
 import { can, refusal } from '@/lib/access-level';
 import { readMediaFieldPick, rememberMediaFieldPick, shownMediaField } from '@/lib/media-field-pick';
@@ -510,70 +510,51 @@ function DatasetPageContent() {
         keepWhileRecounting: true,
     });
 
-    // Schema query uses different filters based on lightning mode:
-    // - Lightning mode ON: use globalFilters (cached, performance-focused)
-    // - Lightning mode OFF: use globalFilters + transient selections (brushedIds, polygon)
-    //   NOTE: We do NOT include simple filter drafts to avoid reloading the panel on every change
-    const schemaFilters = useMemo(() => {
-        if (lightningMode) {
-            return imageGrainFilters;
-        }
-
-        // Build filters that include globalFilters + transient selections
-        // but NOT simple filter drafts
-        const transientFilters: ComplexFilter[] = [];
+    // The pending selections the sidebar reads before they're applied, with lightning mode off (on: the applied view
+    // alone): a brushed set, the grid rows the user has ticked, a drawn polygon, a lasso. Never the sidebar's own
+    // drafts, so the panel doesn't reload on every tick. The list and the range read all four (ticking rows shows their
+    // values); the value picker reads what the grid previews, the brushed set, the polygon and the lasso, and not the
+    // ticked rows: the grid doesn't filter by them, so a value outside them still shows rows.
+    const { pendingSelections, previewedSelections } = useMemo((): Record<'pendingSelections' | 'previewedSelections', ComplexFilter[]> => {
+        if (lightningMode) return { pendingSelections: [], previewedSelections: [] };
 
         // Add brushed IDs from embeddings — but NOT when an embeddings region is active.
         // With a region, the in_selection token below is the authoritative (full) filter and
         // brushedIds is only the visible-point highlight; adding it here would wrongly
         // intersect the selection down to just the on-screen points.
-        if (brushedIds.length > 0 && !currentEmbeddingRegion) {
-            transientFilters.push({
-                field: 'id',
-                operator: 'in',
-                value: brushedIds
-            });
-        }
+        const brushed: ComplexFilter[] = brushedIds.length > 0 && !currentEmbeddingRegion
+            ? [{ field: 'id', operator: 'in', value: brushedIds }]
+            : [];
 
         // Add selection IDs (selected samples)
-        if (selectedIds.length > 0) {
-            transientFilters.push({
-                field: 'id',
-                operator: 'in',
-                value: selectedIds
-            });
-        }
+        const ticked: ComplexFilter[] = selectedIds.length > 0 ? [{ field: 'id', operator: 'in', value: selectedIds }] : [];
 
         // Add polygon from map
-        if (currentPolygon) {
-            transientFilters.push({
-                field: 'location',
-                operator: 'geo_polygon',
-                value: currentPolygon.geometry.coordinates[0]
-            });
-        }
+        const polygon: ComplexFilter[] = currentPolygon
+            ? [{ field: 'location', operator: 'geo_polygon', value: currentPolygon.geometry.coordinates[0] }]
+            : [];
 
         // Add embeddings lasso region as a LIVE geometric filter (embedding_polygon),
         // so it composes with the other filters and stays consistent with the applied
         // stage. (See FilterContext for why this isn't the frozen in_selection token.)
-        if (currentEmbeddingRegion) {
-            transientFilters.push(lassoFilter(currentEmbeddingRegion));
-        }
-
-        // If no transient selections, just use the image-grain filters
-        if (transientFilters.length === 0) {
-            return imageGrainFilters;
-        }
-
-        // Combine image-grain filters with transient selections
+        const lasso: ComplexFilter[] = currentEmbeddingRegion ? [lassoFilter(currentEmbeddingRegion)] : [];
         return {
-            logic: 'AND' as const,
-            filters: [
-                ...(imageGrainFilters.filters || []),
-                ...transientFilters
-            ]
+            pendingSelections: [...brushed, ...ticked, ...polygon, ...lasso],
+            previewedSelections: [...brushed, ...polygon, ...lasso],
         };
-    }, [lightningMode, imageGrainFilters, brushedIds, selectedIds, currentPolygon, currentEmbeddingRegion]);
+    }, [lightningMode, brushedIds, selectedIds, currentPolygon, currentEmbeddingRegion]);
+
+    // The sidebar's list and ranges read the applied view with the pending selections, inside the image grain's
+    // wrapping (sidebarView, as the grid reads them applied); the value picker reads the applied view with what the
+    // grid previews and the other fields' ticks (pickerView).
+    const schemaFilters = useMemo(
+        () => sidebarView(globalFilters, pendingSelections, null, hasObjects),
+        [globalFilters, pendingSelections, hasObjects],
+    );
+    const pickerView = useCallback(
+        (ticks: ComplexFilter | null) => sidebarView(globalFilters, previewedSelections, ticks, hasObjects),
+        [globalFilters, previewedSelections, hasObjects],
+    );
 
     const { data: schema, isLoading: schemaLoading, isPlaceholderData: schemaIsPrevious } = useQuery<SchemaField[]>({
         queryKey: ['schema', datasetId, schemaFilters, lightningMode],
@@ -1442,6 +1423,7 @@ function DatasetPageContent() {
                             isLoading={schemaLoading}
                             filters={simpleFilters}
                             globalFilters={imageGrainFilters}
+                            pickerView={pickerView}
                             onChange={handleSimpleFilterChange}
                             activeOverlayFields={activeOverlayFields}
                             onToggleOverlay={(field) => {

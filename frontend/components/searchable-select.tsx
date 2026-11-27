@@ -15,7 +15,12 @@ import { autocompleteField, type ComplexFilter } from '@/lib/api';
  * `exactOnly`: the selection becomes an exact `in [...]` the user never chose explicitly (the
  * sidebar's value list). Enter then adds only a value that IS listed — typed "Forest" + Enter
  * became `in ["Forest"]` → 0 samples while the list showed the substring matches. The
- * one exception is a server search that ran out of time, where the exact value is the way in.
+ * one exception is a server answer that is not complete (it ran out of time), where the typed value is the way in.
+ *
+ * The server's answer (`exhaustive`, docs/FILTER_QUERY.md "A field's values") gives the dropdown one of three states:
+ * some values, not all of them (listed without numbers, with a line saying so); none, and the list was not complete
+ * (a line saying a typed value still filters); none, and the list is complete ("No value for this view." with nothing
+ * typed, "No matches" with a term). The sidebar's picker and the query builder's are this one component.
  */
 export function SearchableSelect({ datasetId, fieldName, cachedValues, selected, onChange, filters, placeholder, single, exactOnly, valuesComplete = false, containsTerms = [], onContainsChange, showCachedValues = false }: {
     datasetId: number;
@@ -157,6 +162,8 @@ export function SearchableSelect({ datasetId, fieldName, cachedValues, selected,
         setOpen(false);
     };
 
+    // The server's answer is not all the values: it ran out of time counting them (docs/FILTER_QUERY.md).
+    const notComplete = serverResults !== null && !serverExhaustive;
     const displayResults: Array<{value: string, count: number | null}> = query.trim()
         ? (serverResults || cachedValues
             .filter(v => !selectedSet.has(v) && v.toLowerCase().includes(query.toLowerCase()))
@@ -220,11 +227,14 @@ export function SearchableSelect({ datasetId, fieldName, cachedValues, selected,
                             }
                             const typed = query.trim();
                             const listed = displayResults.find(r => r.value === typed);
-                            if (displayResults.length === 1) {
-                                toggleValue(displayResults[0].value);
-                            } else if (listed) {
+                            if (listed) {
                                 toggleValue(listed.value);
-                            } else if (typed && (!exactOnly || (serverResults !== null && !serverExhaustive && displayResults.length === 0))) {
+                            } else if (typed && notComplete) {
+                                // The list is not all the values: the typed one may be among the rest.
+                                toggleValue(typed);
+                            } else if (displayResults.length === 1) {
+                                toggleValue(displayResults[0].value);
+                            } else if (typed && !exactOnly) {
                                 toggleValue(typed);
                             } else if (typed) {
                                 setEnterRefused(true);
@@ -253,6 +263,13 @@ export function SearchableSelect({ datasetId, fieldName, cachedValues, selected,
                             </button>
                         )}
                         {loading && <div className="px-3 py-2 text-xs text-zinc-500">Searching...</div>}
+                        {!loading && !serverFailed && notComplete && displayResults.length > 0 && (
+                            <div data-testid="autocomplete-some-values" className="px-3 py-2 text-xs text-amber-500/90 border-b border-zinc-700">
+                                {onContainsChange
+                                    ? 'Could not search all values in time: these are some of them. Type to search; Enter or Contains filters by what you typed.'
+                                    : 'Could not search all values in time: these are some of them. Type to search; Enter filters by what you typed.'}
+                            </div>
+                        )}
                         {!loading && enterRefused && displayResults.length > 0 && (
                             <div data-testid="autocomplete-pick-hint" className="px-3 py-2 text-xs text-amber-500/90 border-b border-zinc-700">
                                 Pick a value from the list — Enter adds a value only when it matches one exactly.
@@ -274,14 +291,23 @@ export function SearchableSelect({ datasetId, fieldName, cachedValues, selected,
                             </div>
                         )}
                         {!loading && !serverFailed && displayResults.length === 0 && query.trim() && (
-                            serverResults !== null && !serverExhaustive ? (
+                            notComplete ? (
                                 <div data-testid="autocomplete-not-exhaustive" className="px-3 py-2 text-xs text-amber-500/90">
                                     {onContainsChange
                                         ? 'Could not search all values in time. Choose Contains to apply a substring filter.'
                                         : 'Could not search all values in time. Press Enter to filter by the exact value you typed.'}
                                 </div>
                             ) : (
-                                <div className="px-3 py-2 text-xs text-zinc-500">No matches</div>
+                                <div data-testid="autocomplete-no-matches" className="px-3 py-2 text-xs text-zinc-500">No matches</div>
+                            )
+                        )}
+                        {!loading && !serverFailed && !query.trim() && serverResults !== null && serverResults.length === 0 && (
+                            notComplete ? (
+                                <div data-testid="autocomplete-not-exhaustive" className="px-3 py-2 text-xs text-amber-500/90">
+                                    Could not search all values in time. Type a value and press Enter to filter by it.
+                                </div>
+                            ) : (
+                                <div data-testid="autocomplete-no-value" className="px-3 py-2 text-xs text-zinc-500">No value for this view.</div>
                             )
                         )}
                     </div>,

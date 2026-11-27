@@ -26,6 +26,7 @@ from ..filter_query import (
     parse_query,
     region_names,
 )
+from ..label_fields import label_path
 from .datasets import get_dataset_array_columns
 
 router = APIRouter()
@@ -58,6 +59,14 @@ async def field_kinds(dataset_id: int) -> Dict[str, str]:
     return kinds
 
 
+async def list_paths(dataset_id: int, kinds: Dict[str, str]) -> Dict[str, str]:
+    """Each field of `kinds` that is a path through a list (`detections.label`), with that list (`detections`): read so
+    wherever a comparison of it is (label_path, from the dataset's caches). `is empty` is asked of the list."""
+    columns = await get_dataset_array_columns(dataset_id)
+    found = {name: label_path(name, columns) for name in kinds}
+    return {name: path[0] for name, path in found.items() if path is not None}
+
+
 async def dataset_concepts(dataset_id: int) -> List[Concept]:
     """The dataset's concepts, which a query names as `concept "name"`."""
     rows = await db.fetch('SELECT id, name, threshold FROM embedding_concepts WHERE dataset_id = $1', dataset_id)
@@ -81,6 +90,7 @@ async def parse_filter_query(id: int, request: FilterQueryParse):
     their AND as `filter`. A mistake is a 400 whose detail has `message` and `errors`:
     [{message, line, column, suggestions}]."""
     kinds = await field_kinds(id)
+    paths = await list_paths(id, kinds)
     concepts = await dataset_concepts(id)
     # The regions the text names after `within`, and those of the current filters (each read back as text below).
     written = region_names(request.query)
@@ -88,10 +98,10 @@ async def parse_filter_query(id: int, request: FilterQueryParse):
         written += [name for name in region_names(text) if name not in written]
     named = await regions.match_names(db, written)
     try:
-        filters = parse_query(request.query, kinds, regions=named, concepts=concepts)
+        filters = parse_query(request.query, kinds, regions=named, concepts=concepts, paths=paths)
     except FilterQueryError as error:
         raise HTTPException(status_code=400, detail={'message': str(error), 'errors': [error.detail]})
-    current = [_normalized(node, kinds, named, concepts) for node in request.current]
+    current = [_normalized(node, kinds, named, concepts, paths) for node in request.current]
     reuse: List[Optional[int]] = []
     matched: set = set()
     for node in filters:
@@ -130,13 +140,14 @@ def _normalized(
     kinds: Dict[str, str],
     named: Mapping[str, RegionMatch],
     concepts: List[Concept],
+    paths: Mapping[str, str],
 ) -> Optional[Dict[str, Any]]:
     """`node` as the parser writes it, so equal filters compare equal however they were built."""
     text = format_filter(node, concepts=concepts)
     if text is None:
         return None
     try:
-        parts = parse_query(text, kinds, regions=named, concepts=concepts)
+        parts = parse_query(text, kinds, regions=named, concepts=concepts, paths=paths)
     except FilterQueryError:
         return None
     return parts[0] if len(parts) == 1 else None

@@ -134,6 +134,9 @@ test.describe('sidebar text combinations', () => {
         if (datasetId) await apiFetch(cookie, `/datasets/${datasetId}`, { method: 'DELETE' });
     });
 
+    // Excluded (`not (...)`), the terms keep the colours that match none of them: rewritten for contract g7 (one rule
+    // everywhere, rule 1.2), only the two samples that have a colour, not the one whose colour is null nor the one with
+    // none (it kept those too: 4).
     for (const excluded of [false, true]) {
         test(`${excluded ? 'legacy excluded' : 'included'} exact values and multiple contains terms survive preview, apply, edit and reload`, async ({ page }) => {
             await page.goto(`/datasets/${datasetId}`);
@@ -158,10 +161,10 @@ test.describe('sidebar text combinations', () => {
                 await picker.fill('blu');
                 await picker.press('Enter');
             }
-            await expectPreview(page, excluded ? 4 : 6);
+            await expectPreview(page, excluded ? 2 : 6);
             await expectPersistedFilters(page, datasetId, upgradeDraftKeys(draft), []);
             await page.reload();
-            await expectPreview(page, excluded ? 4 : 6);
+            await expectPreview(page, excluded ? 2 : 6);
             if (excluded) {
                 await expect(sidebar.getByText(`Additional filter: not (${label})`, { exact: true })).toBeVisible();
                 await expect(sidebar.getByRole('checkbox', { name: 'Contains "red"', exact: true })).toHaveCount(0);
@@ -169,7 +172,7 @@ test.describe('sidebar text combinations', () => {
                 await expect(sidebar.getByRole('checkbox', { name: 'Contains "red"', exact: true })).toBeChecked();
             }
             await page.getByTestId('apply-filters').click();
-            await expectTotal(page, excluded ? 4 : 6);
+            await expectTotal(page, excluded ? 2 : 6);
             const chip = page.getByTestId('query-stage-chip');
             await expect(chip).toContainText(excluded ? `not (${label})` : label);
             await chip.click();
@@ -177,13 +180,13 @@ test.describe('sidebar text combinations', () => {
             await expect(editor.getByPlaceholder('Value...', { exact: true })).toHaveCount(2);
             if (excluded) await expect(editor.getByRole('button', { name: 'NOT', exact: true }).first()).toHaveClass(/bg-zinc-700/);
             await editor.getByRole('button', { name: 'Apply', exact: true }).click();
-            await expectTotal(page, excluded ? 4 : 6);
+            await expectTotal(page, excluded ? 2 : 6);
             await expectPersistedFilters(page, datasetId, {}, [convertSimpleFiltersToComplex(upgradeDraftKeys(draft))]);
             // The address holds the applied filter only once its query text is back from the server, after the history
             // write: a reload before that reopens the address the page had, which says "no filters".
             await expect(page).toHaveURL(/[?&](q|f)=[^&]/);
             await page.reload();
-            await expectTotal(page, excluded ? 4 : 6);
+            await expectTotal(page, excluded ? 2 : 6);
             await expect(chip).toContainText(excluded ? `not (${label})` : label);
         });
     }
@@ -193,7 +196,9 @@ test.describe('sidebar text combinations', () => {
         await expectTotal(page, 10);
         const sidebar = page.getByTestId('panel-filters');
         await restoreDraft(page, datasetId, { exclude_color: ['red'] });
-        await expectPreview(page, 9);
+        // Not red: the seven other samples that have a colour. Rewritten for contract g7 (one rule everywhere, rule 1.1):
+        // the samples whose colour is null or missing are no longer counted (it was 9).
+        await expectPreview(page, 7);
         const line = sidebar.getByText('Additional filter: color: not red', { exact: true });
         await expect(line).toBeVisible();
         await expect(sidebar.getByRole('combobox', { name: /match mode/ })).toHaveCount(0);
@@ -295,7 +300,9 @@ test.describe('sidebar text combinations', () => {
         await expandField(page, 'color');
         const color = sidebar.getByTestId('field-section-color');
         await color.getByRole('checkbox', { name: '(no value)', exact: true }).check();
-        await expectPreview(page, 2);
+        // Not green, and no value: none. Rewritten for contract g7 (one rule everywhere, rule 1.1): `not in` no longer
+        // keeps the samples with no colour, so none has both (it was 2).
+        await expectPreview(page, 0);
         await expectPersistedFilters(page, datasetId, { [excludeKeyFor('color')]: ['green'], color: { _op: 'is_null' } }, []);
         await color.getByPlaceholder(/color/i).fill('red');
         await color.getByPlaceholder(/color/i).press('Enter');

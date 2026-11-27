@@ -47,6 +47,8 @@ _FILTER_OPS: Dict[str, str] = {
     "not_exists": "not_exists",
     "is_null": "is_null",
     "is_not_null": "is_not_null",
+    "is_empty": "is_empty",
+    "is_not_empty": "is_not_empty",
 }
 
 # Unary operators: the kwarg's bool chooses the polarity, so `reviewed__exists=False` means "the
@@ -56,6 +58,8 @@ _FILTER_UNARY_OPS: Dict[str, tuple] = {
     "not_exists": ("not_exists", "exists"),
     "is_null": ("is_null", "is_not_null"),
     "is_not_null": ("is_not_null", "is_null"),
+    "is_empty": ("is_empty", "is_not_empty"),
+    "is_not_empty": ("is_not_empty", "is_empty"),
 }
 
 
@@ -765,18 +769,24 @@ class Dataset:
             except Exception as e:
                 raise RuntimeError(f"Failed to create dataset: {e}")
 
-    def create_array_field(self, name: str):
-        """Create a new tag-like array field for this dataset.
+    def create_array_field(self, name: str, *, timeout: float = 3600):
+        """Create a list field kept in a column of its own for this dataset.
 
-        Creates a real TEXT[] column with a GIN index on the samples table.
-        Once created, you can set it on samples: sample.my_field = ["val1", "val2"]
+        Creates a real TEXT[] column with a GIN index on the samples table, or registers one another dataset made.
+        Once created, you can set it on samples: sample.my_field = ["val1", "val2"]. A sample never given a list holds
+        no value for it: ``sample.my_field`` is None, apart from an empty list ([]).
+
+        When another dataset made the column and this dataset is large, the server makes the field this dataset's in a
+        job (its empty lists from before become never set first): this waits for it, up to ``timeout`` seconds.
 
         Example:
             dataset.create_array_field("inferred_tags")
             sample.inferred_tags = ["ANIMAL:DOG", "VEHICLE:TRUCK"]
         """
-        result = self.client.create_array_field(self._id, name)
+        result = self.client.create_array_field(self._id, name, timeout=timeout)
         Sample._known_array_fields.add(name)
+        if name not in self._array_field_names:
+            self._array_field_names.append(name)
         return result
 
     def list_array_fields(self) -> list:
@@ -882,10 +892,11 @@ class Dataset:
             heading = row["location"].get("heading")  # the samples endpoints nest it in location
         if heading is not None:
             sample.heading = heading
-        # Populate array fields (uses the cached names — no extra network call)
+        # Populate array fields (uses the cached names — no extra network call): a list, or None for one never set.
         for af in self._array_field_names:
             if af != 'tags' and af in row:
-                sample.array_fields[af] = row[af] or []
+                sample.array_fields[af] = row[af]
+        sample._loaded_unset_arrays = {name for name, value in sample.array_fields.items() if value is None}
         return sample
 
     def get_or_create(self, filepath: str, **kwargs) -> tuple:
@@ -1290,6 +1301,14 @@ class Dataset:
                 groups: Dict[Tuple[bool, bool], List[Dict[str, Any]]] = {}
                 for sample in batch:
                     row = sample.to_dict()
+                    # The source's list fields only (a version's rows carry every list column of the server), each a
+                    # list or, when never set, left out: never set here too (to_dict).
+                    lists = {
+                        name: value for name, value in (row.get("array_fields") or {}).items() if name in array_names
+                    }
+                    row.pop("array_fields", None)
+                    if lists:
+                        row["array_fields"] = lists
                     row["embeddings"] = vectors.get(sample.id)
                     row["hashes"] = hash_values.get(sample.id)
                     moved = orphan = False
@@ -1468,8 +1487,9 @@ class Dataset:
             view = dataset.query("NOT (scene = city OR weather is null)")
 
         Operators: = != > >= < <=, in (...) and not in (...) with commas or spaces between values,
-        contains, between ... and ..., exists, not exists, is null, is not null, with AND, OR, NOT and
-        brackets. AND binds tighter than OR.
+        contains, between ... and ..., exists, not exists, is null, is not null, is empty, is not empty,
+        with AND, OR, NOT and brackets. AND binds tighter than OR. ``is null`` finds no value (never set);
+        ``is empty`` a list that holds nothing, such as ``detections is empty``.
 
         Args:
             query_string: the filter, as text
@@ -1501,7 +1521,8 @@ class Dataset:
             - field__nin=[...] / field__not_in=[...] → not in list
             - field__contains="x" → contains substring
             - field__exists=True   → the metadata key is present (False → absent)
-            - field__is_null=True  → the value is NULL (False → NOT NULL)
+            - field__is_null=True  → no value: missing or null (False → has a value; an empty list is one)
+            - field__is_empty=True → the value is an empty list (False → a value that isn't one)
 
         An unrecognised suffix raises ValueError. It used to fall back to equality, so
         ``filter(brightness__between=[0.3, 0.8])`` quietly became ``brightness = '[0.3, 0.8]'``
@@ -1547,7 +1568,7 @@ class Dataset:
                         f"use a Condition (F({key!r}) == value) or query() instead.",
                     )
                 operator = _FILTER_OPS[op]
-                # exists/is_null are unary on the wire; the kwarg's bool picks the polarity so
+                # exists/is_null/is_empty are unary on the wire; the kwarg's bool picks the polarity so
                 # `reviewed__exists=False` means "the key is absent" rather than "== False".
                 if op in _FILTER_UNARY_OPS:
                     if not isinstance(value, bool):

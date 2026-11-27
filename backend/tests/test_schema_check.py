@@ -3,7 +3,8 @@
 - schema.sql must seed the ledger with the baseline and EVERY migration file the code ships, so a
   fresh install is current and a forgotten entry fails here, not in production.
 - pending_migrations(): files not in the ledger; a database without the ledger table, or without
-  the baseline row, was not created from schema.sql.
+  the baseline row, was not created from schema.sql; a 2.14.0 database still lists what the
+  baseline replaced, and one from before 2.14.0 is upgraded to 2.14.0 first.
 - unknown_migrations(): recorded files the code doesn't ship — the database is newer than the code.
 - stale_functions(): every function body schema.sql defines is fingerprinted against pg_proc —
   the ledger knows which FILES ran, not whether a later re-run undid them (2026-10-10).
@@ -21,6 +22,7 @@ import pytest
 from backend import schema_check
 from backend.schema_check import (
     BASELINE,
+    BEFORE_STOP,
     FUNCTIONS_SQL,
     LEDGER_MISSING,
     NOT_FROM_SCHEMA,
@@ -30,6 +32,7 @@ from backend.schema_check import (
     migration_files,
     pending_migrations,
     stale_functions,
+    stop_ledger,
     unknown_migrations,
 )
 from backend.version import VERSION
@@ -99,6 +102,31 @@ def test_fresh_schema_records_migrations_only_after_all_ddl():
 def test_the_runner_and_the_check_agree_on_the_baseline():
     runner = (ROOT / "scripts" / "apply_migrations.sh").read_text()
     assert f"BASELINE={BASELINE}\n" in runner
+    assert f"STOP_LEDGER={schema_check.STOP_LEDGER.relative_to(ROOT)}\n" in runner
+    assert f"V1_BASELINE={schema_check.V1_BASELINE}\n" in runner
+
+
+def test_the_stop_ledger_is_what_a_2_14_0_database_records():
+    """The 1.0.0 baseline row and the 44 migrations 3.0.0 squashed, none of which this code ships any more."""
+    assert len(stop_ledger()) == 45 and schema_check.V1_BASELINE in stop_ledger()
+    assert not stop_ledger() & set(migration_files())
+
+
+def test_a_2_14_0_ledger_is_pending_the_baseline_and_newer_files(two_migrations):
+    at_stop = _ledger(*stop_ledger(), "0001_a.sql")
+    assert asyncio.run(pending_migrations(at_stop)) == [BASELINE, "0002_b.sql"]
+    assert asyncio.run(unknown_migrations(at_stop)) == []
+    assert asyncio.run(unknown_migrations(_ledger(*stop_ledger(), "0003_newer.sql"))) == ["0003_newer.sql"]
+    msg = schema_check.log_pending([BASELINE, "0002_b.sql"])
+    assert msg and "apply_migrations.sh" in msg
+
+
+def test_a_database_from_before_2_14_0_is_upgraded_to_2_14_0_first(two_migrations):
+    before = _ledger(*(sorted(stop_ledger())[:-1]))
+    assert asyncio.run(pending_migrations(before)) == [BEFORE_STOP]
+    assert asyncio.run(unknown_migrations(before)) == []
+    msg = schema_check.log_pending([BEFORE_STOP])
+    assert msg and "BEFORE 2.14.0" in msg and "v2.14.0" in msg
 
 
 def test_pending_is_the_set_difference(two_migrations):

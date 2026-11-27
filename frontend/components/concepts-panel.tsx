@@ -545,7 +545,7 @@ function ConceptCard({
     const canReset = Math.abs(threshold - initial) > 1e-6; // slider moved off the last applied/saved cut
     const modeBtns = [
         { m: 'off', label: 'off', testid: 'concept-mode-off', title: 'Not applied to the view' },
-        { m: 'exclude', label: 'exclude', testid: 'concept-apply', title: 'Hide the matching images' },
+        { m: 'exclude', label: 'exclude', testid: 'concept-apply', title: 'Hide the matching images, and the images with no score' },
         { m: 'select', label: 'show only', testid: 'concept-show-only', title: 'Show ONLY the matching images' },
         { m: 'sources', label: 'sources', testid: 'concept-mode-sources', title: "Show this concept's defining images in the grid" },
     ] as const;
@@ -716,7 +716,7 @@ function ConceptCard({
                                     by&nbsp;samples
                                 </button>
                                 <span data-testid="concept-hidden-count" className="ml-auto text-cyan-400">
-                                    {preview ? `${preview.matched.toLocaleString()} would be ${mode === 'select' ? 'shown' : 'hidden'}` : '…'}
+                                    {preview ? `${preview.matched.toLocaleString()} would be ${mode === 'select' ? 'shown' : 'hidden, and the images with no score'}` : '…'}
                                 </span>
                                 {canReset && (
                                     <button

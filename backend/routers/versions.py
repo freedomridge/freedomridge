@@ -29,6 +29,7 @@ from ..label_fields import DISCOVERY_TYPES, LEGACY_LABEL_FIELDS, DatasetArrayCol
 from ..request_limits import guest_heavy
 from ..validation import clean_name
 from .datasets import (
+    _SAFE_COLUMN_RE,
     AggregationSpec,
     _derived_field,
     _validate_field_name,
@@ -79,36 +80,16 @@ async def _snapshot_arrays(conn):
     return columns, f'jsonb_build_object({fields})' if fields else "'{}'::jsonb"
 
 
-def _array_field_compare_sql(arr_cols):
-    """Build (diff_sql, same_sql) fragments comparing CURRENT array columns to a
-    version's ``array_fields_snapshot``.
+def _array_field_compare_sql(lists: '_VersionLists'):
+    """(diff_sql, same_sql) fragments comparing the live row `s`'s list fields kept in a column of their own with the
+    version row `v`'s value of them, as the restore writes it (_VersionLists): only the dataset's columns, and a field
+    the dataset has now and didn't have at the version is never set there. ("", "") when there are none.
 
-    Only columns the snapshot actually recorded (key present in
-    ``array_fields_snapshot``) are compared. This is the fix for: an array field
-    ADDED AFTER a snapshot was taken used to make every row diff as 'modified',
-    because the snapshot's object had fewer keys than a freshly-built one. Now a
-    column the snapshot never tracked is simply ignored.
-
-    Column names come from the array-columns registry (validated identifiers,
-    created via create_array_field's _SAFE_COLUMN_RE), so interpolation here is
-    as safe as the surrounding ``s.{col}`` interpolation.
-
-    Returns ("", "") when there are no array columns.
+    Column names come from the array-columns registry (validated identifiers, created via create_array_field's
+    _SAFE_COLUMN_RE), so interpolation here is as safe as the surrounding ``s.{col}`` interpolation.
     """
-    # NB: the jsonb `?` operator returns NULL (not false) when the left side is
-    # SQL NULL, so a wholly-NULL array_fields_snapshot (a snapshot taken when no
-    # array columns existed) must be guarded explicitly — otherwise the boolean
-    # chain goes NULL and silently drops rows from the unchanged tally.
-    diff = ''.join(
-        f" OR (v.array_fields_snapshot IS NOT NULL AND v.array_fields_snapshot ? '{c}' "
-        f"AND v.array_fields_snapshot->'{c}' IS DISTINCT FROM COALESCE(to_jsonb(s.{c}), 'null'::jsonb))"
-        for c in arr_cols
-    )
-    same = ''.join(
-        f" AND (v.array_fields_snapshot IS NULL OR NOT (v.array_fields_snapshot ? '{c}') "
-        f"OR v.array_fields_snapshot->'{c}' IS NOT DISTINCT FROM COALESCE(to_jsonb(s.{c}), 'null'::jsonb))"
-        for c in arr_cols
-    )
+    diff = ''.join(f" OR ({lists.differs(c)})" for c in lists.columns)
+    same = ''.join(f" AND NOT ({lists.differs(c)})" for c in lists.columns)
     return diff, same
 
 
@@ -270,7 +251,10 @@ async def _restore_field_registry(conn, dataset_id: int, version):
                    field_type = EXCLUDED.field_type, display_type = EXCLUDED.display_type,
                    overlay_config = EXCLUDED.overlay_config, origin = EXCLUDED.origin,
                    description = CASE WHEN $3 THEN EXCLUDED.description ELSE dataset_fields.description END,
-                   unit = CASE WHEN $3 THEN EXCLUDED.unit ELSE dataset_fields.unit END""",
+                   unit = CASE WHEN $3 THEN EXCLUDED.unit ELSE dataset_fields.unit END,
+                   -- since when a list field is the dataset's (list_fields.register)
+                   created_at = CASE WHEN EXCLUDED.origin = 'native_array' AND dataset_fields.origin <> 'native_array'
+                                     THEN CURRENT_TIMESTAMP ELSE dataset_fields.created_at END""",
             dataset_id,
             fields,
             described,
@@ -434,14 +418,16 @@ async def _restore_saved_views(conn, dataset_id: int, version_id: int, user: dic
     return restored, removed
 
 
-async def _changed_restore_fields(conn, version_id: int, dataset_id: int, arr_cols, changed_sql: str) -> set:
-    """Names whose values the restore's update will change: metadata keys, tags, media_type and
-    native array columns that differ between a live sample and its row in the version."""
-    array_names = ''.join(
-        f" UNION ALL SELECT '{col}' WHERE v.array_fields_snapshot ? '{col}' "
-        f"AND COALESCE(to_jsonb(s.{col}), 'null'::jsonb) IS DISTINCT FROM v.array_fields_snapshot->'{col}'"
-        for col in arr_cols
-    )
+async def _changed_restore_fields(
+    conn,
+    version_id: int,
+    dataset_id: int,
+    lists: '_VersionLists',
+    changed_sql: str,
+) -> set:
+    """Names whose values the restore's update will change: metadata keys, tags, media_type and the list fields kept
+    in a column of their own whose value differs from the version's (_VersionLists.differs)."""
+    array_names = ''.join(f" UNION ALL SELECT '{col}' WHERE {lists.differs(col)}" for col in lists.columns)
     rows = await conn.fetch(
         f"""SELECT DISTINCT changed.name FROM samples s
             JOIN version_snapshots v ON v.version_id = $1 AND v.sample_id = s.id
@@ -462,6 +448,124 @@ async def _changed_restore_fields(conn, version_id: int, dataset_id: int, arr_co
         timeout=600,
     )
     return {row['name'] for row in rows}
+
+
+class _VersionLists:
+    """A version's value of each list field kept in a column of its own (docs/SDK.md, "List fields"): the one reading
+    of it. The restore writes it; the status, the diff of the live rows against the version, the compare of two
+    versions and the lists of changed samples compare by it; and the version's rows as browsed, filtered, counted and
+    aggregated hold it (_version_lists makes it).
+
+    - A field the version had as one of the dataset's list fields (`had`): the list the version's row holds, or never
+      set where it holds none or has no key for it (a column made after the version). Also where the dataset has
+      dropped the field since.
+    - A field the dataset has now and didn't have then: never set.
+    - Any other column (one this dataset neither had then nor registers now) holds no value of this dataset's: it isn't
+      written, compared or given back. A version records every list column of the table, the dataset's or not.
+
+    Which columns count is known once for the version, so the SQL reads no more of a row than its keys.
+    """
+
+    def __init__(self, had: set, registered: set, arr_cols: list):
+        self.had = had
+        # The dataset's list fields, at the version or now: what a version's rows hold, read from the record alone.
+        self.fields = sorted(had | set(registered))
+        # Those of them the samples table has a column for: what the readers of the live rows compare and write.
+        self.columns = [col for col in self.fields if col in arr_cols]
+
+    def saved(self, col: str, snap: str = 'v') -> str:
+        """The version's value as JSON, from its row `snap`: the list it holds, or null (never set)."""
+        if col not in self.had:
+            return "'null'::jsonb"
+        return (
+            f"(CASE WHEN jsonb_typeof({snap}.array_fields_snapshot->'{col}') = 'array' "
+            f"THEN {snap}.array_fields_snapshot->'{col}' ELSE 'null'::jsonb END)"
+        )
+
+    def saved_object(self, snap: str = 'v') -> str:
+        """The version's list fields as one JSON object from its row `snap`: each of `fields` with its value (null for
+        never set). What a version's row gives back as its `array_fields`."""
+        if not self.fields:
+            return "'{}'::jsonb"
+        return 'jsonb_build_object(' + ', '.join(f"'{col}', {self.saved(col, snap)}" for col in self.fields) + ')'
+
+    def value(self, col: str) -> str:
+        """The version's value as the column holds it (TEXT[], NULL for never set), from its row `v`: what the restore
+        writes, and what the version's rows hold when they are filtered."""
+        if col not in self.had:
+            return 'NULL::text[]'
+        return (
+            f"CASE WHEN jsonb_typeof(v.array_fields_snapshot->'{col}') = 'array' "
+            f"THEN ARRAY(SELECT jsonb_array_elements_text(v.array_fields_snapshot->'{col}')) END"
+        )
+
+    def differs(self, col: str, snap: str = 'v', live: str = 's') -> str:
+        """The live row `live` holds something else than the version's value: never NULL, so its NOT is the same."""
+        if col not in self.had:
+            return f"{live}.{col} IS NOT NULL"
+        return f"COALESCE(to_jsonb({live}.{col}), 'null'::jsonb) IS DISTINCT FROM {self.saved(col, snap)}"
+
+
+async def _registered_lists(conn, dataset_id: int) -> dict:
+    """The dataset's list fields kept in a column of their own now, each with when it registered it."""
+    return {
+        row['field_name']: row['created_at']
+        for row in await conn.fetch(
+            "SELECT field_name, created_at FROM dataset_fields WHERE dataset_id = $1 AND origin = 'native_array'",
+            dataset_id,
+        )
+    }
+
+
+async def _version_lists(conn, dataset_id: int, version, arr_cols, registered: Optional[dict] = None) -> _VersionLists:
+    """The version's list fields (_VersionLists) for `version` (a row with its dataset_snapshot and created_at).
+
+    The version had a field as the dataset's when its record of the dataset's fields lists it as a list field. A version
+    that did not record the field registry (its raw dataset_snapshot carries no field_registry_version, or it has none:
+    one from before versions recorded it, or a hash-only one) and lists no list field had the field when the dataset's
+    registration of it is older than the version (dataset_fields.created_at: a later registration does not move it,
+    and one that takes over a row of another kind sets it). A version that recorded the registry had exactly the list
+    fields it lists, none included. `registered`: the dataset's list fields now (_registered_lists), when the caller
+    has them."""
+    if registered is None:
+        registered = await _registered_lists(conn, dataset_id)
+    snapshot = version['dataset_snapshot']
+    had: set = set()
+    if snapshot is not None:
+        normalized = await conn.fetchval('SELECT normalize_dataset_snapshot($1::jsonb)', snapshot)
+        had = {field['field_name'] for field in normalized['fields'] if field.get('origin') == 'native_array'}
+    if not had and (snapshot is None or snapshot.get('field_registry_version') is None):
+        had = {
+            name
+            for name, created in registered.items()
+            if created is not None and version['created_at'] is not None and created < version['created_at']
+        }
+    # Names go into SQL: only those a list column can have (a dataset's are made through create_array_field's check).
+    # Tags are read apart (_tags_compare_sql).
+    had = {name for name in had if isinstance(name, str) and _SAFE_COLUMN_RE.match(name) and name != 'tags'}
+    now = {name for name in registered if _SAFE_COLUMN_RE.match(name) and name != 'tags'}
+    return _VersionLists(had, now, list(arr_cols))
+
+
+async def _lists_of_version(conn, dataset_id: int, version_id: int, arr_cols=None) -> _VersionLists:
+    """_version_lists for a version known by its id (one of this dataset's), over every list column there is."""
+    version = await conn.fetchrow(
+        'SELECT dataset_snapshot, created_at FROM dataset_versions WHERE id = $1 AND dataset_id = $2',
+        version_id,
+        dataset_id,
+    )
+    if arr_cols is None:
+        arr_cols, _ = await _snapshot_arrays(conn)
+    return await _version_lists(conn, dataset_id, version, arr_cols)
+
+
+async def _pair_lists(conn, dataset_id: int, version_a: int, version_b: int) -> tuple[_VersionLists, _VersionLists]:
+    """_lists_of_version for each of two versions compared."""
+    arr_cols, _ = await _snapshot_arrays(conn)
+    return (
+        await _lists_of_version(conn, dataset_id, version_a, arr_cols),
+        await _lists_of_version(conn, dataset_id, version_b, arr_cols),
+    )
 
 
 async def _invalidate_restored_statistics(conn, dataset_id: int, affected=None):
@@ -584,21 +688,19 @@ def _tags_compare_two_snapshots_sql(a='a', b='b'):
     return diff, same
 
 
-def _array_fields_compare_two_snapshots_sql(a='a', b='b'):
-    """(diff, same) array-field fragments for SNAPSHOT-vs-SNAPSHOT diffs.
-
-    Pair diffs used to skip array fields entirely, so an array-only edit between
-    two versions counted as unchanged. A column is compared only when BOTH
-    snapshots recorded it (key present) — same untracked-facet guard as
-    _array_field_compare_sql — and the pair are exact boolean complements, so
-    modified/unchanged still partition the "in both" set.
+def _array_fields_compare_two_snapshots_sql(first: '_VersionLists', second: '_VersionLists', a='a', b='b'):
+    """(diff, same) list-field fragments for SNAPSHOT-vs-SNAPSHOT diffs: each version's value as a restore of it
+    writes it (_VersionLists), each by what IT had as the dataset's list fields; a field one had and the other didn't
+    is never set in the other. A column neither had holds no value of the dataset's in either, and isn't compared.
+    The pair are exact boolean complements (neither side is ever NULL), so modified/unchanged still partition the
+    "in both" set.
     """
-    different = (
-        f"EXISTS (SELECT 1 FROM jsonb_each({a}.array_fields_snapshot) AS saved_field "
-        f"WHERE {b}.array_fields_snapshot ? saved_field.key "
-        f"AND saved_field.value IS DISTINCT FROM {b}.array_fields_snapshot->saved_field.key)"
-    )
-    return f" OR {different}", f" AND NOT {different}"
+    # From the two records alone: a column the table no longer has still compares.
+    compared = sorted(first.had | second.had)
+    if not compared:
+        return '', ''
+    different = ' OR '.join(f"{first.saved(col, a)} IS DISTINCT FROM {second.saved(col, b)}" for col in compared)
+    return f" OR ({different})", f" AND NOT ({different})"
 
 
 @router.get("/status")
@@ -635,6 +737,7 @@ async def _version_status(conn, id: int):
     current_settings = await conn.fetchval(_dataset_snapshot_sql('$1'), id)
     current_views = _saved_views_sql('$2')
     arr_cols, _ = await _snapshot_arrays(conn)
+    registered = await _registered_lists(conn, id)
     for v in versions:
         if v['sample_count'] != current_count:
             continue
@@ -652,9 +755,8 @@ async def _version_status(conn, id: int):
         geo_diff, _ = _geo_compare_sql((v['snapshot_format'] or 1) >= EXACT_GEO_FORMAT)
         media_diff, _ = _media_compare_sql()
 
-        # Build array field comparison
-
-        af_check, _ = _array_field_compare_sql(arr_cols)
+        # The list fields as the version had them (the restore's reading)
+        af_check, _ = _array_field_compare_sql(await _version_lists(conn, id, v, arr_cols, registered))
         tags_check, _ = _tags_compare_sql('v', 's')
 
         # EXISTS short-circuits on first mismatch
@@ -986,10 +1088,10 @@ async def get_version_samples(
         await _verify_versions(id, base)
         if diff_target is not None:
             await _verify_versions(id, diff_target)
-            selection = await _pair_diff_select_sql(change_type)
+            selection = await _pair_diff_select_sql(change_type, id, base, diff_target)
             args.extend([base, diff_target])
         else:
-            selection = await _current_diff_select_sql(change_type, await _exact_geo(base))
+            selection = await _current_diff_select_sql(change_type, await _exact_geo(base), id, base)
             args.extend([base, id])
         selection = selection.replace('$2', '$3').replace('$1', '$2')
         conditions.append(f"v.sample_id IN ({selection})")
@@ -1018,15 +1120,24 @@ async def get_version_samples(
     args.extend([limit, offset])
     paging = f"ORDER BY v.sample_id LIMIT ${len(args) - 1} OFFSET ${len(args)}"
     if full:
+        # The version's list fields as it had them (_VersionLists), read from its rows alone: built for the page's rows
+        # only, outside the paging (the rows an OFFSET passes over would build them too).
+        lists = await _version_lists(db, id, version, ())
         rows = await db.fetch(
             f"""
-            SELECT v.sample_id as id, v.filepath, v.metadata, v.tags,
-                   v.media_type, v.array_fields_snapshot as array_fields,
-                   ST_X(v.location::geometry) as lon,
-                   ST_Y(v.location::geometry) as lat,
-                   v.heading, v.created_at, v.last_modified_at
-            FROM version_snapshots v
-            WHERE {where} {paging}
+            SELECT page.id, page.filepath, page.metadata, page.tags, page.media_type,
+                   {lists.saved_object('page')} as array_fields,
+                   page.lon, page.lat, page.heading, page.created_at, page.last_modified_at
+            FROM (
+                SELECT v.sample_id as id, v.filepath, v.metadata, v.tags,
+                       v.media_type, v.array_fields_snapshot,
+                       ST_X(v.location::geometry) as lon,
+                       ST_Y(v.location::geometry) as lat,
+                       v.heading, v.created_at, v.last_modified_at
+                FROM version_snapshots v
+                WHERE {where} {paging}
+            ) page
+            ORDER BY page.id
         """,
             *args,
         )
@@ -1094,19 +1205,22 @@ async def _queryable_version(id: int, version_id: int) -> dict:
     return version
 
 
-async def _version_columns(id: int, version: dict) -> DatasetArrayColumns:
+async def _version_columns(id: int, version: dict, lists: _VersionLists) -> DatasetArrayColumns:
     """The field context a version's rows are read with: the fields the version stored, not today's.
 
     Which dotted paths are list elements (``animals.label``) depends on the declared fields. Taken
     from the live registry, a version's answer changed when the live dataset did: clearing a list
     field, or the next statistics refresh after its last value went, made the same query on an
-    unchanged version match nothing. Only the declarations are the version's: the physical array
-    columns (the snapshot's stored arrays are rebuilt into them) and anything else the context holds
-    about the dataset as it is now stay the live context's. A snapshot from before the field registry
-    (no ``field_registry_version``) kept no reliable field list and reads with the live one, as before.
+    unchanged version match nothing. Only the declarations are the version's: the list fields kept in a
+    column of their own are the version's as _VersionLists reads them (`lists`: the snapshot's stored
+    arrays are rebuilt into them), and anything else the context holds about the dataset as it is now
+    stays the live context's. A snapshot from before the field registry (no ``field_registry_version``)
+    kept no reliable field list and reads with the live one, as before.
     """
     live = await get_dataset_array_columns(id)
     columns = copy.copy(live)
+    columns.clear()
+    columns.update(live & {'tags'}, lists.fields)
     # A version's rows are read from a CTE, which no index serves: its datetimes take the unindexed form.
     columns.promoted_datetime = set()
     snapshot = version.get('dataset_snapshot') or {}
@@ -1130,25 +1244,24 @@ async def _version_query(
 
     The WITH clause names a CTE ``samples`` holding the version's rows under the live column names, so
     the live filter compiler and aggregations run on it unchanged: ``id`` is the sample id,
-    ``dataset_id`` the dataset, and each registered array field is rebuilt from the snapshot's
-    ``array_fields_snapshot`` (NULL where the version never recorded it). The CTE is referenced once per
-    statement, so PostgreSQL inlines it and only computes the columns a query touches. Label paths are
-    read with the version's own fields (_version_columns).
+    ``dataset_id`` the dataset, and each of the version's list fields (_VersionLists: the version's list
+    where it had the field, never set where the dataset has it now and didn't then) is rebuilt from the
+    snapshot's ``array_fields_snapshot``, which the CTE holds as those fields alone. The CTE is
+    referenced once per statement, so PostgreSQL inlines it and only computes the columns a query
+    touches. Label paths are read with the version's own fields (_version_columns).
     """
     version = await _queryable_version(id, version_id)
     if filters:
         _reject_live_only_filters(filters)
-    array_columns = await _version_columns(id, version)
-    stored = [c for c in sorted(array_columns & await get_array_columns()) if c != 'tags']
-    rebuilt = ''.join(
-        f", CASE WHEN jsonb_typeof(v.array_fields_snapshot->'{c}') = 'array' "
-        f"THEN ARRAY(SELECT jsonb_array_elements_text(v.array_fields_snapshot->'{c}')) END AS {c}"
-        for c in stored
-    )
+    # Read from the version's rows alone: no column of the live table is needed.
+    lists = await _version_lists(db, id, version, ())
+    array_columns = await _version_columns(id, version, lists)
+    stored = lists.fields
+    rebuilt = ''.join(f", {lists.value(c)} AS {c}" for c in stored)
     with_clause = (
         f"WITH samples AS (SELECT v.sample_id AS id, {int(id)} AS dataset_id, v.filepath, v.metadata, v.tags, "
         f"v.media_type, v.location, ST_X(v.location) AS lon, ST_Y(v.location) AS lat, v.heading, v.created_at, "
-        f"v.last_modified_at, v.array_fields_snapshot{rebuilt} "
+        f"v.last_modified_at, {lists.saved_object('v')} AS array_fields_snapshot{rebuilt} "
         f"FROM version_snapshots v WHERE v.version_id = {int(version_id)}) "
     )
     # A region filter tests each row's location: a join to the samples table would read today's locations.
@@ -1281,7 +1394,7 @@ async def _diff_versions(conn, id: int, version_a: int, version_b: int):
             raise HTTPException(status_code=404, detail=f"Version {vid} not found")
 
     tags_ab_diff, tags_ab_same = _tags_compare_two_snapshots_sql('a', 'b')
-    af_ab_diff, af_ab_same = _array_fields_compare_two_snapshots_sql('a', 'b')
+    af_ab_diff, af_ab_same = _array_fields_compare_two_snapshots_sql(*await _pair_lists(conn, id, version_a, version_b))
     geo_diff, geo_same = _pair_geo_compare_sql()
     media_diff, media_same = _media_compare_sql('a', 'b', pair=True)
 
@@ -1361,7 +1474,7 @@ async def _diff_versions(conn, id: int, version_a: int, version_b: int):
     }
 
 
-async def _pair_diff_select_sql(change_type: str) -> str:
+async def _pair_diff_select_sql(change_type: str, dataset_id: int, version_a: int, version_b: int) -> str:
     """Inner SELECT returning `sample_id` for a version-pair diff.
     Params: $1=version_a, $2=version_b. No ORDER/LIMIT (caller appends)."""
     if change_type == "added":
@@ -1376,7 +1489,9 @@ async def _pair_diff_select_sql(change_type: str) -> str:
         )
     if change_type == "modified":
         tags_ab_diff, _ = _tags_compare_two_snapshots_sql('a', 'b')
-        af_ab_diff, _ = _array_fields_compare_two_snapshots_sql('a', 'b')
+        af_ab_diff, _ = _array_fields_compare_two_snapshots_sql(
+            *await _pair_lists(db, dataset_id, version_a, version_b),
+        )
         geo_diff, _ = _pair_geo_compare_sql()
         media_diff, _ = _media_compare_sql('a', 'b', pair=True)
         return (
@@ -1423,7 +1538,7 @@ async def diff_samples(
     change_type: 'added', 'removed', 'modified'
     """
     await _verify_versions(id, version_a, version_b)
-    sel = await _pair_diff_select_sql(change_type)
+    sel = await _pair_diff_select_sql(change_type, id, version_a, version_b)
     rows = await db.fetch(
         f"{sel} ORDER BY sample_id LIMIT $3 OFFSET $4",
         version_a,
@@ -1439,7 +1554,7 @@ async def diff_pair_select(id: int, version_a: int, version_b: int, change_type:
     """Materialize ALL changed sample_ids for a version-pair diff into a
     region_selections token (no id list to the client). Returns {token, total}."""
     await _verify_versions(id, version_a, version_b)
-    sel = await _pair_diff_select_sql(change_type)
+    sel = await _pair_diff_select_sql(change_type, id, version_a, version_b)
     return await _materialize_selection(sel, version_a, version_b)
 
 
@@ -1485,9 +1600,8 @@ async def _diff_current(conn, id: int, version_id: int):
         id,
     )
 
-    # Build array field + tags comparisons for diff
-    arr_cols, _ = await _snapshot_arrays(conn)
-    af_diff, af_same = _array_field_compare_sql(arr_cols)
+    # Build array field + tags comparisons for diff: the list fields as the version had them (the restore's reading)
+    af_diff, af_same = _array_field_compare_sql(await _lists_of_version(conn, id, version_id))
     tags_diff, tags_same = _tags_compare_sql('v', 's')
     geo_diff, geo_same = _geo_compare_sql(exists >= EXACT_GEO_FORMAT)
     media_diff, media_same = _media_compare_sql()
@@ -1612,8 +1726,8 @@ async def _restore_version(
     # Verify version exists and has full metadata
     version = await db.fetchrow(
         """
-        SELECT id, name, include_metadata, sample_count, snapshot_format, dataset_snapshot FROM dataset_versions
-        WHERE id = $1 AND dataset_id = $2
+        SELECT id, name, include_metadata, sample_count, snapshot_format, dataset_snapshot, created_at
+        FROM dataset_versions WHERE id = $1 AND dataset_id = $2
     """,
         version_id,
         id,
@@ -1739,18 +1853,10 @@ async def _restore_version(
                 )
                 removed = int(delete_status.split()[-1])
 
-            # Revert metadata, tags, and array fields. Array columns the snapshot
-            # never recorded (added after it was taken) are left as-is — never
-            # wiped — consistent with the diff now ignoring them.
-            af_set_clauses = ""
-            if arr_cols:
-                af_set_clauses = ",\n                " + ",\n                ".join(
-                    f"{col} = CASE WHEN v.array_fields_snapshot ? '{col}' "
-                    f"THEN CASE WHEN jsonb_typeof(v.array_fields_snapshot->'{col}') = 'array' "
-                    f"THEN ARRAY(SELECT jsonb_array_elements_text(v.array_fields_snapshot->'{col}')) ELSE NULL END "
-                    f"ELSE s.{col} END"
-                    for col in arr_cols
-                )
+            # Revert metadata, tags, and the list fields: each as _restored_lists says (the version's list where the
+            # version had the field as the dataset's, never set where the dataset has it now and didn't then).
+            lists = await _version_lists(conn, id, version, arr_cols)
+            af_set_clauses = ''.join(f",\n                {col} = {lists.value(col)}" for col in lists.columns)
 
             # A format-2 snapshot recorded every row's geo, so its NULL is restored as NULL; an
             # older one never recorded geo and keeps the live value.
@@ -1761,11 +1867,7 @@ async def _restore_version(
                 geo_set = "location = COALESCE(v.location, s.location), heading = COALESCE(v.heading, s.heading)"
             geo_diff, _ = _geo_compare_sql(exact_geo)
             media_diff, _ = _media_compare_sql()
-            af_diff = "".join(
-                f" OR (v.array_fields_snapshot ? '{col}' AND COALESCE(to_jsonb(s.{col}), 'null'::jsonb) "
-                f"IS DISTINCT FROM v.array_fields_snapshot->'{col}')"
-                for col in arr_cols
-            )
+            af_diff, _ = _array_field_compare_sql(lists)
             # Only a row the revert actually changes is stamped modified — and by whom. It stamped
             # every snapshotted row NOW() with no author, so "recently modified" and the modified-by
             # filter meant nothing after a revert. Every row is still written, so
@@ -1779,7 +1881,7 @@ async def _restore_version(
             affected = (
                 None
                 if exact_membership or restore_deleted
-                else await _changed_restore_fields(conn, version_id, id, arr_cols, changed)
+                else await _changed_restore_fields(conn, version_id, id, lists, changed)
             )
             update_status = await conn.execute(
                 f"""
@@ -1810,13 +1912,8 @@ async def _restore_version(
                 # back 'unknown'); only older snapshots still guess. If another sample
                 # reoccupied the filepath since, that row is skipped (the
                 # filepath "exists again"); the count reflects actual inserts.
-                af_insert_cols = ''.join(f", {col}" for col in arr_cols)
-                af_insert_vals = ''.join(
-                    f", CASE WHEN jsonb_typeof(v.array_fields_snapshot->'{col}') = 'array' "
-                    f"THEN ARRAY(SELECT jsonb_array_elements_text(v.array_fields_snapshot->'{col}')) "
-                    f"ELSE NULL END"
-                    for col in arr_cols
-                )
+                af_insert_cols = ''.join(f", {col}" for col in lists.columns)
+                af_insert_vals = ''.join(f", {lists.value(col)}" for col in lists.columns)
                 conflict = (
                     '' if exact_membership else 'ON CONFLICT ON CONSTRAINT samples_dataset_filepath_unique DO NOTHING'
                 )
@@ -1882,7 +1979,7 @@ async def _restore_version(
     }
 
 
-async def _current_diff_select_sql(change_type: str, exact_geo: bool) -> str:
+async def _current_diff_select_sql(change_type: str, exact_geo: bool, dataset_id: int, version_id: int) -> str:
     """Inner SELECT returning `sample_id` for a vs-current diff.
     Params: $1=version_id, $2=dataset_id. No ORDER/LIMIT (caller appends)."""
     if change_type == "added":
@@ -1899,8 +1996,7 @@ async def _current_diff_select_sql(change_type: str, exact_geo: bool) -> str:
         # SAME comparison (incl. location/heading) as diff_current's count so the
         # listing can't disagree with the badge — omitting geo here made a
         # location-only or heading-only change count as modified but never list.
-        arr_cols = sorted(await get_array_columns() - {'tags'})
-        af_diff, _ = _array_field_compare_sql(arr_cols)
+        af_diff, _ = _array_field_compare_sql(await _lists_of_version(db, dataset_id, version_id))
         tags_diff, _ = _tags_compare_sql('v', 's')
         geo_diff, _ = _geo_compare_sql(exact_geo)
         media_diff, _ = _media_compare_sql()
@@ -1926,7 +2022,7 @@ async def diff_current_samples(
 ):
     """Get sample IDs for a specific change type vs current state (paged)."""
     await _verify_versions(id, version_id)
-    sel = await _current_diff_select_sql(change_type, await _exact_geo(version_id))
+    sel = await _current_diff_select_sql(change_type, await _exact_geo(version_id), id, version_id)
     rows = await db.fetch(f"{sel} ORDER BY sample_id LIMIT $3 OFFSET $4", version_id, id, min(limit, 10000), offset)
     return {"sample_ids": [r['sample_id'] for r in rows]}
 
@@ -1936,5 +2032,5 @@ async def diff_current_select(id: int, version_id: int, change_type: str = "adde
     """Materialize ALL changed sample_ids (vs current) into a region_selections
     token (no id list to the client). Returns {token, total}."""
     await _verify_versions(id, version_id)
-    sel = await _current_diff_select_sql(change_type, await _exact_geo(version_id))
+    sel = await _current_diff_select_sql(change_type, await _exact_geo(version_id), id, version_id)
     return await _materialize_selection(sel, version_id, id)

@@ -354,9 +354,10 @@ export function withGrain(
     if (baseFilters.length === 0) {
         return { logic: 'AND', filters: grainPredicate(grain, pivot) };
     }
-    // A dataset with no object rows can't cross-link, so emit the plain grain-filtered query —
-    // this keeps NULL-tolerant negation intact for ordinary image datasets and only
-    // applies the cross-grain link (with its presence guard) where objects actually exist.
+    // A dataset with no object rows can't cross-link, so emit the plain grain-filtered query: each
+    // row is read on its own, by the same rule for a missing value as the wrapped form below (a
+    // negation shows only the rows that have a value, docs/FILTER_QUERY.md), and the cross-grain
+    // link is applied only where objects actually exist.
     if (!hasObjects) {
         return { logic: 'AND', filters: [...grainPredicate(grain, pivot), ...baseFilters] };
     }
@@ -372,10 +373,9 @@ export function withGrain(
     const fieldGrain = (f: string | undefined): Grain => (f === 'clip_obj' ? 'object' : 'image');
     const isOffGrainEmb = (f: ComplexFilter): boolean =>
         f.operator === 'embedding_polygon' && fieldGrain(f.field) !== grain;
-    // An excluded region (a map region, a named region or a lasso, excluded) keeps the rows with no location or no
-    // point on its map. Coupled like the other leaves, such a row on the partner grain (an object with no point on an
-    // image map) would vacuously let its partner through. So it is coupled as NOT (the row or its partner is inside the
-    // region).
+    // An excluded region (a map region, a named region or a lasso, excluded) is coupled as NOT (the row or its partner
+    // is inside the region), which the server reads for the row as a whole: it or its partner has a location (or a
+    // point on the region's map) and neither is inside (backend/grain_reading.py).
     // A filter card saved from its Builder tab wraps the exclusion in an AND group of one rule: it is the same filter and
     // the same chip, so it is coupled as the bare one is (soleRule).
     const isRegionExclude = (f: ComplexFilter): boolean => {
@@ -428,6 +428,25 @@ export function withGrain(
         });
     }
     return { logic: 'AND', filters: parts };
+}
+
+// The view every reader of the filter sidebar is given (one way, over withGrain): the applied stages, the pending
+// selections the page passes (with lightning mode off) and, for the value picker, the other fields' unapplied ticks (as
+// convertSimpleFiltersToComplex gives them: one rule, or an AND of several), all inside the image grain's wrapping, as
+// the grid would read them applied. The page passes the list and the range its four pending selections (a brushed set,
+// the ticked grid rows, a drawn polygon, a lasso) and no ticks; the picker what the grid previews (the brushed set, the
+// polygon, the lasso: not the ticked rows, which the grid doesn't filter by) and the ticks.
+// So the grain's kind is at the top of its AND, where the server reads a field's values from the rows that have it
+// (docs/FILTER_QUERY.md, "A field's values"). On a dataset without objects it is the plain AND, as before.
+export function sidebarView(
+    applied: ComplexFilter,
+    pending: ComplexFilter[],
+    ticks: ComplexFilter | null,
+    hasObjects: boolean,
+): ComplexFilter {
+    const anAnd = ticks !== null && ticks.field === undefined && (ticks.logic ?? 'AND') === 'AND';
+    const tickParts = ticks === null ? [] : anAnd ? ticks.filters ?? [] : [ticks];
+    return withGrain({ logic: 'AND', filters: [...(applied.filters || []), ...pending, ...tickParts] }, 'image', null, hasObjects);
 }
 
 // `search`: the query the router opened the page with, read once by the page (not window.location: after login the app

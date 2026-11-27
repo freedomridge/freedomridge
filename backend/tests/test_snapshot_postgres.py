@@ -98,8 +98,18 @@ async def snapshot(name):
     return (await versions.create_version(1, versions.CreateVersionRequest(name=name)))['id']
 
 
+async def register_list_column(database):
+    """Dataset 1 registers the list column the fixture made, from before any version the test takes: a version holds
+    a list column's values only for a list field the dataset had then."""
+    await database.execute(
+        "INSERT INTO dataset_fields (dataset_id, field_name, field_type, origin, is_promoted, created_at) "
+        "VALUES (1, 'inferred_tags', 'list', 'native_array', TRUE, CURRENT_TIMESTAMP - interval '1 day')",
+    )
+
+
 def test_checkout_survives_changes_and_deletion(snapshot_database):
     async def scenario(database):
+        await register_list_column(database)
         sample_id = await add_sample(database)
         await database.execute(
             "UPDATE datasets SET segmentation_config = '{\"default_mask_targets\":{\"1\":\"car\"}}'",
@@ -125,7 +135,7 @@ def test_checkout_survives_changes_and_deletion(snapshot_database):
         assert (await versions.get_version_samples(1, version_id, full=True))['items'] == [original]
         info = await versions.get_version(1, version_id)
         assert info['dataset_snapshot']['segmentation_config']['default_mask_targets'] == {'1': 'car'}
-        assert info['dataset_snapshot']['fields'][0]['field_name'] == 'mask'
+        assert 'mask' in {field['field_name'] for field in info['dataset_snapshot']['fields']}
         from backend.main import _build_media_path_sql
 
         media = await database.fetchrow(_build_media_path_sql('mask.maskPath', versioned=True), sample_id, version_id)
@@ -152,6 +162,7 @@ def test_checkout_survives_changes_and_deletion(snapshot_database):
 )
 def test_diffs_and_changed_sample_lists_agree(snapshot_database, assignment):
     async def scenario(database):
+        await register_list_column(database)
         sample_id = await add_sample(database)
         before = await snapshot('before')
         await database.execute(f'UPDATE samples SET {assignment}')
@@ -312,10 +323,12 @@ def test_snapshot_has_one_consistent_state_during_ingest(snapshot_database, monk
 
 def test_historical_arrays_survive_registry_removal(snapshot_database):
     async def scenario(database):
+        await register_list_column(database)
         sample_id = await add_sample(database)
         before = await snapshot('before')
         await database.execute("UPDATE samples SET inferred_tags = ARRAY['changed']")
         after = await snapshot('after')
+        await database.execute("DELETE FROM dataset_fields WHERE dataset_id = 1 AND field_name = 'inferred_tags'")
         await database.execute("DELETE FROM sample_array_columns WHERE column_name = 'inferred_tags'")
         await database.execute('ALTER TABLE samples DROP COLUMN inferred_tags')
         assert (await versions.diff_versions(1, before, after))['modified'] == 1

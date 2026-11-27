@@ -6,8 +6,9 @@ and backend/tests/shard_timings.json (each file's seconds in a full run): larges
 least time so far. A file missing from the timings counts as the median file. Stale timings only unbalance the
 shards; every collected file still runs in exactly one of them.
 
-Refresh the timings after a full run with `pytest --junitxml=<file>`:
-    python -m scripts.backend_test_shards <file>
+Refresh the timings after a full run with `pytest --junitxml=<file>`, or from the reports a sharded run leaves, one
+for each shard (scripts/ci_local.sh puts them beside its logs):
+    python -m scripts.backend_test_shards <file> [<file> ...]
 """
 
 import json
@@ -45,21 +46,23 @@ def load_timings() -> dict[str, float]:
     return json.loads(TIMINGS.read_text())
 
 
-def timings_from_junit(path: str) -> dict[str, float]:
-    """Seconds per test file from a pytest JUnit XML report of the backend suite."""
+def timings_from_junit(*paths: str) -> dict[str, float]:
+    """Seconds per test file from pytest JUnit XML reports of the backend suite: one of a whole run, or one for each
+    shard of a run."""
     files: dict[str, float] = defaultdict(float)
-    for case in ET.parse(path).iter('testcase'):
-        # A module skipped as a whole has an empty classname and the module as its name.
-        parts = (case.get('classname') or case.get('name') or '').split('.')
-        if parts[:2] != ['backend', 'tests'] or len(parts) < 3:
-            raise ValueError(f'not a backend test: {case.get("classname")!r} {case.get("name")!r}')
-        files[f'backend/tests/{parts[2]}.py'] += float(case.get('time') or 0)
+    for path in paths:
+        for case in ET.parse(path).iter('testcase'):
+            # A module skipped as a whole has an empty classname and the module as its name.
+            parts = (case.get('classname') or case.get('name') or '').split('.')
+            if parts[:2] != ['backend', 'tests'] or len(parts) < 3:
+                raise ValueError(f'not a backend test: {case.get("classname")!r} {case.get("name")!r}')
+            files[f'backend/tests/{parts[2]}.py'] += float(case.get('time') or 0)
     return {name: round(seconds, 1) for name, seconds in sorted(files.items())}
 
 
 if __name__ == '__main__':
-    if len(sys.argv) != 2:
-        sys.exit('Usage: python -m scripts.backend_test_shards <pytest JUnit XML of a full backend run>')
-    timings = timings_from_junit(sys.argv[1])
+    if len(sys.argv) < 2:
+        sys.exit('Usage: python -m scripts.backend_test_shards <pytest JUnit XML of a full backend run> [...]')
+    timings = timings_from_junit(*sys.argv[1:])
     TIMINGS.write_text(json.dumps(timings, indent=0, sort_keys=True) + '\n')
     print(f'{TIMINGS}: {len(timings)} files, {sum(timings.values()) / 60:.1f} minutes')

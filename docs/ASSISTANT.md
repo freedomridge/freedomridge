@@ -239,7 +239,8 @@ administrator relying on it should know an editor can undo it.
 `salary > 100000` finds every value by halving. So a tool may test a private field only for having a value (`exists`,
 `not_exists`), and for being, or not being, one of the values of a value list the server keeps, which the model holds
 only a handle to. Comparing it with a value the model wrote is refused, even for equality, and so are ranges,
-`contains`, sorting by it, a histogram of it, and its minimum, maximum, mean or quantiles. The refusal says why and
+`contains`, `is empty` (an empty list is one of its values), sorting by it, a histogram of it, and its minimum,
+maximum, mean or quantiles. The refusal says why and
 what works instead, in the same words whatever value was asked about. People in the app are not affected.
 
 What a model can still learn about a private field, by design:
@@ -504,10 +505,16 @@ objects carry has no values.
 
 - **`make_view`** (`dataset`, `filter`): filter text in the [filter language](FILTER_QUERY.md); each top-level AND part
   is a stage. Answers the handle, the exact `count`, `filter` and each stage's `text` as the server read them, and a
-  `link`.
+  `link`. The instructions tell the model that `is null` finds the samples with no value for a field (never set),
+  `is empty` those whose list holds nothing, which is a value (`detections is empty`), and `is not empty` those whose
+  value is not an empty list, and that the samples with no tags are `tags is null`
+  ([no value and an empty list](FILTER_QUERY.md#no-value-and-an-empty-list)).
 - **`refine_view`** (`view`, and any of `add`, `remove`, `negate`, `in_list`, `not_in_list`, applied in that order):
   add text as stages, drop or turn around stages by their number, or keep (or remove) the samples whose field has a
   value in a value list (`{"field", "list"}`). Answers the new view with `from`. Negating twice gives the original.
+  A turned-around stage and `not_in_list` follow the filter language's rule for a negation
+  ([FILTER_QUERY.md](FILTER_QUERY.md#operators)): they keep only the samples that have a value for the field, so
+  turning around `split = "train"` keeps the samples with another `split`, and not those with none.
 - **`field_values`** (`view` or `dataset`, `field`, `search`, `limit` up to 50, `offset`): the field's distinct values
   among the view's samples with their counts, commonest first (ties by value), a page at a time, with `distinct` (how
   many in all) and `samples_with_value`. For a list field (tags) a value is one element. It keeps the whole list under
@@ -575,7 +582,8 @@ a private field's values kept back) or by a fixed phrase for a stage with no tex
 **`find_place`** (`text`, `limit` 1 to 10): the regions of the loaded boundary set whose name or key matches, best
 first (`GET /api/regions`, the search the app's filter text uses for names), with `total`. Each has `key`, `name`,
 `kind` (`country`, `state` or `group`), `country` (the country a state or group belongs to) and `use`, the filter text
-that keeps its samples (`location within "US-KS"`; `location not within` removes them). When several match (Georgia is
+that keeps its samples (`location within "US-KS"`; `location not within` keeps the samples located elsewhere, and not
+those with no location). When several match (Georgia is
 a country and a state) the model asks which is meant and then has that one's text. When a hundred or more of one kind
 match, `total` is null and a `note` says to write more of the name. With no boundary set loaded: `"loaded": false`, no
 places, and a `note` that an administrator loads boundaries under Settings → System status ([regions](REGIONS.md)). It
@@ -589,7 +597,9 @@ filter text that keeps the images above the cut (`concept "equipment" > 0.62`, w
 **`concept_preview`** (`view` or `dataset`, `concept`, `threshold`, `limit` 1 to 10): what the cut would do before it
 is applied. `above` and `below` are the grid's exact counts of the view's images with `concept "…" > t`, and with
 `concept "…" <= t`, added; `unscored` is the images with no score; `keep` and `remove` are the filter texts for
-`refine_view`, and `remove` does what the dataset's page does with that filter. `just_above` and `just_below` are the
+`refine_view`, and `remove` does what the dataset's page does with that filter: it keeps only the images that have a
+score, at or below the cut, so it takes the `unscored` images out too, on every dataset. After `remove` the view has
+`below` images (on a dataset with objects, those counted below and not above). `just_above` and `just_below` are the
 images nearest the cut on each side, nearest first, with their scores and links. The server keeps those for the whole
 dataset only, so they come for a `dataset` or a view with no stages, and are null with a `boundary_note` for a view
 with stages (the counts are exact either way; nothing is approximated). A concept the dataset doesn't have is
@@ -597,8 +607,8 @@ with stages (the counts are exact either way; nothing is approximated). A concep
 
 On a dataset with objects, an object row is never one of the nearest, and an image counts where it or one of its
 objects does: an image whose objects score on the other side of the cut counts both above and below, and a `note` says
-how many do. There, the app's `not concept …` keeps only images that have a score, so `remove` takes the unscored
-images out too: `unscored` says how many before the filter is applied.
+how many do. `unscored` is counted there too, never inferred: the images of which neither the image nor any object
+has a score.
 
 **`search_similar`** (`view` or `dataset`, `text` or `sample_ids` (1 to 20), `limit` 1 to 200, `field`): the images the
 view selects most like the words or the samples, most similar first, by an embedding field (the dataset's `clip`, else
@@ -800,7 +810,7 @@ It stands on `GET /api/admin/jobs/all` (administrators only): `state` (repeatabl
 `field`, `started_by`, `created_at`, `started_at`, `finished_at`, `progress`, `failures`, `max_failures`,
 `cancel_requested` and `error`: no result, and nothing of what a job was asked beyond the dataset it is about, but for
 a `backup` job's `backup`, its own `{"file", "size_bytes", "tables"}`, null until it has succeeded. It reads
-the jobs table through two indexes of its own (migration `0041_jobs_across_datasets.sql`) and never reads samples: on a
+the jobs table through two indexes of its own (added in 2.14.0) and never reads samples: on a
 million jobs it answers a week's window in a few milliseconds and a year's in about a tenth of a second.
 
 ### `index_advice`

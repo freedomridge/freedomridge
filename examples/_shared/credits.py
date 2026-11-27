@@ -11,7 +11,7 @@ DATASET_CREDITS = {
     ),
     'open-images-v7-val': (
         'Open Images V7 — Google Open Images and Localized Narratives, annotations CC BY 4.0. '
-        'Photos © their respective creators; per-image Author, License and source links are in metadata. '
+        'Photos © their respective creators; per-image attribution, license and source links are in metadata. '
         'https://storage.googleapis.com/openimages/web/index.html'
     ),
     'inaturalist-2021-val': (

@@ -94,8 +94,10 @@ def test_the_image_grid_shows_the_images_of_matching_objects_and_no_other_row(re
 
 
 def test_the_object_grid_shows_the_objects_of_matching_images_and_keeps_unlinked_ones_out(registry_database):
-    """parent_matches: an object whose image matches. Every unlinked kind matches no image, and an excluded region
-    (NOT around the coupled filter) keeps every one of them, as before."""
+    """parent_matches: an object whose image matches. Every unlinked kind matches no image. A NOT around the coupled
+    filter keeps the object of the soy image; rewritten for contract g7 (one rule everywhere, rule 1.2): it needs a
+    value for what the wrapped filter compares, the row as a whole (the object with its image), so it no longer keeps
+    the unlinked objects, which have no image and no crop of their own (it kept every one of them)."""
 
     async def scenario(database):
         made = await every_kind(database)
@@ -107,7 +109,7 @@ def test_the_object_grid_shows_the_objects_of_matching_images_and_keeps_unlinked
                 {'logic': 'NOT', 'filters': [grid('object', CORN)['filters'][1]]},
             ],
         }
-        kept = [made['on_soy'], *(made[kind] for kind in UNLINKED)]
+        kept = [made['on_soy']]
         assert await rows(excluded) == (sorted(kept), len(kept))
 
     registry_database(scenario)

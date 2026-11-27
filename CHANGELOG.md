@@ -4,6 +4,267 @@ Freedom Ridge has one version for the server, the web app and the Python SDK (th
 file), following [Semantic Versioning](https://semver.org). A release lists **upgrade notes** when
 it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
 
+## 3.0.0 (2026-11-27)
+
+A major version: the server and the SDK must both be 3.x, and the upgrade starts from 2.14.0. Filters now read one
+way everywhere: a sample with no value for a field never matches a comparison of it, `is null` means no value for
+every list, and the new `is empty` and `is not empty` find an empty list; a list field kept in a column of its own can
+hold never set apart from `[]`. These change what some existing filters find (Changed). Also: the sidebar lists a
+field's values whichever kind of row has the field, a drawn polygon may be at most 10 turns of the globe wide, and the
+demo importers write one field per fact. One migration, `0045`.
+
+### Upgrade notes
+
+- **Upgrade from 2.14.0: the migrations before it are squashed into a new baseline**
+  ([From a release before 2.14.0](docs/UPGRADING.md#from-a-release-before-2140)). `0001` to `0044` are now one baseline
+  schema, 2.14.0's, which the ledger records as `baseline_2.14.0.sql`. On a 2.14.0 database `scripts/apply_migrations.sh`
+  first records it in place of the ledger's 45 rows (the 1.0.0 baseline and its 44 migrations), changing no table, then
+  applies the migrations since. A database from an older release is refused before anything changes, and
+  `/api/health` answers 503 saying so: upgrade it to 2.14.0 first, then to this release. A backup taken before 2.14.0 is
+  restored with the 2.14.0 checkout first. The launcher (`npx freedomridge`) upgrades a folder from 2.14.0 only and
+  otherwise says to run `npx freedomridge@2.14.0` first.
+- **Upgrade the SDK with the server.** A 3.x server refuses a 2.x SDK (426, naming the version to install), and the
+  3.x SDK refuses a 2.x server: run `pip install "freedomridge==3.0.0"` on every machine that uses the SDK against an
+  upgraded server, compute workers (`python -m fridge.worker`) included. A primary and its followers talk through the
+  follower API, not the SDK, and are still upgraded one at a time, in either order
+  ([Upgrading](docs/UPGRADING.md#primaries-and-followers)); the list field item under Changed says what a follower on
+  2.14.0 shows meanwhile.
+- One migration, `0045_list_columns_hold_never_set.sql`, applied with `scripts/apply_migrations.sh` (step 4 of
+  [Upgrading](docs/UPGRADING.md)). It changes no row: it takes the default off each list column, waiting at most 2 s
+  for a lock; if it gives up, nothing has changed: run step 4 again.
+
+### Added
+
+- **New: `is empty` and `is not empty`, and `is null` means no value for every list in a field**
+  ([FILTER_QUERY.md](docs/FILTER_QUERY.md#no-value-and-an-empty-list)). `is null` finds the samples with no value for
+  a field: no key, or `null`, a field never looked at. An empty list written in a field is a value (looked at, nothing
+  found), which `detections is empty` finds; `detections is not empty`, its `NOT`, finds the samples whose
+  `detections` has a value that isn't an empty list, and a sample with no value matches neither. So every sample is in
+  exactly one of `is null`, `is empty` and `is not empty`, and `detections.label is null` reads as the item above says.
+  A list of labels has no key to look for, so `detections.label exists` and `not exists` now answer as its
+  `is not null` and `is null`, on one sample as through the page's wrapping: on one sample `not exists` showed the
+  samples with a detection that has no label, and `exists` didn't show an empty list. `segmentation.labels exists` and
+  `not exists`, which matched no sample, answer the same way.
+  The filter text, the JSON filters (`is_empty`, `is_not_empty`), every reader of a filter, the app's query builder,
+  the SDK (`s.detections.is_empty()`, `detections__is_empty=True`) and the assistant take them. `is empty` reads any
+  metadata key sample by sample, and is refused (400) on the built-in fields, `location` and a path through a list:
+  `detections.label is empty` names `detections is empty` instead. **Tags don't change**: a sample with no tags has no
+  value for `tags`, so `tags is null` still finds the untagged samples, and `tags is empty` finds the same ones; the
+  same holds for `@local.tags`. A list field kept in a column of its own answers as a list in a field does (the next
+  item). Nothing saved is rewritten. An older
+  server, or a mirror on an older version, refuses a filter with the new tests (400 `Unknown filter operator`), except
+  on `segmentation.labels`: there it answers `is empty` and `is not empty` with no sample and no error. A patch search
+  a primary relays to a mirror on an older version is refused there with any of them. A mirror on an older version
+  reads `detections.label is null` the old way until it is upgraded. On a dataset without
+  objects of a million samples the new tests measured 0.87 to 1.10 times the absence test of the same field, and
+  `detections.label is null` 0.44 times its time before (a count: 230 ms where it was 525 ms).
+
+### Changed
+
+- **A change in behaviour: a sample with no value for a field never matches a comparison of that field, and never
+  matches the `NOT` of one, on every dataset and through every reader** ([FILTER_QUERY.md](docs/FILTER_QUERY.md#operators)).
+  Only `is null` and `not exists` find it. Before, three places kept the samples with no value, and now show fewer
+  rows:
+  - on a dataset without objects, and in any filter read on one sample (the SDK, the API without the page's wrapping,
+    a version's query), `colour != "red"`, `colour not in (...)` and `NOT (colour = "red")` kept the samples with no
+    `colour`, or a `null` one; a `NOT` around several fields kept the samples missing any of them;
+    `not concept "x" > 0.62` (the Concepts panel's exclude) kept the samples the concept has no score for, a sample
+    added since the concept was last scored included; `detections.label != "car"` kept the samples with no
+    `detections` and those whose detections have no label, and the `NOT` of an element match the samples with no
+    list;
+  - an excluded place (`location not within`, a map region or a drawn polygon excluded, `NOT (location within ...)`)
+    kept the samples with no location, and an excluded lasso the samples with no point on its map;
+  - `tags not in ("rejected")` (and `tags != ...`, `NOT (tags in ...)`) kept the samples with no tags, and so did the
+    same test of a list field kept in a column of its own and of `@local.tags`.
+
+  An empty list written in a field is a value, so a `NOT` shows its sample: `detections.label != "car"` and the `NOT`
+  of an element match keep a sample whose list is empty. A sample with no tags has no value for `tags` (and the same
+  holds for `@local.tags`): every sample holds them, the empty list until a tag is written. A list field kept in a
+  column of its own is a list in a field like any other, and can now hold no value apart from `[]` (the item on list
+  fields below). To keep the old meaning, write the samples with no value out:
+  `colour != "red" OR colour is null`, `tags not in ("rejected") OR tags is null`, `location not within "US-KS" OR
+  location is null`. The filter text now takes `location is null`, `is not null`, `exists` and `not exists` for that.
+  `detections.label is null` (and the same test of any list of labels) now shows the samples with no list, a `null`
+  one, or detections none of which has a label, and `detections.label is not null` those whose list is empty or holds
+  a label: the samples a comparison of the labels can show (the next item). `is null` showed the samples with a
+  detection that has no label. A value of another kind than the one compared is still a value: `n != 2` keeps a
+  sample whose `n` is the text `"abc"`. **Saved views, links and the dataset's default view are not rewritten**: they
+  keep their filters and read them by the new rule, so one that used `!=`, `not in`, an excluded region or a concept's
+  exclude may show fewer samples. A mirror on an older version reads the old way (including a patch search its
+  primary relays to it) until it is upgraded. The assistant's tools follow the same rule; `concept_preview`'s `remove`
+  keeps only the scored images at or below the cut on every dataset. The SDK's filter of a similarity result
+  (`sort_by_similarity(...).filter(...)`) is read by the server now, in one request for the results' ids (one per
+  1,000 results), and shows what the same filter shows anywhere, in the results' order with their distances. Before,
+  it read the filter in Python: it compared `tags` as a whole list, read only the first part of a `NOT`, and read
+  `distance`, which is no field of the dataset and is refused now (`NotImplementedError`: compare `sample.distance` in
+  Python). On a dataset without objects of a million samples the readings this changes measured 0.87 to 1.21 times
+  their time before (a count of `NOT (a = x AND b = y)`: 82 to 98 ms). On a dataset with objects of a million rows an
+  excluded lasso now has to find which rows have a point on the map: about 0.15 to 0.45 s more per reading, the first
+  page 0.14 to 0.66 s where it was 0.02 to 0.30 s. An excluded region or drawn polygon there measured up to about
+  twice its time before on some readings.
+- **A change in behaviour: a list field kept in a column of its own can hold no value apart from the empty list**
+  ([SDK.md](docs/SDK.md#list-fields-in-a-column-of-their-own), [FILTER_QUERY.md](docs/FILTER_QUERY.md#operators)).
+  Such a field (`dataset.create_array_field(...)`, `POST /api/datasets/{id}/array-fields`, the owner's
+  `inferred_tags`) is now read as a list in a field: never set is no value, `[]` is a value (looked at, nothing found).
+  - **A sample written without the field holds no value for it, where it held `[]`.** `null` is taken for it where it
+    was refused (422): on a new sample it is never set, on an update (`PATCH`) it unsets the field. The columns lose
+    their default (migration `0045`, a change of the catalog only, a few milliseconds whatever the table's size; it
+    waits at most 2 s for its lock behind a long query, and if it gives up the upgrade stops with nothing changed:
+    run it again); `tags` and `@local.tags` keep theirs and don't change at all.
+  - **What comes back:** the samples query, a version's rows, a mirror's sync and the assistant's samples give a field
+    never set as `null` under its name, and `[]` for the empty list. The SDK's sample gives `None`
+    (`sample.inferred_tags or []` treats the two alike), never writes back a `None` it read, and leaves a `None` field
+    out when it adds a sample. The app's sample view leaves a field never set out. The app's CSV export writes an
+    empty list as `[]` where it wrote an empty cell, for a list in the metadata too; no value, and tags with none,
+    stay an empty cell.
+  - **Filters:** `inferred_tags is null` and `not exists` find the samples never set, `is empty` those holding `[]`,
+    `is not null` and `exists` both; `inferred_tags not in ("car")` and `NOT (inferred_tags contains "car")` show the
+    samples whose list is there, empty or not, without `car`. Until now they were read as tags are (an empty list was
+    no value). The sidebar now offers its "(no value)" tick for such a field, for the samples never set.
+  - **Rows written before keep `[]`**: a sample that held `[]` holds it still, so a `NOT` shows it and `is empty`
+    finds it, and `is null` doesn't. No row is rewritten by the upgrade.
+  - **Adding a sample again** with `on_duplicate="update"` and without the field keeps its list, whatever the other
+    samples of the request name; it got `[]` when another sample of the same request named the field. `null` for the
+    field unsets it, as on an update (the SDK's `add_samples` leaves a `None` out, so through it the list is kept).
+    (A metadata key left out is still removed: a list field is a field of the dataset, not a key of the sample's
+    metadata.)
+  - **Adding a field another dataset made first** makes the dataset's samples from before never set: their `[]`, the
+    old default, is set to no value before the field is the dataset's (lists with elements are kept). Within the call
+    for a dataset of up to 1,000 samples; otherwise in a job (`list_field_registration`), during which the field isn't
+    listed, a write that names it gets a 409 with `Retry-After` and `X-Job-End-Seconds` (the SDK keeps retrying until
+    then), and a version can't be restored. On a table of 2.1 million rows of about 950 bytes, a million samples took
+    215 s and wrote 10.9 GB of WAL, and the table and its indexes grew 1.18 GB (space reused later, not given back);
+    100,000 samples took 22 s, 1.5 GB, 0.14 GB. A dataset that had the field under an older version, lost it and adds it
+    again gets the same: its empty lists from before become never set.
+  - **A version's restore** writes a list field only where the version had it as the dataset's: one the dataset added
+    since is never set afterwards (a version made before versions recorded the dataset's fields counts a field as the
+    dataset's when it was added before the version). Before, a restore wrote every list column of the server and kept a
+    list written since. **Every reading of a version takes a list field the same way**
+    ([SDK.md](docs/SDK.md#list-fields-in-a-version)): the status of which version the dataset is at, the diff of the
+    live samples against a version and its lists of changed samples, the compare of two versions (each by what it had),
+    and a version's samples as browsed, queried, filtered and counted. So after a restore the diff against the version
+    restored is empty, where it could count samples modified by a list column the dataset doesn't have; and after a
+    dataset adds a field another dataset made first, no version from before reports its samples modified, where every
+    sample whose `[]` became never set was, and the version's rows give the field as `null` where they gave `[]`. A list
+    column the dataset neither had at the version nor has now is no longer compared, nor given back with the version's
+    rows.
+  - **Mirrors and older SDKs:** the primary sends `null` for never set; a mirror on an older version stores `[]` for it
+    until it is upgraded. An older SDK reads `null` as `[]`: its `save()` writes back every list it read, and its
+    `add_samples_from` copies never set as `[]`, so a script on an older SDK that loads and saves samples, or copies a
+    dataset, turns never set into `[]`: **upgrade the SDK with the server.** The SDK against an older server leaves a
+    never-set field out when it adds a sample (that server stores `[]`); unsetting a field there gets its 422.
+    `python/fridge/sync_between_instances.py` now sends `[]` and leaves never set out (it dropped both). A sync from
+    FiftyOne written outside this repository should do the same: send `[]` for an empty list and leave out a field that
+    is `None`.
+
+  On a million samples with such a field (half never set, a quarter `[]`, a quarter with elements) in a table of two
+  million, the first page and the count of `not in`, `NOT (... contains ...)`, `is null`, `is not null` and `is empty`
+  measured 0.86 to 1.15 times their time before (counts 170 to 190 ms), and an ingest of 10,000 samples without the
+  field 0.90 times (3.4 s where it was 3.7 s). Adding 10,000 samples again with `on_duplicate="update"` (in requests of
+  1,000, every second sample or every one naming the field, all there already or none) measured 1.02 to 1.05 times (2.6
+  to 3.0 s); a request in which samples send `null` for the field takes one statement more (every second of 10,000
+  samples there already: 3.7 s, where 2.9 s naming a list). On a version of 100,000 samples with two such fields, the
+  status, the diffs, the lists of changed samples and the version's pages, queries and counts measured 0.75 to 1.07
+  times their time before.
+- **A change in behaviour: a drawn polygon may be at most 10 turns of the globe wide (3,600 degrees), where 2.14.0 took
+  60** ([SDK.md](docs/SDK.md#geospatial-filtering)). A `geo_polygon` (or its exclusion) whose longitudes span more than
+  3,600 degrees is refused with a 400 that names the limit; one spanning exactly 3,600 degrees is answered. No view
+  reachable in the app holds that much: the map keeps the world at least as tall as itself, so a view spans about its
+  width over its height in worlds (measured at the least zoom: 0.7 in the map's panel of a 1920 x 1080 window; 11.5
+  only with the map alone in a 3840 x 600 one, at a zoom reached by code). A saved view, link or script with a polygon
+  wider than 10 turns now gets the 400.
+- **The demo importers write one field per fact, under Freedom Ridge's names** (`examples/`: COCO, Open Images,
+  iNaturalist, KITTI). They copied the source's own columns beside the fields made from them, so a dataset showed the
+  same fact twice or three times: COCO's 0/1 `iscrowd` beside the boolean `is_crowd`, its license number twice, Open
+  Images' five flags as 0/1 numbers and its class codes (`/m/0k4j`) beside the class names, its whole image list
+  (`OriginalURL`, `Thumbnail300KURL`, `OriginalMD5`, ...), iNaturalist's latitude and longitude beside the map
+  location, KITTI's frame fields copied onto every object. Now:
+  - flags are booleans: COCO's `is_crowd`; Open Images' `is_occluded`, `is_truncated`, `is_group_of`, `is_depiction`,
+    `is_inside` (the source's -1, unknown, is no value); KITTI's `occluded` is a word (`none`, `partly`, `largely`,
+    `unknown`);
+  - classes go by their names only, and a list's items keep their own facts (a COCO pose: its joint names and which
+    are seen; an outline: the `annotation_id` of its detection), not the source's whole record;
+  - captions are one searchable text, a caption per line, in `captions` (no `caption_text` or `narratives`); an
+    image's classes are the native list columns `class_names` (and COCO's `supercategory_names`), no longer repeated
+    as the metadata lists `classes` and `supercategories`;
+  - an image's credit is `attribution` (where the source names an author), `license`, `license_url` and `source_url`;
+    the source's file names, its own numbers for an image's license, annotation and category, and its paths are not
+    copied;
+  - an object holds its own fields only (its image's are read through it by an image filter), and no tags: the
+    importers tagged each image with its split and each object with its label, which `split` and `label` hold;
+  - image totals that recount the objects (Open Images' `IsGroupOf_count` and the like; KITTI's `num_easy`,
+    `num_occluded_0`, `truncation_mean`, ...) are gone; KITTI keeps `num_cuboids` and `num_dontcare`, which no object
+    row gives.
+
+  The masks are unchanged here (`instance_mask_000` and the rest, one per field). A dataset imported before keeps its
+  fields until it is imported again; saved views of it that name a field that's gone find nothing for that field.
+  iNaturalist keeps `scientific_name` beside the `species` label: a single classification's label can't be filtered
+  for an exact value or typed ahead in the sidebar, a string can.
+
+### Fixed
+
+- **The sidebar lists a field's values whichever kind of row has the field, and says so when it can't list them**
+  ([FILTER_QUERY.md](docs/FILTER_QUERY.md#a-fields-values)). On a dataset with objects:
+  - a field only objects have (the `label` of the Open Images, COCO and KITTI demos) suggested no value as you typed
+    in the sidebar, its list of values was empty, and its range was the whole dataset's, objects with no image
+    included, labelled as kept. On the images' grid it now lists the values of the objects whose pair with their
+    image meets the filter, read as the grid reads it: with `label = "car"` applied, `occluded` offers the cars'
+    values, not a truck's in the same image. On the objects' grid a field only images have lists the values of the
+    images of the objects shown. A field both kinds have lists the values of both (before: the grid's own kind's
+    only), `tags` among them. An object with no image is listed on the objects' grid, never on the images'. The number
+    beside a suggestion counts the rows that have the value among the rows read: objects, not images, for an object's
+    field on the images' grid; images, each once, for an image's field on the objects' grid.
+  - with fast mode off, a selection waiting to be applied (a lasso drawn on the objects' map, a brushed set, a drawn
+    polygon, ticked grid rows) emptied the lists of values: it was sent beside the grid's reading as a test of the
+    image. It is read inside it now, as the grid reads it once applied.
+
+  On every dataset:
+  - a field whose values are nearly all different (a URL, a path, an id) opened a blank picker when its values could
+    not be counted within 2 s, and so did a term most of them hold (`flickr`). The server then reads the values of up
+    to a thousand of the view's rows without counting them, within 1 s of its own: having read every row, it answers
+    as the count would; otherwise it offers some of the values, without numbers. The picker says which: "Could not
+    search all values in time: these are some of them. Type to search; Enter filters by what you typed." with the
+    values, "Could not search all values in time. Type a value and press Enter to filter by it." with none, and "No
+    value for this view." for a complete list with nothing in it ("No matches" with a term). Enter takes the typed term
+    whenever the answer was not complete. The query builder's picker is the same one.
+  - equal counts among the suggestions come in the order of the value, byte by byte, where no order was defined. The
+    values are counted bytewise too, with the same values and counts: a term every value of a million holds took
+    0.9 s, where it took 4.4 s.
+  - a suggestions request the page gives up (a keystroke later) is stopped on the server, as the sidebar's lists'
+    requests already were. Ten keystrokes in two seconds on a field of three million different values kept 15 to 17
+    database processes busy at their peak, each statement running to the end of its 2 s; now one statement at a time
+    (3 processes with its parallel workers), and the last answer comes as soon as before (3.9 s).
+
+  Four changes on a dataset without objects too:
+  - the picker of a field with an applied rule offers the values the view has, those that still show rows when
+    ticked; it offered every value of the field (with `split = "train"` applied, `split` offered `test`, and ticking it
+    showed nothing);
+  - a brushed set, a drawn polygon or a lasso waiting to be applied narrows the picker (fast mode off), as it narrowed
+    the list. Ticked grid rows don't: the grid doesn't filter by them, so a value outside them still shows rows. The
+    picker still opens on the field's list (with rows ticked, their values) and asks the server for a term that list
+    doesn't hold;
+  - a request with no kind (a script calling `POST /api/datasets/{id}/fields/{field}/autocomplete` with a filter)
+    keeps the field's own rule in its filter, where it was left out;
+  - a range the view has no value for is no range: `min` and `max` are null and the sidebar shows "No compatible range
+    available", where the dataset's range was answered, labelled as kept. The dataset's range is kept only where the
+    reading ran out of time or failed, or where fast mode didn't compute the field for the filter.
+
+  The route's answer keeps its shape (`{"values": [{"value", "count"}], "exhaustive"}`); `exhaustive: false` may now
+  come with values that carry no count. Not changed: the histogram panel of a field the other kind has, and the "(no
+  value)" tick. Measured on a dataset shaped like the Open Images demo (41,620 images, 291,586 objects) and on one of
+  200,000 images and 800,000 objects: an object's field's suggestions on the images' grid take 0.06 to 0.16 s and
+  0.13 to 0.41 s, a typed term 0.05 to 0.10 s and 0.13 to 0.25 s, within the 2 s (before, the same request sent with
+  no filter at all, which reads every row: 0.14 s and 0.35 s, typed 0.10 s and 0.26 s); `tags` on the images' grid,
+  which now reads the objects' tags too, 1.2 to 1.9 times its time before for the suggestions (with nothing filtered
+  0.04 s became 0.06 s, and 0.10 s 0.17 s; 0.57 s at most), within the 2 s, and 1.0 to 1.2 times for the opened list,
+  within the 5 s; an opened field's list or range 0.05 to 0.70 s under fast mode's 5 s, its gates unchanged; with fast
+  mode off the whole sidebar on the larger dataset 0.7 to 2.0 s, where it answered the objects' fields with the kept
+  values before (0.6 to 2.2 s); with fast mode on, the sidebar of the demo's shape with nothing filtered 0.36 s (0.22 s
+  before), since its objects' fields are now read. With nothing filtered, an object's image is read from the object
+  alone (its `parent_id`), not looked up. The requests this doesn't mean to change (with no kind, an image's own field,
+  every request on a dataset without objects, up to three million samples) measured 0.93 to 1.14 times their time
+  before.
+
 ## 2.14.0 (2026-11-25)
 
 This release adds an AI assistant: Claude Code and other MCP clients answer questions about a server's datasets

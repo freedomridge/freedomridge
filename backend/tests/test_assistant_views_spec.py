@@ -558,13 +558,15 @@ def test_the_five_tools_are_listed_as_reads_with_the_arguments_the_contract_name
 
 
 def test_make_view_counts_exactly_and_writes_its_stages_as_the_server_writes_them(world):
+    # Rewritten for contract g7 (one rule everywhere, rule 1.2): the NOT around `state` and `flag` keeps only samples
+    # that have a flag (samples 20 to 29 have none; it kept 21, 24 and 27).
     cases: list[tuple[str, Callable[[dict[str, Any]], bool]]] = [
         ('', everything),
         ('state = Kansas', lambda r: r['state'] == 'Kansas'),
         ('state = Kansas AND brightness < 40', lambda r: r['state'] == 'Kansas' and r.get('brightness', 99) < 40),
         (
             'tags in (late) AND NOT (state = Iowa OR flag = true)',
-            lambda r: 'late' in r['tags'] and not (r['state'] == 'Iowa' or r.get('flag') is True),
+            lambda r: 'late' in r['tags'] and 'flag' in r and not (r['state'] == 'Iowa' or r.get('flag') is True),
         ),
         ('serial contains "SN-001"', lambda r: r['serial'].startswith('SN-001')),
         ('seen_at >= 2026-03-05', lambda r: r.get('seen_at', '') >= '2026-03-05'),
@@ -773,7 +775,11 @@ def test_refining_a_view_never_changes_it(world):
             f.of(lambda r: r['state'] == 'Kansas' and r.get('brightness', 99) < 60 and r.get('flag') is True),
         )
         assert third['count'] == len(f.of(lambda r: r.get('brightness', 99) < 60 and r.get('flag') is True))
-        assert fourth['count'] == len(f.of(lambda r: r['state'] == 'Kansas' and not r.get('brightness', 99) < 60))
+        # Rewritten for contract g7 (one rule everywhere, rule 1.2): the negated stage needs a brightness (it kept the
+        # samples with none).
+        assert fourth['count'] == len(
+            f.of(lambda r: r['state'] == 'Kansas' and 'brightness' in r and not r['brightness'] < 60),
+        )
         # The view refined three times over selects what it did, stage for stage.
         assert await view_ids(ADMIN, first['view']) == selected
         assert await stages_of(w, ADMIN, first['view']) == stages
@@ -1325,8 +1331,12 @@ def test_refine_view_applies_remove_negate_add_and_the_lists_in_that_order(world
         twice = await refine(ADMIN, once, negate=[2])
         original = f.of(lambda r: r['state'] != 'Nebraska' and r.get('brightness', 99) < 80 and 'dry' in r['tags'])
         assert await view_ids(ADMIN, twice['view']) == await view_ids(ADMIN, start['view']) == original
+        # Rewritten for contract g7 (one rule everywhere, rule 1.2): the negated stage keeps only samples that have a
+        # brightness (27 to 29 have none; it kept 27 and 28).
         assert await view_ids(ADMIN, once['view']) == f.of(
-            lambda r: r['state'] != 'Nebraska' and not r.get('brightness', 99) < 80 and 'dry' in r['tags'],
+            lambda r: (
+                r['state'] != 'Nebraska' and 'brightness' in r and not r['brightness'] < 80 and 'dry' in r['tags']
+            ),
         )
         # Appended stages take the next numbers.
         more = await refine(ADMIN, start, add='flag = true AND serial exists')
@@ -1828,7 +1838,7 @@ def test_a_count_that_runs_into_the_time_limit_is_too_slow_and_never_partial(lim
 
 
 def test_region_and_concept_stages_count_exactly(regions_world):
-    from backend.tests.test_regions_spec import POINTS, D, inside, loaded
+    from backend.tests.test_regions_spec import LOCATED, POINTS, D, inside, loaded
 
     rank = {name: index for index, (name, _, _, _) in enumerate(POINTS, start=1)}
 
@@ -1860,7 +1870,13 @@ def test_region_and_concept_stages_count_exactly(regions_world):
         grp = {name: 'a' if rank[name] % 2 else 'b' for name in names}
         for text, keep, first_text in (
             ('location within Isla', lambda n: n in inside('XA-IS'), 'location within "XA-IS"'),
-            ('location not within "XA" AND grp = a', lambda n: n not in inside('XA') and grp[n] == 'a', None),
+            # Rewritten for contract g7 (one rule everywhere, rule 1.6): only samples that have a location (p21, in
+            # group a, has none; it was kept).
+            (
+                'location not within "XA" AND grp = a',
+                lambda n: n in LOCATED and n not in inside('XA') and grp[n] == 'a',
+                None,
+            ),
             ('concept weeds > 0.5', lambda n: score(n) > 0.5, None),
             (
                 'not concept weeds > 0.5 AND location within "XA:midlands"',

@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from backend.routers import embeddings
+from backend.tests import test_field_registry_postgres
 from backend.tests.test_layout_coordinates import registry_database, seed
 
 __all__ = ['registry_database']
@@ -23,6 +24,12 @@ def conjunction(*nodes):
 
 async def populate(db, n=20):
     await seed(db, n)
+    async with test_field_registry_postgres.bulk_setup(db) as connection:
+        await points_tags_and_scores(connection, n)
+
+
+async def points_tags_and_scores(db, n):
+    """populate's map points, tags, concepts, scores and duplicates, written in its bulk setup."""
     await db.execute(
         "INSERT INTO embedding_coordinates SELECT i,'clip',i,i/3.0 FROM generate_series(1,$1::int) i",
         n - 1,
@@ -49,6 +56,14 @@ async def populate(db, n=20):
     )
     await db.execute(
         "INSERT INTO sample_dup_secondary VALUES(1,'_any',2),(1,'_any',7),(1,'named',8),(2,'_any',200001)",
+    )
+    # Contract g7 (one rule everywhere, rules 1.3 and 1.5): a concept's exclude rejects the points with no score, and a
+    # tags exclusion the samples with no tags, too. Every sample of dataset 1 gets a low score for the concept and,
+    # but for the bad ones and sample 4 (the NULL tags case), a tag of its own, so each exclusion still rejects the
+    # few points these tests are about, on either reading.
+    await db.execute("UPDATE samples SET tags=ARRAY['ok'] WHERE dataset_id=1 AND id NOT IN (2,3,4)")
+    await db.execute(
+        'INSERT INTO embedding_concept_scores SELECT 1,id,0.2 FROM samples WHERE dataset_id=1 ON CONFLICT DO NOTHING',
     )
 
 
@@ -149,7 +164,8 @@ def test_rank_concurrent_transactions_and_rollback(registry_database):
         {'logic': 'NOT', 'filters': [{'field': 'tags', 'operator': 'in', 'value': ['bad']}]},
         {'logic': 'NOT', 'filters': [{'field': 'tags', 'operator': 'contains', 'value': 'bad'}]},
         conjunction(GRAIN, CONCEPT, DUPS, TAG),
-        conjunction(GRAIN, {**CONCEPT, 'value': {'concept_id': 1, 'op': '<=', 'threshold': 1}}),
+        # `<=` at 0.15 (it was 1, which now rejects every point: each has a score at or below 1, or none).
+        conjunction(GRAIN, {**CONCEPT, 'value': {'concept_id': 1, 'op': '<=', 'threshold': 0.15}}),
     ],
 )
 @pytest.mark.parametrize('pct', [0, 30, 100])
@@ -181,19 +197,36 @@ def test_broad_scatter_matches_all_ids_coordinates_and_headers(registry_database
 
 
 @pytest.mark.parametrize(
-    'filters, scores, fast',
+    'filters, scores, tagged, fast',
     [
-        # 40 ranked points: at a 30% share the probed-rejection cap is 12.
-        (conjunction(GRAIN, BIG), 12, True),
-        (conjunction(GRAIN, BIG), 13, False),
+        # 40 ranked points: at a 30% share the counted-rejection cap is 12. The tags exclusion rejects the `tagged`
+        # samples tagged 'bad' and sample 4, which has no tags (contract g7, rule 1.4).
+        (conjunction(GRAIN, TAG), 0, 11, True),
+        (conjunction(GRAIN, TAG), 0, 12, False),
         # Sources add up (the two '_any' duplicates in dataset 1 count too).
-        (conjunction(GRAIN, BIG, DUPS), 10, True),
-        (conjunction(GRAIN, BIG, DUPS), 11, False),
+        (conjunction(GRAIN, TAG, DUPS), 0, 9, True),
+        (conjunction(GRAIN, TAG, DUPS), 0, 10, False),
+        # A concept's exclude is not in that count: it has a bound of its own, half the field's points. 13 of the 40
+        # points over its cut (past the 30% cap, not most of the points) stay on the fast path, alone or with the
+        # others; 20 (half) stay; 21 (more than half) go to the general path at once.
+        (conjunction(GRAIN, BIG), 13, 0, True),
+        (conjunction(GRAIN, BIG, TAG, DUPS), 13, 9, True),
+        (conjunction(GRAIN, BIG), 20, 0, True),
+        (conjunction(GRAIN, BIG), 21, 0, False),
     ],
 )
-def test_large_probed_rejections_go_to_the_general_path(registry_database, monkeypatch, filters, scores, fast):
-    """Each concept/duplicate rejection costs a rank-PK probe, so past a share of the field the
-    general path is faster. Admission counts the sources first and probes nothing when over."""
+def test_large_probed_rejections_go_to_the_general_path(
+    registry_database,
+    monkeypatch,
+    filters,
+    scores,
+    tagged,
+    fast,
+):
+    """Past a share of the field the general path is faster than the fast path's probes. Admission counts the
+    duplicates' collapse and a tags exclusion's rejected set first, bounded, and probes nothing when their sum is
+    over; a concept's exclude goes to the general path at once when the scores over its cut are more than half the
+    field's points. The answer is the rule's on either path."""
 
     async def scenario(db):
         await populate(db, 41)
@@ -205,6 +238,20 @@ def test_large_probed_rejections_go_to_the_general_path(registry_database, monke
             'INSERT INTO embedding_concept_scores SELECT 3,i,0.9 FROM generate_series(1,$1::int) i',
             scores,
         )
+        # The other points scored low: the exclusion rejects the points with no score too (contract g7, rule 1.3), and
+        # its rejections are to be the `scores` ones.
+        await db.execute(
+            'INSERT INTO embedding_concept_scores SELECT 3,id,0.1 FROM samples WHERE dataset_id=1 '
+            'ON CONFLICT DO NOTHING',
+        )
+        # The tagged ones are ids 10 on (ranked points, none of them a duplicate, sample 4 or the object 5); every
+        # other sample of dataset 1 but sample 4 is tagged 'ok'.
+        await db.execute("UPDATE samples SET tags=ARRAY['ok'] WHERE dataset_id=1 AND id != 4")
+        await db.execute(
+            "UPDATE samples SET tags=ARRAY['bad'] WHERE id BETWEEN 10 AND 9 + $1::int",
+            tagged,
+        )
+        assert await db.fetchval("SELECT count(*) FROM samples WHERE dataset_id=1 AND tags IS NULL") == 1
         # populate's '_any' duplicate in dataset 2 must not count against dataset 1.
         assert await db.fetchval("SELECT count(*) FROM sample_dup_secondary WHERE dataset_id=2 AND hash_config='_any'")
         request = embeddings.EmbeddingsRequest(filters=filters, sample_pct=30)
@@ -366,7 +413,16 @@ def test_empty_rank_population_and_null_tag_elements(registry_database, monkeypa
         )
         monkeypatch.setattr(embeddings, '_query_broad_exclusions', original)
         await db.execute('DELETE FROM embedding_coordinates WHERE sample_id < 200001')
-        rows, total = await original(1, request)
+        # The map has no points now, its bookkeeping still counting occupied cells. A tags exclusion's rejected set is
+        # counted first against 30% of the field's points (contract g7, one rule everywhere: the scatter's admission),
+        # a cap of nought here, so the samples tagged 'bad' send the request to the general path: no points.
+        assert await original(1, request) is None
+        answer = await embeddings.get_embeddings_post(1, request)
+        assert answer['points'] == [] and answer['total'] == 0
+        # The fast path's own arithmetic on that empty map, with a filter that has nothing counted first.
+        found = await original(1, embeddings.EmbeddingsRequest(filters=GRAIN))
+        assert found is not None, 'the fast path answers the grain filter alone'
+        rows, total = found
         assert rows == [] and total == 0
         await exact_count(db)
 
@@ -451,6 +507,7 @@ def test_duplicate_rejections_are_scoped_to_the_dataset():
     # Config names like _any are shared across datasets; probing another dataset's secondaries made
     # the fast path 4.6x slower than the admission count (which is scoped) allowed for.
     args = [7, 'clip']
-    rejected, _, probed = embeddings._scatter_rejections({'logic': 'AND', 'filters': [DUPS]}, args)
+    rejected, _, capped, majority = embeddings._scatter_rejections({'logic': 'AND', 'filters': [DUPS]}, args)
     assert 'dataset_id = $1' in rejected
-    assert all('dataset_id = $1' in shape for shape in probed)
+    assert capped, "the duplicates' collapse is counted against the 30% cap"
+    assert all('dataset_id = $1' in shape for shape in [*capped, *majority])

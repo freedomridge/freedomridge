@@ -18,7 +18,9 @@ computed from the rows planted here, or is what main answers today where a line 
    added, with main's status and sentence, storing nothing.
 3. On a dataset without objects a negation (`not concept "x" > t`, `!=`, `NOT (... = ...)`, `not in`) keeps the images
    that have no score or no such field too; with objects, the image grid keeps only the images that have one. The
-   docs say so.
+   docs say so. (Rewritten for the later contract g7, one rule everywhere: on every dataset a negation, and an
+   excluded place, keep only the images that have the score, the field or a location; the tests of this section that
+   pinned the old reading say so where they are.)
 4. describe_dataset answers as main does, and one call sends at most one statement that counts or scans the samples
    (one answered from the ends of an index, the smallest and largest id or created_at, doesn't count).
 
@@ -673,12 +675,21 @@ async def grid(r: Regions, dataset_id: int, query: str, objects: bool) -> set[in
     return await selected(r, image_grain(node) if objects else node, dataset_id)
 
 
-def test_a_negation_keeps_the_images_without_the_score_or_the_field_only_on_a_dataset_without_objects(regions_world):
-    """Pins main: these pass before the fix (no behaviour changes)."""
+def test_a_negation_keeps_only_the_images_that_have_the_score_or_the_field_on_both_kinds_of_dataset(regions_world):
+    """Rewritten for contract g7 (one rule everywhere, rules 1.1 to 1.3): on a dataset without objects too a negation
+    keeps only the images that have the score or the field. The positive forms, which main answers alike on both,
+    are asked first."""
 
     async def scenario(r):
         plain, _ = await planted_images(r, PLAIN, objects=False)
         coupled, _ = await planted_images(r, WITH_OBJECTS, objects=True)
+        # The positive forms keep the same images on both.
+        for query, keep in (
+            (f'concept "x" > {CUT}', lambda score, _: score is not None and score > CUT),
+            ('crop = "corn"', lambda _, crop: crop == 'corn'),
+        ):
+            assert await grid(r, PLAIN, query, objects=False) == kept(plain, keep), query
+            assert await grid(r, WITH_OBJECTS, query, objects=True) == kept(coupled, keep), query
         scored, cropped = 'score', 'crop'
         # (the query, what a row must have for the negation to hold there, which of those it keeps)
         cases = [
@@ -692,23 +703,18 @@ def test_a_negation_keeps_the_images_without_the_score_or_the_field_only_on_a_da
             index = 0 if needs == scored else 1
             having = {k for k, image in enumerate(IMAGES) if image[index] is not None}
             with_one = {k for k in having if passes(*IMAGES[k])}
-            without_objects = with_one | (set(range(len(IMAGES))) - having)
-            assert with_one < without_objects, query  # the two kinds of dataset differ here
-            assert await grid(r, PLAIN, query, objects=False) == {plain[k] for k in without_objects}, query
+            assert having < set(range(len(IMAGES))), query  # some images have no score or no such field
+            assert await grid(r, PLAIN, query, objects=False) == {plain[k] for k in with_one}, query
             assert await grid(r, WITH_OBJECTS, query, objects=True) == {coupled[k] for k in with_one}, query
-        # The positive forms keep the same images on both.
-        for query, keep in (
-            (f'concept "x" > {CUT}', lambda score, _: score is not None and score > CUT),
-            ('crop = "corn"', lambda _, crop: crop == 'corn'),
-        ):
-            assert await grid(r, PLAIN, query, objects=False) == kept(plain, keep), query
-            assert await grid(r, WITH_OBJECTS, query, objects=True) == kept(coupled, keep), query
 
     regions_world(scenario)
 
 
-def test_concept_preview_counts_the_unscored_images_on_both_kinds_of_dataset(regions_world):
-    """Pins main (contract 3.3): concept_preview's unscored stays what its description says."""
+def test_concept_preview_counts_are_what_its_keep_and_remove_show_on_both_kinds_of_dataset(regions_world):
+    """Contract 3.3: concept_preview's unscored stays what its description says. Rewritten for contract g7 (one rule
+    everywhere, rule 2.1): its numbers are the counts of the views its `keep` and `remove` then make, on both kinds of
+    dataset, so `remove` keeps the images at or below the cut and no unscored one (main keeps those too on a dataset
+    without objects)."""
 
     async def scenario(r):
         await planted_images(r, PLAIN, objects=False)
@@ -724,6 +730,14 @@ def test_concept_preview_counts_the_unscored_images_on_both_kinds_of_dataset(reg
             counts = (answer['view_count'], answer['above'], answer['below'], answer['unscored'])
             assert counts == (len(IMAGES), above, below, unscored), (dataset_id, answer)
             assert (answer['keep'], answer['remove']) == (f'concept "x" > {CUT}', f'not concept "x" > {CUT}'), answer
+        for dataset_id in (PLAIN, WITH_OBJECTS):
+            answer = await result(ADMIN, 'concept_preview', {'dataset': dataset_id, 'concept': 'x', 'threshold': CUT})
+            whole = await result(ADMIN, 'make_view', {'dataset': dataset_id})
+            # Asked first, as main answers it: the keep.
+            keeping = await result(ADMIN, 'refine_view', {'view': whole['view'], 'add': answer['keep']})
+            assert keeping['count'] == answer['above'], (dataset_id, keeping['count'], answer)
+            removing = await result(ADMIN, 'refine_view', {'view': whole['view'], 'add': answer['remove']})
+            assert removing['count'] == answer['below'], (dataset_id, removing['count'], answer)
 
     regions_world(scenario)
 
@@ -828,25 +842,29 @@ async def grid_plots(r: Regions, dataset: tuple[int, dict[int, str], bool], form
 
 
 EVERY_PLACE = {plot for plot, _ in PLACES}
-OUTSIDE_PLACE = EVERY_PLACE - INSIDE_PLACE  # the images with no location among them
+# The images an excluded place keeps: located outside it. Rewritten for contract g7 (one rule everywhere, rule 1.6):
+# the images with no location, and none on their objects, are no longer among them, on any dataset.
+OUTSIDE_PLACE = EVERY_PLACE - INSIDE_PLACE - NO_PLACE
 
 
 def test_a_place_excluded_as_the_whole_filter_keeps_the_same_images_with_and_without_objects(regions_world):
     """A requirement (contract 3.2's second point, as decided): the text `location not within`, `geo_region_exclude`
     and `geo_polygon_exclude`, each the whole filter, and the place itself, keep on a dataset whose objects carry no
     location, and on one whose objects carry their image's, exactly the images they keep on the same images without
-    objects. Without objects an exclusion keeps the images with no location too (main, pinned)."""
+    objects. Rewritten for contract g7 (one rule everywhere, rule 1.6): an exclusion keeps only the images located
+    outside, on every dataset (main kept the images with no location too). The place itself, which main answers
+    alike, is asked first."""
 
     async def scenario(r):
         made = await placed(r)
         for name, form, kept in (
-            ('text: location not within "XA-NM"', 'location not within "XA-NM"', OUTSIDE_PLACE),
-            ('geo_region_exclude', place('geo_region_exclude', 'XA-NM'), OUTSIDE_PLACE),
-            ('geo_polygon_exclude', place('geo_polygon_exclude', SQUARE), OUTSIDE_PLACE),
             ('text: location within "XA-NM"', 'location within "XA-NM"', INSIDE_PLACE),
             ('geo_region', place('geo_region', 'XA-NM'), INSIDE_PLACE),
             ('geo_polygon', place('geo_polygon', SQUARE), INSIDE_PLACE),
             ('geo_near', place('geo_near', NEAR), INSIDE_PLACE),
+            ('text: location not within "XA-NM"', 'location not within "XA-NM"', OUTSIDE_PLACE),
+            ('geo_region_exclude', place('geo_region_exclude', 'XA-NM'), OUTSIDE_PLACE),
+            ('geo_polygon_exclude', place('geo_polygon_exclude', SQUARE), OUTSIDE_PLACE),
         ):
             for which, dataset in made.items():
                 assert await grid_plots(r, dataset, form) == kept, (name, which)
@@ -856,12 +874,15 @@ def test_a_place_excluded_as_the_whole_filter_keeps_the_same_images_with_and_wit
 
 def test_a_not_around_a_place_keeps_what_the_exclusion_keeps_whatever_the_objects_carry(regions_world):
     """Contract g5 (objects filter reading), 2.8: a NOT around the place itself keeps what the exclusion standing alone
-    keeps, on every dataset: the images outside the place and those with no location, never an image inside brought
-    back through an object with no location (an image inside the place is out, whatever its objects). The exclusion
-    standing alone is asked first, as main answers it."""
+    keeps, on every dataset: the images outside the place, never an image inside brought back through an object with
+    no location (an image inside the place is out, whatever its objects). Rewritten for contract g7 (one rule
+    everywhere, rule 1.6): the images with no location are out too (main kept them). The place itself, which main
+    answers alike, is asked first, then the exclusion standing alone."""
 
     async def scenario(r):
         made = await placed(r)
+        for which, dataset in made.items():
+            assert await grid_plots(r, dataset, place('geo_region', 'XA-NM')) == INSIDE_PLACE, which
         for which, dataset in made.items():
             assert await grid_plots(r, dataset, place('geo_region_exclude', 'XA-NM')) == OUTSIDE_PLACE, which
         for name, form in (
@@ -882,10 +903,14 @@ def test_an_excluded_place_inside_an_or_or_sharing_a_filter_card_keeps_what_the_
     wrapped by the page's withGrain, which test_assistant_views_spec.image_grain writes again), keep what the
     exclusion standing alone keeps. As a top-level AND part (each part a stage, as the parse route, the SDK and the
     assistant make them) it keeps that already, and that is asked first. The objects all have `label = "crate"`, a
-    field the images lack, so a form naming it is asked of the two datasets with objects only."""
+    field the images lack, so a form naming it is asked of the two datasets with objects only. Rewritten for contract
+    g7 (one rule everywhere, rule 1.6): what the exclusion keeps is the images located outside the place (main kept
+    the images with no location too); the place itself, which main answers alike, is asked first."""
 
     async def scenario(r):
         made = await placed(r)
+        for which, dataset in made.items():
+            assert await grid_plots(r, dataset, 'location within "XA-NM"') == INSIDE_PLACE, which
         never = ('plot = "no-such-plot"', {'field': 'plot', 'operator': '=', 'value': 'no-such-plot'})
         exclusion = place('geo_region_exclude', 'XA-NM')
         # (the form, what the plain, bare-objects and located-objects datasets keep; None: not asked)
@@ -970,6 +995,23 @@ def test_the_server_keeps_the_same_images_for_a_lifted_place_exclusion_however_i
 
     async def scenario(r):
         made = await placed(r)
+        # Asked first, as main answers it: the place itself in the coupled form (not lifted, not negated). Rewritten for
+        # contract g7 (one rule everywhere, rule 1.6): the lifted exclusion keeps the images located outside the place
+        # (the images with no location, nor on their objects, are out; main kept them).
+        for which in ('bare', 'located'):
+            dataset_id, plots, _ = made[which]
+            node = {'logic': 'AND', 'filters': [place('geo_region', 'XA-NM')]}
+            coupled = {
+                'logic': 'AND',
+                'filters': [
+                    {'field': 'media_type', 'operator': '!=', 'value': 'object'},
+                    either(
+                        {'field': '_cgself', 'operator': 'cg_self', 'value': node},
+                        {'field': '_crossgrain', 'operator': 'has_matching_object', 'value': node},
+                    ),
+                ],
+            }
+            assert await kept_plots(r, dataset_id, plots, coupled, False) == INSIDE_PLACE, which
         insides = [
             ('the region', place('geo_region', 'XA-NM')),
             ('the region in a group', one_rule(place('geo_region', 'XA-NM'))),
@@ -1007,11 +1049,29 @@ def test_a_saved_view_whose_stage_is_a_wrapped_place_exclusion_keeps_for_the_ass
     location). A wrapped exclusion reaches the assistant's wrapper (backend/assistant/grain.py) through its public
     surface as a saved view's stage, which open_saved_view opens as a working view: its count and its samples
     (get_samples) are the five images on every dataset, as for the bare stage. A polygon has no text form, so only a
-    saved view, an f= link or another program writes one wrapped; it is checked the same way."""
+    saved view, an f= link or another program writes one wrapped; it is checked the same way. Rewritten for contract
+    g7 (one rule everywhere, rule 1.6): those are now the three images located outside the place (main kept the two
+    with no location too). A saved view of the place itself, which main answers alike, is opened first."""
 
     async def scenario(r):
         made = await placed(r)
         await open_door(r)
+        for which, (dataset_id, plots, _) in made.items():
+            stage = place('geo_region', 'XA-NM')
+            content = {
+                'filters': {'logic': 'AND', 'filters': [stage]},
+                'viewStages': [{'type': 'map_region', 'description': 'In XA-NM', 'filter': stage}],
+            }
+            saved = await ok(
+                await post(
+                    r,
+                    f'/api/datasets/{dataset_id}/views',
+                    {'name': f'in-{which}', 'content': content, 'is_public': False},
+                ),
+            )
+            view = await result(ADMIN, 'open_saved_view', {'slug': saved['slug']})
+            kept = {plots[i] for i in await view_ids(ADMIN, view['view'])}
+            assert (view['count'], kept) == (len(INSIDE_PLACE), INSIDE_PLACE), (which, view['count'], kept)
         for number, (name, stage) in enumerate(LONE_EXCLUSIONS):
             for which, (dataset_id, plots, _) in made.items():
                 content = {
@@ -1047,8 +1107,8 @@ def test_a_not_over_two_fields_needs_both_fields_and_no_longer_brings_an_image_b
     """Contract g5 (objects filter reading), 2.3: on a dataset with objects `NOT (colour = "red" AND n = 0)` shows an
     image that has both fields (itself or through its objects; here the objects have neither) and that the inside
     doesn't show. The red images with n 0 stay out whether or not they have an object, and the image with neither
-    field is out. On the same images without objects (2.8, unchanged) the negation keeps the image with neither field
-    too."""
+    field is out. Rewritten for contract g7 (one rule everywhere, rule 1.2): on the same images without objects the
+    image with neither field is out too (main kept it). The inside alone, which main answers alike, is asked first."""
 
     async def scenario(r):
         found = {}
@@ -1073,12 +1133,17 @@ def test_a_not_over_two_fields_needs_both_fields_and_no_longer_brings_an_image_b
                     if plot in having
                 ]
                 await datasets.add_samples(dataset_id, {'samples': children}, user=ADMIN_USER)
+            inside = await nodes(r, 'colour = "red" AND n = 0', dataset_id)
+            assert await kept_plots(r, dataset_id, plots, {'logic': 'AND', 'filters': inside}, objects) == {
+                'red-0',
+                'red-0-alone',
+            }, objects
             filters = await nodes(r, 'NOT (colour = "red" AND n = 0)', dataset_id)
             assert len(filters) == 1 and filters[0]['logic'] == 'NOT', filters
             found[objects] = await kept_plots(r, dataset_id, plots, {'logic': 'AND', 'filters': filters}, objects)
-        assert found[False] == {'red-1', 'blue-0', 'neither'}, found[False]
         # red-0 no longer comes back through its object, which has neither field; `neither` has no colour and no n.
         assert found[True] == {'red-1', 'blue-0'}, found[True]
+        assert found[False] == {'red-1', 'blue-0'}, found[False]
 
     regions_world(scenario)
 
@@ -1093,17 +1158,34 @@ def prose(text: str) -> str:
 
 
 NEGATION = re.compile(r'\b(negation|negated|not|NOT)\b|!=')
+CODE = re.compile(r'`[^`]*`')
+KEEPING = re.compile(r'\b(keep|keeps|kept|stay|stays|include|includes|included)\b', re.I)
+NO_VALUE = re.compile(
+    r'\bwithout the field\b|\bwithout tags\b|\bno (value|score|location|point|tags)\b|\bha(ve|s) no `',
+    re.I,
+)
+SAYS_NOT = re.compile(r"\b(only|not|never|no longer|nor|neither|unless)\b|n't\b", re.I)
 
 
-def test_the_docs_say_what_a_negation_keeps_on_each_kind_of_dataset():
+def test_the_docs_say_a_negation_keeps_only_the_rows_that_have_a_value_on_every_dataset():
+    """Rewritten for contract g7 (one rule everywhere, section 5.1): the paragraph on negation is one rule for every
+    dataset. No sentence says that a negation, an exclusion or a list's `not in` keeps the samples with no value (no
+    field, score, location, point or tags) on some kind of dataset, as the docs said of a dataset without objects; a
+    sentence that keeps them with `is null` or `not exists` (the old meaning written out) is no such sentence. The
+    sentence on datasets with objects that the contract keeps is still asked for, and the Concept scores and Operators
+    sections still say what a negation keeps."""
     text = (ROOT / 'docs/FILTER_QUERY.md').read_text()
-    # No sentence keeps "the samples the concept has no score for" without saying which kind of dataset.
-    for found in sentences(text):
-        if re.search(r'no score', found, re.I) and re.search(r'\b(keep|keeps|kept|includ\w*)\b', found, re.I):
-            assert re.search(r'object', found, re.I), (
-                f'says what a concept keeps without naming the kind of dataset: {found}'
-            )
-    # The rule for datasets with objects, in a sentence.
+    # No sentence keeps the samples that have no value.
+    keeping = []
+    body = '\n'.join(line for line in prose(text).splitlines() if not line.lstrip().startswith('#'))  # no headings
+    for found in sentences(body):
+        if re.search(r'is null|not exists', found, re.I):
+            continue
+        words = CODE.sub(' ', found)
+        if KEEPING.search(words) and NO_VALUE.search(found) and not SAYS_NOT.search(words):
+            keeping.append(found)
+    assert not keeping, f'these sentences keep the samples with no value: {keeping}'
+    # The rule for datasets with objects, in a sentence (contract 5.1 keeps it).
     rule = [
         found
         for found in sentences(prose(text))
@@ -1113,11 +1195,12 @@ def test_the_docs_say_what_a_negation_keeps_on_each_kind_of_dataset():
         and re.search(r'\b(field|score)s?\b', found, re.I)
     ]
     assert rule, 'no sentence says that on a dataset with objects a negation keeps only the samples that have one'
-    # Where a concept is described, and where NOT is.
-    concepts = prose(section(text, '## Concept scores'))
-    assert re.search(r'\bobjects?\b', concepts, re.I), concepts
-    operators = prose(section(text, '## Operators'))
-    assert re.search(r'\bobjects\b', operators, re.I), operators
+    # Where a concept is described, and where NOT is: a negation keeps only the samples that have a score, a field.
+    having = re.compile(r'\bonly\b[^.;]*\b(have|has|with)\b[^.;]*\b(field|value|score)s?\b', re.I)
+    concepts = sentences(prose(section(text, '## Concept scores')))
+    assert any(having.search(found) and re.search(r'\bscore\b', found) for found in concepts), concepts
+    operators = sentences(prose(section(text, '## Operators')))
+    assert any(NEGATION.search(found) and having.search(found) for found in operators), operators
 
 
 # --- 4. describe_dataset ---

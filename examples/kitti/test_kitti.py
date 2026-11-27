@@ -64,9 +64,10 @@ def test_labels_calibration_projection_and_summary():
     assert set(calibration['kitti']) == {'R0_rect', 'Tr_velo_to_cam', 'Tr_imu_to_velo'}
     assert calibration.to_camera([[10, 0, 0]], 'lidar').tolist() == [[0, 0, 10]]
     assert list(importer.projection_ious(calibration, boxes)) == pytest.approx([1])
-    summary = importer.label_summary(detections, boxes)
-    assert summary['num_dontcare'] == summary['num_easy'] == summary['num_occluded_0'] == 1
-    assert summary['truncation_mean'] == summary['occlusion_max'] == 0
+    # Only the counts the object rows don't give: the cuboids' own difficulty and occlusion are their rows' fields.
+    assert importer.label_summary(detections, boxes) == {'num_cuboids': 1, 'num_dontcare': 1}
+    importer.occlusion_words(detections + boxes)
+    assert [box['occluded'] for box in detections + boxes] == ['none', None, 'none']
 
 
 @pytest.mark.parametrize(
@@ -114,8 +115,8 @@ def test_oxts_values_and_verified_timezone():
     assert gps['heading'] == pytest.approx(0)
     assert gps['speed_kmh'] == 18
     assert gps['captured_at'] == '2011-09-26T13:02:45.123456+02:00'
-    assert gps['oxts_timestamp_raw'] == TIMESTAMP + ' (Europe/Berlin local)'
-    assert 'corroborated by sun position' in gps['timestamp_timezone']
+    # One time field: the raw text and the zone's explanation aren't kept beside it.
+    assert not {'oxts_timestamp_raw', 'timestamp_timezone'} & gps.keys()
     with pytest.raises(ValueError):
         oxts.parse_oxts(PACKET.replace('49 ', 'nan ', 1), TIMESTAMP)
     assert oxts.frame_gps(None, RAW) == {}
@@ -293,7 +294,6 @@ class MemoryDataset:
         self.rows = {}
         self.reductions = []
         self.refreshes = 0
-        self.displays = []
         self.projected = set()
         self.logins = []
 
@@ -358,12 +358,6 @@ class MemoryDataset:
     def get_dataset_by_id(self, dataset_id):
         return {}
 
-    def get_schema(self):
-        return [{'name': 'occluded'}] if any(r.media_type == 'object' for r in self.rows.values()) else []
-
-    def set_field_display_type(self, dataset_id, field, display):
-        self.displays.append((field, display))
-
 
 @pytest.fixture
 def memory_api(monkeypatch):
@@ -406,11 +400,15 @@ def test_import_links_embeddings_and_resume(source, tmp_path, memory_api, monkey
         assert child.metadata['num_lidar_points'] == 1
         assert child.location == parent.location == (8, 49)
         assert child.heading == parent.heading == pytest.approx(0)
-        assert child.metadata['license'] == parent.metadata['license'] == importer.LICENSE
+        # The frame's own fields stay on the frame.
+        assert parent.metadata['license'] == importer.LICENSE
+        assert not {'license', 'attribution', 'drive', 'captured_at', 'speed_kmh', 'split'} & child.metadata.keys()
+        assert child.tags == [] and parent.tags == []
+        assert child.metadata['occluded'] in ('none', 'partly', 'largely', 'unknown')
         assert Path(child.filepath).is_relative_to(root)
         assert set(child.embeddings) == {'clip_obj'}
     assert all(set(parent.embeddings) == {'clip'} for parent in images)
-    assert memory_api.displays == [('occluded', 'enum')]
+    assert all('gps_available' not in parent.metadata and 'date' not in parent.metadata for parent in images)
     assert not list(root.rglob('*.txt'))  # labels/calibration stay in their ZIPs
     monkeypatch.setattr(socket.socket, 'connect', lambda *args: pytest.fail('Offline import attempted network'))
     mtimes = {p: p.stat().st_mtime_ns for p in root.rglob('*.jpg')}
@@ -418,7 +416,6 @@ def test_import_links_embeddings_and_resume(source, tmp_path, memory_api, monkey
     counts = importer.run(args, lambda args: pytest.fail('Completed rerun loaded CLIP'))
     assert importer.ATTRIBUTION in memory_api.description
     assert {p: p.stat().st_mtime_ns for p in mtimes} == mtimes
-    assert memory_api.displays == [('occluded', 'enum')] * 2
     assert counts['images_written'] == counts['objects_written'] == 0
     assert memory_api.refreshes == 2
     assert memory_api.reductions == []
@@ -437,7 +434,7 @@ def test_testing_split_and_limit(source, tmp_path, memory_api):
     sample = next(iter(memory_api.rows.values()))
     assert sample.location is None
     assert not {'ground_truth', 'ground_truth_3d', 'drive'} & sample.metadata.keys()
-    assert sample.tags == ['testing']
+    assert sample.tags == [] and sample.metadata['split'] == 'testing'
     assert Path(sample.metadata['lidar']['path']).is_file()
     assert not memory_api.reductions
 
@@ -572,8 +569,6 @@ def test_raw_timestamp_not_auto_detected_as_utc():
     from datetime import datetime
 
     gps = oxts.parse_oxts(PACKET, TIMESTAMP)
-    with pytest.raises(ValueError):
-        datetime.fromisoformat(gps['oxts_timestamp_raw'])
     offset = datetime.fromisoformat(gps['captured_at']).utcoffset()
     assert offset is not None and offset.total_seconds() == 7200
 
@@ -678,12 +673,11 @@ def test_crash_after_last_upload_recovers_finalization(source, tmp_path, memory_
 
     with pytest.raises(RuntimeError, match='crash after uploads'):
         importer.run(args, factory)
-    assert len(memory_api.rows) == 4 and not memory_api.reductions and not memory_api.displays
+    assert len(memory_api.rows) == 4 and not memory_api.reductions
     monkeypatch.setattr(memory_api, 'refresh_stats', original)
     counts = importer.run(args, lambda args: pytest.fail('Resume loaded CLIP'))
     assert counts['images_written'] == counts['objects_written'] == 0
     assert memory_api.refreshes == 1
-    assert memory_api.displays == [('occluded', 'enum')]
     assert memory_api.reductions == ['clip', 'clip_obj']
     importer.run(args, lambda args: pytest.fail('No-op rerun loaded CLIP'))
     assert memory_api.reductions == ['clip', 'clip_obj']

@@ -9,12 +9,14 @@ frontend/e2e/polygon-across-180.spec.ts.
 The rule (contract section 1): a polygon is a shape as it was drawn, its points in one frame whose longitudes may run
 past 180 or below -180; a sample is inside when its location, moved east or west by whole turns of 360 degrees, lies
 inside the shape. A polygon whose longitudes all lie from -180 to 180 means what it means today. The exclusion removes
-exactly what the polygon holds and keeps every other sample, those with no location included. A polygon 360 degrees
-wide or more is no error, up to 60 turns of the globe (21,600 degrees); one wider is refused with a 400 (amended
-2026-11-24). What each other value answers (rule 1.6, amended 2026-11-24): null and a list of fewer than three entries
-keep every sample, and so does a ring with fewer than three points besides its closing point; an open ring is closed
-and a point's entries after its latitude are ignored; a coordinate written as text is read as that number; any other
-value is refused with a 400 naming `geo_polygon` wherever the filter is read at once.
+exactly what the polygon holds and keeps every other sample that has a location (rewritten for the later contract g7,
+one rule everywhere, rule 1.6: the sample with no location is no longer kept; main kept it). A polygon 360 degrees
+wide or more is no error, up to 10 turns of the globe (3,600 degrees); one wider is refused with a 400 (amended
+2026-11-24; the limit changed 2026-11-26 from 60 turns to 10, the owner's word). What each other value answers (rule
+1.6, amended 2026-11-24): null and a list of fewer than three entries keep every sample, and so does a ring with fewer
+than three points besides its closing point; an open ring is closed and a point's entries after its latitude are
+ignored; a coordinate written as text is read as that number; any other value is refused with a 400 naming
+`geo_polygon` wherever the filter is read at once.
 
 The samples (section 5.1): two each side of the antimeridian near Fiji (177.4 and 179.2; -179.5 and -178.2, which are
 180.5 and 181.8 in a frame running past 180), three far away (longitude 0, 100 and -100) and one with no location;
@@ -41,10 +43,11 @@ Where the contract leaves something open, these tests read it this way:
   is read as an answer whose text holds `geo_polygon`, `longitude` and `latitude`; "a coordinate that is not a finite
   number" includes text that reads as no finite number (`"NaN"`) and null. The value read as 1.6.1's "a list of fewer
   than three entries" holds whatever its entries are (`[[1]]`, `[1, 2]`).
-- Rule 1.5's limit is a test of its own: a polygon whose longitudes span exactly 21,600 degrees is answered, one
-  spanning more (21,601 degrees, and points at 176 and 1e15) is refused with a 400 whose text names the limit (60
-  turns, or 21,600 degrees). A narrow polygon lying far out (all its longitudes near 1e15) is not asked: the limit is
-  written for a polygon's width.
+- Rule 1.5's limit is a test of its own: a polygon whose longitudes span exactly 3,600 degrees is answered, one
+  spanning more (3,601 degrees, and points at 176 and 1e15) is refused with a 400 whose text names the limit (10
+  turns, or 3,600 degrees). A narrow polygon lying far out (all its longitudes near 1e15) is not asked: the limit is
+  written for a polygon's width. The two pages that name the limit (docs/MAP_REQUIREMENTS.md #8, docs/SDK.md's
+  geospatial section) name 10 turns.
 - "Every reader" (2.1) is samples/query and its count, an export's pages (samples/query with after_id, slim and
   skip_count, as the export dialog pages), aggregate, the histogram, field-stats and a field's autocomplete (the
   sidebar), map_points, map_extent, a selection token and in_selection (Select All), /api/search, a bulk tag (its count
@@ -62,6 +65,8 @@ Where the contract leaves something open, these tests read it this way:
 import asyncio
 import json
 import os
+import re
+from pathlib import Path
 from typing import Any, Optional
 from uuid import uuid4
 
@@ -530,24 +535,29 @@ async def version_of(r: Regions) -> int:
     return await r.database.fetchval('SELECT id FROM dataset_versions WHERE dataset_id = $1', PLAIN)
 
 
-def test_a_polygon_within_minus_180_to_180_holds_what_it_holds_today(regions_world, monkeypatch):
-    """Contract 1.3 and 5.4, a pin that passes on main: a polygon whose longitudes all lie from -180 to 180 holds what
-    it holds today, through every route: samples/query and its count, map_extent and map_points, alone and ANDed with
-    another filter, as geo_polygon and geo_polygon_exclude; the image and the object grid of a dataset with objects; and
-    every reader of filters. A polygon with points at 170 and -170 stays the shape through longitude 0."""
+def test_a_polygon_within_minus_180_to_180_holds_what_it_holds_today_and_its_exclusion_needs_a_location(
+    regions_world,
+    monkeypatch,
+):
+    """Contract 1.3 and 5.4: a polygon whose longitudes all lie from -180 to 180 holds what it holds today, through
+    every route: samples/query and its count, map_extent and map_points, alone and ANDed with another filter, as
+    geo_polygon and geo_polygon_exclude; the image and the object grid of a dataset with objects; and every reader of
+    filters. A polygon with points at 170 and -170 stays the shape through longitude 0. Rewritten for the later contract
+    g7 (one rule everywhere, rule 1.6): geo_polygon_exclude keeps the other samples that have a location, not the one
+    with none (main kept it); geo_polygon is asked first for each polygon, as main answers it."""
     check_expectations(ORDINARY)
 
     async def scenario(r):
         p = await plant(r)
         for label, polygon, names in ORDINARY:
             await assert_alone_and_anded(r, p, place('geo_polygon', polygon), names, label)
-            await assert_alone_and_anded(r, p, place('geo_polygon_exclude', polygon), EVERY - names, (label, 'out'))
+            await assert_alone_and_anded(r, p, place('geo_polygon_exclude', polygon), LOCATED - names, (label, 'out'))
         o = await plant_objects(r)
         await assert_grids(r, o, WEST_HALF, {'iw'}, 'the west half')
         await assert_grids(r, o, EAST_HALF, {'ie', 'ox'}, 'the east half')
         version = await version_of(r)
         await assert_every_reader(r, p, place('geo_polygon', WEST_HALF), WEST, version, monkeypatch)
-        await assert_every_reader(r, p, place('geo_polygon_exclude', WEST_HALF), EVERY - WEST, version, monkeypatch)
+        await assert_every_reader(r, p, place('geo_polygon_exclude', WEST_HALF), LOCATED - WEST, version, monkeypatch)
 
     regions_world(scenario)
 
@@ -555,23 +565,26 @@ def test_a_polygon_within_minus_180_to_180_holds_what_it_holds_today(regions_wor
 # --- 1.4 ---
 
 
-def test_the_exclusion_keeps_exactly_the_samples_the_polygon_does_not_hold(regions_world):
+def test_the_exclusion_keeps_exactly_the_located_samples_the_polygon_does_not_hold(regions_world):
     """Contract 1.4: geo_polygon_exclude of a polygon across the antimeridian (on any copy of the world, and 360 degrees
-    wide or more) removes exactly the samples geo_polygon of the same points holds, and keeps every other sample, the
-    one with no location included; alone and ANDed with another filter, through every route. Main keeps the samples
-    east of the antimeridian a polygon across it holds."""
+    wide or more) removes exactly the samples geo_polygon of the same points holds, and keeps every other sample;
+    alone and ANDed with another filter, through every route. Main keeps the samples east of the antimeridian a polygon
+    across it holds. Rewritten for the later contract g7 (one rule everywhere, rule 1.6): every other sample that has a
+    location, not the one with none (main kept it). The control, asked first as main answers it, is the west half as
+    an ordinary polygon, included."""
     cases = CROSSING + OTHER_COPIES + WIDE
     check_expectations(cases + ORDINARY[:1])
 
     async def scenario(r):
         p = await plant(r)
         control = ORDINARY[0]  # the west half, an ordinary polygon
-        await assert_alone_and_anded(r, p, place('geo_polygon_exclude', control[1]), EVERY - control[2], control[0])
+        await assert_alone_and_anded(r, p, place('geo_polygon', control[1]), control[2], control[0])
+        await assert_alone_and_anded(r, p, place('geo_polygon_exclude', control[1]), LOCATED - control[2], control[0])
         for label, polygon, names in cases:
-            await assert_alone_and_anded(r, p, place('geo_polygon_exclude', polygon), EVERY - names, label)
+            await assert_alone_and_anded(r, p, place('geo_polygon_exclude', polygon), LOCATED - names, label)
             kept = await selected(r, place('geo_polygon', polygon), PLAIN)
             dropped = await selected(r, place('geo_polygon_exclude', polygon), PLAIN)
-            assert not kept & dropped and kept | dropped == p.of(EVERY), label
+            assert not kept & dropped and kept | dropped == p.of(LOCATED), label
 
     regions_world(scenario)
 
@@ -664,7 +677,8 @@ async def assert_refused(r: Regions, p: Planted, value: Any, words: tuple[str, .
 
 
 SAYS_WHAT_IT_TAKES = ('geo_polygon', 'longitude', 'latitude')
-NAMES_THE_LIMIT = ('60', '21600', '21,600')  # 60 turns, or 21,600 degrees
+# 10 turns, or 3,600 degrees (contract 1.5, changed 2026-11-26 from 60 turns and 21,600 degrees)
+NAMES_THE_LIMIT = re.compile(r'\b10 turns\b|\bten turns\b|\b3,?600\b', re.I)
 
 # 1.6.1: no polygon, as today.
 NO_POLYGON: list[tuple[str, Any]] = [
@@ -729,14 +743,17 @@ CLOSED_AND_LONG_POINTS: list[tuple[str, Optional[Polygon], set[str]]] = [
     ids=[case[0] for case in CLOSED_AND_LONG_POINTS],
 )
 def test_an_open_ring_is_closed_and_the_entries_after_a_points_latitude_are_ignored(regions_world, label, value, kept):
-    """Contract 1.6.3, a pin that passes on main: an open ring is closed with its first point (it answers what the
-    same ring closed answers, within -180 to 180 and across 180); a point's first two entries are its longitude and
-    latitude and further entries are ignored (points of three numbers on a line are a polygon with no inside)."""
+    """Contract 1.6.3: an open ring is closed with its first point (it answers what the same ring closed answers,
+    within -180 to 180 and across 180); a point's first two entries are its longitude and latitude and further entries
+    are ignored (points of three numbers on a line are a polygon with no inside). Rewritten for the later contract g7
+    (one rule everywhere, rule 1.6): geo_polygon_exclude keeps the other samples that have a location (main kept the
+    one with none too), so the cases with a polygon fail on main at their exclusion; the open ring's comparison with
+    the closed one passes there."""
 
     async def scenario(r):
         p = await plant(r)
         if value is not None:
-            await assert_keeps_at_once(r, p, value, kept, EVERY - kept)
+            await assert_keeps_at_once(r, p, value, kept, LOCATED - kept)
             return
         for polygon in (WEST_HALF, ACROSS, turned(ACROSS, -1)):
             for operator in ('geo_polygon', 'geo_polygon_exclude'):
@@ -771,12 +788,14 @@ TEXT_COORDINATES: list[tuple[str, Any, set[str]]] = [
 def test_a_coordinate_written_as_text_is_read_as_that_number(regions_world, label, value, kept):
     """Contract 1.6.4: a coordinate is a number, or text that reads as one, and text is read as that number, so a
     longitude "183" is past 180 and makes the polygon one across the antimeridian. Text within -180 to 180 answers as
-    the numbers do today (those cases pass on main); main reads text past 180 as a polygon that does not cross."""
+    the numbers do today; main reads text past 180 as a polygon that does not cross. Rewritten for the later contract
+    g7 (one rule everywhere, rule 1.6): geo_polygon_exclude keeps the other samples that have a location (main kept the
+    one with none too), so every case fails on main at its exclusion, after its geo_polygon."""
     assert by_the_rule([[float(lon), float(lat)] for lon, lat in value], PLACES) == kept, "the test's own expectation"
 
     async def scenario(r):
         p = await plant(r)
-        await assert_keeps_at_once(r, p, value, kept, EVERY - kept)
+        await assert_keeps_at_once(r, p, value, kept, LOCATED - kept)
 
     regions_world(scenario)
 
@@ -820,19 +839,21 @@ def test_any_other_value_is_refused_with_a_400_naming_geo_polygon(regions_world,
     regions_world(scenario)
 
 
-def test_a_polygon_wider_than_60_turns_of_the_globe_is_refused_with_a_400(regions_world):
-    """Contract 1.5's limit (amended 2026-11-24, waiting for the owner's word, so a test of its own): a polygon exactly
-    60 turns wide (21,600 degrees) is answered, holding every sample within its latitudes; one wider (21,601 degrees,
-    and one with a longitude of 1e15) is refused with a 400 that says so, by samples/query, map_extent and map_points.
-    Main answers the wider ones too."""
-    sixty_turns = rect(-10800, -25, 10800, 25)
-    check_expectations([('60 turns wide', sixty_turns, FIJI | {'zero', 'hundred'})])
+def test_a_polygon_wider_than_10_turns_of_the_globe_is_refused_with_a_400(regions_world):
+    """Contract 1.5's limit (changed 2026-11-26, the owner's word: 10 turns, where 2.14.0 shipped 60): a polygon exactly
+    10 turns wide (3,600 degrees) is answered, holding every sample within its latitudes; one wider (3,601 degrees, and
+    one with a longitude of 1e15) is refused with a 400 whose text names the limit, by samples/query, map_extent and
+    map_points. 2.14.0 answers 3,601 degrees, and refuses 1e15 naming 60 turns. By the later contract g7 (one rule
+    everywhere, rule 1.6) the exclusion of the polygon 10 turns wide keeps `minus` alone, not `none`, which has no
+    location."""
+    ten_turns = rect(-1800, -25, 1800, 25)
+    check_expectations([('10 turns wide', ten_turns, FIJI | {'zero', 'hundred'})])
 
     async def scenario(r):
         p = await plant(r)
-        await assert_keeps_at_once(r, p, sixty_turns, FIJI | {'zero', 'hundred'}, {'minus', 'none'})
+        await assert_keeps_at_once(r, p, ten_turns, FIJI | {'zero', 'hundred'}, {'minus'})
         for label, polygon in (
-            ('21,601 degrees wide', rect(-10800, -25, 10801, 25)),
+            ('3,601 degrees wide', rect(-1800, -25, 1801, 25)),
             ('a longitude of 1e15', rect(176, -20, 1e15, -14)),
         ):
             for operator in ('geo_polygon', 'geo_polygon_exclude'):
@@ -840,11 +861,23 @@ def test_a_polygon_wider_than_60_turns_of_the_globe_is_refused_with_a_400(region
                 wrong = [
                     f'{route}: {status} {str(text)[:200]}'
                     for route, (status, text) in found.items()
-                    if status != 400 or not any(limit in str(text) for limit in NAMES_THE_LIMIT)
+                    if status != 400 or not NAMES_THE_LIMIT.search(str(text))
                 ]
                 assert not wrong, (label, operator, wrong)
 
     regions_world(scenario)
+
+
+def test_the_pages_that_name_the_limit_name_10_turns():
+    """docs/MAP_REQUIREMENTS.md (#8) and docs/SDK.md (the geospatial section) say a polygon wider than the limit is
+    refused: each names 10 turns of the globe (or 3,600 degrees), and neither still names 60 turns or 21,600 degrees."""
+    root = Path(__file__).resolve().parents[2]
+    for page in ('docs/MAP_REQUIREMENTS.md', 'docs/SDK.md'):
+        text = ' '.join((root / page).read_text().split())
+        limits = [found for found in re.split(r'(?<=[.;:])\s+', text) if re.search(r'\bturns? of the globe\b', found)]
+        assert limits, (page, 'no sentence names the limit')
+        assert all(NAMES_THE_LIMIT.search(found) for found in limits), (page, limits)
+        assert not re.search(r'\b60 turns\b|\bsixty turns\b|\b21,?600\b', text, re.I), page
 
 
 # --- 2.1 ---
@@ -863,7 +896,8 @@ def test_every_reader_of_filters_finds_the_samples_on_both_sides(regions_world, 
     """Contract 2.1: the rule holds wherever a filter is read: the grid and its count, an export, aggregate, the
     histogram, the sidebar's field-stats and values, map_points (points and bubbles), map_extent, Select All's token,
     /api/search, a bulk tag, a version, the SDK and the assistant's tools; for geo_polygon and geo_polygon_exclude.
-    Main misses the samples east of the antimeridian in each."""
+    Main misses the samples east of the antimeridian in each. Rewritten for the later contract g7 (one rule everywhere,
+    rule 1.6): geo_polygon_exclude keeps the other samples that have a location, not the one with none."""
     check_expectations(CROSSING[:1])
 
     async def scenario(r):
@@ -871,7 +905,7 @@ def test_every_reader_of_filters_finds_the_samples_on_both_sides(regions_world, 
         version = await version_of(r)
         for node, names in (
             (place('geo_polygon', ACROSS), FIJI),
-            (place('geo_polygon_exclude', ACROSS), EVERY - FIJI),
+            (place('geo_polygon_exclude', ACROSS), LOCATED - FIJI),
             (place('geo_polygon', turned(ACROSS, -1)), FIJI),
         ):
             await assert_every_reader(r, p, node, names, version, monkeypatch)
@@ -924,7 +958,8 @@ def test_a_polygon_across_180_saved_in_a_view_finds_the_same_samples_when_opened
     """Contract 2.4: a polygon across the antimeridian saved in a view keeps its longitudes on the way (read back by its
     slug and in the dataset's list exactly as saved), and finds the same samples when it is opened again: by its stage's
     filter, by the SDK's load_view and by the assistant's open_saved_view. Its text form is today's for a polygon (none:
-    the address carries it encoded)."""
+    the address carries it encoded). Rewritten for the later contract g7 (one rule everywhere, rule 1.6): an excluded
+    polygon finds the other samples that have a location, not the one with none."""
     check_expectations(CROSSING[:1] + OTHER_COPIES[:2] + ORDINARY[:1])
 
     async def scenario(r):
@@ -934,9 +969,9 @@ def test_a_polygon_across_180_saved_in_a_view_finds_the_same_samples_when_opened
         cases = [
             ('the control: the west half', place('geo_polygon', WEST_HALF), WEST),
             ('176 to 183', place('geo_polygon', ACROSS), FIJI),
-            ('176 to 183, excluded', place('geo_polygon_exclude', ACROSS), EVERY - FIJI),
+            ('176 to 183, excluded', place('geo_polygon_exclude', ACROSS), LOCATED - FIJI),
             ('-184 to -177', place('geo_polygon', turned(ACROSS, -1)), FIJI),
-            ('536 to 543, excluded', place('geo_polygon_exclude', turned(ACROSS, 1)), EVERY - FIJI),
+            ('536 to 543, excluded', place('geo_polygon_exclude', turned(ACROSS, 1)), LOCATED - FIJI),
         ]
         formatted = await ok(await post(r, f'/api/datasets/{PLAIN}/filter_query/format', {'filters': [cases[0][1]]}))
         for name, node, names in cases:

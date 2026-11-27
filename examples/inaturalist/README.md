@@ -55,8 +55,8 @@ Use a **new dataset name** when narrowing the license selection: reruns do not r
 previously imported samples. A public site's chosen image policy remains a publishing decision.
 
 Credit the dataset as “iNaturalist 2021, Grant Van Horn and the Visipedia Team.” For each
-displayed image retain its `rights_holder`, license name and license URL. The stored attribution
-text is “`<rights_holder>; iNaturalist 2021; <license_url>`”. Original images are served unchanged;
+displayed image show its `attribution`, “`<rights_holder>; iNaturalist 2021; <license_url>`”, and its
+`license` name. Original images are served unchanged;
 the script only decodes them in memory for CLIP. License names/URLs are taken from the source
 table, including CC0's public-domain dedication URL.
 
@@ -89,15 +89,15 @@ separate counters. Startup lists the number of JPEGs currently available.
 
 | Source | Sample destination/type |
 |---|---|
-| `categories.name` | `species`: `Classification` object (overlay); `scientific_name`: string (exact filter) |
+| `categories.name` | `species`: `Classification` object (overlay); `scientific_name`: the same name as a string, because a single classification's label can't be filtered for an exact value or typed ahead in the sidebar |
 | Category taxonomy | `kingdom`, `phylum`, `class`, `order`, `family`, `genus`: strings |
-| Other category attributes | `common_name`, `specific_epithet`, `supercategory`, `image_dir_name`: strings |
+| Other category attributes | `common_name`, `specific_epithet`, `supercategory`: strings (`image_dir_name`, the image's folder, is not copied) |
 | Image `date` | `date`: UTC datetime (missing stays null; timezone-less values assume UTC) |
-| Image latitude/longitude | `location=(longitude, latitude)` plus numeric `latitude`, `longitude` fields |
+| Image latitude/longitude | The sample's `location=(longitude, latitude)`: the map point, filterable by region and lasso (not repeated as fields) |
 | Image `location_uncertainty` | Nullable number, preserved in source units |
-| Image license ID + license table | `license_id`: number; `license`, `license_url`: strings |
-| Image attribution | `rights_holder`, `attribution`: strings |
-| Source identity | `image_id`, `annotation_id`, `category_id`: numbers; `file_name`: string |
+| Image license + license table | `license`, `license_url`: strings (the license number is not copied) |
+| Image attribution | `attribution`: string, naming the rights holder |
+| Source identity | `image_id`: number (the annotation's and category's numbers and the `file_name`, which the filepath has, are not copied) |
 | Image dimensions | `width`, `height`: numbers |
 | CLIP features | `embeddings[--field-name]`, default `clip` |
 

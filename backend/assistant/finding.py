@@ -247,12 +247,12 @@ async def concept_preview(api: Api, arguments: dict[str, Any]) -> dict[str, Any]
     view_count, above, below = [await _count(api, dataset_id, tree) for tree in (viewed, over, under)]
     if api.facts.get(f'objects:{dataset_id}', True):
         # With object rows, an image is above the cut when it or one of its objects scores above it, and below when it
-        # or one of them scores at or below it (the image grain): it can be both. The rest is counted, never inferred.
-        rest = {
-            'logic': 'AND',
-            'filters': [viewed, {'logic': 'NOT', 'filters': [over]}, {'logic': 'NOT', 'filters': [under]}],
-        }
-        unscored = await _count(api, dataset_id, rest)
+        # or one of them scores at or below it (the image grain): it can be both. The rest is counted, never inferred:
+        # the images of which neither the image nor any object has a score (a NOT of the score's presence needs no
+        # value, where a NOT of `over` would need a score: docs/FILTER_QUERY.md).
+        scored = {'field': '_cpresent', 'operator': 'concept_present', 'value': {'concept_id': concept['id']}}
+        unscored_images = await _images(api, dataset_id, [*nodes, {'logic': 'NOT', 'filters': [scored]}])
+        unscored = await _count(api, dataset_id, unscored_images)
     else:
         unscored = view_count - above - below  # an image's own score is above, at or below, or missing
     kept, removed = await _written(api, dataset_id, [keep, _concept_test(concept, '>', threshold, exclude=True)])

@@ -25,7 +25,7 @@ pytestmark = pytest.mark.skipif(
     not os.getenv('FRIDGE_TEST_POSTGRES_DSN') or not os.getenv('FRIDGE_TEST_POSTGRES_CONTAINER'),
     reason='Requires disposable PostgreSQL',
 )
-# Rows every 1.x schema accepts, so a migration also has to work on a database that holds data.
+# Rows every schema since the baseline accepts, so a migration also has to work on a database that holds data.
 SEED = """
 INSERT INTO datasets (name) VALUES ('upgrade-check');
 INSERT INTO samples (dataset_id, filepath, media_type) SELECT id, 's3://upgrade-check/a.jpg', 'image' FROM datasets;
@@ -33,10 +33,12 @@ INSERT INTO views (dataset_id, name, slug, content) SELECT id, 'v', 'upgrade-che
 """
 
 
-# The oldest release whose database this checkout's migrations upgrade: the start of the current schema
-# baseline (docs/UPGRADING.md, "What is supported"). 2.0 kept 1.x's baseline, so every 1.x release upgrades
-# straight to 2.x; a major version that starts a new baseline moves this to its own first release.
-BASELINE_RELEASE = 'v1.0.0'
+# The oldest release whose database this checkout's migrations upgrade: the current schema baseline, the upgrade
+# stop (docs/UPGRADING.md, "What is supported"). 3.0.0 squashed the migrations up to 2.14.0 into its baseline, so a
+# 2.14.0 database upgrades straight to 3.x and an older one goes to 2.14.0 first; the release just before it is
+# refused. A major version that starts a new baseline moves both.
+BASELINE_RELEASE = 'v2.14.0'
+LAST_BEFORE_BASELINE = 'v2.13.2'
 
 
 def _version(tag):
@@ -147,106 +149,23 @@ def test_every_release_upgrades_to_a_fresh_installs_schema(database):
         assert rows == '1,1,1', tag
 
 
-# The last release before 0021 rewrote embeddings, with what followers keep: a followed dataset (a subscription, an
-# acknowledged cursor, change-log rows) and a mirror of another primary's dataset (written as its sync writes it).
-FOLLOWER_RELEASE = 'v2.8.0'
-FOLLOWER_SEED = """
-INSERT INTO users (username, password_hash, role) VALUES ('follower:lab', 'x', 'power_user');
-INSERT INTO datasets (name) VALUES ('followed'), ('mirror');
-INSERT INTO followers (name, user_id) SELECT 'lab', id FROM users WHERE username = 'follower:lab';
-INSERT INTO follower_datasets (follower_id, dataset_id, start_txid, acked_txid)
-    SELECT id, 1, txid_current(), txid_current() FROM followers;
-INSERT INTO samples (dataset_id, filepath, media_type)
-    SELECT 1, 'followed-' || g, 'image' FROM generate_series(1, 20) g;
-INSERT INTO embeddings (sample_id, field_name, vector) SELECT id, 'clip', ARRAY[id, 1]::real[]::vector FROM samples;
-INSERT INTO embedding_coordinates (sample_id, field_name, x, y) SELECT id, 'clip', id, -id FROM samples;
-INSERT INTO primary_links (url, token_encrypted, identity) VALUES ('https://primary.example/api', 'x', 'cluster');
-INSERT INTO mirrors (dataset_id, link_id, origin_dataset_id, state, feed_cursor, vector_fields)
-    SELECT 2, id, 5, 'following', 12345, '{clip}' FROM primary_links;
-BEGIN;
-SELECT set_config('fridge.mirror_sync', '2', TRUE);
-INSERT INTO samples (dataset_id, filepath, media_type)
-    SELECT 2, 'mirror-' || g, 'image' FROM generate_series(1, 10) g;
-INSERT INTO mirror_samples (dataset_id, origin_id, sample_id)
-    SELECT 2, 1000 + id, id FROM samples WHERE dataset_id = 2;
-INSERT INTO embeddings (sample_id, field_name, vector)
-    SELECT id, 'clip', ARRAY[id, 2]::real[]::vector FROM samples WHERE dataset_id = 2;
-INSERT INTO embedding_coordinates (sample_id, field_name, x, y)
-    SELECT id, 'clip', id, id FROM samples WHERE dataset_id = 2;
-COMMIT;
-"""
-# Each as text, in both schemas: the followers' logs, the mirror's samples and cursor, and every vector and point.
-FOLLOWER_STATE = {
-    'logs': """SELECT (SELECT string_agg(format('%s/%s/%s/%s/%s', dataset_id, sample_id, kind, field_name,
-                                                transaction_id), ',' ORDER BY id) FROM vector_changes)
-               || '|' || (SELECT count(*) FROM sample_block_changes) || '|' || (SELECT count(*) FROM dataset_changes)
-               || '|' || (SELECT count(*) FROM map_block_changes)""",
-    'mirror': """SELECT (SELECT string_agg(format('%s/%s', origin_id, sample_id), ',' ORDER BY origin_id)
-                         FROM mirror_samples)
-                 || '|' || (SELECT feed_cursor FROM mirrors WHERE dataset_id = 2)""",
-    'vectors': """SELECT string_agg(format('%s/%s/%s/%s', s.dataset_id, e.sample_id, e.field_name, e.vector), ','
-                                    ORDER BY e.sample_id)
-                  FROM embeddings e JOIN samples s ON s.id = e.sample_id""",
-    'points': """SELECT string_agg(format('%s/%s/%s/%s', sample_id, field_name, x, y), ',' ORDER BY sample_id)
-                 FROM embedding_coordinates""",
-}
-
-
-def test_0021_keeps_what_followers_and_mirrors_hold_and_logs_nothing(database):
-    """0021 copies every vector and gives every map point its dataset. On a primary, none of it is a change its
-    followers must fetch again; on a follower, its mirrors' rows are copied though only their sync may write them."""
-    make, psql, _, migrate = database
+def test_a_release_before_the_baseline_is_refused_and_left_as_it_was(database):
+    """Its migrations are no longer in this checkout: the runner names the release to upgrade to first and changes
+    nothing."""
+    make, psql, schema, migrate = database
     old_schema_sql = subprocess.run(
-        ['git', '-C', str(ROOT), 'show', f'{FOLLOWER_RELEASE}:backend/db/schema.sql'],
+        ['git', '-C', str(ROOT), 'show', f'{LAST_BEFORE_BASELINE}:backend/db/schema.sql'],
         capture_output=True,
         text=True,
         check=True,
     ).stdout
-    name = make(old_schema_sql + FOLLOWER_SEED)
-    before = {key: psql(name, query) for key, query in FOLLOWER_STATE.items()}
-    assert before['logs'].count('/clip/') == 20, before['logs']  # the followed dataset's vectors were logged
+    name = make(old_schema_sql + SEED)
+    ledger = 'SELECT string_agg(filename, \',\' ORDER BY filename) FROM schema_migrations'
+    before = (schema(name), psql(name, ledger))
     result = migrate(name)
-    assert result.returncode == 0, f'apply_migrations.sh failed\n{result.stdout}\n{result.stderr}'
-    after = {key: psql(name, query) for key, query in FOLLOWER_STATE.items()}
-    assert after == before
-    assert psql(name, 'SELECT count(*) FROM embeddings_d2') == '10'
-
-
-def test_0021_continues_vector_ids_after_the_old_sequence_without_samples_index(database):
-    """New ids continue after the last one the old table gave out, not after the newest vector left: a manual
-    concept's "Score new" scores ids above its watermark, which is past max(id) once the newest vectors were deleted.
-    The index advisor can have removed samples' (dataset_id, id) index, which 0021 makes unique."""
-    make, psql, _, migrate = database
-    old_schema_sql = subprocess.run(
-        ['git', '-C', str(ROOT), 'show', f'{FOLLOWER_RELEASE}:backend/db/schema.sql'],
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout
-    name = make(
-        old_schema_sql
-        + SEED
-        + """
-INSERT INTO samples (dataset_id, filepath, media_type)
-    SELECT id, 's3://upgrade-check/' || g || '.jpg', 'image' FROM datasets, generate_series(2, 4) g;
-INSERT INTO embeddings (sample_id, field_name, vector) SELECT id, 'clip', '[1,0]' FROM samples ORDER BY id;
-DELETE FROM embeddings WHERE id > (SELECT min(id) FROM embeddings);
-DROP INDEX idx_samples_dataset_id_id;
-""",
-    )
-    given = int(psql(name, 'SELECT last_value FROM embeddings_id_seq'))
-    assert given == 4 and psql(name, 'SELECT max(id) FROM embeddings') == '1'
-    result = migrate(name)
-    assert result.returncode == 0, f'apply_migrations.sh failed\n{result.stdout}\n{result.stderr}'
-    new_id = psql(
-        name,
-        "INSERT INTO embeddings (dataset_id, sample_id, field_name, vector) "
-        "SELECT dataset_id, id, 'other', '[1,1]' FROM samples ORDER BY id LIMIT 1 RETURNING id",
-    )
-    assert int(new_id) > given
-    assert (
-        psql(name, "SELECT indisunique FROM pg_index WHERE indexrelid = 'idx_samples_dataset_id_id'::regclass") == 't'
-    )
+    assert result.returncode == 1, result.stdout
+    assert f'before {BASELINE_RELEASE[1:]}' in result.stderr and f'Check out {BASELINE_RELEASE}' in result.stderr
+    assert (schema(name), psql(name, ledger)) == before
 
 
 def test_apply_migrations_sets_the_databases_plan_cache_mode_on_every_run(database):

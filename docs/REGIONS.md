@@ -1,7 +1,8 @@
 # Regions
 
 Named regions are countries, states or provinces, and named groups of states, loaded from public boundary data. The
-filter `location within "US-KS"` keeps the samples located in Kansas, and `location not within "US-KS"` removes them.
+filter `location within "US-KS"` keeps the samples located in Kansas, and `location not within "US-KS"` the samples
+located elsewhere.
 The assistant uses them to answer "all the images in Kansas"; anyone can use them in the filter bar's query text, in
 links, in the SDK and in the API.
 
@@ -181,13 +182,16 @@ filter gives.
 | Operator | Value | Keeps |
 |---|---|---|
 | `geo_region` | a region key | the samples whose `location` is inside the region, or on its border |
-| `geo_region_exclude` | a region key | every other sample, samples with no location included |
+| `geo_region_exclude` | a region key | the samples whose `location` is outside the region: a sample with no location is in neither |
 
 ```json
 {"field": "location", "operator": "geo_region", "value": "US-KS"}
 ```
 
 - **The field is `location`**; the value is a key in any case.
+- **A sample with no location matches neither.** As for every negation ([FILTER_QUERY.md](FILTER_QUERY.md#operators)),
+  `not within` keeps only the samples that have a location; `location not within "US-KS" OR location is null` keeps
+  the samples with no location too.
 - **Islands and holes are exact:** a sample on an island of Alaska is in `US-AK`, and one in Lesotho is not in `ZA`.
   A point exactly on a border between two states is in both.
 - **A key this server doesn't have is a 400**, never a filter that matches nothing, with up to three close keys:
@@ -226,10 +230,11 @@ filter gives.
   chosen in Saved Views), the dataset's default view (opened, the Default view button, Clear All), a reload, Back and
   Forward.
 - **Datasets with objects.** On a dataset with objects, `not within` is read across the images and their objects as
-  a drawn region's exclude is: the image grid keeps the images outside the region with no object inside it, the
-  object grid the objects outside it whose image isn't inside it, and both keep the rows with no location. It reads
-  the same as a chip of its own, sharing a filter card with another test, inside an `OR`, or as `NOT (location within
-  …)` ([FILTER_QUERY.md](FILTER_QUERY.md#on-a-dataset-with-objects)).
+  a drawn region's exclude is: the image grid keeps the images that have a location, or an object with one, and
+  neither are inside the region nor have an object inside it; the object grid the objects that have a location, or
+  whose image has one, outside it and whose image isn't inside it. A row with no location of its own or its
+  partner's is in neither. It reads the same as a chip of its own, sharing a filter card with another test, inside an
+  `OR`, or as `NOT (location within …)` ([FILTER_QUERY.md](FILTER_QUERY.md#on-a-dataset-with-objects)).
 - **Loading boundaries.** Settings → System status has a Region boundaries card for administrators. It shows each
   set, its source and licence, and what is loaded of it: the version, when, how ("automatically, from the file that
   came with this release", "by admin, from the file that came with this release", "by admin, downloaded", or "from a

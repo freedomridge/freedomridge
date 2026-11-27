@@ -62,7 +62,7 @@ from backend.field_registry import (
     unchanged_column_keys,
     validate_metadata,
 )
-from backend.filter_query import canonical_region_key
+from backend.filter_query import canonical_region_key, emptiness_refusal
 from backend.label_fields import (
     DISCOVERY_TYPES,
     LEGACY_GEOMETRY_FIELDS,
@@ -73,7 +73,7 @@ from backend.label_fields import (
     label_context,
     label_path,
 )
-from backend.local_fields import LOCAL_TAGS, local_field
+from backend.local_fields import LOCAL_TAGS, LocalField, local_field
 from backend.sample_ingest import insert_samples
 
 from .. import (
@@ -84,7 +84,9 @@ from .. import (
     grain_reading,
     job_queue,
     job_wait,
+    list_fields,
     local_writes,
+    negation,
     regions,
     stale_lassos,
     statistics,
@@ -212,16 +214,12 @@ _BUILTIN_ARRAY_COLUMNS = frozenset({'tags'})
 # Classification-list vocabularies follow the discovered shape, including ground_truth/predictions.
 _LABEL_ARRAY_FIELDS = LEGACY_GEOMETRY_FIELDS
 # Equality/membership operators handled by the JSONB-containment fast path for label
-# arrays (`<field>.label` / `segmentation.labels`). Negative ops mean "contains NONE",
-# i.e. NOT(containment); anything outside this set (exists/is_null/comparisons) falls
-# through to the generic per-element EXISTS handler.
-# Include both 'not in' (the space form the frontend emits for facet/multi-select excludes) and
-# 'not_in'/'nin' so a label exclusion is recognized however it's spelled.
-_LABEL_NEG_OPS = ('!=', '<>', 'not in', 'not_in', 'nin')
-_LABEL_EQ_OPS = ('=', '==', 'in') + _LABEL_NEG_OPS
-# List-valued label ops (value is a list of labels); scalar ops (=, !=) wrap their single value.
-# 'not in' (space) is list-valued like 'in' — omitting it wraps the list and 500s the @> build.
-_LABEL_LIST_OPS = ('in', 'not in', 'not_in', 'nin')
+# arrays (`<field>.label` / `segmentation.labels`); the other comparisons fall through to the generic per-element
+# EXISTS handler (the absence tests are the list's: _value_sql).
+_LABEL_EQ_OPS = ('=', '==', 'in')
+# The spellings of a negation a list of labels takes: `!=` and `not in`, as every field does, and `<>`, `not_in` and
+# `nin`. Each is the NOT of one of the operators above (backend/negation.py), compiled as a NOT before it gets there.
+_LABEL_NEG_OPS = (*negation.NEGATIONS, *negation.LABEL_NEGATIONS)
 
 
 async def get_dataset_array_columns(dataset_id: int, source=None) -> DatasetArrayColumns:
@@ -1551,8 +1549,13 @@ _LIGHTNING_FACET_MAX_ROWS = 100_000
 _LIGHTNING_PROBE_BUDGET_S = 2.0
 
 # Per-keystroke autocomplete cap. On an unindexed field the value GROUP BY is a full
-# seq scan; above this budget we serve the cached preview instead of hanging the pool.
+# seq scan; above this budget the uncounted reading answers, then the cached preview, instead of hanging the pool.
 _AUTOCOMPLETE_BUDGET_S = 2.0
+# The uncounted reading after it (_autocomplete_impl): the values of this many rows at most, read without sorting or
+# grouping, so it stops as soon as it has them (0.3 ms for the first of two million different values, measured), under
+# a limit of its own. A term few values hold still reads every row (0.6 s on two million), and then knows them all.
+_AUTOCOMPLETE_UNCOUNTED_ROWS = 1000
+_AUTOCOMPLETE_UNCOUNTED_BUDGET_S = 1.0
 
 
 async def _filtered_set_is_broad(
@@ -1758,7 +1761,14 @@ async def _get_dataset_field_stats_impl(
 
         @functools.wraps(read)
         async def unit(*args: Any, **kwargs: Any) -> Any:
-            return await field_kinds.reading(db, id, filter_obj, lambda: read(*args, **kwargs), record=kinds_record)
+            return await field_kinds.reading(
+                db,
+                id,
+                filter_obj,
+                lambda: read(*args, **kwargs),
+                record=kinds_record,
+                always=values_view is not None,
+            )
 
         return unit
 
@@ -1794,6 +1804,9 @@ async def _get_dataset_field_stats_impl(
     descriptions: Dict[str, Any] = {}  # what was written about each field, read with the overlay configs below
     # Which kinds of sample (images, objects) each field has been seen on, beside its sample_count (field_kinds).
     kinds_record, kinds_arrays = await field_kinds.load(db, id), await get_dataset_array_columns(id)
+    # On a dataset with objects, a field's values and range are those of the rows that have it for the view, of either
+    # kind (field_value_source): the list in each of its paths reads them so.
+    values_view = await value_view(id, filter_obj) if filter_active else None
 
     # Selectivity gate (lightning_mode only). Decide ONCE whether the active filter is selective
     # enough that a per-field faceted recompute (one filtered scan PER field, fanned out across the
@@ -1959,27 +1972,40 @@ async def _get_dataset_field_stats_impl(
         args = [id]
         arg_idx = 2
         # Only called when should_filter_annotations is truthy, i.e. filter_obj is set.
-        filter_sql, _ = parse_filter_node(
-            cast('Dict[str, Any]', filter_obj),
-            args,
-            arg_idx,
-            None,
-            numeric_indexed_fields=filter_numeric_fields,
-            dataset_id=id,
-            array_columns=await get_dataset_array_columns(id),
-        )
+        present = f"metadata ? '{json_field}' AND jsonb_typeof(metadata->'{json_field}') = 'array'"
+        element = f"jsonb_array_elements(metadata->'{json_field}')->>'label'"
+        if values_view is not None:
+            source, _ = field_value_source(
+                values_view,
+                cast('Dict[str, Any]', filter_obj),
+                f'{json_field}.label',
+                id,
+                args,
+                arg_idx,
+                value=element,
+                present=present,
+                numeric_indexed_fields=filter_numeric_fields,
+                array_columns=await get_dataset_array_columns(id),
+            )
+            labels = f"SELECT DISTINCT val AS label FROM ({source}) _values"
+        else:
+            filter_sql, _ = parse_filter_node(
+                cast('Dict[str, Any]', filter_obj),
+                args,
+                arg_idx,
+                None,
+                numeric_indexed_fields=filter_numeric_fields,
+                dataset_id=id,
+                array_columns=await get_dataset_array_columns(id),
+            )
+            labels = (
+                f"SELECT DISTINCT {element} AS label FROM samples WHERE dataset_id = $1 AND {present} AND {filter_sql}"
+            )
 
         try:
             rows = await db.fetch(
                 f"""
-                SELECT label FROM (
-                    SELECT DISTINCT jsonb_array_elements(metadata->'{json_field}')->>'label' AS label
-                    FROM samples
-                    WHERE dataset_id = $1
-                      AND metadata ? '{json_field}'
-                      AND jsonb_typeof(metadata->'{json_field}') = 'array'
-                      AND {filter_sql}
-                ) AS labels
+                SELECT label FROM ({labels}) AS labels
                 WHERE label IS NOT NULL AND label <> ''
                 ORDER BY label
                 LIMIT 201
@@ -2005,29 +2031,41 @@ async def _get_dataset_field_stats_impl(
         args = [id]
         arg_idx = 2
         # Only called when should_filter_annotations is truthy, i.e. filter_obj is set.
-        filter_sql, _ = parse_filter_node(
-            cast('Dict[str, Any]', filter_obj),
-            args,
-            arg_idx,
-            None,
-            numeric_indexed_fields=filter_numeric_fields,
-            dataset_id=id,
-            array_columns=await get_dataset_array_columns(id),
+        present = (
+            "metadata ? 'segmentation' AND metadata->'segmentation' ? 'labels' "
+            "AND jsonb_typeof(metadata->'segmentation'->'labels') = 'array'"
         )
+        element = "jsonb_array_elements_text(metadata->'segmentation'->'labels')"
+        if values_view is not None:
+            source, _ = field_value_source(
+                values_view,
+                cast('Dict[str, Any]', filter_obj),
+                'segmentation.labels',
+                id,
+                args,
+                arg_idx,
+                value=element,
+                present=present,
+                numeric_indexed_fields=filter_numeric_fields,
+                array_columns=await get_dataset_array_columns(id),
+            )
+            query = f"SELECT DISTINCT val AS label FROM ({source}) _values"
+        else:
+            filter_sql, _ = parse_filter_node(
+                cast('Dict[str, Any]', filter_obj),
+                args,
+                arg_idx,
+                None,
+                numeric_indexed_fields=filter_numeric_fields,
+                dataset_id=id,
+                array_columns=await get_dataset_array_columns(id),
+            )
+            query = (
+                f"SELECT DISTINCT {element} as label FROM samples WHERE dataset_id = $1 AND {present} AND {filter_sql}"
+            )
 
         try:
-            rows = await db.fetch(
-                f"""
-                SELECT DISTINCT jsonb_array_elements_text(metadata->'segmentation'->'labels') as label
-                FROM samples
-                WHERE dataset_id = $1
-                AND metadata ? 'segmentation'
-                AND metadata->'segmentation' ? 'labels'
-                AND jsonb_typeof(metadata->'segmentation'->'labels') = 'array'
-                AND {filter_sql}
-            """,
-                *args,
-            )
+            rows = await db.fetch(query, *args)
             return [r['label'] for r in rows if r['label']]
         except _REFUSED:
             raise  # a refusal (a concept being rescored, or not the dataset's) is a 409 or 400, not an empty label list
@@ -2127,30 +2165,42 @@ async def _get_dataset_field_stats_impl(
         if recompute:
             f_args = [id]
             f_idx = 2
+            # The rows that have the list, as the compiler's `is not null` says (a list, empty or not; for tags at least
+            # one element): its elements are the values.
+            present = _value_sql(col_name, None, None, await get_dataset_array_columns(id))
             # recompute_filtered implies filter_obj is set.
-            f_sql, _ = parse_filter_node(
-                cast('Dict[str, Any]', filter_obj),
-                f_args,
-                f_idx,
-                None,
-                numeric_indexed_fields=filter_numeric_fields,
-                dataset_id=id,
-                array_columns=await get_dataset_array_columns(id),
-            )
-            array_state, filtered = await _facet_query(
-                db.fetch(
-                    f"""
+            if values_view is not None:
+                source, _ = field_value_source(
+                    values_view,
+                    cast('Dict[str, Any]', filter_obj),
+                    col_name,
+                    id,
+                    f_args,
+                    f_idx,
+                    value=f"unnest({col_name})",
+                    present=present,
+                    numeric_indexed_fields=filter_numeric_fields,
+                    array_columns=await get_dataset_array_columns(id),
+                )
+                query = f"SELECT DISTINCT val FROM ({source}) _values ORDER BY val LIMIT 201"
+            else:
+                f_sql, _ = parse_filter_node(
+                    cast('Dict[str, Any]', filter_obj),
+                    f_args,
+                    f_idx,
+                    None,
+                    numeric_indexed_fields=filter_numeric_fields,
+                    dataset_id=id,
+                    array_columns=await get_dataset_array_columns(id),
+                )
+                query = f"""
                 WITH filtered AS (
                     SELECT {col_name} FROM samples
-                    WHERE dataset_id = $1 AND {col_name} IS NOT NULL
-                    AND array_length({col_name}, 1) > 0 AND {f_sql}
+                    WHERE dataset_id = $1 AND {present} AND {f_sql}
                 )
                 SELECT DISTINCT unnest({col_name}) as val FROM filtered ORDER BY val LIMIT 201
-            """,
-                    *f_args,
-                ),
-                filter_budget_s,
-            )
+            """
+            array_state, filtered = await _facet_query(db.fetch(query, *f_args), filter_budget_s)
             if filtered is not None:
                 values = [r['val'] for r in filtered[:200] if r['val']]
                 complete = len(filtered) <= 200
@@ -2405,6 +2455,15 @@ async def _get_dataset_field_stats_impl(
     total_count = 0
     if not brief:
         total_count = await db.fetchval("SELECT count(*) FROM samples WHERE dataset_id = $1", id) or 0
+    # A list field kept in a column of its own has the same count: its rows never set (the statistics count an empty
+    # list as a value), for the sidebar's "(no value)" tick, which then shows exactly them (`is null`). Tags, whose
+    # empty list is no value, have no such tick.
+    for entry in schema:
+        name = entry.get('name')
+        stat = get_cached_stat(name) if name in array_cols and not negation.empty_is_no_value(name) else None
+        count = stat.get('sample_count') if stat is not None else None
+        if count is not None and total_count and 0 < count < total_count:
+            entry['null_count'] = total_count - count
 
     async def fill_cached(field_schema: Dict[str, Any], stat, kind: str) -> None:
         """A field's facet the gate does not recompute: the dataset's values."""
@@ -2446,18 +2505,35 @@ async def _get_dataset_field_stats_impl(
         # Fields are only queued for filtering when recompute_filtered is
         # True, which implies filter_obj is set.
         with field_usage.measure(id, {'facet': [field_name]}):
-            state, result = await _facet_query(
-                compute_filtered_minmax(id, field_name, cast('Dict[str, Any]', filter_obj)),
-                filter_budget_s,
+            # With a view (a dataset with objects), the range of the rows that have the field for it, either kind.
+            reading = (
+                compute_filtered_minmax(id, field_name, cast('Dict[str, Any]', filter_obj))
+                if values_view is None
+                else compute_filtered_minmax(
+                    id,
+                    field_name,
+                    cast('Dict[str, Any]', filter_obj),
+                    values_view,
+                    kinds_record,
+                )
             )
+            state, result = await _facet_query(reading, filter_budget_s)
         return (field_name, 'number', state, result, stat)
 
     async def filter_enum_field(field_name, stat):
         with field_usage.measure(id, {'facet': [field_name]}):
-            state, result = await _facet_query(
-                compute_filtered_values(id, field_name, cast('Dict[str, Any]', filter_obj)),
-                filter_budget_s,
+            reading = (
+                compute_filtered_values(id, field_name, cast('Dict[str, Any]', filter_obj))
+                if values_view is None
+                else compute_filtered_values(
+                    id,
+                    field_name,
+                    cast('Dict[str, Any]', filter_obj),
+                    values_view,
+                    kinds_record,
+                )
             )
+            state, result = await _facet_query(reading, filter_budget_s)
         return (field_name, 'enum', state, result, stat)
 
     @with_record
@@ -2470,20 +2546,41 @@ async def _get_dataset_field_stats_impl(
         instant = instant_expr(text, True) if promoted else '_instant'
         args = [id]
         arg_idx = 2
-        conditions = ["dataset_id = $1", f"{instant} IS NOT NULL"] if promoted else ["dataset_id = $1"]
-        if filter_obj:
-            sql, arg_idx = parse_filter_node(
+        if values_view is not None and filter_obj:
+            # The rows that have the field for the view, of either kind (field_value_source): their text, read once.
+            values, _ = field_value_source(
+                values_view,
                 filter_obj,
+                field_name,
+                id,
                 args,
                 arg_idx,
+                value=text,
+                present=f"{text} IS NOT NULL",
                 numeric_indexed_fields=filter_numeric_fields,
-                dataset_id=id,
                 array_columns=await get_dataset_array_columns(id),
             )
-            if sql and sql != "TRUE":
-                conditions.append(sql)
-        where = " AND ".join(conditions)
-        source = f"samples WHERE {where}" if promoted else instants_from(text, f"samples WHERE {where}")
+            instant = instant_expr('val', True) if promoted else '_instant'
+            source = (
+                f"({values}) _values WHERE {instant} IS NOT NULL"
+                if promoted
+                else instants_from('val', f"({values}) _values")
+            )
+        else:
+            conditions = ["dataset_id = $1", f"{instant} IS NOT NULL"] if promoted else ["dataset_id = $1"]
+            if filter_obj:
+                sql, arg_idx = parse_filter_node(
+                    filter_obj,
+                    args,
+                    arg_idx,
+                    numeric_indexed_fields=filter_numeric_fields,
+                    dataset_id=id,
+                    array_columns=await get_dataset_array_columns(id),
+                )
+                if sql and sql != "TRUE":
+                    conditions.append(sql)
+            where = " AND ".join(conditions)
+            source = f"samples WHERE {where}" if promoted else instants_from(text, f"samples WHERE {where}")
         earliest, latest = UTC_TEXT_SQL.format(f'MIN({instant})'), UTC_TEXT_SQL.format(f'MAX({instant})')
         with field_usage.measure(id, {'facet': [field_name]}):
             state, row = await _facet_query(
@@ -2501,13 +2598,20 @@ async def _get_dataset_field_stats_impl(
         return (field_name, 'datetime', state, None, stat)
 
     def apply_result(field_name, field_type, state, result, stat) -> None:
-        """A filtered query's answer on its field. Only an answer that replaced the cached values is
-        exact: a filtered set without values keeps them, as do a timeout and an error."""
+        """A filtered query's answer on its field. An answer that replaced the cached values is exact, and so is a
+        range the view has no value for; a timeout and an error keep the cached values."""
         if field_name not in field_schemas:
             return
         answered = isinstance(result, list) if field_type == 'enum' else bool(result)
-        field_schemas[field_name]['provenance'] = 'cached' if state == 'exact' and not answered else state
-        if field_type == 'number':
+        # A range the view has no value for is no range, on every dataset and for every request: a reading that
+        # finished and found no value answers min and max null, the view's own answer, not the dataset's kept range.
+        # The kept range stays for a reading that ran out of its budget or failed (a field the gates don't compute
+        # never comes here).
+        no_range = state == 'exact' and field_type != 'enum' and not result
+        field_schemas[field_name]['provenance'] = 'cached' if state == 'exact' and not (answered or no_range) else state
+        if no_range:
+            field_schemas[field_name]['min'] = field_schemas[field_name]['max'] = None
+        elif field_type == 'number':
             if result:
                 field_schemas[field_name]['min'] = result['min']
                 field_schemas[field_name]['max'] = result['max']
@@ -2777,59 +2881,83 @@ async def compute_filtered_minmax(
     dataset_id: int,
     field_name: str,
     filters: Dict[str, Any],
+    view: Optional['ValueView'] = None,
+    record: Any = field_kinds.UNREAD,
 ) -> Optional[Dict[str, float]]:
-    """compute_filtered_minmax_now, with the record of which kind of row has which field (field_kinds.reading)."""
+    """compute_filtered_minmax_now, with the record of which kind of row has which field (field_kinds.reading). `view`
+    (value_view): the range of the rows that have the field for the view, on a dataset with objects; `record`: the one
+    the request already read."""
     return await field_kinds.reading(
         db,
         dataset_id,
         filters,
-        lambda: compute_filtered_minmax_now(dataset_id, field_name, filters),
+        lambda: compute_filtered_minmax_now(dataset_id, field_name, filters, view),
+        record=record,
+        always=view is not None,
     )
+
+
+async def _field_values_from(
+    dataset_id: int,
+    field_name: str,
+    filters: Dict[str, Any],
+    view: Optional['ValueView'],
+    args: List[Any],
+) -> tuple[str, str]:
+    """(FROM item, value expression) of a field's rows under the filter, for the sidebar's list and range: the rows the
+    filter shows, as before, or with `view` the one reading of a field's values on a dataset with objects
+    (field_value_source), its own rule kept."""
+    text = _field_text_sql(field_name)  # metadata->>'x', or a mirror's own local_metadata->>'x'
+    numeric, arrays = await get_promoted_numeric_fields(dataset_id), await get_dataset_array_columns(dataset_id)
+    if view is not None:
+        source, _ = field_value_source(
+            view,
+            filters,
+            field_name,
+            dataset_id,
+            args,
+            len(args) + 1,
+            value=text,
+            present=f"{text} IS NOT NULL",
+            numeric_indexed_fields=numeric,
+            array_columns=arrays,
+        )
+        return f"({source}) _values", 'val'
+    filter_sql, _ = parse_filter_node(
+        filters,
+        args,
+        len(args) + 1,
+        None,
+        numeric_indexed_fields=numeric,
+        dataset_id=dataset_id,
+        array_columns=arrays,
+    )
+    return f"samples WHERE dataset_id = $1 AND {filter_sql} AND {text} IS NOT NULL", text
 
 
 async def compute_filtered_minmax_now(
     dataset_id: int,
     field_name: str,
     filters: Dict[str, Any],
+    view: Optional['ValueView'] = None,
 ) -> Optional[Dict[str, float]]:
     """
     Compute min/max for a specific field given filter constraints.
     Uses the B-Tree index on the promoted field for performance.
     """
-    text = _field_text_sql(field_name)  # metadata->>'x', or a mirror's own local_metadata->>'x'
-    # Build filter SQL
-    args = [dataset_id]
-    arg_idx = 2
-    filter_sql, arg_idx = parse_filter_node(
-        filters,
-        args,
-        arg_idx,
-        None,
-        numeric_indexed_fields=await get_promoted_numeric_fields(dataset_id),
-        dataset_id=dataset_id,
-        array_columns=await get_dataset_array_columns(dataset_id),
-    )
-
+    args: List[Any] = [dataset_id]
+    rows, text = await _field_values_from(dataset_id, field_name, filters, view, args)
     # Query for min/max with filters
     # The index on (metadata->>'field_name')::float makes this fast
-    query = f"""
-        SELECT
-            MIN(({text})::float) as min_val,
-            MAX(({text})::float) as max_val
-        FROM samples
-        WHERE dataset_id = $1 AND {filter_sql}
-          AND {text} IS NOT NULL
-    """
+    query = f"SELECT MIN(({text})::float) as min_val, MAX(({text})::float) as max_val FROM {rows}"
     result = await db.fetchrow(query, *args)
     bounds = (result['min_val'], result['max_val']) if result and result['min_val'] is not None else ()
     if not all(map(math.isfinite, bounds)):
         # The text 'NaN', 'Infinity' or '-Infinity' that a number field can hold (Postgres casts it, and
         # sorts NaN above Infinity): JSON has no such numbers, so the bounds are the finite values'.
         # Only then: the guards read the field from every row twice more.
-        query += f"""
-          AND ({text})::float > '-Infinity'::float
-          AND ({text})::float < 'Infinity'::float
-        """
+        guards = f"({text})::float > '-Infinity'::float AND ({text})::float < 'Infinity'::float"
+        query += f" AND {guards}" if view is None else f" WHERE {guards}"
         result = await db.fetchrow(query, *args)
 
     if result and result['min_val'] is not None:
@@ -2837,47 +2965,41 @@ async def compute_filtered_minmax_now(
     return None
 
 
-async def compute_filtered_values(dataset_id: int, field_name: str, filters: Dict[str, Any]) -> List[str]:
-    """compute_filtered_values_now, with the record of which kind of row has which field (field_kinds.reading)."""
+async def compute_filtered_values(
+    dataset_id: int,
+    field_name: str,
+    filters: Dict[str, Any],
+    view: Optional['ValueView'] = None,
+    record: Any = field_kinds.UNREAD,
+) -> List[str]:
+    """compute_filtered_values_now, with the record of which kind of row has which field (field_kinds.reading). `view`
+    and `record`: as for compute_filtered_minmax."""
     return await field_kinds.reading(
         db,
         dataset_id,
         filters,
-        lambda: compute_filtered_values_now(dataset_id, field_name, filters),
+        lambda: compute_filtered_values_now(dataset_id, field_name, filters, view),
+        record=record,
+        always=view is not None,
     )
 
 
-async def compute_filtered_values_now(dataset_id: int, field_name: str, filters: Dict[str, Any]) -> List[str]:
+async def compute_filtered_values_now(
+    dataset_id: int,
+    field_name: str,
+    filters: Dict[str, Any],
+    view: Optional['ValueView'] = None,
+) -> List[str]:
     """
     Compute unique values for a specific field given filter constraints.
     Uses the B-Tree index on the promoted field for performance.
     """
-    text = _field_text_sql(field_name)  # metadata->>'x', or a mirror's own local_metadata->>'x'
-    # Build filter SQL
-    args = [dataset_id]
-    arg_idx = 2
-    filter_sql, arg_idx = parse_filter_node(
-        filters,
-        args,
-        arg_idx,
-        None,
-        numeric_indexed_fields=await get_promoted_numeric_fields(dataset_id),
-        dataset_id=dataset_id,
-        array_columns=await get_dataset_array_columns(dataset_id),
-    )
-
+    args: List[Any] = [dataset_id]
+    rows, text = await _field_values_from(dataset_id, field_name, filters, view, args)
     # Query for distinct values with filters
     # The index on metadata->>'field_name' makes this fast
-    query = f"""
-        SELECT DISTINCT {text} as value
-        FROM samples
-        WHERE dataset_id = $1 AND {filter_sql}
-          AND {text} IS NOT NULL
-        ORDER BY value LIMIT 101
-    """
-
-    rows = await db.fetch(query, *args)
-    return [r['value'] for r in rows]
+    rows_found = await db.fetch(f"SELECT DISTINCT {text} as value FROM {rows} ORDER BY value LIMIT 101", *args)
+    return [r['value'] for r in rows_found]
 
 
 @router.post("/datasets/refresh-stats")
@@ -2974,7 +3096,9 @@ async def add_array_column(pool, dataset_id: int, name: str) -> None:
             try:
                 async with conn.transaction():
                     await conn.execute("SET LOCAL lock_timeout = '2s'")
-                    await conn.execute(f"ALTER TABLE samples ADD COLUMN IF NOT EXISTS {name} TEXT[] DEFAULT '{{}}'")
+                    # No default: a sample written without the field holds no value for it (NULL), apart from the
+                    # empty list (0045_list_columns_hold_never_set.sql).
+                    await conn.execute(f"ALTER TABLE samples ADD COLUMN IF NOT EXISTS {name} TEXT[]")
             except asyncpg.LockNotAvailableError:
                 raise HTTPException(
                     status_code=409,
@@ -3000,13 +3124,20 @@ async def create_array_field(
     id: int,
     request: CreateArrayFieldRequest,
     user: dict = Depends(require_level("edit")),
+    wait: bool = True,
 ):
-    """Create a new tag-like array field on the samples table.
+    """Create a list field kept in a column of its own: a TEXT[] column of samples with a GIN index, the same
+    performance as the built-in tags. The column has no default, so a sample written without the field holds no value
+    for it (never set), apart from the empty list.
 
-    This adds a real TEXT[] column with a GIN index — same performance
-    characteristics as the built-in tags field. PostgreSQL 11+ makes
-    ADD COLUMN with a default instant (no table rewrite).
+    The column is shared by every dataset that registers the name. When another dataset made it first, this dataset's
+    rows holding the empty list (the old default, from before the column lost it) become never set before the field is
+    this dataset's (backend/list_fields.py): inside this request for a dataset of at most 1,000 samples; otherwise in a
+    job, and the request answers within five seconds as a promotion does: the final message, or 202 {job_id, state}
+    while the job continues (a second request joins it). Until the job ends the field is not this dataset's, and a write
+    that names it is answered 409 with Retry-After and X-Job-End-Seconds.
     """
+    started = _time.monotonic()
     name = request.field_name.lower().strip()
 
     if not _SAFE_COLUMN_RE.match(name):
@@ -3036,14 +3167,13 @@ async def create_array_field(
     if not already_exists and len(existing) >= 20:
         raise HTTPException(status_code=400, detail="Maximum of 20 array fields reached")
 
-    # Create the physical column + index only when it doesn't exist yet.
+    # Create the physical column + index only when it doesn't exist yet. A column made here has no default: every row
+    # of every dataset holds no value in it, so nothing of this dataset's needs changing.
     if not already_exists:
         assert db.pool is not None  # connected at startup (lifespan)
         await add_array_column(db.pool, id, name)
 
-    # Register the field for THIS dataset regardless of whether the global column
-    # already existed — otherwise a second dataset adopting an existing array column
-    # would never show it in its own list_array_fields / schema.
+    registered_message = {'message': f"Array field '{name}' registered for this dataset", 'created': not already_exists}
     origin_query = 'SELECT origin FROM dataset_fields WHERE dataset_id = $1 AND field_name = $2'
     async with db.pool.acquire() as conn:
         # Already registered here (a sync calls this on every run): the shared gate is enough.
@@ -3051,25 +3181,41 @@ async def create_array_field(
             await lock_field_lifecycle(conn, id, wait=False)
             registered = await conn.fetchval(origin_query, id, name) == 'native_array'
         if registered:
-            return {'message': f"Array field '{name}' registered for this dataset", 'created': not already_exists}
+            return registered_message
+        # Another dataset made the column, and this one is large: a job sets its empty lists to never set and then
+        # makes the field this dataset's (list_fields.handler). One already running for this name is joined, looked
+        # for before the size: whatever the dataset counts now, a second request never registers the field beside
+        # a job that is still walking it.
+        if already_exists and (
+            await list_fields.pending(db, id, [name]) is not None
+            or await _large_bulk_target(id, limit=list_fields.INLINE_SAMPLES)
+        ):
+            try:
+                job = await list_fields.submit(db.pool, id, user['id'], name)
+            except job_queue.QueueBusy as error:
+                raise HTTPException(
+                    status_code=409,
+                    detail='Registration is busy; retry',
+                    headers={'Retry-After': '1'},
+                ) from error
+            if job is None:  # the job ended meanwhile, and the field is this dataset's
+                return registered_message
+            return await job_wait.answer(db.pool, job, started, user=user, wait=wait, failure_status=409)
         # Registering needs the exclusive gate, taken in a new transaction: two callers that each kept
         # the shared one while trying for exclusive blocked each other until both gave up.
         async with conn.transaction():
             await lock_field_lifecycle(conn, id, exclusive=True, wait=False)
             origin = await conn.fetchval(origin_query, id, name)
             if origin == 'native_array':  # another caller registered it meanwhile
-                return {'message': f"Array field '{name}' registered for this dataset", 'created': not already_exists}
+                return registered_message
             if origin == 'metadata':
                 raise HTTPException(status_code=409, detail=f"'{name}' is already a metadata field")
-            await conn.execute(
-                """INSERT INTO dataset_fields (dataset_id, field_name, field_type, origin, is_promoted)
-                   VALUES ($1, $2, 'list', 'native_array', TRUE)
-                   ON CONFLICT (dataset_id, field_name) DO UPDATE SET field_type = 'list',
-                       origin = 'native_array', is_promoted = TRUE""",
-                id,
-                name,
-            )
-            await conn.execute('DELETE FROM dataset_field_stats WHERE dataset_id = $1 AND field_name = $2', id, name)
+            if already_exists:
+                # A small dataset: its rows holding the old default become never set in this same transaction, so
+                # no list of the field can have been written to them before (writes of it are refused until this
+                # commits, and every one after sees the field).
+                await list_fields.empty_to_never_set(conn, id, name)
+            await list_fields.register(conn, id, name)
 
     if already_exists:
         return {"message": f"Array field '{name}' registered for this dataset", "created": False}
@@ -3447,20 +3593,25 @@ class AutocompleteRequest(BaseModel):
 
 @router.post("/datasets/{id}/fields/{field_name}/autocomplete", dependencies=[Depends(require_dataset_access)])
 @guest_heavy
-async def autocomplete_field_post(id: int, field_name: str, request: AutocompleteRequest):
+async def autocomplete_field_post(
+    id: int,
+    field_name: str,
+    request: AutocompleteRequest,
+    http_request: Request = None,  # type: ignore[assignment]  # FastAPI always passes it; a direct caller may not
+):
     """Search for matching values in a metadata field with counts.
 
-    Accepts filters so results are scoped to the current view.
-    Returns ``{"values": [...], "exhaustive": bool}``; ``exhaustive`` is False when
-    the bounded scan timed out and ``values`` is only the cached preview.
+    Accepts filters so results are scoped to the current view (on a dataset with objects, the values of the rows that
+    have the field for that view: field_value_source). Returns ``{"values": [...], "exhaustive": bool}``: see
+    _autocomplete_impl for what each answer means. A request the client gives up (the picker's, a keystroke later) is
+    stopped, its statements cancelled, as the field-stats route's is.
     """
-    with field_usage.measure(id, {'facet': [field_name]}):
-        return await field_kinds.reading(
-            db,
-            id,
-            request.filters,
-            lambda: _autocomplete_impl(id, field_name, request.q, request.limit, request.filters),
-        )
+
+    async def measured() -> dict:
+        with field_usage.measure(id, {'facet': [field_name]}):
+            return await _autocomplete(id, field_name, request.q, request.limit, request.filters)
+
+    return await (measured() if http_request is None else _cancel_on_disconnect(http_request, measured()))
 
 
 @router.get("/datasets/{id}/fields/{field_name}/autocomplete", dependencies=[Depends(require_dataset_access)])
@@ -3468,15 +3619,67 @@ async def autocomplete_field_post(id: int, field_name: str, request: Autocomplet
 async def autocomplete_field(id: int, field_name: str, q: str = "", limit: int = 100, filters: Optional[str] = None):
     filter_obj = json.loads(filters) if filters else None
     with field_usage.measure(id, {'facet': [field_name]}):
-        return await field_kinds.reading(
-            db,
-            id,
-            filter_obj,
-            lambda: _autocomplete_impl(id, field_name, q, limit, filter_obj),
-        )
+        return await _autocomplete(id, field_name, q, limit, filter_obj)
 
 
-async def _autocomplete_impl(id: int, field_name: str, q: str, limit: int, filter_obj=None):
+async def _autocomplete(id: int, field_name: str, q: str, limit: int, filter_obj: Any) -> dict:
+    """_autocomplete_impl with the record of which kind of row has which field (field_kinds.reading), read for any
+    filter with a kind on a dataset with objects: the values' reading skips a kind's rows by it."""
+    view = await value_view(id, filter_obj)
+    return await field_kinds.reading(
+        db,
+        id,
+        filter_obj,
+        lambda: _autocomplete_impl(id, field_name, q, limit, filter_obj, view),
+        always=view is not None,
+    )
+
+
+def _value_expression(field_name: str, local: Optional[LocalField], array_cols: set) -> tuple[str, str, bool]:
+    """A field's values as a row gives them, for its suggestions: (the value expression, which may give several
+    values a row, the row having the field, whether it is a scalar metadata field). Every field's whole value space
+    is searchable: list columns (tags), a mirror's own fields and the label paths, not only scalar metadata."""
+    path = None if local is not None else label_path(field_name, array_cols)
+    if path and path[1] == 'label':
+        arr = _validate_field_name(path[0])
+        return f"jsonb_array_elements(metadata->'{arr}')->>'label'", f"jsonb_typeof(metadata->'{arr}') = 'array'", False
+    if field_name == 'segmentation.labels':
+        labels = "metadata->'segmentation'->'labels'"
+        return f"jsonb_array_elements_text({labels})", f"jsonb_typeof({labels}) = 'array'", False
+    if local is not None and local.array or local is None and field_name in array_cols:
+        # A list kept in a column of its own: a row has it as the compiler's `is not null` says (_value_sql: a list,
+        # empty or not; for tags at least one element), and gives its elements (none for an empty list).
+        column = local.column if local is not None else field_name
+        return f"unnest({column})", _value_sql(field_name, local, None, array_cols), False
+    text = local.text if local is not None else f"{_metadata_source(field_name)}->>'{field_name}'"
+    return text, f"{text} IS NOT NULL", True
+
+
+async def _autocomplete_impl(
+    id: int,
+    field_name: str,
+    q: str,
+    limit: int,
+    filter_obj=None,
+    view: Optional['ValueView'] = None,
+):
+    """A field's values holding the typed term `q` (anywhere; % and _ literal) for the view `filter_obj`, the most
+    frequent first. The view is read as sent: a rule of the field itself narrows its values too (the page leaves the
+    field's own unapplied ticks out of what it sends). With `view` (value_view: a dataset with objects, a filter with a
+    kind) the values are those of the rows that have the field for the view (field_value_source).
+
+    The answer, `{"values": [{"value", "count"}], "exhaustive"}`:
+    - counted (within _AUTOCOMPLETE_BUDGET_S): the top `limit` values by count, equal counts in the order of the value
+      in the "C" collation; `exhaustive` true. A count counts the rows that have the value among the rows read.
+    - uncounted, when counting ran out of time: up to _AUTOCOMPLETE_UNCOUNTED_ROWS rows' values read without sorting
+      or grouping, within _AUTOCOMPLETE_UNCOUNTED_BUDGET_S. Having read every row before that many, its answer is the
+      counted one (`exhaustive` true); otherwise the first `limit` distinct values in the order of the value in "C",
+      `count` null, `exhaustive` false: some of the values, not all of them.
+    - cached, when that ran out too: the statistics' kept list (holding the term), `count` null, `exhaustive` false.
+    - a filter that failed to compile for an unexpected reason (logged; a refusal is an HTTP error): the dataset's
+      values, read as above without the filter, in the kept list's form, `count` null, `exhaustive` false.
+    So `exhaustive` true with no value means the field has no value for the view (holding the term), and false with
+    none that the values could not be listed in time. A verified exact value (the probe below) leads the list."""
     try:
         local = local_field(field_name)  # a mirror's own field: local_metadata, or the local_tags array
     except ValueError as error:
@@ -3486,67 +3689,61 @@ async def _autocomplete_impl(id: int, field_name: str, q: str, limit: int, filte
     ):
         raise HTTPException(status_code=400, detail="Invalid field name")
 
-    # Build base WHERE clause
-    conditions = ["dataset_id = $1"]
+    array_cols = await get_dataset_array_columns(id)
+    value, present, scalar_meta = _value_expression(field_name, local, array_cols)
+    has = f" AND {present}" if present != 'TRUE' else ''
     args: list = [id]
     arg_idx = 2
-
-    # Apply global filters (excluding the field being searched)
+    val_source, unread = None, False
     if filter_obj:
         try:
-            # Remove filter for the field being autocompleted to avoid circular filtering
-            cleaned = _remove_field_from_filter(filter_obj, field_name)
-            if cleaned:
-                sql, arg_idx = parse_filter_node(
-                    cleaned,
+            numeric = await get_promoted_numeric_fields(id)
+            if view is not None:
+                val_source, arg_idx = field_value_source(
+                    view,
+                    filter_obj,
+                    field_name,
+                    id,
                     args,
                     arg_idx,
-                    numeric_indexed_fields=await get_promoted_numeric_fields(id),
+                    value=value,
+                    present=present,
+                    numeric_indexed_fields=numeric,
+                    array_columns=array_cols,
+                )
+            else:
+                sql, arg_idx = parse_filter_node(
+                    filter_obj,
+                    args,
+                    arg_idx,
+                    numeric_indexed_fields=numeric,
                     dataset_id=id,
-                    array_columns=await get_dataset_array_columns(id),
+                    array_columns=array_cols,
                 )
                 if sql and sql != "TRUE":
-                    conditions.append(sql)
+                    val_source = f"SELECT {value} AS val FROM samples WHERE dataset_id = $1 AND {sql}{has}"
         except HTTPException:
             raise  # a filter that can't be read is refused (400), never dropped from the values it scopes
-        except Exception as e:
-            print(f"Autocomplete filter error: {e}")
-
-    where = " AND ".join(conditions)
-
-    # Per-field-type value source so EVERY field's full value space is searchable,
-    # not just scalar metadata — array columns (tags/inferred_tags) and the
-    # annotation-label pseudo-fields were previously unreachable beyond the cached
-    # top-200 preview. Search reaching all = the cache is just a
-    # preview, never a cap.
-    array_cols = await get_dataset_array_columns(id)
-    scalar_meta = False
-    path = None if local is not None else label_path(field_name, array_cols)
-    scalar_text = local.text if local is not None else f"{_metadata_source(field_name)}->>'{field_name}'"
-    if path and path[1] == 'label':
-        arr = _validate_field_name(path[0])
-        val_source = (
-            f"SELECT jsonb_array_elements(metadata->'{arr}')->>'label' AS val "
-            f"FROM samples WHERE {where} AND jsonb_typeof(metadata->'{arr}') = 'array'"
-        )
-    elif field_name == 'segmentation.labels':
-        val_source = (
-            f"SELECT jsonb_array_elements_text(metadata->'segmentation'->'labels') AS val "
-            f"FROM samples WHERE {where} AND jsonb_typeof(metadata->'segmentation'->'labels') = 'array'"
-        )
-    elif local is not None and local.array:
-        val_source = f"SELECT unnest({local.column}) AS val FROM samples WHERE {where}"
-    elif local is None and field_name in array_cols:
-        val_source = f"SELECT unnest({field_name}) AS val FROM samples WHERE {where}"
-    else:
-        scalar_meta = True
-        val_source = f"SELECT {scalar_text} AS val FROM samples WHERE {where} AND {scalar_text} IS NOT NULL"
+        except Exception:
+            # Unexpected: the view isn't read, so the values below are the dataset's, and the answer never says
+            # they are all of the view's (answer()).
+            logging.getLogger("fridge.errors").error(
+                "the suggestions of %r on dataset %s could not read their filter",
+                field_name,
+                id,
+                exc_info=True,
+            )
+            del args[1:]
+            arg_idx, val_source, unread = 2, None, True
+    if val_source is None:
+        val_source = f"SELECT {value} AS val FROM samples WHERE dataset_id = $1{has}"
 
     # Indexed exact-match probe, promoted scalar fields only. A pasted full identifier on a
     # high-cardinality field (every value unique) is never in the cached preview, and the
     # GROUP BY below cannot use the field's btree under a non-C collation, so the
     # budget trips and the typeahead used to answer "no match" for a value that EXISTS,
-    # while Enter (an indexed `=` filter) found it instantly. `=` IS indexed: probe it first.
+    # while Enter (an indexed `=` filter) found it instantly. `=` IS indexed: probe it first,
+    # over the same rows (the planner takes the `=` into each part of the source).
     exact_hit = None
     if q and scalar_meta:
         # A datetime field's index is on its instant, not its text (backend/datetimes.py): no probe to ride.
@@ -3558,15 +3755,18 @@ async def _autocomplete_impl(id: int, field_name: str, q: str, limit: int, filte
         )
         if promoted:
             cnt = await _safe_filter_query(
-                db.fetchval(
-                    f"SELECT COUNT(*) FROM samples WHERE {where} AND {scalar_text} = ${arg_idx}",
-                    *args,
-                    q,
-                ),
+                db.fetchval(f"SELECT COUNT(*) FROM ({val_source}) probe WHERE val = ${arg_idx}", *args, q),
                 budget_s=_AUTOCOMPLETE_BUDGET_S,
             )
             if cnt:
                 exact_hit = {"value": q, "count": cnt}
+
+    def answer(values: list, *, exhaustive: bool) -> dict:
+        result = _autocomplete_result(values, exact_hit, exhaustive=exhaustive)
+        if not unread:
+            return result
+        # The dataset's values for a view that wasn't read: in the kept list's form, no count and not complete.
+        return {"values": [{"value": entry["value"], "count": None} for entry in result["values"]], "exhaustive": False}
 
     val_conds = ["val IS NOT NULL"]
     if q:
@@ -3578,60 +3778,60 @@ async def _autocomplete_impl(id: int, field_name: str, q: str, limit: int, filte
         args.append('%' + _escape_like(q) + '%')
         val_conds.append(f"val ILIKE ${arg_idx} ESCAPE '\\'")
         arg_idx += 1
-    args.append(limit)
+    where = ' AND '.join(val_conds)
     # Bound the per-keystroke scan: on an unindexed field over millions of rows this
     # GROUP BY is a full seq scan, and rapid typing stacks them on the pool. Cap it and
-    # fall back to the cached value preview so a keystroke returns instantly instead of
-    # freezing the sidebar. (Promoted/indexed fields resolve well within the budget.)
+    # fall back to the uncounted reading, then the cached value preview, so a keystroke returns
+    # instead of freezing the sidebar. (Promoted/indexed fields resolve well within the budget.)
+    # Grouped in the "C" collation: the same groups (equal text is equal in both), without the linguistic sort a
+    # misestimated term made the planner choose (a term every value of a million holds: 4.7 s, 0.84 s so).
     rows = await _safe_filter_query(
         db.fetch(
-            f"SELECT val, COUNT(*) AS cnt FROM ({val_source}) sub "
-            f"WHERE {' AND '.join(val_conds)} GROUP BY val ORDER BY cnt DESC LIMIT ${arg_idx}",
+            f'SELECT val COLLATE "C" AS val, COUNT(*) AS cnt FROM ({val_source}) sub '
+            f"WHERE {where} GROUP BY 1 ORDER BY cnt DESC, 1 LIMIT ${arg_idx}",
             *args,
+            limit,
         ),
         budget_s=_AUTOCOMPLETE_BUDGET_S,
     )
-    if rows is None:
-        cached = await db.fetchval(
-            "SELECT unique_values FROM dataset_field_stats WHERE dataset_id = $1 AND field_name = $2",
-            id,
-            field_name,
-        )
-        preview = cached or []
-        if q:
-            ql = q.lower()
-            preview = [v for v in preview if v and ql in v.lower()]
-        # count omitted (None): this is the cached preview, not a true value-space count.
-        values = [{"value": v, "count": None} for v in preview[:limit]]
-        return _autocomplete_result(values, exact_hit, exhaustive=False)
-    values = [{"value": r['val'], "count": r['cnt']} for r in rows if r['val']]
-    return _autocomplete_result(values, exact_hit, exhaustive=True)
+    if rows is not None:
+        values = [{"value": r['val'], "count": r['cnt']} for r in rows if r['val']]
+        return answer(values, exhaustive=True)
+    # The uncounted reading: the first rows' values, no sort or grouping in the statement, so it stops as soon as it
+    # has them (EXPLAIN: a Limit over the dataset's scan).
+    found = await _safe_filter_query(
+        db.fetch(f"SELECT val FROM ({val_source}) sub WHERE {where} LIMIT {_AUTOCOMPLETE_UNCOUNTED_ROWS}", *args),
+        budget_s=_AUTOCOMPLETE_UNCOUNTED_BUDGET_S,
+    )
+    if found is not None:
+        if len(found) < _AUTOCOMPLETE_UNCOUNTED_ROWS:
+            # Every row read: what the counted reading would answer, its order too ("C" is the order of code points).
+            counts = collections.Counter(row['val'] for row in found)
+            ranked = sorted(counts.items(), key=lambda item: (-item[1], item[0].encode()))[:limit]
+            values = [{"value": v, "count": n} for v, n in ranked if v]
+            return answer(values, exhaustive=True)
+        some = sorted({row['val'] for row in found if row['val']}, key=str.encode)[:limit]
+        return answer([{"value": v, "count": None} for v in some], exhaustive=False)
+    cached = await db.fetchval(
+        "SELECT unique_values FROM dataset_field_stats WHERE dataset_id = $1 AND field_name = $2",
+        id,
+        field_name,
+    )
+    preview = cached or []
+    if q:
+        ql = q.lower()
+        preview = [v for v in preview if v and ql in v.lower()]
+    # count omitted (None): this is the cached preview, not a true value-space count.
+    values = [{"value": v, "count": None} for v in preview[:limit]]
+    return answer(values, exhaustive=False)
 
 
 def _autocomplete_result(values: list, exact_hit: Optional[dict], *, exhaustive: bool) -> dict:
-    """``exhaustive=False`` means the bounded scan hit its budget and ``values`` is only the
-    cached preview, so an empty list is NOT "no such value" and the UI must say so. A verified
-    exact hit always leads the list (once)."""
+    """``exhaustive=False`` means the values are not all of them (the counted reading ran out of time), so an empty
+    list is NOT "no such value" and the UI must say so. A verified exact hit always leads the list (once)."""
     if exact_hit and all(v["value"] != exact_hit["value"] for v in values):
         values.insert(0, exact_hit)
     return {"values": values, "exhaustive": exhaustive}
-
-
-def _remove_field_from_filter(filter_obj: dict, field_name: str) -> Optional[dict]:
-    """Remove a specific field from a filter tree so autocomplete isn't self-filtering."""
-    if not filter_obj:
-        return None
-    if 'field' in filter_obj:
-        if filter_obj['field'] == field_name:
-            return None
-        return filter_obj
-    if 'logic' in filter_obj and 'filters' in filter_obj:
-        cleaned = [_remove_field_from_filter(f, field_name) for f in filter_obj['filters']]
-        cleaned = [f for f in cleaned if f is not None]
-        if not cleaned:
-            return None
-        return {**filter_obj, 'filters': cleaned}
-    return filter_obj
 
 
 async def _kept_value_lists(id: int, is_stale: Optional[Callable[[str], bool]]) -> Dict[str, Dict[str, Any]]:
@@ -4160,13 +4360,14 @@ def _element_predicate_sql(key: str, op: str, val, args: List[Any], arg_idx: int
         args.append([str(v) for v in values])
         sql = f"{base} = ANY(${arg_idx}::text[])"
         return sql, arg_idx + 1
-    if op in ('not_in', 'nin'):
+    if op in ('not in', 'not_in', 'nin'):  # every spelling the filter language and the SDK (F(...).not_in) have
         values = val if isinstance(val, list) else [val]
         if not values:
-            return "TRUE", arg_idx
+            return f"{base} IS NOT NULL", arg_idx
         args.append([str(v) for v in values])
-        # NULL-aware: an element whose key is absent is "not in" the set.
-        sql = f"({base} IS NULL OR NOT ({base} = ANY(${arg_idx}::text[])))"
+        # An element with no value for the key is never "not in" the set, as `!=` (below) never holds for it: the rule
+        # for a missing value (backend/negation.py), within a match_elements condition.
+        sql = f"({base} IS NOT NULL AND NOT ({base} = ANY(${arg_idx}::text[])))"
         return sql, arg_idx + 1
     if op == 'contains':
         args.append(f"%{_escape_like(val)}%")
@@ -4322,11 +4523,11 @@ def _datetime_window(value) -> Optional[tuple[datetime.datetime, datetime.dateti
 
 def _datetime_leaf_sql(field, col, op, val, args, arg_idx, indexed) -> Optional[tuple[str, int]]:
     """A comparison on a field declared datetime, by instant: `=` is the window the value was written to (a whole
-    UTC day for a date), `!=` its complement, `in` any of them, `not in` none, and a range starts or ends where the
-    value's unit does. Every predicate is TRUE or FALSE, never NULL, so a complement includes the samples without a
-    datetime, as `!=` always has. A promoted field is compared through its index. Returns None for comparisons the
-    field makes as any other does: equality with a value that isn't a datetime compares text (a stray "unknown"
-    can still be found), with a JSON number, numbers."""
+    UTC day for a date), `in` any of them, and a range starts or ends where the value's unit does. `!=` and `not in`
+    are their NOT (backend/negation.py): a sample with a value that isn't in the window, a value that isn't a datetime
+    included. A promoted field is compared through its index. Returns None for comparisons the field makes as any
+    other does: equality with a value that isn't a datetime compares text (a stray "unknown" can still be found), with
+    a JSON number, numbers."""
 
     next_idx = arg_idx
 
@@ -4357,13 +4558,12 @@ def _datetime_leaf_sql(field, col, op, val, args, arg_idx, indexed) -> Optional[
             upper=bound(upper) if upper is not None else None,
         )
         return sql, next_idx
-    if op in ('=', '!='):
+    if op == '=':
         window = _datetime_window(val)
         if window is None:
             return None
-        sql = window_sql(col, indexed, lower=bound(window[0]), upper=bound(window[1]))
-        return (sql if op == '=' else f"(NOT {sql})"), next_idx
-    if op in ('in', 'not in'):
+        return window_sql(col, indexed, lower=bound(window[0]), upper=bound(window[1])), next_idx
+    if op == 'in':
         values = val if isinstance(val, list) else [val]
         windows = [window for window in map(_datetime_window, values) if window is not None]
         if not windows:
@@ -4372,8 +4572,7 @@ def _datetime_leaf_sql(field, col, op, val, args, arg_idx, indexed) -> Optional[
         others = [_text_value(value) for value in values if _datetime_window(value) is None]
         if others:
             clauses.append(f"COALESCE({col} = ANY({param(others)}::text[]), FALSE)")
-        sql = f"({' OR '.join(clauses)})"
-        return (sql if op == 'in' else f"(NOT {sql})"), next_idx
+        return f"({' OR '.join(clauses)})", next_idx
     return None
 
 
@@ -4721,169 +4920,9 @@ async def get_promoted_numeric_fields(dataset_id: int, source=None) -> set:
     return {r['field_name'] for r in rows}
 
 
-# Ops that match by their OWN machinery (embeddings, region tokens, parent links, geo) or that
-# legitimately want missing-key rows (is_null / the "(no value)" filter) — a leaf using one
-# never vacuously leaks the whole grain, so the cross-grain presence guard must NOT suppress it.
-_CROSSGRAIN_SKIP_OPS = {
-    'embedding_polygon',
-    'embedding_polygon_exclude',
-    'in_selection',
-    'concept_select',
-    'concept_exclude',
-    'geo_polygon',
-    'geo_polygon_exclude',
-    'geo_near',
-    'geo_region',
-    'geo_region_exclude',
-    'collapse_duplicates',
-    'cg_self',
-    'parent_matches',
-    'has_matching_object',
-    unlinked_objects.OPERATOR,
-    'is_null',
-    'exists',
-    'not_exists',
-}
-# Native columns that exist on every row (no JSONB-presence check needed).
+# Native columns every row has a value for: a test of one needs no value (backend/negation.py), and on a dataset with
+# objects a hiding test of one is answered by the grid's own row (backend/grain_reading.py).
 _CROSSGRAIN_NATIVE_FIELDS = {'id', 'filepath', 'created_at', 'last_modified_at', 'media_type'}
-# All negation operators, however spelled: the frontend emits 'not in' (with a space) for facet /
-# multi-select excludes; the dotted-label/array path also accepts 'not_in'/'nin'.
-_STRICT_NEG_OPS = {'!=', '<>', 'not in', 'not_in', 'nin'}
-
-
-def _top_field(field: str) -> str:
-    """The field a filter leaf's presence depends on: a dotted metadata path's top key, or a whole `@local.` name."""
-    return field if field.startswith(LOCAL_PREFIX) else field.split('.', 1)[0]
-
-
-def _collect_top_meta_fields(node: Dict[str, Any], array_columns: Optional[set] = None) -> set:
-    """Distinct top-level METADATA field names `node` references (excluding native columns and
-    virtual ops). Used to attach a field-presence check to a NOT group."""
-    fields: set = set()
-    arrays = array_columns if array_columns is not None else _get_array_columns_sync()
-
-    def walk(n: Any) -> None:
-        if not isinstance(n, dict):
-            return
-        if 'filters' in n or 'logic' in n:
-            for c in n.get('filters', []):
-                walk(c)
-            return
-        if str(n.get('operator', '=')).lower() in _CROSSGRAIN_SKIP_OPS:
-            return
-        f = n.get('field')
-        if isinstance(f, str):
-            top = _top_field(f)
-            if (
-                top not in _CROSSGRAIN_NATIVE_FIELDS
-                and top not in arrays
-                and top != LOCAL_TAGS
-                and _queryable_field(top)
-            ):
-                fields.add(top)
-
-    walk(node)
-    return fields
-
-
-def _id_text_test(node: Any) -> bool:
-    """`id contains ...`, or an AND / OR of such tests only (the sidebar's several typed terms)."""
-    if not isinstance(node, dict):
-        return False
-    if 'filters' in node or 'logic' in node:
-        children = node.get('filters') or []
-        return (
-            str(node.get('logic', 'AND')).upper() in ('AND', 'OR')
-            and bool(children)
-            and all(map(_id_text_test, children))
-        )
-    return node.get('field') == 'id' and str(node.get('operator', '=')).lower() == 'contains'
-
-
-def _strictify_negations(node: Any, partner: bool = False, array_columns: Optional[set] = None) -> Any:
-    """Transform `node` for use inside the cross-grain link so a NULL-tolerant negation can't
-    vacuously match a row that lacks the field. PER-LEAF (correct even inside an OR — unlike a
-    single whole-filter guard, which a present-key positive in a sibling arm defeats): each
-    metadata negation (!=, not in, not_in, ...) is ANDed with an existence check on ITS OWN
-    field. NATIVE-column exclusions (id/filepath/... — always present, so an exists check can't
-    help) are DROPPED in the partner subquery (`partner=True`): a same-grain row-identity
-    exclusion has no meaning for the cross-grain partner, which would otherwise trivially satisfy
-    it and leak the whole grain (e.g. the duplicates "collapse" id-not-in). In the self branch
-    (`partner=False`) native exclusions are kept (they apply to the same grain). Positive filters,
-    the lasso, selections, and is_null pass through unchanged.
-
-    Returns a filter dict, or a sentinel: True (reduced to no constraint) / False (no match) /
-    None (drop this leaf — a partner-mode native exclusion). Callers handle the sentinels."""
-    if not isinstance(node, dict):
-        return node
-    arrays = array_columns if array_columns is not None else _get_array_columns_sync()
-    if 'filters' in node or 'logic' in node:
-        logic = str(node.get('logic', 'AND')).upper()
-        kids = [_strictify_negations(c, partner, array_columns) for c in node.get('filters', [])]
-        kids = [k for k in kids if k is not None]
-        if logic == 'NOT':
-            # A NOT group (e.g. the sidebar's exclude-contains / exclude-range) is NULL-tolerant
-            # too; if it concerns exactly one metadata field, require that field present.
-            real = [k for k in kids if not isinstance(k, bool)]
-            if not real:
-                return None
-            if partner and all(_id_text_test(k) for k in real):
-                # "id does not contain": a row-identity exclusion like `id != 5`, dropped for the partner (above).
-                return None
-            rebuilt = {'logic': 'NOT', 'filters': real}
-            fields = _collect_top_meta_fields(node, array_columns)
-            if len(fields) == 1:
-                only = next(iter(fields))
-                return {'logic': 'AND', 'filters': [rebuilt, {'field': only, 'operator': 'exists'}]}
-            return rebuilt
-        if logic == 'OR':
-            if any(k is True for k in kids):
-                return True
-            kept = [k for k in kids if k is not False]
-            return {'logic': 'OR', 'filters': kept} if kept else False
-        # AND (and an implicit-AND node carrying `filters` but no explicit logic)
-        if any(k is False for k in kids):
-            return False
-        kept = [k for k in kids if k is not True]
-        return {'logic': 'AND', 'filters': kept} if kept else True
-    op = str(node.get('operator', '=')).lower()
-    f = node.get('field')
-    if op in _STRICT_NEG_OPS and isinstance(f, str):
-        top = _top_field(f)
-        if top in _CROSSGRAIN_NATIVE_FIELDS or top in arrays or top == LOCAL_TAGS:
-            return None if partner else node
-        if _queryable_field(top):
-            return {'logic': 'AND', 'filters': [node, {'field': top, 'operator': 'exists'}]}
-    # Absence ops (is_null / not_exists) are NULL-tolerant the same way: rendered against the
-    # cross-grain PARTNER — the other grain, which lacks the field — they are vacuously TRUE and
-    # leak the whole partner grain (an image-grid "(no value)" filter would match every image that
-    # merely HAS a child object). Drop them from the partner subquery (None → the partner arm
-    # contributes no match), leaving the self branch (the row's own grain) intact. Native columns
-    # exist on both grains, so keep those. (The exists-guard rewrite used for !=/not in would be
-    # contradictory for an absence op, hence a drop.) NOTE: this fixes the partner leak; the
-    # symmetric self case — an image-only field's absence on the OBJECT grid still matching every
-    # object — is a known limitation that needs per-grain field-presence to resolve.
-    if partner and op in ('is_null', 'not_exists') and isinstance(f, str):
-        top = _top_field(f)
-        if top not in _CROSSGRAIN_NATIVE_FIELDS:
-            return None
-    # concept_exclude is a NULL-tolerant negation too (NOT EXISTS a passing score row): on a row
-    # whose grain doesn't OWN this concept's embedding field there is no score row at all, so the
-    # exclude vacuously matches and leaks the whole grain across the cross-grain link. Require the
-    # concept PRESENT (a score row exists for this row) in BOTH branches: the off-grain row — be it
-    # the SELF row (opposite-grain concept on this grid) or the PARTNER row (same-grain concept, so
-    # the partner is off-grain) — then can't vacuously satisfy the NOT EXISTS. When the row's grain
-    # DOES own the concept the presence guard is simply TRUE, so the exclude is unchanged.
-    if op == 'concept_exclude':
-        cval = node.get('value')
-        cfg = cval if isinstance(cval, dict) else {}
-        cid = cfg.get('concept_id')
-        if cid is not None:
-            return {
-                'logic': 'AND',
-                'filters': [node, {'field': '_cpresent', 'operator': 'concept_present', 'value': {'concept_id': cid}}],
-            }
-    return node
 
 
 def _record_name(field: Any, arrays: Any) -> Optional[str]:
@@ -4932,28 +4971,157 @@ class _GrainRow(NamedTuple):
 # assistant's image_grain): every row it keeps is of that kind.
 _GRID_KINDS = {('=', 'object'): 'object', ('!=', 'object'): 'image'}
 # Comparisons that hold only where the field has a value (a row without the key reads NULL or FALSE), except a range
-# whose value is missing or blank, which filters nothing (TRUE for every row).
-_HOLD_WITH_VALUE = {'=', 'in', 'contains', 'is_not_null', 'exists', 'match_elements', 'elem_match'}
+# whose value is missing or blank, which filters nothing (TRUE for every row). `is empty` of a list kept in a column of
+# its own holds where it has none, but such a list is no field of the record (_record_name).
+_HOLD_WITH_VALUE = {'=', 'in', 'contains', 'is_not_null', 'exists', 'match_elements', 'elem_match', 'is_empty'}
 _RANGE_OPS = {'<', '<=', '>', '>='}
+
+
+def _kind_test(node: Any) -> Optional[str]:
+    """The kind a part of an AND is the page's kind predicate for ('object' for media_type = 'object', 'image' for !=
+    'object'), else None."""
+    if isinstance(node, dict) and node.get('field') == 'media_type' and 'logic' not in node and 'filters' not in node:
+        value = node.get('value')
+        return _GRID_KINDS.get((str(node.get('operator', '=')).lower(), value)) if isinstance(value, str) else None
+    return None
 
 
 def _grid_kind(filters: Any) -> Optional[str]:
     """The kind an AND's parts restrict its rows to: 'object' for media_type = 'object', 'image' for != 'object'."""
     if not isinstance(filters, list):
         return None
-    kinds = set()
-    for node in filters:
-        if (
-            isinstance(node, dict)
-            and node.get('field') == 'media_type'
-            and 'logic' not in node
-            and 'filters' not in node
-        ):
-            value = node.get('value')
-            kind = _GRID_KINDS.get((str(node.get('operator', '=')).lower(), value)) if isinstance(value, str) else None
-            if kind is not None:
-                kinds.add(kind)
+    kinds = {kind for kind in map(_kind_test, filters) if kind is not None}
     return kinds.pop() if len(kinds) == 1 else None
+
+
+def _scored(concept: Any) -> dict:
+    """The test that a row has a score for the concept (any score: a concept's exclude and a NOT around its show need
+    one, backend/negation.py)."""
+    return {'field': '_cpresent', 'operator': 'concept_present', 'value': {'concept_id': concept}}
+
+
+_PATCH_FIELD = re.compile(r'_patch_\d+x\d+$')  # a patch-scale embedding field (clip_patch_4x4)
+
+
+def _lasso_field_match(field: str, args: List[Any], arg_idx: int) -> tuple[str, int]:
+    """The test of an embedding_coordinates row (`ep`) for a lasso's map: a patch-scale field (clip_patch_4x4) is stored
+    as one row per tile (clip_patch_4x4_r0c0), matched by its prefix; any other field exactly."""
+    if _PATCH_FIELD.search(field):
+        args.append(field + '_%')
+        return f"ep.field_name LIKE ${arg_idx}", arg_idx + 1
+    args.append(field)
+    return f"ep.field_name = ${arg_idx}", arg_idx + 1
+
+
+def _list_sql(json: str) -> str:
+    """The JSON value is a list, empty or not: TRUE or FALSE, never NULL (FALSE for no key, a JSON null, anything not a
+    list), so a caller may negate it."""
+    return f"(jsonb_typeof({json}) IS NOT DISTINCT FROM 'array')"
+
+
+def _labels_valued_sql(parent: str, key: str) -> str:
+    """A list of labels (`detections.label`: the metadata list `parent`, each element's `key`) has a value, as a NOT
+    needs it: the list is there, and empty or holding a label. A list whose elements have no label at all has none
+    (something was found and what it is isn't known); an empty one does (nothing was found)."""
+    _validate_field_name(parent)
+    _validate_field_name(key)
+    json = f"metadata->'{parent}'"
+    elements = f"(CASE WHEN jsonb_typeof({json}) = 'array' THEN {json} ELSE '[]'::jsonb END)"
+    return (
+        f"({_list_sql(json)} AND (jsonb_array_length({elements}) = 0 OR EXISTS (SELECT 1 FROM "
+        f"jsonb_array_elements({elements}) AS elem WHERE elem->>'{key}' IS NOT NULL)))"
+    )
+
+
+def _value_sql(
+    field: str,
+    local: Optional[LocalField],
+    field_mapping: Optional[Dict[str, str]],
+    array_columns: Optional[set],
+    present: bool = True,
+) -> str:
+    """The row has a value for the field (docs/FILTER_QUERY.md, "Operators"), or with `present` False has none: the one
+    place that knows it for each kind of list. `is not null` is it and `is null` the other (and so `exists` and
+    `not exists` of a list of labels, which has no key to find), the guard of a NOT reads it
+    (`_GrainRows.has`, for backend/negation.py's ('value', field)), and so do `exists` and `not exists` of a list kept
+    in a column of its own, and `is empty` of tags. TRUE or FALSE, never NULL. A value is there and isn't a JSON null
+    or a NULL column, and an empty list written in a field is a value (the list was looked at and holds nothing), a
+    list field kept in a column of its own included (NULL there is a sample written without it), except:
+    - tags (`tags`, `@local.tags`: negation.EMPTY_IS_NO_VALUE) have a value when they have an element: every sample
+      holds them, the empty list until one is written, so an empty one can't be told from one never set, and is no
+      value;
+    - a list of labels (`detections.label`) has a value when the list is there and is empty or holds a label: one whose
+      elements have no label at all has none (something was found, and what it is isn't known).
+    `local` is the field's `@local.` place (local_field), the name already checked as the compiler checks it."""
+    arrays = array_columns if array_columns is not None else _get_array_columns_sync()
+    test = 'IS NOT NULL' if present else 'IS NULL'
+    if local is not None:
+        if not local.array:
+            return f"{local.text} {test}"
+        return (
+            f"array_length({local.column}, 1) {test}" if negation.empty_is_no_value(field) else f"{local.column} {test}"
+        )
+    if field_mapping and field in field_mapping:
+        return f"{field_mapping[field]} {test}"
+    if field in ('media_type', 'filepath', 'id', *_NATIVE_TIMESTAMPS):
+        return f"{field} {test}"
+    if field in arrays:
+        return f"array_length({field}, 1) {test}" if negation.empty_is_no_value(field) else f"{field} {test}"
+    labels = label_path(field, arrays)
+    if field == 'segmentation.labels':
+        listed = _list_sql("metadata->'segmentation'->'labels'")
+    elif labels is not None:
+        listed = _labels_valued_sql(*labels)
+    else:
+        return f"{_metadata_source(field)}->>'{field}' {test}"
+    return listed if present else f"NOT {listed}"
+
+
+def _emptiness_refusal(field: str, operator: str, array_columns: Optional[set]) -> Optional[str]:
+    """Why `is empty` (or `is not empty`) can't be asked of the field, or None, in the words the filter text gives
+    (filter_query.emptiness_refusal, the one place): a path through a list is read so wherever a comparison of it is
+    (label_path, from the dataset's caches), and an embedding's or a hash's presence is a field only this compiler is
+    asked about."""
+    labels = label_path(field, array_columns if array_columns is not None else _get_array_columns_sync())
+    return emptiness_refusal(
+        field,
+        operator,
+        through=labels[0] if labels is not None else None,
+        derived=_derived_field(field) is not None,
+    )
+
+
+def _empty_sql(field: str, local: Optional[LocalField], arrays: Optional[set] = None) -> str:
+    """The row's field (a metadata key, a mirror's own `@local.` field, `segmentation.labels`, a list field kept in a
+    column of its own) is a list that holds nothing: NULL where the field has no value, so a NOT around it is guarded as
+    any comparison's is. Tags are no field of this: their empty list is no value (`is null`, the compiler's emptiness
+    branch)."""
+    if local is None and arrays is not None and field in arrays:
+        return f"({field} = '{{}}'::text[])"
+    if field == 'segmentation.labels':
+        return "((metadata->'segmentation'->'labels') = '[]'::jsonb)"
+    source, key = ('local_metadata', local.name) if local is not None else (_metadata_source(field), field)
+    return f"(({source}->'{key}') = '[]'::jsonb)"
+
+
+def _elements_sql(field: str) -> str:
+    """The row's field (a metadata key, or a mirror's own `@local.` field) is a list, empty or not: what a NOT around an
+    element match needs (backend/negation.py). The name is checked as the compiler checks it."""
+    try:
+        local = local_field(field)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from None
+    if local is None:
+        _validate_field_name(field)
+    source, key = ('local_metadata', local.name) if local is not None else (_metadata_source(field), field)
+    return _list_sql(f"{source}->'{key}'")
+
+
+def _points_sql(field: str, id_col: str, args: List[Any], arg_idx: int) -> tuple[str, int]:
+    """The row (its id column `id_col`) has a point on the field's embedding map: what an excluded lasso, and a NOT
+    around a lasso, need (backend/negation.py)."""
+    match, arg_idx = _lasso_field_match(field, args, arg_idx)
+    return f"EXISTS (SELECT 1 FROM embedding_coordinates ep WHERE ep.sample_id = {id_col} AND {match})", arg_idx
 
 
 class _GrainRows:
@@ -5020,7 +5188,8 @@ class _GrainRows:
     def _held_name(self, node: Any) -> Optional[str]:
         """The record's name for the field a test never holds without (a row with no such key or location reads NULL
         or FALSE: a comparison, a presence test, a place), else None: a range with no value and a polygon that is
-        none filter nothing, and an exclusion keeps the rows without a location."""
+        none filter nothing, and an exclusion is read as the NOT of its place (grain_reading), or is no polygon and
+        keeps every row."""
         if isinstance(node, dict) and 'field' not in node and str(node.get('logic', 'AND')).upper() == 'AND':
             children = node.get('filters')
             if not isinstance(children, list) or not children:
@@ -5080,26 +5249,63 @@ class _GrainRows:
             return self._skipped(node, row)
         return self._compiled(node, row)
 
-    def has(self, field: str, row: _GrainRow, presence: bool = False) -> str:
-        """The row has a value for the field: there, and not a JSON null. `presence`: for `is null`, where `location` is
-        the sample's own location; otherwise it is a field compared with an operator other than a place's, the
-        metadata field named location. A metadata key's test (`?`) goes first: the same rows, found through the
-        metadata index where few rows have the key."""
+    def has(self, field: str, row: _GrainRow, presence: bool = False, keyed: bool = True) -> str:
+        """The row has a value for the field: the rows `is not null` finds (_value_sql says what a value is for each
+        kind of list), which is also what a NOT needs (backend/negation.py's ('value', field)). `presence`: for
+        `is null`, where `location` is the sample's own location; otherwise it is a field compared with an operator
+        other than a place's, the metadata field named location. With `keyed`, a metadata key's test (`?`) goes first:
+        the same rows, found through the metadata index where few rows have the key. A NOT read on one row
+        (_compile_not) leaves it out: there the row is a scan's, which the key's test only slows (a count of a NOT over
+        two fields on a million samples: 125 ms with it, 100 without)."""
         if self._skip(self.record_name(field), row):
             return 'FALSE'
         if field == 'location' and not presence:
             return f"({_metadata_source(field)}->>'location' IS NOT NULL)"
-        if field == 'segmentation.labels':
-            field = 'segmentation'
         value = self.test({'field': field, 'operator': 'is_not_null'}, row)
         keyed = (
-            _is_safe_field_name(field)
+            keyed
+            and _is_safe_field_name(field)
             and '.' not in field
             and field not in RESERVED_METADATA_KEYS
             and _derived_field(field) is None
             and self.row_field(field) is None
         )
         return f"({self.test({'field': field, 'operator': 'exists'}, row)} AND {value})" if keyed else value
+
+    def has_need(self, need: negation.Need, row: _GrainRow, keyed: bool = True) -> str:
+        """The row has what a NOT needs (backend/negation.py): a field's value, the sample's own location, a point on an
+        embedding field's map, or a score for a concept. `keyed`: as for `has`."""
+        kind = need[0]
+        if kind == 'value':
+            return self.has(need[1], row, keyed=keyed)
+        if kind == 'location':
+            return self.has('location', row, presence=True)
+        if kind == 'points':
+            sql, self.arg_idx = _points_sql(need[1], row.id_col, self.args, self.arg_idx)
+            return sql
+        if kind == 'elements':
+            return 'FALSE' if self._skip(self.record_name(need[1]), row) else _elements_sql(need[1])
+        return self.test(_scored(need[1]), row)
+
+    def builtin(self, field: Any) -> bool:
+        return self.row_field(field) == 'builtin'
+
+    def filters_nothing(self, node: Any) -> bool:
+        """A test that compares nothing: a range with no value, a place or a lasso whose value is no polygon, a
+        geo_near with no point. It keeps every row or none, whatever the row's values (the compiler's TRUE or FALSE)."""
+        if not isinstance(node, dict) or 'logic' in node or 'filters' in node:
+            return False
+        operator, value = str(node.get('operator', '=')).lower(), node.get('value')
+        if operator in _RANGE_OPS:
+            return value is None or (isinstance(value, str) and not value.strip())
+        if operator in ('geo_polygon', 'geo_polygon_exclude'):
+            return _polygon_points(operator, value) is None
+        if operator == 'geo_near':
+            point = value.get('point') if isinstance(value, dict) else None
+            return not (isinstance(point, (list, tuple)) and len(point) >= 2)
+        if operator in ('embedding_polygon', 'embedding_polygon_exclude'):
+            return not isinstance(value, list) or len(value) < 3
+        return False
 
     def keyed(self, node: Any, row: _GrainRow) -> str:
         """A test asked of a partner row (an image's object, an object's image), with its metadata key's test first: the
@@ -5112,14 +5318,17 @@ class _GrainRows:
         return f"({self.test({'field': key, 'operator': 'exists'}, row)} AND {sql})" if key else sql
 
     def _compared_key(self, node: Any) -> Optional[str]:
-        """The metadata key a test reads (a comparison, `is not null`, or a range of one field), else None."""
+        """The metadata key a test reads (a comparison, `is not null`, `is empty`, or a range of one field), else
+        None."""
         if isinstance(node, dict) and node.get('logic') == 'AND' and node.get('filters'):
             keys = {self._compared_key(child) for child in node['filters']}
             return keys.pop() if len(keys) == 1 else None
         if not isinstance(node, dict) or 'logic' in node or 'filters' in node:
             return None
         field, operator = node.get('field'), str(node.get('operator', '=')).lower()
-        if operator not in ('=', 'in', '<', '<=', '>', '>=', 'contains', 'is_not_null') or not isinstance(field, str):
+        if operator not in ('=', 'in', '<', '<=', '>', '>=', 'contains', 'is_not_null', 'is_empty'):
+            return None
+        if not isinstance(field, str):
             return None
         path = label_path(field, self.arrays)
         key = path[0] if path is not None else 'segmentation' if field == 'segmentation.labels' else field
@@ -5156,7 +5365,13 @@ class _GrainRows:
         alias = sub.table
         scope = f"{alias}.dataset_id = {int(self.ds)} AND " if self.ds is not None else ""
         link = (
-            f"EXISTS (SELECT 1 FROM samples {alias} WHERE {scope}{alias}.id = {row.table}.parent_id "
+            # Nothing asked of the image (TRUE holds no parameter either): it exists exactly when the row's parent_id is
+            # set, since the triggers set it only to a non-object sample of the row's dataset, and the parent key
+            # deletes the row with its image (backend/db/schema.sql, samples.parent_id). No join of every object to its
+            # image: the images' sidebar with nothing filtered reads its objects' fields so.
+            f"{row.table}.parent_id IS NOT NULL"
+            if sub_sql == 'TRUE'
+            else f"EXISTS (SELECT 1 FROM samples {alias} WHERE {scope}{alias}.id = {row.table}.parent_id "
             f"AND {alias}.media_type != 'object' AND ({sub_sql}))"
         )
         ids = _id_list_bound(plain) if plain is not None else None
@@ -5214,6 +5429,51 @@ def _grain_pairs(filters: Any) -> tuple[list[tuple[str, Any]], Any]:
                 pairs.append((_GRAIN_PARTNERS[str(partner['operator']).lower()], own['value']))
                 break
     return pairs, [node for k, node in enumerate(filters) if k not in used]
+
+
+def _negated_pair(sub_filters: Any) -> Optional[tuple[str, Any]]:
+    """The page's wrapping of a filter B alone under a NOT, `NOT (cg_self(B) OR partner(B))`, as withGrain and the
+    assistant's image_grain write an excluded region: (the grid, B), else None. A NOT with the pair and another part
+    beside it, `NOT (pair(B), C)`, which only a hand-written filter holds, is not taken: it goes to _compile_not, whose
+    needs don't look inside cg_self (B's fields are not needed there)."""
+    if not isinstance(sub_filters, list) or len(sub_filters) != 1:
+        return None
+    only = sub_filters[0]
+    if not isinstance(only, dict) or 'field' in only or str(only.get('logic', '')).upper() != 'OR':
+        return None
+    pairs, rest = _grain_pairs(only.get('filters'))
+    return pairs[0] if len(pairs) == 1 and not rest else None
+
+
+def _compile_not(sub_filters: list, rows: _GrainRows) -> tuple[str, int]:
+    """NOT (X), X the AND of `sub_filters`, read on one row (rows.outer()): the row has a value for everything X
+    compares (backend/negation.py), and X doesn't hold for it (a part that is NULL for the row counts as not holding).
+    Returns (sql, next_arg_idx)."""
+    inner = {'logic': 'AND', 'filters': sub_filters}
+    row, mark = rows.outer(), rows.mark()
+    guards = []
+    for need in negation.needs(inner, rows):
+        sql = rows.has_need(need, row, keyed=False)
+        if sql == 'FALSE':  # skipped for the row's kind (backend/field_kinds.py): no row of that kind has a value
+            rows.rollback(mark)
+            return rows._skipped(inner, row), rows.arg_idx
+        guards.append(sql)
+    child_sqls = []
+    for child in sub_filters:
+        sql, rows.arg_idx = _compile_filter_node(
+            child,
+            rows.args,
+            rows.arg_idx,
+            rows.field_mapping,
+            rows.numeric_indexed_fields,
+            rows.dataset_id,
+            array_columns=rows.array_columns,
+            concepts=rows.concepts,
+            outer_kind=rows.outer_kind,
+        )
+        child_sqls.append(sql)
+    negated = f"NOT (COALESCE({' AND '.join(child_sqls)}, FALSE))"
+    return (f"({' AND '.join([*guards, negated])})" if guards else negated), rows.arg_idx
 
 
 def _filter_concept_ids(node: Any) -> set:
@@ -5301,10 +5561,10 @@ def _region_leaf(
     join: Optional[tuple[str, Optional[int]]] = None,
 ) -> tuple[str, int]:
     """A geo_region / geo_region_exclude leaf: its value is a region's key (backend/regions.py), in any case. A key
-    no loaded set has is a 400, never a filter that matches nothing. Exclude removes what is inside and keeps
-    everything else, samples with no location included, as geo_polygon_exclude does. `join` (the id column and the
-    dataset) tests an exclude ANDed at the top of a statement on the samples table as an anti-join from the region's
-    pieces; any other leaf tests the row's own location."""
+    no loaded set has is a 400, never a filter that matches nothing. Exclude is the NOT of the region
+    (backend/negation.py): a sample with a location, not inside, as geo_polygon_exclude is. `join` (the id column and
+    the dataset) tests an exclude ANDed at the top of a statement on the samples table as an anti-join from the
+    region's pieces; any other leaf tests the row's own location."""
     op, field, val = str(node.get('operator')).lower(), node.get('field'), node.get('value')
     if field != 'location':
         raise HTTPException(status_code=400, detail=f"{op} applies to the field 'location', not {field!r}")
@@ -5314,17 +5574,21 @@ def _region_leaf(
     key = f'${arg_idx}'
     if join is not None:
         inside = regions.joined_inside_sql(key, *join)
-        return (f'NOT {inside}' if op == 'geo_region_exclude' else inside), arg_idx + 1
+        return (f'(location IS NOT NULL AND NOT {inside})' if op == 'geo_region_exclude' else inside), arg_idx + 1
     inside = regions.row_inside_sql(key)
-    return (f'(location IS NULL OR NOT {inside})' if op == 'geo_region_exclude' else inside), arg_idx + 1
+    return (f'(location IS NOT NULL AND NOT {inside})' if op == 'geo_region_exclude' else inside), arg_idx + 1
 
 
 # The widest polygon across the antimeridian a filter takes, in turns of the globe (_polygon_across_leaf). It is tested
 # on one copy per turn it spans, and one more, each a search of the location index: the copies of a polygon trillions
 # of turns wide would never finish being written, so a wider one is refused (400). The limit is for the server's
-# safety, and its size is what one view of the map can hold: at mapbox-gl's least zoom (-2) a world is 128 px wide, so a
-# panel 7,680 px wide shows 60 of them. (The map can be panned while a polygon is drawn, so a wider one can be drawn.)
-_POLYGON_MAX_TURNS = 60
+# safety; its size, 10 turns (3,600 degrees), is the owner's choice (2.14.0 took 60). No view reachable in the app holds
+# that much: mapbox-gl keeps the world at least as tall as the map, so a view spans about its width over its height in
+# worlds. Measured in the app (Playwright) at the least zoom: 0.7 worlds in the map's panel of a 1920 x 1080 window
+# (2.4 with the map alone there), 3.4 in its panel of a 3840 x 600 window, and 11.5 only with the map alone in that
+# window, at a zoom reached by code (the wheel stops at zoom 0, 7.5 worlds). (The map can be panned while a polygon is
+# drawn, so a wider one can be drawn.)
+_POLYGON_MAX_TURNS = 10
 
 
 def _shown(value: Any) -> str:
@@ -5403,9 +5667,10 @@ def _polygon_across_leaf(
 
     A shape on one copy only (370 to 380) is the statement a polygon within -180 to 180 makes, on that copy. Of two or
     more, the include tests each on its own, each a search of the location index (a BitmapOr): about two searches where
-    a polygon that doesn't cross costs one. The exclude, which no index serves, removes exactly what the include holds
-    and keeps samples with no location. Of a shape narrower than 360 degrees, whose two copies are apart, it tests them
-    as one MULTIPOLYGON, one test a sample as for any polygon, behind a test of the copies' boxes, so PostgreSQL counts
+    a polygon that doesn't cross costs one. The exclude, which no index serves, is the include's NOT: a sample with a
+    location that the include doesn't hold (backend/negation.py). Of a shape narrower than 360 degrees, whose two
+    copies are apart, it tests them as one MULTIPOLYGON, one test a sample as for any polygon, behind a test of the
+    copies' boxes, so PostgreSQL counts
     on the samples in the copies and not the band between them. On a million samples, the plain NOT of the include's
     two tests, or the MULTIPOLYGON alone, made it plan the grid's first page in parallel: 13 to 15 ms instead of 0.3.
     Wider copies overlap or touch, which makes no valid MULTIPOLYGON: the exclude of a wider shape is the include's
@@ -5432,12 +5697,12 @@ def _polygon_across_leaf(
         '((' + ', '.join(f'{lon - 360.0 * k!r} {lat!r}' for lon, lat in ring) + '))' for k in range(first, last + 1)
     ]
     if not copies:  # no width, on the antimeridian of another world copy (540): nothing is inside it
-        return ('TRUE' if op == 'geo_polygon_exclude' else 'FALSE'), arg_idx
+        return ('location IS NOT NULL' if op == 'geo_polygon_exclude' else 'FALSE'), arg_idx
     exclude = op == 'geo_polygon_exclude'
     if len(copies) == 1:
         args.append(f'POLYGON{copies[0]}')
         within = f"ST_Within(location, ST_GeomFromText(${arg_idx}, 4326))"
-        return (f"(location IS NULL OR NOT {within})" if exclude else within), arg_idx + 1
+        return (f"(location IS NOT NULL AND NOT {within})" if exclude else within), arg_idx + 1
     tests, boxes = [], []
     for copy in copies:
         args.append(f'POLYGON{copy}')
@@ -5447,9 +5712,9 @@ def _polygon_across_leaf(
     if exclude and east - west < 360.0:
         args.append(f"MULTIPOLYGON({', '.join(copies)})")
         whole = f"ST_Within(location, ST_GeomFromText(${arg_idx}, 4326))"
-        return f"(location IS NULL OR NOT ({' OR '.join(boxes)}) OR NOT {whole})", arg_idx + 1
+        return f"(location IS NOT NULL AND (NOT ({' OR '.join(boxes)}) OR NOT {whole}))", arg_idx + 1
     inside = f"({' OR '.join(tests)})"
-    return (f"(location IS NULL OR NOT {inside})" if exclude else inside), arg_idx
+    return (f"(location IS NOT NULL AND NOT {inside})" if exclude else inside), arg_idx
 
 
 # The `field_mapping` every caller that queries `FROM samples s JOIN ...` must pass.
@@ -5521,9 +5786,14 @@ def parse_filter_node(
     array_columns: Optional[set] = None,
     *,
     region_joins: bool = True,
+    reading: Optional[Callable[[Dict[str, Any], List[Any], int, set], tuple[str, int]]] = None,
 ) -> tuple[str, int]:
     """
     Compiles a whole filter tree for a statement's WHERE and returns (sql_snippet, next_arg_idx).
+
+    `reading`: compiles the filter (as the assistant's guard left it) in place of the compiler, taking (node, args,
+    arg_idx, the concept ids it reads) and returning (sql, next_arg_idx), under the same guards (the record of which
+    kind of row has which field, regions, concepts): a field's values (field_value_source).
 
     `numeric_indexed_fields`: promoted numeric fields (from
     get_promoted_numeric_fields) whose range comparisons should use the bare
@@ -5558,16 +5828,19 @@ def parse_filter_node(
     # skips the other kind's rows for a field only one kind has; a statement with skips starts with their guard.
     record, skipped = field_kinds.current(dataset_id), set[tuple[str, str]]()
     with field_kinds.compiling(record, skipped):
-        sql, arg_idx = _compile_filter_node(
-            node,
-            args,
-            arg_idx,
-            field_mapping,
-            numeric_indexed_fields,
-            dataset_id,
-            array_columns=array_columns,
-            concepts=concept_ids,
-        )
+        if reading is not None:
+            sql, arg_idx = reading(node, args, arg_idx, concept_ids)
+        else:
+            sql, arg_idx = _compile_filter_node(
+                node,
+                args,
+                arg_idx,
+                field_mapping,
+                numeric_indexed_fields,
+                dataset_id,
+                array_columns=array_columns,
+                concepts=concept_ids,
+            )
     if skipped and dataset_id is not None:
         sql, arg_idx = field_kinds.guarded(sql, args, arg_idx, dataset_id, skipped)
     for leaf in joined:
@@ -5591,6 +5864,179 @@ def parse_filter_node(
     args.append(int(dataset_id))
     owned = f"(SELECT require_dataset_concepts(${arg_idx}::int[], ${arg_idx + 1}::int))"
     return f"({owned} AND {guard} AND ({sql}))", arg_idx + 2
+
+
+# --- A field's values under a view on a dataset with objects (docs/FILTER_QUERY.md, "A field's values") ---
+
+
+class ValueView(NamedTuple):
+    """A filter with the page's kind predicate at the top of its AND (withGrain): the kind ('image' or 'object'), the
+    filter the page wraps there (None while nothing is filtered) and the AND's other parts (an excluded region, a lasso
+    of the other kind, a hand-written test of the grid's own row)."""
+
+    kind: str
+    base: Optional[Dict[str, Any]]
+    rest: List[Any]
+
+
+def _value_view(node: Any) -> Optional[ValueView]:
+    """The view a filter is, read at the top of its AND as the compiler reads a grid's kind (_grid_kind) and the page's
+    wrapping (_grain_pairs); None for a filter with no kind there (the query builder's picker, a script)."""
+    if not isinstance(node, dict) or 'field' in node or str(node.get('logic', 'AND')).upper() != 'AND':
+        return None
+    parts = node.get('filters')
+    kind = _grid_kind(parts)
+    if kind is None:
+        return None
+    base, rest = None, []
+    for part in cast('List[Any]', parts):
+        if _kind_test(part) == kind:
+            continue
+        if (
+            base is None
+            and isinstance(part, dict)
+            and 'field' not in part
+            and str(part.get('logic', '')).upper() == 'OR'
+        ):
+            pairs, others = _grain_pairs(part.get('filters'))
+            if len(pairs) == 1 and not others and pairs[0][0] == kind:
+                base = pairs[0][1]
+                continue
+        rest.append(part)
+    return ValueView(kind, base, rest)
+
+
+async def value_view(dataset_id: int, filters: Any) -> Optional[ValueView]:
+    """The view a field's values are read for with the other kind's rows (field_value_source), or None to read them as
+    before, from the rows the filter shows: a filter with no kind, or a dataset with no objects (whose page sends its
+    filter unwrapped)."""
+    view = _value_view(filters)
+    if view is None:
+        return None
+    # The first media_type at or after 'object' in the (dataset_id, media_type) index: one index step whatever the
+    # estimates. `EXISTS (... media_type = 'object')` is planned as a scan expected to meet an object soon, so on a
+    # large dataset without objects (most of the table) it read every row: 0.4 s a request on 3 million images.
+    objects = await db.fetchval(
+        "SELECT media_type = 'object' FROM samples WHERE dataset_id = $1 AND media_type >= 'object' "
+        "ORDER BY media_type LIMIT 1",
+        dataset_id,
+    )
+    return view if objects else None
+
+
+def field_value_source(
+    view: ValueView,
+    filters: Dict[str, Any],
+    field: str,
+    dataset_id: int,
+    args: List[Any],
+    arg_idx: int,
+    *,
+    value: str,
+    present: str,
+    numeric_indexed_fields: Optional[set],
+    array_columns: Optional[set],
+) -> tuple[str, int]:
+    """The one reading of a field's values under a view on a dataset with objects (contract g12, rule 1.5): a source
+    `SELECT <value> AS val ...` of every row whose value counts, `present` the row having the field. Its parts, a UNION
+    ALL:
+    - the rows of the view's kind the view shows: the statement every reader ran before, for `filters` as sent;
+    - the rows of the other kind whose pair meets the view. Under the images' kind, an object that has an image, whose
+      image meets the view's other parts, and whose pair with that image meets the wrapped filter as the images' grid
+      reads it (grain_reading.read_partner: each test by either, a NOT or `is null` by the image as a whole). Under the
+      objects' kind, the image of an object the view shows (each image once).
+    A part runs only where the record of which kind of row has which field (field_kinds) says that kind has the field;
+    a part left out is a skip of the statement like any other, refused by require_field_kinds if a row of that kind
+    has the field in its snapshot. A field the record has on neither kind reads the view's own rows, as before. An
+    object with no image is no one's partner: under the images' kind its values aren't read (the images' grid never
+    shows it); under the objects' kind it is one of the grid's rows."""
+    other = 'object' if view.kind == 'image' else 'image'
+    record, name = field_kinds.current(dataset_id), _record_name(field, array_columns or set())
+
+    def seen(kind: str) -> bool:
+        return record is None or name is None or record.seen(name, kind)
+
+    own, partner = seen(view.kind), seen(other)
+    own = own or not partner
+
+    def noting(left_out: Optional[str]) -> None:
+        """Inside a compile with the record (parse_filter_node): the part of the kind left out, guarded like a skip."""
+        _, skipped = field_kinds.compile_state()
+        if left_out is not None and skipped is not None and name is not None:
+            skipped.add((name, left_out))
+
+    def compile_view(left_out: Optional[str]) -> Callable[[Dict[str, Any], List[Any], int, set], tuple[str, int]]:
+        """The view's own reading of its rows, as every reader compiled it before."""
+
+        def reading(node: Dict[str, Any], args: List[Any], arg_idx: int, concepts: set) -> tuple[str, int]:
+            noting(left_out)
+            return _compile_filter_node(
+                node,
+                args,
+                arg_idx,
+                None,
+                numeric_indexed_fields,
+                dataset_id,
+                array_columns=array_columns,
+                concepts=concepts,
+            )
+
+        return reading
+
+    def compile_pairs(node: Dict[str, Any], args: List[Any], arg_idx: int, concepts: set) -> tuple[str, int]:
+        """An object read with its image for the view (the filter as the assistant's guard left it)."""
+        noting(None if own else view.kind)
+        guarded = _value_view(node) or view
+        rows = _GrainRows(args, arg_idx, None, numeric_indexed_fields, dataset_id, array_columns, concepts, 'object')
+        outer, mark = rows.outer(), rows.mark()
+
+        def image(row: _GrainRow) -> str:
+            parts = []
+            for part in guarded.rest:
+                sql = rows.test(part, row)
+                if sql == 'FALSE':
+                    return sql
+                if sql != 'TRUE':
+                    parts.append(sql)
+            return ' AND '.join(parts) or 'TRUE'
+
+        conditions = ["samples.media_type = 'object'", rows.parent(outer, image)]
+        if guarded.base is not None:
+            conditions.append(grain_reading.read_partner(guarded.base, rows))
+        if 'FALSE' in conditions:
+            rows.rollback(mark)
+            return 'FALSE', rows.arg_idx
+        return '(' + ' AND '.join(part for part in conditions if part != 'TRUE') + ')', rows.arg_idx
+
+    def compiled(reading: Callable[[Dict[str, Any], List[Any], int, set], tuple[str, int]]) -> str:
+        nonlocal arg_idx
+        sql, arg_idx = parse_filter_node(
+            filters,
+            args,
+            arg_idx,
+            None,
+            numeric_indexed_fields,
+            dataset_id,
+            array_columns,
+            reading=reading,
+        )
+        return sql
+
+    parts = []
+    has = f" AND {present}" if present != 'TRUE' else ''
+    if own:
+        sql = compiled(compile_view(None if partner else other))
+        parts.append(f"SELECT {value} AS val FROM samples WHERE dataset_id = $1 AND {sql}{has}")
+    if partner and view.kind == 'image':
+        sql = compiled(compile_pairs)
+        parts.append(f"SELECT {value} AS val FROM samples WHERE dataset_id = $1 AND {sql}{has}")
+    elif partner:
+        sql = compiled(compile_view(None if own else view.kind))
+        parts.append(
+            f"SELECT {value} AS val FROM samples WHERE dataset_id = $1 AND samples.media_type <> 'object'{has} "
+            f"AND samples.id IN (SELECT parent_id FROM samples WHERE dataset_id = $1 AND {sql})",
+        )
+    return ' UNION ALL '.join(parts), arg_idx
 
 
 def _compile_filter_node(
@@ -5622,11 +6068,33 @@ def _compile_filter_node(
         if logic == 'NOT':
             if not sub_filters:
                 return "TRUE", arg_idx
-
-            child_sqls = []
-            for f in sub_filters:
-                sql, arg_idx = _compile_filter_node(
-                    f,
+            rows = _GrainRows(
+                args,
+                arg_idx,
+                field_mapping,
+                numeric_indexed_fields,
+                dataset_id,
+                array_columns,
+                concepts,
+                outer_kind,
+            )
+            pair = _negated_pair(sub_filters)
+            if pair is not None:
+                # NOT around the page's wrapping alone (an excluded region, withGrain): the row as a whole has a value
+                # for what the wrapped filter compares, and the filter, read for it, doesn't hold
+                # (backend/grain_reading.py).
+                grid, base = pair
+                sql = grain_reading.read_not(base, grid, rows)
+                return sql, rows.arg_idx
+            lone = sub_filters[0] if len(sub_filters) == 1 and isinstance(sub_filters[0], dict) else {}
+            while ('logic' in lone or 'filters' in lone) and str(lone.get('logic', 'AND')).upper() == 'AND':
+                inner = lone.get('filters')  # through AND groups of one rule, as the page's soleRule reads them
+                lone = inner[0] if isinstance(inner, list) and len(inner) == 1 and isinstance(inner[0], dict) else {}
+            if str(lone.get('operator', '')).lower() == 'embedding_polygon':
+                # NOT around a lasso alone is the excluded lasso (the same rows), whose one probe keeps the plan:
+                # a guard beside NOT (EXISTS ...) can turn the count into a probe per point.
+                return _compile_filter_node(
+                    {**lone, 'operator': 'embedding_polygon_exclude'},
                     args,
                     arg_idx,
                     field_mapping,
@@ -5636,18 +6104,13 @@ def _compile_filter_node(
                     concepts=concepts,
                     outer_kind=outer_kind,
                 )
-                child_sqls.append(sql)
-
-            combined = " AND ".join(child_sqls)
-            # COALESCE→FALSE so a child that is NULL for missing-key rows still
-            # falls into the NOT complement, consistent with != / not in.
-            return f"NOT (COALESCE({combined}, FALSE))", arg_idx
+            return _compile_not(sub_filters, rows)
 
         else:  # AND / OR
             if not sub_filters:
                 return "TRUE", arg_idx
 
-            child_sqls = []
+            child_sqls: list[str] = []
             if logic == 'AND':
                 sub_filters, child_sqls, arg_idx = _merge_datetime_ranges(
                     sub_filters,
@@ -5760,19 +6223,18 @@ def _compile_filter_node(
             args.append(int(cid))
             args.append(threshold)
             concepts.add(int(cid))
-            # No guard in here: parse_filter_node puts one for every concept in front of the whole filter.
-            inner = (
-                f"SELECT 1 FROM embedding_concept_scores _cs "
+            # No guard in here: parse_filter_node puts one for every concept in front of the whole filter. The exclude
+            # is the NOT of the show with the score as the value (backend/negation.py): the sample has a score, and it
+            # doesn't pass. A sample has at most one score per concept (its key), never NULL, so that is one row's test.
+            passes = f"_cs.score {cmp} ${arg_idx + 1}"
+            return (
+                f"EXISTS (SELECT 1 FROM embedding_concept_scores _cs "
                 f"WHERE _cs.sample_id = {id_col} AND _cs.concept_id = ${arg_idx} "
-                f"AND _cs.score {cmp} ${arg_idx + 1}"
-            )
-            exists = f"EXISTS ({inner})" if op == 'concept_select' else f"NOT EXISTS ({inner})"
-            return exists, arg_idx + 2
+                f"AND {passes if op == 'concept_select' else f'NOT ({passes})'})"
+            ), arg_idx + 2
 
-        # Presence-only concept guard (internal; emitted by _strictify_negations for the cross-grain
-        # SELF branch). Does THIS row have ANY score for the concept? Pairs with concept_exclude so a
-        # row whose grain doesn't own the concept's embedding field (and thus has no score rows)
-        # can't vacuously satisfy the NOT EXISTS and leak the whole grain.
+        # Does THIS row have ANY score for the concept? What a NOT around a concept's test needs (backend/negation.py,
+        # _scored); internal, never written by the filter text.
         if op == 'concept_present':
             cfg = val if isinstance(val, dict) else {}
             cid = cfg.get('concept_id')
@@ -5802,20 +6264,15 @@ def _compile_filter_node(
         # it (field-stats, map, selection_token), args[0] — every dataset-scoped query seeds args
         # with [dataset_id], so args[0] is reliably it. Without either, an image's objects are
         # found by its own dataset_id, still one probe of (dataset_id, parent_id).
-        # cg_self: the cross-grain link's SAME-grain branch — render the sub-filter (with each
-        # negation strictified PER-LEAF so an exclusion on a metadata field this grain LACKS can't
-        # vacuously match every row, the whole-grain leak) against the current row. Positive
-        # filters, the lasso, selections, and is_null pass through _strictify_negations unchanged.
+        # Paired (cg_self with has_matching_object or parent_matches, the page's wrapping), they are read together by
+        # backend/grain_reading.py, above. Standing alone, each reads its sub-filter on one row, by the same rule as any
+        # filter (a negation needs a value, backend/negation.py): cg_self on the current row, has_matching_object on an
+        # image's objects, parent_matches on an object's image.
         if op == 'cg_self':
             if not isinstance(val, dict):
                 return "TRUE", arg_idx
-            strict = _strictify_negations(val, partner=False, array_columns=array_columns)
-            if strict is False:
-                return "FALSE", arg_idx
-            if not isinstance(strict, dict):  # True / None -> no constraint on the same-grain row
-                return "TRUE", arg_idx
             sub_sql, arg_idx = _compile_filter_node(
-                strict,
+                val,
                 args,
                 arg_idx,
                 field_mapping,
@@ -5829,11 +6286,8 @@ def _compile_filter_node(
         if op in ('parent_matches', 'has_matching_object'):
             if not isinstance(val, dict):
                 return "TRUE", arg_idx
-            # Strictify for the PARTNER: drops same-grain-only (native id/filepath) exclusions that
-            # have no cross-grain meaning. If nothing partner-meaningful remains, no partner matches.
-            strict = _strictify_negations(val, partner=True, array_columns=array_columns)
-            if not isinstance(strict, dict):
-                return "FALSE", arg_idx
+            if not val.get('filters') and 'field' not in val:
+                return "FALSE", arg_idx  # an empty sub-filter asks nothing of a partner: no partner matches
             ds = dataset_id if dataset_id is not None else (args[0] if args and isinstance(args[0], int) else None)
             id_col = (field_mapping or {}).get('id', 'samples.id')
             outer_tbl = id_col.rsplit('.', 1)[0] if '.' in id_col else 'samples'
@@ -5849,7 +6303,7 @@ def _compile_filter_node(
                 # IMAGE row matches if its id is the parent of an object satisfying the sub-filter.
                 sub_map = {**_realiased(field_mapping, 'o'), 'id': 'o.id'}
                 sub_sql, arg_idx = _compile_filter_node(
-                    strict,
+                    val,
                     args,
                     arg_idx,
                     sub_map,
@@ -5859,7 +6313,7 @@ def _compile_filter_node(
                     concepts=concepts,
                 )
                 scope = int(ds) if ds is not None else f"{outer_tbl}.dataset_id"
-                ids = _id_list_bound(strict)
+                ids = _id_list_bound(val)
                 if ds is None or ids is None or len(ids) > _IMAGES_OF_LISTED_OBJECTS_MAX:
                     return (
                         f"EXISTS (SELECT 1 FROM samples o WHERE o.dataset_id = {scope} AND o.parent_id = {id_col} "
@@ -5878,7 +6332,7 @@ def _compile_filter_node(
             ds_scope = f"s2.dataset_id = {int(ds)} AND " if ds is not None else ""
             sub_map = {**_realiased(field_mapping, 's2'), 'id': 's2.id'}
             sub_sql, arg_idx = _compile_filter_node(
-                strict,
+                val,
                 args,
                 arg_idx,
                 sub_map,
@@ -5900,7 +6354,7 @@ def _compile_filter_node(
             # NULL: an unlinked object's NULL = ANY(...) is ANDed with its FALSE EXISTS. The list is a constant, so
             # a plan that still reads every object looks it up in a hash table. has_matching_object can't say its
             # images without a sub-query, and an array from one is searched element by element on every row.
-            ids = _id_list_bound(strict)
+            ids = _id_list_bound(val)
             if ids is None:
                 return link, arg_idx
             args.append(ids)
@@ -5921,6 +6375,51 @@ def _compile_filter_node(
         json_source, json_key = (
             ('local_metadata', local.name) if local is not None else (_metadata_source(field), field)
         )
+
+        # `is empty`: the field's value is a list that holds nothing; `is not empty` is its NOT (backend/negation.py),
+        # so it shows only the rows that have a value, one that isn't an empty list. Tags have no value when they are
+        # empty (negation.EMPTY_IS_NO_VALUE): there they are `is null` and `is not null`, compiled below.
+        if op in negation.EMPTINESS:
+            refusal = _emptiness_refusal(field, op, array_columns)
+            if refusal is not None:
+                raise HTTPException(status_code=400, detail=refusal)
+            arrays = array_columns if array_columns is not None else _get_array_columns_sync()
+            if negation.empty_is_no_value(field) and (local.array if local is not None else field in arrays):
+                op = negation.EMPTINESS[op]
+            elif op == 'is_not_empty':
+                return _compile_filter_node(
+                    {'logic': 'NOT', 'filters': [{**node, 'operator': 'is_empty'}]},
+                    args,
+                    arg_idx,
+                    field_mapping,
+                    numeric_indexed_fields,
+                    dataset_id,
+                    array_columns=array_columns,
+                    concepts=concepts,
+                    outer_kind=outer_kind,
+                )
+            else:
+                return _empty_sql(field, local, arrays), arg_idx
+
+        # A negation of a field is the NOT of its comparison (backend/negation.py): `f != v` is NOT (f = v), `f not in`
+        # NOT (f in), and so shows only the rows that have a value for `f`. On a list of labels `<>`, `not_in` and `nin`
+        # are taken too. The built-in columns every row has keep their own SQL below.
+        labels = field == 'segmentation.labels' or bool(label_path(field, array_columns))
+        if op in (_LABEL_NEG_OPS if labels else negation.NEGATIONS) and not (
+            field in ('id', 'filepath', 'media_type', *_NATIVE_TIMESTAMPS) or (field_mapping and field in field_mapping)
+        ):
+            positive = negation.NEGATIONS.get(op) or negation.LABEL_NEGATIONS[op]
+            return _compile_filter_node(
+                {'logic': 'NOT', 'filters': [{**node, 'operator': positive}]},
+                args,
+                arg_idx,
+                field_mapping,
+                numeric_indexed_fields,
+                dataset_id,
+                array_columns=array_columns,
+                concepts=concepts,
+                outer_kind=outer_kind,
+            )
 
         # Derived fields: an embedding or hash (rows in their own tables, not metadata keys) or the
         # location, named `embeddings.<field>` / `hashes.<field>` / `location`. They answer presence
@@ -5954,6 +6453,13 @@ def _compile_filter_node(
                 scope = f"_d.dataset_id = {id_col.rsplit('.', 1)[0] + '.' if '.' in id_col else ''}dataset_id AND "
             lookup = f"EXISTS (SELECT 1 FROM {table} _d WHERE {scope}_d.sample_id = {id_col} AND {match})"
             return (lookup if present else f"NOT {lookup}"), arg_idx + 1
+
+        # `is not null`: the row has a value for the field, and `is null` none (_value_sql, for every kind of list). On
+        # a list of labels (`detections.label`, `segmentation.labels`) there is no key to find, so `exists` and
+        # `not exists` are the same two tests: an empty list exists.
+        if op in ('is_null', 'is_not_null') or (labels and op in ('exists', 'not_exists')):
+            present = op in ('is_not_null', 'exists')
+            return _value_sql(field, local, field_mapping, array_columns, present=present), arg_idx
 
         # Per-object match: `field` is an array-of-objects label field and `value`
         # is a (possibly compound) filter node evaluated against each element.
@@ -5993,17 +6499,14 @@ def _compile_filter_node(
             and all(isinstance(item, str) for item in (val if isinstance(val, list) else [val]))
         ):
             # JSONB containment avoids expanding each object: metadata->'detections' @> [{"label": V}].
-            # =/in -> contains ANY of the values; !=/not_in -> contains NONE of them
-            # (NULL-aware via coalesce, so a sample with no detections joins the negative
-            # set). Other operators (exists/is_null/comparison) are NOT matched here and
-            # fall through to the generic dotted handler below.
+            # =/in -> contains ANY of the values. The other comparisons are NOT matched here and fall
+            # through to the generic dotted handler below.
             parent = field.rsplit('.', 1)[0]
-            negate = op in _LABEL_NEG_OPS
-            values = val if op in _LABEL_LIST_OPS else [val]
+            values = val if op == 'in' else [val]
             if not isinstance(values, list):
                 values = [values]
             if not values:
-                return ("TRUE" if negate else "FALSE"), arg_idx
+                return "FALSE", arg_idx
             or_clauses = []
             for v in values:
                 args.append(v)
@@ -6011,47 +6514,35 @@ def _compile_filter_node(
                     f"coalesce(metadata->'{parent}','[]'::jsonb) @> jsonb_build_array(jsonb_build_object('label', ${arg_idx}::text))",  # noqa: E501
                 )
                 arg_idx += 1
-            inner = f"({' OR '.join(or_clauses)})"
-            return (f"(NOT {inner})" if negate else inner), arg_idx
+            return f"({' OR '.join(or_clauses)})", arg_idx
 
         elif field == 'segmentation.labels':
             # metadata->'segmentation'->'labels' is a string array ["a","b"]; `?` tests
-            # array membership. =/in -> contains ANY; !=/not_in -> contains NONE (NULL-aware).
-            negate = op in _LABEL_NEG_OPS
-            values = val if op in _LABEL_LIST_OPS else [val]
+            # array membership. =/in -> contains ANY. (The absence tests: _value_sql, above.)
+            labels_json = "metadata->'segmentation'->'labels'"
+            values = val if op == 'in' else [val]
             if not isinstance(values, list):
                 values = [values]
             if not values:
-                return ("TRUE" if negate else "FALSE"), arg_idx
+                return "FALSE", arg_idx
             or_clauses = []
             for v in values:
                 args.append(v)
-                or_clauses.append(f"coalesce(metadata->'segmentation'->'labels','[]'::jsonb) ? ${arg_idx}::text")
+                or_clauses.append(f"coalesce({labels_json},'[]'::jsonb) ? ${arg_idx}::text")
                 arg_idx += 1
-            inner = f"({' OR '.join(or_clauses)})"
-            return (f"(NOT {inner})" if negate else inner), arg_idx
+            return f"({' OR '.join(or_clauses)})", arg_idx
 
         elif label_path(field, array_columns):
             # Dotted per-object convenience, e.g. "detections.confidence" > 0.9 or
             # "ground_truth.label" = "car": EXISTS over the array with a predicate on the
-            # element key. Negative ops (!=/not_in) mean the sample contains NO matching
-            # element -> NOT EXISTS(positive predicate), so a sample without the field is
-            # included (NULL-aware), matching the @> handlers above.
+            # element key. `is null`, `is not null`, `exists` and `not exists` are the list's (_value_sql, above).
             arr, sub = field.rsplit('.', 1)
-            negate = op in _LABEL_NEG_OPS
-            # Every spelling in _LABEL_NEG_OPS must map to its positive form. 'not in' (with the
-            # space) is the one the FRONTEND actually emits for facet / multi-select excludes
-            # (filter-utils.ts) and for histogram double-click-to-exclude; omitting it meant it
-            # reached _element_predicate_sql unmapped and raised HTTP 400 on ground_truth.label /
-            # predictions.label while detections.label (its own @> branch above) worked fine.
-            pos_op = {'!=': '=', '<>': '=', 'not in': 'in', 'not_in': 'in', 'nin': 'in'}.get(op, op)
-            inner, arg_idx = _element_predicate_sql(sub, pos_op, val, args, arg_idx)
-            exists = (
+            inner, arg_idx = _element_predicate_sql(sub, op, val, args, arg_idx)
+            return (
                 f"EXISTS (SELECT 1 FROM jsonb_array_elements("
                 f"CASE WHEN jsonb_typeof(metadata->'{arr}') = 'array' "
                 f"THEN metadata->'{arr}' ELSE '[]'::jsonb END) AS elem WHERE {inner})"
-            )
-            return (f"(NOT {exists})" if negate else exists), arg_idx
+            ), arg_idx
 
         else:
             # Metadata field
@@ -6086,9 +6577,9 @@ def _compile_filter_node(
                 return compiled
 
         # A date / datetime given to day, minute or second precision means that whole unit
-        #: `=` is the unit, `!=` its complement, `<=` ends where the next unit
+        #: `=` is the unit (`!=` is its NOT, above), `<=` ends where the next unit
         # starts and `>` starts there. (`>=` and `<` are already right at the unit's start.)
-        if op in ('=', '!=', '<=', '>') and not is_array and field not in ('id', 'media_type', 'filepath'):
+        if op in ('=', '<=', '>') and not is_array and field not in ('id', 'media_type', 'filepath'):
             window = _iso_unit_window(val)
             if window is not None:
                 lo, hi = window
@@ -6102,8 +6593,7 @@ def _compile_filter_node(
                     args.append(bounds[1])
                     return f"{col} >= ${arg_idx}", arg_idx + 1
                 args.extend(bounds)
-                in_unit = f"({col} >= ${arg_idx} AND {col} < ${arg_idx + 1})"
-                return (in_unit if op == '=' else f"({col} IS NULL OR NOT {in_unit})"), arg_idx + 2
+                return f"({col} >= ${arg_idx} AND {col} < ${arg_idx + 1})", arg_idx + 2
 
         # created_at is timestamptz; coerce string values to datetime so asyncpg binds
         # them as timestamps (a raw string param errors: `timestamp = text`). Applies to
@@ -6146,25 +6636,10 @@ def _compile_filter_node(
                 return f"{col} = ${arg_idx}", arg_idx + 1
 
         elif op == '!=':
-            if is_array:
-                args.append(val)
-                # Include rows with no/empty array value in the complement.
-                return f"(NOT (${arg_idx} = ANY({arr})) OR {arr} IS NULL)", arg_idx + 1
-            elif field in ['id', *_NATIVE_TIMESTAMPS]:
-                # Native typed columns — bind as-is (int / coerced datetime). _text_value
-                # would stringify and break `integer/timestamp IS DISTINCT FROM text`.
-                args.append(val)
-                return f"{col} IS DISTINCT FROM ${arg_idx}", arg_idx + 1
-            elif field in ['media_type', 'filepath']:
-                args.append(str(val))
-                return f"{col} IS DISTINCT FROM ${arg_idx}", arg_idx + 1
-            # IS DISTINCT FROM so rows missing the field (NULL) are part of the
-            # complement; _text_value handles booleans.
-            num = _equality_number(val, numeric_strings)
-            if num is not None:  # numeric, as for `=`; non-numeric rows are NULL here -> included
-                args.append(num)
-                return f"{numeric_col} IS DISTINCT FROM ${arg_idx}", arg_idx + 1
-            args.append(_text_value(val))
+            # Only a built-in column gets here: a negation of any other field is the NOT of its comparison (above).
+            # Native typed columns bind as-is (int / coerced datetime): _text_value would stringify and break
+            # `integer/timestamp IS DISTINCT FROM text`.
+            args.append(val if field in ['id', *_NATIVE_TIMESTAMPS] else str(val))
             return f"{col} IS DISTINCT FROM ${arg_idx}", arg_idx + 1
 
         elif op in ('>', '>=', '<', '<='):
@@ -6250,50 +6725,19 @@ def _compile_filter_node(
                 return f"{col} = ANY(${arg_idx}::text[])", arg_idx + 1
 
         elif op == 'not in':
-            if not isinstance(val, list):
-                val = [val]
-            if is_array:
-                args.append(val)
-                # Include rows with no/empty array value in the complement.
-                return f"(NOT ({arr} && ${arg_idx}::text[]) OR {arr} IS NULL)", arg_idx + 1
-            elif field in ['media_type', 'filepath', 'id', *_NATIVE_TIMESTAMPS]:
-                # Native columns — compare WITHOUT the ::text[] cast, mirroring `in`
-                # above. id is integer / created_at is timestamp; a text[] cast here
-                # produced `integer = text` and broke every `id not in [...]` (e.g.
-                # excluding a selection). NULL-aware so missing rows join the complement.
-                args.append(val)
-                return f"({col} IS NULL OR NOT ({col} = ANY(${arg_idx})))", arg_idx + 1
-            # NULL-aware + text-typed to mirror `in`: rows missing the field are
-            # part of the complement; _text_value handles booleans.
-            nums = [_equality_number(v, numeric_strings) for v in val]
-            if val and all(n is not None for n in nums):  # numeric, as for `in`
-                args.append(nums)
-                return f"({numeric_col} IS NULL OR NOT ({numeric_col} = ANY(${arg_idx}::float8[])))", arg_idx + 1
-            str_vals = [_text_value(v) for v in val]
-            args.append(str_vals)
-            return f"({col} IS NULL OR NOT ({col} = ANY(${arg_idx}::text[])))", arg_idx + 1
-
-        elif op == 'is_null':
-            if is_array:
-                # Empty tags are stored as '{}', not NULL: `tags IS NULL` matched nothing, so the
-                # "(no value)" filter on an array field was always empty. Same as not_exists.
-                return f"array_length({arr}, 1) IS NULL", arg_idx
-            # `col` resolves to the native column (id/created_at/filepath/media_type),
-            # an array column, or metadata->>'field' — checking the right thing instead
-            # of always probing metadata (which made id/created_at is_null match every row).
-            return f"{col} IS NULL", arg_idx
-
-        elif op == 'is_not_null':
-            if is_array:
-                return f"array_length({arr}, 1) IS NOT NULL", arg_idx
-            return f"{col} IS NOT NULL", arg_idx
+            # Only a built-in column gets here: a negation of any other field is the NOT of its comparison (above).
+            # Compared WITHOUT the ::text[] cast, mirroring `in` above: id is integer / created_at is timestamp, and a
+            # text[] cast here produced `integer = text` and broke every `id not in [...]` (e.g. excluding a selection).
+            args.append(val if isinstance(val, list) else [val])
+            return f"({col} IS NULL OR NOT ({col} = ANY(${arg_idx})))", arg_idx + 1
 
         elif op == 'exists':
             if is_array:
-                # Native TEXT[] column (tags, ...): "exists" = has >= 1 element. A row with
-                # tags=[] has the column but no tags; NULL/empty -> not exists. (metadata ? field
-                # was wrong here — tags isn't a metadata key, so `exists` matched zero rows.)
-                return f"({arr} IS NOT NULL AND array_length({arr}, 1) > 0)", arg_idx
+                # A list kept in a column of its own has no key to find. Tags (negation.EMPTY_IS_NO_VALUE): at least one
+                # tag, as before. Any other: `is not null` (_value_sql), the rows with a list, empty or not.
+                if negation.empty_is_no_value(field):
+                    return f"({arr} IS NOT NULL AND array_length({arr}, 1) > 0)", arg_idx
+                return _value_sql(field, local, field_mapping, array_columns), arg_idx
             native = ('media_type', 'filepath', 'id', *_NATIVE_TIMESTAMPS)
             if (field_mapping and field in field_mapping) or field in native:
                 # Native scalar column: existence = the column is set.
@@ -6307,8 +6751,8 @@ def _compile_filter_node(
 
         elif op == 'not_exists':
             if is_array:
-                # Inverse of exists: no elements (NULL column or empty array).
-                return f"array_length({arr}, 1) IS NULL", arg_idx
+                # `is null` (_value_sql): never set; for tags, no tag.
+                return _value_sql(field, local, field_mapping, array_columns, present=False), arg_idx
             native = ('media_type', 'filepath', 'id', *_NATIVE_TIMESTAMPS)
             if (field_mapping and field in field_mapping) or field in native:
                 return f"{col} IS NULL", arg_idx
@@ -6333,11 +6777,11 @@ def _compile_filter_node(
 
             wkt = f"POLYGON(({coords}))"
             args.append(wkt)
-            # Include path uses ST_Within (spatial index). Exclude removes what is inside and keeps everything
-            # else, samples with no location included (NOT ST_Within alone is NULL for them, which drops them).
+            # Include path uses ST_Within (spatial index). Exclude is its NOT (backend/negation.py): a sample with a
+            # location, not inside.
             if op == 'geo_polygon_exclude':
                 return (
-                    f"(location IS NULL OR NOT ST_Within(location, ST_GeomFromText(${arg_idx}, 4326)))",
+                    f"(location IS NOT NULL AND NOT ST_Within(location, ST_GeomFromText(${arg_idx}, 4326)))",
                     arg_idx + 1,
                 )
             return f"ST_Within(location, ST_GeomFromText(${arg_idx}, 4326))", arg_idx + 1
@@ -6411,15 +6855,9 @@ def _compile_filter_node(
             layout = node.get('layout_id')
             if layout is not None and (not isinstance(layout, str) or len(layout) > 64):
                 raise HTTPException(status_code=400, detail="embedding_polygon layout_id must be a string or null")
-            if re.search(r'_patch_\d+x\d+$', field):
-                args.append(field + '_%')
-                field_match = f"ep.field_name LIKE ${arg_idx}"
-            else:
-                args.append(field)
-                field_match = f"ep.field_name = ${arg_idx}"
-            arg_idx += 1
-            bbox = (
-                f"AND ep.x BETWEEN {min(xs)} AND {max(xs)} AND ep.y BETWEEN {min(ys)} AND {max(ys)} "  # bbox pre-filter (index)  # noqa: E501
+            field_match, arg_idx = _lasso_field_match(field, args, arg_idx)
+            in_polygon = (
+                f"ep.x BETWEEN {min(xs)} AND {max(xs)} AND ep.y BETWEEN {min(ys)} AND {max(ys)} "  # bbox pre-filter (index)  # noqa: E501
                 f"AND ST_Contains(ST_GeomFromText('{wkt}', 0), ST_SetSRID(ST_MakePoint(ep.x, ep.y), 0))"
             )
             # Match samples whose embedding point for `field` is inside the polygon. This
@@ -6429,13 +6867,20 @@ def _compile_filter_node(
             # is NOT duplicated here.
             inside = (
                 f"EXISTS (SELECT 1 FROM embedding_coordinates ep WHERE ep.sample_id = {outer_id} "
-                f"AND {field_match} AND ep.x IS NOT NULL {bbox})"
+                f"AND {field_match} AND ep.x IS NOT NULL AND {in_polygon})"
             )
             if op == 'embedding_polygon_exclude':
-                # Exclude removes what is inside the polygon and keeps everything else, samples with no point on
-                # this map included (as geo_polygon_exclude keeps samples with no location). The inside test keeps
-                # its bbox index.
-                return f"(NOT {inside})", arg_idx
+                # Exclude is the NOT of the lasso (backend/negation.py): a sample with a point on this map, none of
+                # its points inside (as geo_polygon_exclude needs a location). A whole-image or object field has one
+                # point per sample (the table's key is the sample and the field), so that is one probe: its point,
+                # outside the polygon. A patch-scale field has a point per tile: one of them, and none inside.
+                if not _PATCH_FIELD.search(field):
+                    return (
+                        f"EXISTS (SELECT 1 FROM embedding_coordinates ep WHERE ep.sample_id = {outer_id} "
+                        f"AND {field_match} AND NOT ({in_polygon}))"
+                    ), arg_idx
+                has_point, arg_idx = _points_sql(field, outer_id, args, arg_idx)
+                return f"({has_point} AND NOT {inside})", arg_idx
             return inside, arg_idx
 
         else:
@@ -8277,7 +8722,8 @@ class SampleCreate(BaseModel):
     embedding: Any = None
     embeddings: Optional[Dict[str, List[float]]] = None  # Named embeddings: {"clip": [...], "dinov2": [...]}
     hashes: Optional[Dict[str, str]] = None  # Named hashes (hex): {"phash": "ff00...", "dhash": "0a1b..."}
-    array_fields: Optional[Dict[str, List[str]]] = None  # Dynamic array fields
+    # List fields kept in a column of their own: a list, or null for never set (as leaving the field out).
+    array_fields: Optional[Dict[str, Optional[List[str]]]] = None
 
 
 _HASH_HEX_RE = re.compile(r'^[0-9a-fA-F]+$')
@@ -8397,6 +8843,7 @@ async def add_samples(id: int, payload: Any = Body(...), user: dict = Depends(re
     valid_array_cols = await get_dataset_array_columns(id) - {'tags'}
     requested_array_fields = {name for sample in samples for name in (sample.array_fields or {})}
     if requested_array_fields - valid_array_cols:
+        await list_fields.refuse_while_registering(db, id, requested_array_fields - valid_array_cols)
         raise HTTPException(
             status_code=422,
             detail=f'Unregistered array fields: {sorted(requested_array_fields - valid_array_cols)}',
@@ -8609,7 +9056,20 @@ class SampleUpdate(BaseModel):
     remove_metadata_keys: Optional[List[str]] = None
     location: Optional[Dict[str, Any]] = None
     heading: Optional[float] = None
-    array_fields: Optional[Dict[str, List[str]]] = None
+    # A list field kept in a column of its own: a list replaces it, null unsets it (never set). A mirror's own
+    # `@local.tags` takes a list only, as tags do.
+    array_fields: Optional[Dict[str, Optional[List[str]]]] = None
+
+    @field_validator('array_fields')
+    @classmethod
+    def _array_fields(
+        cls,
+        fields: Optional[Dict[str, Optional[List[str]]]],
+    ) -> Optional[Dict[str, Optional[List[str]]]]:
+        if fields is not None and LOCAL_TAGS in fields and fields[LOCAL_TAGS] is None:
+            raise ValueError(f'{LOCAL_TAGS} takes a list of tags, not null')
+        return fields
+
     # Never written: a sample's path can't be changed (FILEPATH_UNCHANGEABLE). Accepted only as the path the sample
     # has, so a client that sends a whole sample back keeps working.
     filepath: Optional[str] = None
@@ -8700,6 +9160,7 @@ async def update_sample(
         return await _update_local_fields(id, sample_id, local_set, local_remove, local_tags, user)
     valid_cols = await get_dataset_array_columns(id) - {'tags'} if request.array_fields else set()
     if request.array_fields and set(request.array_fields) - valid_cols:
+        await list_fields.refuse_while_registering(db, id, set(request.array_fields) - valid_cols)
         raise HTTPException(
             status_code=422,
             detail=f'Unregistered array fields: {sorted(set(request.array_fields) - valid_cols)}',
@@ -9111,6 +9572,7 @@ async def tag_samples(id: int, request: BulkTagRequest, user: dict, made_by: str
         return await _tag_local(id, request, user)
     array_cols = await get_dataset_array_columns(id)
     if col not in array_cols:
+        await list_fields.refuse_while_registering(db, id, [col])
         raise HTTPException(status_code=400, detail=f"'{col}' is not a registered array field")
 
     overlap = sorted(set(request.add_tags) & set(request.remove_tags))

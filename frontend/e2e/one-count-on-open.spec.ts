@@ -133,8 +133,10 @@ test.describe('datasets of its own', () => {
         return { id: ds.id as number, ids: ids as number[] };
     }
 
+    // Each image is tagged `seen`: "not hidden" (`tags != "hide"`) shows only the images that have a tag, none of them
+    // hide (contract g7, one rule everywhere, rule 1.5), so untagged images would count none.
     const sixImages = (prefix: string) =>
-        Array.from({ length: 6 }, (_, i) => ({ filepath: `s3://${prefix}/img_${i}.jpg`, metadata: { idx: i } }));
+        Array.from({ length: 6 }, (_, i) => ({ filepath: `s3://${prefix}/img_${i}.jpg`, metadata: { idx: i }, tags: ['seen'] }));
 
     /** Opens `id` with "not hidden" applied and waits until both counts show `n`. */
     async function openNotHidden(page: Page, id: number, n: number) {

@@ -6,6 +6,7 @@ import html
 import json
 import sys
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from PIL import Image
 
@@ -71,7 +72,27 @@ ATTRIBUTE_NAMES = {
     '/m/015lz1': 'Sing',
     '/m/01lhf': 'Talk',
 }
-FLAGS = ('IsOccluded', 'IsTruncated', 'IsGroupOf', 'IsDepiction', 'IsInside')
+# The box CSV's flag columns and the boolean each becomes. The CSV writes 1, 0, or -1 where the flag is unknown.
+FLAGS = {
+    'IsOccluded': 'is_occluded',
+    'IsTruncated': 'is_truncated',
+    'IsGroupOf': 'is_group_of',
+    'IsDepiction': 'is_depiction',
+    'IsInside': 'is_inside',
+}
+
+
+def flag(value):
+    return {'1': True, '0': False}.get(value.strip())
+
+
+def license_name(url):
+    """'https://creativecommons.org/licenses/by/2.0/' -> 'CC BY 2.0'; another address stays as it is."""
+    parts = urlsplit(url)
+    path = [part for part in parts.path.split('/') if part]
+    if parts.netloc.endswith('creativecommons.org') and len(path) == 3 and path[0] == 'licenses':
+        return f'CC {path[1].upper()} {path[2]}'
+    return url
 
 
 def build_parser():
@@ -202,58 +223,59 @@ def map_sample(root, row, index, names, ancestors, assets, metadata_only=False, 
             saved_image = assets.save(relative, image, decoded=True)
             image.close()
             image = saved_image
-        metadata: dict = {k: html.unescape(v) if k in ('Author', 'Title') else v for k, v in row.items() if k != '_row'}
-        metadata.update(
-            image_id=image_id,
-            split='validation',
-            source_filepath=str(path),
-            Rotation=rotation,
-            rotation_applied=bool(rotation),
-            detections=[],
-            positive_labels=[],
-            verified_absent=[],
-            points=[],
-            mask_instances=[],
-            relationships=[],
-            captions=[],
-            narratives=[],
-        )
+        # One field per fact, under Freedom Ridge's names. Of the image list's columns only the photo's credit is kept
+        # (CC BY asks for it wherever the photo is shown): its title and author, its license and its page.
+        title = html.unescape(row.get('Title') or '').strip()
+        author = html.unescape(row.get('Author') or '').strip() or 'an unknown author'
+        license_url = row.get('License') or None
+        metadata: dict = {
+            'image_id': image_id,
+            'split': 'validation',
+            'rotation': rotation,
+            # Curly quotes: a title may hold straight ones.
+            'attribution': f'“{title}” by {author}' if title else f'Photo by {author}',
+            'license': license_name(license_url) if license_url else None,
+            'license_url': license_url,
+            'source_url': row.get('OriginalLandingURL') or None,
+            'detections': [],
+            'positive_labels': [],
+            'verified_absent': [],
+            'points': [],
+            'mask_instances': [],
+            'relationships': [],
+        }
         if image is not None:
             metadata.update(width=image.width, height=image.height)
         positive_mids: set[str] = set()
         negative_mids: set[str] = set()
         boxes_by_bounds: dict = {}
+        # Classes go by their names; Google's class codes (/m/...) are not kept.
         for box in index.rows('detections', image_id):
             mid = box['LabelName']
             positive_mids.add(mid)
-            attrs = {'Source': box['Source'], 'LabelName': mid, 'box_id': f"box-{box['_row']}"}
-            attrs.update({flag: int(box[flag]) for flag in FLAGS})
             detection = Detection(
                 names.get(mid, mid),
                 rotate_bbox(bbox(box), rotation),
                 confidence=float(box['Confidence']),
                 id=f"box-{box['_row']}",
             )
-            detection.update(attrs, is_group_of=bool(attrs['IsGroupOf']))
+            detection.update(source=box['Source'], **{name: flag(box[column]) for column, name in FLAGS.items()})
             metadata['detections'].append(detection)
             boxes_by_bounds.setdefault(mid, []).append((box_corners(box), detection))
         for kind in ('boxable_labels', 'image_labels'):
             for label in index.rows(kind, image_id):
                 mid, confidence = label['LabelName'], float(label['Confidence'])
                 (positive_mids if confidence > 0 else negative_mids).add(mid)
-                attrs = {'Source': label['Source'], 'LabelName': mid, 'annotation_file': CSV_FILES[kind]}
                 if confidence > 0:
                     value = Classification(names.get(mid, mid), confidence=confidence, id=f"{kind}-{label['_row']}")
-                    value.update(attrs)
+                    value.update(source=label['Source'])
                     metadata['positive_labels'].append(value)
                 else:
-                    metadata['verified_absent'].append({'class': names.get(mid, mid), **attrs})
+                    metadata['verified_absent'].append({'class': names.get(mid, mid), 'source': label['Source']})
         for point in index.rows('points', image_id):
             mid = point['Label']
             if point['EstimatedYesNo'] == 'yes':
                 positive_mids.add(mid)
-            attrs = {k: v for k, v in point.items() if k not in ('_row', 'ImageId', 'X', 'Y')}
-            attrs.update({key: int(point[key]) for key in ('YesVotes', 'NoVotes', 'UnsureVotes')})
             metadata['points'].append(
                 Keypoint(
                     [rotate_point([float(point['X']), float(point['Y'])], rotation)],
@@ -261,7 +283,14 @@ def map_sample(root, row, index, names, ancestors, assets, metadata_only=False, 
                     id=f"point-{point['_row']}",
                 ),
             )
-            metadata['points'][-1].update(attrs)
+            # Whether the class is at the point (yes, no or unsure), as the votes decided it.
+            metadata['points'][-1].update(
+                source=point['Source'],
+                answer=point['EstimatedYesNo'],
+                yes_votes=int(point['YesVotes']),
+                no_votes=int(point['NoVotes']),
+                unsure_votes=int(point['UnsureVotes']),
+            )
         for slot, mask in enumerate(index.rows('masks', image_id)):
             mid = mask['LabelName']
             positive_mids.add(mid)
@@ -307,8 +336,8 @@ def map_sample(root, row, index, names, ancestors, assets, metadata_only=False, 
                     'detection_id': detection_ids[0],
                     'detection_ids': detection_ids,
                     'mask_field': field,
-                    'PredictedIoU': float(mask['PredictedIoU']),
-                    'Clicks': mask['Clicks'],
+                    'predicted_iou': float(mask['PredictedIoU']),
+                    'clicks': mask['Clicks'],
                 },
             )
             for detection in matches:
@@ -334,34 +363,27 @@ def map_sample(root, row, index, names, ancestors, assets, metadata_only=False, 
                 object=names.get(second, second),
                 subject_bbox=subject,
                 object_bbox=object_box,
-                LabelName1=first,
-                LabelName2=second,
             )
-        for narrative in index.rows('narratives', image_id):
-            metadata['captions'].append(narrative['caption'])
-            metadata['narratives'].append(narrative['caption'])
+        # One searchable text, a narrative per line (a list of strings can't be searched for a word).
         metadata.update(
-            caption_text='\n'.join(metadata['captions']),
-            classes=sorted({names.get(mid, mid) for mid in positive_mids}),
-            parent_classes=sorted({names.get(p, p) for mid in positive_mids for p in ancestors.get(mid, [])}),
-            negative_parent_classes=sorted({names.get(p, p) for mid in negative_mids for p in ancestors.get(mid, [])}),
+            captions='\n'.join(narrative['caption'] for narrative in index.rows('narratives', image_id)),
             mask_count=len(metadata['mask_instances']),
         )
         # Native TEXT[] fields give exact membership filters and sidebar facets.
         arrays = {
-            'class_names': metadata['classes'],
-            'parent_classes': metadata.pop('parent_classes'),
-            'negative_parent_classes': metadata.pop('negative_parent_classes'),
+            'class_names': sorted({names.get(mid, mid) for mid in positive_mids}),
+            'parent_classes': sorted({names.get(p, p) for mid in positive_mids for p in ancestors.get(mid, [])}),
+            'negative_parent_classes': sorted(
+                {names.get(p, p) for mid in negative_mids for p in ancestors.get(mid, [])},
+            ),
             'positive_classes': sorted({v['label'] for v in metadata['positive_labels']}),
             'negative_classes': sorted({names.get(mid, mid) for mid in negative_mids}),
             'point_classes': sorted({v['label'] for v in metadata['points']}),
-            'point_states': sorted({v['EstimatedYesNo'] for v in metadata['points']}),
+            'point_states': sorted({v['answer'] for v in metadata['points']}),
             'relationship_predicates': sorted({v['label'] for v in metadata['relationships']}),
             'mask_classes': sorted({v['class'] for v in metadata['mask_instances']}),
         }
-        for flag in FLAGS:
-            metadata[f'{flag}_count'] = sum(d[flag] for d in metadata['detections'])
-        return Sample(filepath, tags=['validation'], metadata=metadata, array_fields=arrays), image
+        return Sample(filepath, metadata=metadata, array_fields=arrays), image
     except Exception:
         if image is not None:
             image.close()

@@ -4,8 +4,9 @@ grain the app's dataset page shows, applied to a view's stages before every requ
 This is the frontend's `withGrain(base, 'image', null, hasObjects)` (frontend/contexts/FilterContext.tsx), written
 again here: object rows are left out (`media_type != object`), and on a dataset with object rows each filter is
 coupled across the grains, so an image passes when it matches itself (`cg_self`) or one of its objects matches
-(`has_matching_object`); an excluded region is coupled as NOT (the image or one of its objects is inside it), and a
-lasso on the objects' map couples on its own. The stages a view keeps stay as they are: the app wraps them itself
+(`has_matching_object`); an excluded region is coupled as NOT (the image or one of its objects is inside it), which
+the server reads for the image as a whole (it or an object has a location, and none is inside), and a lasso on the
+objects' map couples on its own. The stages a view keeps stay as they are: the app wraps them itself
 when it opens the view's link. frontend/tests/fixtures/image-grain-cases.json holds cases both sides must reproduce
 exactly (frontend/tests/image-grain-cases.test.cjs runs the real withGrain, backend/tests/test_assistant_grain.py
 this), so the two can't drift apart.

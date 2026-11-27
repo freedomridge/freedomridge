@@ -87,7 +87,7 @@ text, links and the SDK filter on it, and the sample modal shows it with the res
 
 With a distinct field, the object scatter is just `field='clip_obj'` — its own rank set, its own disjoint HNSW index, **zero backend change**. (The earlier draft's "add `media_type` to the `embedding_viz_rank` WHERE" was wrong: that table has no `media_type` column, and the filtered scatter path already routes `media_type` through its `_fids` temp table.)
 
-The grain switch is therefore **two derived effects of one toggle**: a `media_type='object'` filter for the grid, and an `embeddingField: 'clip' → 'clip_obj'` swap for the scatter. The facets (the sidebar and the histogram) and the map always read the images, whichever grid is shown.
+The grain switch is therefore **two derived effects of one toggle**: a `media_type='object'` filter for the grid, and an `embeddingField: 'clip' → 'clip_obj'` swap for the scatter. The sidebar, the histogram and the map read the images' grid's view, whichever grid is shown. A field's values and range in the sidebar come from the rows that have the field for that view, of either kind: a field the objects have lists the values of the objects paired with the images shown ([FILTER_QUERY.md](FILTER_QUERY.md#a-fields-values)). The histogram panel and the sidebar's "(no value)" tick still read the images only.
 
 ## The 4 bidirectional behaviors
 

@@ -51,6 +51,8 @@ RELAYED_OPERATORS = frozenset(
         'not in',
         'is_null',
         'is_not_null',
+        'is_empty',
+        'is_not_empty',
         'exists',
         'not_exists',
         'geo_polygon',

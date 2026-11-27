@@ -13,6 +13,10 @@ import { defaultRule, type ClassProbabilities, type ClassRule, type ProbabilityV
 import { PatchGridOverlay } from './annotations/PatchGridOverlay';
 import { localEntries } from '@/lib/local-fields';
 
+// The sample's own fields, shown even with no value (a sample with no location says so). Any other key of the row is a
+// list field kept in a column of its own, whose null is a list never set.
+const SAMPLE_OWN_FIELDS = new Set(['id', 'filepath', 'media_type', 'tags', 'metadata', 'location', 'heading', 'created_at', 'last_modified_at']);
+
 interface Props {
     sample: Sample;
     activeMediaField?: string;
@@ -132,6 +136,11 @@ export function SampleModal({ sample, activeMediaField = 'filepath', availableMe
         const rest: Partial<typeof sample> = { ...sample };
         delete rest.local_metadata;
         delete rest.local_tags;
+        // A list field never set comes as its key with null: left out, as a metadata key the sample doesn't have is.
+        const record = rest as Record<string, unknown>;
+        for (const key of Object.keys(record)) {
+            if (record[key] === null && !SAMPLE_OWN_FIELDS.has(key)) delete record[key];
+        }
         return rest;
     }, [sample]);
     const [selectedAnnotation, setSelectedAnnotation] = useState<{ key: string; index: number } | null>(null);

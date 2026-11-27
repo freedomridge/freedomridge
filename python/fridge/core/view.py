@@ -122,6 +122,7 @@ class FieldExpression:
     - field.is_in([...])
     - field.contains("...")
     - field.exists()
+    - field.is_empty(), field.is_not_empty()
     """
 
     def __init__(self, field_name: str):
@@ -165,6 +166,22 @@ class FieldExpression:
         started matching missing-key rows too — i.e. every sample.)
         """
         return Condition(self.field_name, "exists", None)
+
+    def is_empty(self) -> Condition:
+        """Check if the field is a list that holds nothing: s.detections.is_empty()
+
+        An empty list is a value (the list was looked at and nothing was found), so it is not what
+        ``is null`` finds. A sample's own tags are the exception: ``s.tags.is_empty()`` finds the samples
+        with no tags, as ``tags is null`` does. Not for a path through a list (``detections.label``).
+        """
+        return Condition(self.field_name, "is_empty", None)
+
+    def is_not_empty(self) -> Condition:
+        """Check if the field has a value that is not an empty list: s.detections.is_not_empty()
+
+        The NOT of ``is_empty()``: a sample with no value for the field matches neither.
+        """
+        return Condition(self.field_name, "is_not_empty", None)
 
     def __repr__(self) -> str:
         return f"FieldExpression({self.field_name!r})"
@@ -360,7 +377,8 @@ class DatasetView:
         return self.filter(condition)
 
     def exclude(self, condition: Condition) -> 'DatasetView':
-        """Exclude samples matching condition. Chainable."""
+        """Exclude samples matching condition: the NOT of it, which keeps only the samples that have a value for every
+        field the condition compares (docs/FILTER_QUERY.md). Chainable."""
         return self.filter(~condition)
 
     def order_by(self, field: str, descending: bool = False) -> 'DatasetView':
@@ -972,83 +990,28 @@ def _sample_field_value(sample, field: str):
     return getattr(sample, field, None)
 
 
-def _matches_filter(sample, node) -> bool:
-    """Evaluate a Freedom Ridge filter dict against a Sample in-memory."""
-    if not node:
-        return True
-    if "logic" in node:
-        subs = node.get("filters", [])
-        logic = node["logic"]
-        if logic == "AND":
-            return all(_matches_filter(sample, s) for s in subs)
-        if logic == "OR":
-            return any(_matches_filter(sample, s) for s in subs)
-        if logic == "NOT":
-            return not _matches_filter(sample, subs[0]) if subs else True
-        return True
-
-    field = node.get("field")
-    op = node.get("operator")
-    value = node.get("value")
-
-    # Per-object match: any element of the array field satisfies the inner filter.
-    if op in ("match_elements", "elem_match"):
-        elements = _sample_field_value(sample, field)
-        if not isinstance(elements, (list, tuple)):
-            return False
-        return any(isinstance(el, dict) and _matches_element(el, value) for el in elements)
-
-    return _compare(_sample_field_value(sample, field), op, value)
+# The ids a similarity result asks the server about per request: 1,000 ids of up to ten digits are about 12 KB of
+# JSON beside the filter, far under a proxy's cap on a request (1 MB in the production nginx), and one indexed
+# `id = ANY(...)` lookup on the server.
+_ID_PAGE = 1000
+_DISTANCE_REFUSED = (
+    "the similarity distance is not a field of the dataset, so the server can't filter by it; compare it in Python "
+    "instead, e.g. [sample for sample in similar if sample.distance < 0.3]"
+)
 
 
-def _matches_element(el: dict, node) -> bool:
-    """Evaluate a filter node against a single array element (fields = element keys)."""
-    if not node:
-        return True
-    if "logic" in node:
-        subs = node.get("filters", [])
-        logic = node["logic"]
-        if logic == "AND":
-            return all(_matches_element(el, s) for s in subs)
-        if logic == "OR":
-            return any(_matches_element(el, s) for s in subs)
-        if logic == "NOT":
-            return not _matches_element(el, subs[0]) if subs else True
+def _names_distance(node) -> bool:
+    """Whether a filter names the field `distance` among its rows and groups; an element match's own keys (the
+    elements' `distance`) aside."""
+    if not isinstance(node, dict):
         return False
-    return _compare(el.get(node.get("field")), node.get("operator"), node.get("value"))
-
-
-def _compare(actual, op, value) -> bool:
-    """Evaluate a single comparison. Raises on operators that can't be evaluated
-    in-memory, so a similarity view never silently matches everything."""
-    if op in ("=", "=="):
-        return actual == value
-    if op in ("!=", "<>"):
-        return actual != value
-    if op == "exists":
-        return actual is not None
-    if op == "in":
-        if isinstance(actual, (list, tuple, set)):
-            return any(a in value for a in actual)
-        return actual in value
-    if op == "not in":
-        if isinstance(actual, (list, tuple, set)):
-            return all(a not in value for a in actual)
-        return actual not in value
-    if op == "contains":
-        if isinstance(actual, (list, tuple, set, str)):
-            return value in actual
-        return False
-    if op in (">", "<", ">=", "<="):
-        if actual is None:
-            return False
-        try:
-            return {">": actual > value, "<": actual < value, ">=": actual >= value, "<=": actual <= value}[op]
-        except TypeError:
-            return False
-    raise NotImplementedError(
-        f"operator {op!r} is not supported on in-memory similarity results; "
-        f"apply it before sort_by_similarity (server-side) instead.",
+    if 'logic' in node or 'filters' in node:
+        children = node.get('filters')
+        return any(_names_distance(child) for child in children) if isinstance(children, list) else False
+    if node.get('field') == 'distance':
+        return True
+    return str(node.get('operator', '')).lower() not in ('match_elements', 'elem_match') and _names_distance(
+        node.get('value'),
     )
 
 
@@ -1058,14 +1021,22 @@ class SimilarityResultView(DatasetView):
     Returned by ``sort_by_similarity()``. Holds a precomputed, distance-ordered
     list of samples (each carrying a ``distance``). Supports the full
     ``DatasetView`` chaining API — filter/match/exclude/order_by/limit/skip/
-    to_list/ids/first/count/values and aggregations — evaluated **in-memory**
-    over the materialized results, so distances and ordering are preserved
-    without re-querying the backend.
+    to_list/ids/first/count/values and aggregations — over the materialized
+    results, so distances and ordering are preserved. A filter is read by the
+    server, once per view: it is asked which of the results' ids the filter
+    shows, so the view shows what the same filter shows anywhere, and filtering
+    a result needs the server. The server answers on the samples' values now,
+    while the kept samples show the values they had at the search: a sample
+    edited since can be kept on its new value, and a deleted one drops out.
+    Sorting, the window and the aggregations are in memory, on the values from
+    the search. ``distance`` is no field of the dataset: a filter naming it
+    raises ``NotImplementedError``.
     """
 
     def __init__(self, samples: List[Sample], dataset):
         super().__init__(dataset)
         self._materialized = list(samples)
+        self._shown: Optional[set] = None  # the ids the server says the filter shows, once asked
 
     def _clone(self) -> 'SimilarityResultView':
         new_view = SimilarityResultView(self._materialized, self._dataset)
@@ -1078,10 +1049,26 @@ class SimilarityResultView(DatasetView):
         return new_view
 
     def _filtered(self) -> List[Sample]:
-        """Materialized samples after in-memory filters (no offset/limit/sort)."""
-        if not self._filters:
+        """The materialized samples the filter shows, in their order, each as often as it is there (no offset, limit
+        or sort). The server is asked once, in pages of ids: the filter AND `id in` the page, ids only back."""
+        if not self._filters or not self._materialized:
             return list(self._materialized)
-        return [s for s in self._materialized if _matches_filter(s, self._filters)]
+        if self._shown is None:
+            if _names_distance(self._filters):
+                raise NotImplementedError(_DISTANCE_REFUSED)
+            ids = list(dict.fromkeys(sample.id for sample in self._materialized))
+            shown: set = set()
+            for start in range(0, len(ids), _ID_PAGE):
+                page = ids[start : start + _ID_PAGE]
+                asked = DatasetView(
+                    self._dataset,
+                    {'logic': 'AND', 'filters': [self._filters, F('id').is_in(page).to_dict()]},
+                ).select_fields(['id'])
+                asked._limit_val = len(page)
+                found, _ = asked._execute_query(after_id=0, skip_count=True)
+                shown.update(sample.id for sample in found)
+            self._shown = shown
+        return [sample for sample in self._materialized if sample.id in self._shown]
 
     def _resolve(self) -> List[Sample]:
         """Filtered + sorted + sliced view of the materialized samples."""

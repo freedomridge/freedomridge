@@ -10,7 +10,7 @@ import pytest
 from backend import datetimes
 from backend.datetimes import parse_instant
 from backend.field_registry import infer_fields, value_type
-from backend.schema_check import MIGRATIONS_DIR, SCHEMA_SQL, function_statements
+from backend.schema_check import function_statements
 from backend.tests.datetime_corpus import CASES, corpus
 
 # metadata_instant_v1 must NEVER change once an index uses it: PostgreSQL doesn't rebuild an index when a function is
@@ -122,17 +122,6 @@ def test_new_fields_are_datetimes_only_in_the_grammar(value, kind):
     assert infer_fields([{'captured_at': value}, {'captured_at': '2026-01-02'}]) == {'captured_at': kind}
 
 
-def _definition(text):
-    """metadata_instant_v1's comment and CREATE statement in a SQL file."""
-    start = text.index("-- The instant a metadata datetime's text names")
-    return text[start : text.index('$$;\n', start) + len('$$;\n')]
-
-
 def test_metadata_instant_v1_never_changes():
     (statement,) = [s for s in function_statements() if 'FUNCTION metadata_instant_v1(' in s]
     assert hashlib.sha256(statement.encode()).hexdigest() == METADATA_INSTANT_V1_SHA256
-
-
-def test_the_migration_creates_the_function_schema_sql_defines():
-    migration = (MIGRATIONS_DIR / '0031_metadata_instant.sql').read_text()
-    assert _definition(migration) == _definition(SCHEMA_SQL.read_text())

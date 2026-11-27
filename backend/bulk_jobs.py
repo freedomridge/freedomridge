@@ -86,6 +86,19 @@ async def require_no_pending_bulk(connection, dataset_id, *, fields_only=False):
         dataset_id,
         fields_only,
     )
+    if not blocking and not fields_only:
+        # A list field being made this dataset's (backend/list_fields.py): its empty lists from before are being set to
+        # never set, and a restore would write them back from its version.
+        from .list_fields import pending
+
+        registering = await pending(connection, dataset_id)
+        if registering is not None:
+            raise HTTPException(
+                409,
+                f"Unfinished jobs block this operation: '{registering['args']['field_name']}' is being added to this "
+                f"dataset as a list field (job {registering['id']}, {registering['state']}). Let it finish, or cancel "
+                'it.',
+            )
     if blocking:
         names = '; '.join(
             f"{row['operation']} job {row['id']} ({row['state']}, by {row['username'] or 'a deleted user'})"

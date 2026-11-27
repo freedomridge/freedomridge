@@ -62,6 +62,10 @@ def test_discovery_and_statistics_use_shape_not_name(registry_database):
 
 
 def test_custom_labels_filter_autocomplete_and_aggregate(registry_database):
+    """Rewritten for contract g7 (one rule everywhere, rule 1.4, changed 2026-11-26): `not in` on a list of labels
+    keeps the samples whose list is there and holds none of them named: here the empty list (it kept the sample with
+    no list too)."""
+
     async def scenario(database):
         await ingest([{'vehicles': BOX, 'lanes': LANES}, {'vehicles': [], 'lanes': []}, {}])
         await datasets._get_dataset_field_stats_impl(1, None)
@@ -78,7 +82,7 @@ def test_custom_labels_filter_autocomplete_and_aggregate(registry_database):
             1,
             datasets.SamplesRequest(filters={'field': 'vehicles.label', 'operator': 'not in', 'value': ['car']}),
         )
-        assert negative['total'] == 2
+        assert negative['total'] == 1
         assert 'car' in str(await datasets._autocomplete_impl(1, 'vehicles.label', 'ca', 100))
         result = await datasets.aggregate(
             1,
@@ -344,12 +348,16 @@ def test_vector_schema_keeps_registry_metadata(registry_database):
 
 
 def test_custom_label_equality_uses_containment(registry_database):
+    """`=` and `in` on a custom list of labels use containment. The text of `!=` and `not in` changed with contract g7
+    (one rule everywhere, rule 1.4), so they are asked as rows: the sample whose list has the label, none of them
+    named, and not the sample with no list (it was kept)."""
+
     async def scenario(database):
-        await ingest([{'vehicles': BOX, 'lanes': LANES}])
+        made = (await ingest([{'vehicles': BOX, 'lanes': LANES}, {}]))['ids']
         await datasets._get_dataset_field_stats_impl(1, None)
         context = await datasets.get_dataset_array_columns(1)
         for field in ['vehicles.label', 'lanes.label']:
-            for op in ['=', '!=', 'in', 'not in']:
+            for op in ['=', 'in']:
                 args: list = []
                 sql, _ = datasets.parse_filter_node(
                     {'field': field, 'operator': op, 'value': ['car'] if 'in' in op else 'car'},
@@ -358,6 +366,11 @@ def test_custom_label_equality_uses_containment(registry_database):
                     array_columns=context,
                 )
                 assert '@>' in sql and 'jsonb_array_elements' not in sql
+        for field in ['vehicles.label', 'lanes.label']:
+            for op, value in (('!=', 'truck'), ('not in', ['truck'])):
+                spec = {'field': field, 'operator': op, 'value': value}
+                result = await datasets.list_samples_post(1, datasets.SamplesRequest(filters=spec))
+                assert [item['id'] for item in result['items']] == [made[0]], spec
 
     registry_database(scenario)
 
@@ -502,6 +515,9 @@ def test_ingest_and_bulk_append_before_locking_value_rows(registry_database, mon
 @pytest.mark.parametrize('name', ['ground_truth', 'predictions', 'classes'])
 @pytest.mark.parametrize('refresh', [False, True])
 def test_classification_lists_keep_label_paths(registry_database, name, refresh):
+    """Rewritten for contract g7 (one rule everywhere, rule 1.4): `not in` on a list of labels no longer keeps the
+    sample with no list (it did): every listed sample has a dog."""
+
     async def scenario(database):
         await ingest([{name: [{'label': 'dog'}]}, {name: [{'label': 'dog'}, {'label': 'cat'}]}, {}])
         if refresh:
@@ -509,7 +525,7 @@ def test_classification_lists_keep_label_paths(registry_database, name, refresh)
         fields = {f['name']: f for f in await datasets._get_dataset_field_stats_impl(1, None)}
         assert fields[name]['type'] == 'classification'
         assert fields[name + '.label']['values'] == ['cat', 'dog']
-        for op, value, expected in [('=', 'dog', 2), ('not in', ['dog'], 1)]:
+        for op, value, expected in [('=', 'dog', 2), ('not in', ['dog'], 0), ('not in', ['cat'], 1)]:
             result = await datasets.list_samples_post(
                 1,
                 datasets.SamplesRequest(filters={'field': name + '.label', 'operator': op, 'value': value}),
@@ -795,14 +811,15 @@ def test_a_full_refresh_that_ended_without_the_cache_is_not_queued_again_on_ever
 
 
 def test_uncached_list_field_still_filters_and_autocompletes(registry_database):
-    """A box field that exists but isn't in a discovery cache yet (new dataset, deploy, restore)."""
+    """A box field that exists but isn't in a discovery cache yet (new dataset, deploy, restore). Rewritten for contract
+    g7 (one rule everywhere, rule 1.4): `not in` no longer keeps the sample with no box field (it did)."""
 
     async def scenario(database):
         await ingest([{'vehicles': BOX}, {'vehicles': BOX}, {'other': 1}])
         await database.execute("DELETE FROM dataset_field_stats WHERE field_name LIKE '\\_\\_%'")
         for spec, expected in [
             ({'field': 'vehicles.label', 'operator': '=', 'value': 'car'}, 2),
-            ({'field': 'vehicles.label', 'operator': 'not in', 'value': ['car']}, 1),
+            ({'field': 'vehicles.label', 'operator': 'not in', 'value': ['car']}, 0),
             ({'field': 'vehicles.confidence', 'operator': '>', 'value': 0.5}, 2),
         ]:
             result = await datasets.list_samples_post(1, datasets.SamplesRequest(filters=spec))

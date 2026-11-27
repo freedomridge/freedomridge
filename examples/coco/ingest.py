@@ -146,18 +146,21 @@ def map_sample(root, image, index, categories, licenses, assets, metadata_only=F
     require_files([path])
     width, height = image['width'], image['height']
     license_info = licenses[image['license']]
+    # One field per fact, under Freedom Ridge's names: COCO's own columns (file_name, coco_url, the license number) are
+    # not copied, and a flag is a boolean.
     metadata = {
-        **{key: value for key, value in image.items() if key != 'id'},
         'image_id': image['id'],
         'split': 'val2017',
-        'license_id': image['license'],
-        'license_name': license_info['name'],
+        'width': width,
+        'height': height,
+        'date_captured': image.get('date_captured'),
+        'license': license_info['name'],
         'license_url': license_info['url'],
+        'source_url': image.get('flickr_url'),
         'detections': [],
         'polygons': [],
         'keypoints': [],
         'skeletons': [],
-        'captions': [],
     }
     classes, supercategories = set(), set()
     mask_count = 0
@@ -166,16 +169,15 @@ def map_sample(root, image, index, categories, licenses, assets, metadata_only=F
         label = category['name']
         classes.add(label)
         supercategories.add(category['supercategory'])
-        attrs = {
-            key: value for key, value in annotation.items() if key not in ('id', 'bbox', 'segmentation', 'image_id')
-        }
-        attrs['annotation_id'] = annotation['id']
-        attrs['supercategory'] = category['supercategory']
         bbox = [value / scale for value, scale in zip(annotation['bbox'], (width, height, width, height))]
         stable_id = f"coco-{annotation['id']}"
         detection = Detection(label, bbox, id=stable_id)
-        detection.update(attrs)
-        detection['is_crowd'] = bool(annotation['iscrowd'])
+        detection.update(
+            annotation_id=annotation['id'],
+            area=annotation['area'],
+            supercategory=category['supercategory'],
+            is_crowd=bool(annotation['iscrowd']),
+        )
         metadata['detections'].append(detection)
         segmentation = annotation.get('segmentation', [])
         if isinstance(segmentation, list):
@@ -185,7 +187,10 @@ def map_sample(root, image, index, categories, licenses, assets, metadata_only=F
                 if ring
             ]
             if paths:
-                metadata['polygons'].append(Polygon(label, paths=paths, id=f'{stable_id}-polygon', **attrs))
+                # The outline of the detection above: its facts stay on the detection, annotation_id links the two.
+                metadata['polygons'].append(
+                    Polygon(label, paths=paths, id=f'{stable_id}-polygon', annotation_id=annotation['id']),
+                )
         else:
             field = f'crowd_mask_{mask_count:03d}' if annotation['iscrowd'] else f'instance_mask_{mask_count:03d}'
             mask = None if annotations_only else decode_rle(segmentation)
@@ -211,16 +216,19 @@ def map_sample(root, image, index, categories, licenses, assets, metadata_only=F
         visible = [i for i, (_, _, visibility) in enumerate(triples) if visibility > 0]
         points = [[triples[i][0] / width, triples[i][1] / height] for i in visible]
         edges = [[a - 1, b - 1] for a, b in category['skeleton']]
-        attrs = {key: value for key, value in annotation.items() if key != 'id'}
-        attrs.update(
-            annotation_id=annotation['id'],
-            names=[names[i] for i in visible],
-            all_names=names,
-            point_indices=visible,
-            visibility=[v for _, _, v in triples],
-            skeleton=edges,
+        # Per point, in the order of `points`: the joint's name and whether it is seen (COCO's v=2) or only labelled
+        # behind something (v=1). The bones are the `skeletons` lines; the person's box and outline are its detection
+        # (the same annotation_id).
+        metadata['keypoints'].append(
+            Keypoint(
+                points,
+                label=category['name'],
+                id=f"pose-{annotation['id']}",
+                annotation_id=annotation['id'],
+                names=[names[i] for i in visible],
+                visible=[triples[i][2] == 2 for i in visible],
+            ),
         )
-        metadata['keypoints'].append(Keypoint(points, label=category['name'], id=f"pose-{annotation['id']}", **attrs))
         paths = [
             [[triples[i][0] / width, triples[i][1] / height] for i in edge]
             for edge in edges
@@ -235,17 +243,13 @@ def map_sample(root, image, index, categories, licenses, assets, metadata_only=F
                     annotation_id=annotation['id'],
                 ),
             )
-    for annotation in index.rows('captions', image['id']):
-        metadata['captions'].append(annotation['caption'])
+    # One searchable text, a caption per line (a list of strings can't be searched for a word).
     metadata.update(
-        caption_text='\n'.join(metadata['captions']),
-        classes=sorted(classes),
-        supercategories=sorted(supercategories),
+        captions='\n'.join(annotation['caption'] for annotation in index.rows('captions', image['id'])),
         mask_count=mask_count,
     )
     return Sample(
         str(path),
-        tags=['val2017'],
         metadata=metadata,
         array_fields={'class_names': sorted(classes), 'supercategory_names': sorted(supercategories)},
     ), None if annotations_only else rgb_image(path)

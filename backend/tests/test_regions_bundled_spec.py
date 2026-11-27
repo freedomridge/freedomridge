@@ -101,7 +101,6 @@ import os
 import re
 import subprocess
 import time
-from collections import Counter
 from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import urlparse
@@ -117,7 +116,7 @@ from backend.job_runner import ServerWorker
 from backend.tests import test_regions_spec as spec
 from backend.tests import test_upgrade_paths
 from backend.tests.test_access_rule_spec import ADMIN
-from backend.tests.test_upgrade_paths import ROOT, SEED
+from backend.tests.test_upgrade_paths import ROOT
 
 database = test_upgrade_paths.database
 regions_world = spec.regions_world
@@ -931,12 +930,7 @@ def test_after_a_fetch_the_next_runner_start_loads_the_set(regions_world):
 
 # --- The database ---
 
-RELEASE_BEFORE_0039 = 'v2.13.2'  # the last release before 0039 (and before 0034: the migrations bring the tables)
-REGION_ROW = (
-    'INSERT INTO region_sets (name, version, sha256, verified, loaded_from) '
-    "VALUES ('natural-earth-admin1', 'v0', repeat('0', 64), FALSE, 'file');"
-)
-# What region_sets.loaded_from accepts, after 0039 and in schema.sql.
+# What region_sets.loaded_from accepts in schema.sql.
 LOADED_FROM = {'download': True, 'file': True, 'bundled': True, 'Bundled': False, 'elsewhere': False, '': False}
 
 
@@ -960,34 +954,9 @@ async def loaded_from_accepted(name: str) -> dict[str, bool]:
 
 
 @needs_database
-def test_0039_lets_loaded_from_be_bundled_and_changes_nothing_else(database):
-    make, psql, schema, migrate = database
-    old_schema = subprocess.run(
-        ['git', '-C', str(ROOT), 'show', f'{RELEASE_BEFORE_0039}:backend/db/schema.sql'],
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout
-    name = make(old_schema + SEED)
-    spec.apply_before(psql, name, '0039')
-    psql(name, REGION_ROW)
-    tables = set(psql(name, spec.TABLES).split(','))
-    rows = spec.tables_as_they_are(psql, name, tables)
-    before = schema(name)
-    found = sorted(spec.MIGRATIONS.glob('0039_*.sql'))
-    assert len(found) == 1, f'one migration numbered 0039: found {[path.name for path in found]}'
-    spec.apply_migration(psql, name, found[0])
-    assert set(psql(name, spec.TABLES).split(',')) == tables
-    assert spec.tables_as_they_are(psql, name, tables) == rows  # every table's columns and rows, as they were
-    after = schema(name)
-    changed = [*(Counter(before) - Counter(after)).elements(), *(Counter(after) - Counter(before)).elements()]
-    assert changed and all('loaded_from' in line for line in changed), changed
-    assert asyncio.run(loaded_from_accepted(name)) == LOADED_FROM
-    # The rest of the way, as an upgrade runs: the same schema as a fresh install's.
-    result = migrate(name)
-    assert result.returncode == 0, f'apply_migrations.sh failed\n{result.stdout}\n{result.stderr}'
-    fresh = make((ROOT / 'backend/db/schema.sql').read_text() + SEED)
-    assert schema(name) == schema(fresh)
+def test_loaded_from_takes_download_file_or_bundled_on_a_fresh_install(database):
+    make, _, _, _ = database
+    fresh = make((ROOT / 'backend/db/schema.sql').read_text())
     assert asyncio.run(loaded_from_accepted(fresh)) == LOADED_FROM
 
 

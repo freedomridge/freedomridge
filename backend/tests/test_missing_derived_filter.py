@@ -6,12 +6,18 @@ grid count after clicking matches the warning's number. The end-to-end check aga
 database is frontend/e2e/coverage-gaps.spec.ts.
 """
 
+import os
 from typing import Any
 
 import pytest
 from fastapi import HTTPException
 
-from backend.routers.datasets import SAMPLES_JOIN_FIELD_MAPPING, _strictify_negations, parse_filter_node
+from backend.routers import datasets
+from backend.routers.datasets import SAMPLES_JOIN_FIELD_MAPPING, parse_filter_node
+from backend.tests import test_field_registry_postgres
+from backend.tests.test_object_parent_column import add, ids
+
+registry_database = test_field_registry_postgres.registry_database
 
 
 def _sql(field, op='not_exists', field_mapping=None, value=None):
@@ -81,9 +87,59 @@ def test_a_metadata_key_is_unaffected():
     assert sql == '(metadata ? $1)'
 
 
-def test_cross_grain_partner_drops_the_absence_and_self_keeps_it():
-    # An absence test on the OTHER grain (objects carry no image hashes) would be vacuously
-    # true and leak every row across the parent link, exactly like is_null / not_exists on metadata.
-    node = {'field': 'hashes.phash', 'operator': 'not_exists'}
-    assert _strictify_negations(node, partner=True) is None
-    assert _strictify_negations(node, partner=False) == node
+def grid(grain: str, *base: dict) -> dict:
+    """A grid's filter as the page sends it on a dataset with objects (FilterContext.withGrain)."""
+    node = {'logic': 'AND', 'filters': list(base)}
+    partner = 'parent_matches' if grain == 'object' else 'has_matching_object'
+    return {
+        'logic': 'AND',
+        'filters': [
+            {'field': 'media_type', 'operator': '=' if grain == 'object' else '!=', 'value': 'object'},
+            {
+                'logic': 'OR',
+                'filters': [
+                    {'field': '_cgself', 'operator': 'cg_self', 'value': node},
+                    {'field': '_crossgrain', 'operator': partner, 'value': node},
+                ],
+            },
+        ],
+    }
+
+
+@pytest.mark.skipif(not os.getenv('FRIDGE_TEST_POSTGRES_DSN'), reason='Requires disposable PostgreSQL')
+def test_cross_grain_a_missing_hash_is_asked_of_the_row_as_a_whole_and_never_leaks_through_the_partner(
+    registry_database,
+):
+    """Was a check of the cross-grain guard's internals (the partner dropped the absence test, the row kept it), which
+    the one-rule piece removes; asked here at the surface instead, as the page wraps the filter. An absence test on
+    the other kind of row (objects carry no image hashes) must not be vacuously true and bring every image back
+    through its objects: `hashes.phash not exists` shows the images with no hash, on the images' grid, and on the
+    objects' grid the objects whose image has none (an object with no image has none)."""
+
+    async def scenario(database):
+        await add(1, [(None, {'n': 1}), (None, {'n': 2}), (None, {'n': 3})], 'img')
+        hashed, plain, alone = await ids(database, 1, 'img')
+        await add(
+            1,
+            [('object', {'parent_id': hashed}), ('object', {'parent_id': plain}), ('object', {})],
+            'obj',
+        )
+        on_hashed, on_plain, loose = await ids(database, 1, 'obj')
+        await database.execute(
+            "INSERT INTO sample_hashes (sample_id, field_name, hash_hex) VALUES ($1, 'phash', 'ab')",
+            hashed,
+        )
+
+        async def shown(node: dict) -> set:
+            page = await datasets.list_samples_post(1, datasets.SamplesRequest(filters=node, limit=100))
+            assert page['total'] == len(page['items'])
+            return {item['id'] for item in page['items']}
+
+        missing = {'field': 'hashes.phash', 'operator': 'not_exists'}
+        present = {'field': 'hashes.phash', 'operator': 'exists'}
+        assert await shown(grid('image', present)) == {hashed}
+        assert await shown(grid('object', present)) == {on_hashed}
+        assert await shown(grid('image', missing)) == {plain, alone}
+        assert await shown(grid('object', missing)) == {on_plain, loose}
+
+    registry_database(scenario)

@@ -12,8 +12,10 @@ while on a large database, downtime, a configuration change or an SDK change.
   (or as its release notes say). You don't need to install the versions in between: the migration
   runner applies every migration the database lacks, in order. CI checks this for each release: it
   upgrades a database created by that release and compares it with a fresh install.
-- A new major version may start from a new baseline schema. Its release notes then name the release
-  to upgrade to first.
+- **3.x upgrades a 2.14.0 database.** 3.0.0 starts from a new baseline schema, 2.14.0's: from an older
+  release, upgrade to 2.14.0 first, then to 3.x ([From a release before 2.14.0](#from-a-release-before-2140)).
+  A later major version may start from a new baseline again; its release notes then name the release to
+  upgrade to first.
 - **Migrations only go forward.** Going back is restoring the backup taken before the upgrade
   and running the previous version (below).
 - Versions follow [Semantic Versioning](https://semver.org): a release that breaks the SDK, the
@@ -35,9 +37,8 @@ From the checkout the server runs, with `docker-compose.prod.yml`:
    To build them from the checkout instead, as releases before 2.2.0 need, run
    `docker compose -f docker-compose.prod.yml build --pull`. Building needs BuildKit (`docker compose build`, or
    `docker build` with the buildx plugin); the legacy builder stops at the step that adds the region boundaries.
-4. Stop the app, apply the migrations with it stopped, then recreate the containers. Crossing 2.9.0, read
-   [Upgrading across 2.9.0](#upgrading-across-290) first: its migration takes longer. Crossing 2.11.0, read
-   [Upgrading to 2.11.0](#upgrading-to-2110).
+4. Stop the app, apply the migrations with it stopped, then recreate the containers. From a release before
+   2.14.0, upgrade to 2.14.0 first ([From a release before 2.14.0](#from-a-release-before-2140)).
    ```bash
    docker compose -f docker-compose.prod.yml stop backend job-runner worker backup frontend
    FRIDGE_DB_CONTAINER=$(docker compose -f docker-compose.prod.yml ps -q db) \
@@ -88,6 +89,22 @@ its own migrations, and they talk only through the follower API. So:
   it held. The primary refuses the older position, and the follower copies those datasets again into the same
   mirrors, reading every block again: hours for a large dataset. A dataset it started following after the backup
   is copied as a new one.
+
+## From a release before 2.14.0
+
+3.0.0 squashed the migrations up to 2.14.0 into its baseline schema, so its `scripts/apply_migrations.sh` upgrades
+only a 2.14.0 database. On an older one it stops before changing anything and says so; `/api/health` answers 503
+with the same reason in `pending_migrations`. Upgrade in two steps, each with the steps of
+[A Docker server](#a-docker-server):
+
+1. To 2.14.0: steps 1 to 5 with `git checkout v2.14.0`. The migrations of every release since 1.0.0 are in that
+   checkout; crossing 2.9.0 or 2.11.0 on the way, read [Upgrading across 2.9.0](#upgrading-across-290) and
+   [Upgrading to 2.11.0](#upgrading-to-2110) first.
+2. To 3.x: the same steps with the new tag. Its migration runner first records its baseline in place of the 45
+   ledger rows of a 2.14.0 database (the 1.0.0 baseline and its 44 migrations), then applies the migrations since.
+
+The launcher upgrades a folder from 2.14.0 only, and otherwise says to run `npx freedomridge@2.14.0` first.
+A backup taken before 2.14.0 is restored the same way: restore it with the 2.14.0 checkout, then upgrade.
 
 ## Upgrading to 2.11.0
 
@@ -183,7 +200,9 @@ before it migrates. In a development checkout, stop the backend, the job runner 
 Stop the services and restore the backup from step 2 into an empty database
 ([restore procedure](BACKUP_AND_MIGRATION.md)). Then check out the previous tag, build and start.
 Don't run an older version against the upgraded database: its migration runner and
-`/api/health` refuse a database that records migrations the code doesn't have.
+`/api/health` refuse a database that records migrations the code doesn't have. From 3.x back to 2.14.0
+the same holds: once 3.x's runner has recorded its baseline, 2.14.0 reports the database as not created
+from `schema.sql`, so going back is restoring the backup there too.
 
 ## A development checkout
 

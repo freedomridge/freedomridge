@@ -55,6 +55,7 @@ def coco(tmp_path):
         'license': 2,
         'coco_url': 'http://images.cocodataset.org/val2017/000000000001.jpg',
         'flickr_url': 'https://flickr.com/photo/1',
+        'date_captured': '2013-11-14 11:18:45',
     }
     category = {'id': 1, 'name': 'person', 'supercategory': 'person', 'keypoints': NAMES, 'skeleton': [[1, 2], [2, 3]]}
     annotation = {'id': 7, 'image_id': 1, 'category_id': 1, 'bbox': [1, 0, 2, 2], 'area': 4, 'iscrowd': 0}
@@ -102,24 +103,32 @@ def test_every_coco_annotation(coco, tmp_path):
         m = sample.metadata
         assert len(m['detections']) == 2
         assert m['detections'][0]['bbox'] == [0.25, 0, 0.5, 2 / 3]
-        assert m['detections'][1]['iscrowd'] == 1
+        assert m['detections'][1]['is_crowd'] is True and m['detections'][0]['is_crowd'] is False
         assert m['detections'][0]['area'] == 4
         assert m['detections'][0]['supercategory'] == 'person'
+        assert m['detections'][0]['annotation_id'] == 7
+        # One field per fact: COCO's 0/1 and category number aren't kept beside the boolean and the label.
+        assert not {'iscrowd', 'category_id'} & m['detections'][0].keys()
         assert len(m['polygons'][0]['paths']) == 2
         assert m['polygons'][0]['closed'] and m['polygons'][0]['filled']
+        assert m['polygons'][0]['attributes'] == {'annotation_id': 7}
         assert m['mask_count'] == 1
         with Image.open(tmp_path / 'derived/coco/000000000001/8.png') as mask:
             assert np.asarray(mask).tolist() == [[1, 0, 0, 0]] * 3
         pose = m['keypoints'][0]
         assert pose['points'] == [[0.25, 1 / 3], [0.5, 2 / 3]]
-        assert pose['attributes']['all_names'] == NAMES
-        assert pose['attributes']['visibility'] == [2, 1] + [0] * 15
-        assert pose['attributes']['skeleton'] == [[0, 1], [1, 2]]
+        # Per point: its joint and whether it is seen (v=2) or only labelled (v=1); the raw record isn't copied.
+        assert pose['attributes'] == {'annotation_id': 7, 'names': NAMES[:2], 'visible': [True, False]}
         assert len(m['skeletons'][0]['points']) == 2
-        assert len(m['captions']) == 5 and 'café' in m['caption_text']
-        assert m['license_name'] == 'Attribution License'
+        assert m['captions'].split('\n') == [f'Caption {i}: café' for i in range(5)]
+        assert m['license'] == 'Attribution License'
         assert m['license_url'].startswith('https://creativecommons.org')
-        assert m['coco_url'] == image['coco_url'] and m['flickr_url'] == image['flickr_url']
+        assert m['source_url'] == image['flickr_url']
+        assert m['date_captured'] == image['date_captured']
+        assert not {'file_name', 'coco_url', 'flickr_url', 'license_id', 'license_name', 'caption_text'} & m.keys()
+        assert not {'classes', 'supercategories'} & m.keys()  # the native list columns hold them
+        assert sample.tags == []
+        assert sample.array_fields == {'class_names': ['person'], 'supercategory_names': ['person']}
         assert map_sample(root, image, index, categories, licenses, assets, True) == sample.filepath
         # Round trip through the actual SDK serialization.
         assert json.loads(json.dumps(sample.to_dict()))['metadata']['keypoints'][0]['_type'] == 'keypoints'

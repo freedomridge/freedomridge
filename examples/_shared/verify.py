@@ -50,12 +50,12 @@ def verify_objects(client, dataset_name, expected_count, kind):
     counts: Counter[str] = Counter()
     schema = {field['name']: field for field in client.get_schema(dataset_id)}
     scalar_fields = (
-        ('license_name', 'license_url', 'coco_url', 'flickr_url')
+        ('license', 'license_url', 'source_url')
         if kind == 'coco'
-        else ('OriginalURL', 'Author', 'License', 'Title', 'Rotation')
+        else ('attribution', 'license', 'license_url', 'source_url', 'rotation')
     )
     list_fields = (
-        ('detections', 'polygons', 'keypoints', 'skeletons', 'captions')
+        ('detections', 'polygons', 'keypoints', 'skeletons')
         if kind == 'coco'
         else (
             'detections',
@@ -63,7 +63,6 @@ def verify_objects(client, dataset_name, expected_count, kind):
             'points',
             'mask_instances',
             'relationships',
-            'captions',
         )
     )
     array_fields = (
@@ -98,12 +97,13 @@ def verify_objects(client, dataset_name, expected_count, kind):
             assert sample['media_type'] == 'image'
             parents[sample['id']] = sample
             assert 'negative_labels' not in metadata
-            assert all(isinstance(x, str) for x in metadata.get('narratives', []))
-            assert all(isinstance(x, str) for x in metadata['captions'])
+            assert isinstance(metadata['captions'], str)
             assert not metadata.get('caption_annotations')
             assert all('label' not in x for x in metadata.get('verified_absent', []))
             for field in ('negative_classes', 'negative_parent_classes'):
-                assert all(isinstance(x, str) for x in sample.get('array_fields', {}).get(field, sample.get(field, [])))
+                # A list field never set comes back null: no list.
+                values = sample.get('array_fields', {}).get(field, sample.get(field)) or []
+                assert all(isinstance(x, str) for x in values)
             for instance in metadata.get('mask_instances', []):
                 assert any(d['id'] == instance['detection_id'] for d in metadata['detections'])
             fetch(sample['id'])
@@ -117,7 +117,7 @@ def verify_objects(client, dataset_name, expected_count, kind):
                 counts[field] += len(metadata[field])
             for field in array_fields:
                 assert field in schema, field
-                values = sample.get('array_fields', {}).get(field, sample.get(field, []))
+                values = sample.get('array_fields', {}).get(field, sample.get(field)) or []  # null: never set
                 if values:
                     arrays.setdefault(field, values[0])
             for field, value in metadata.items():
@@ -134,26 +134,26 @@ def verify_objects(client, dataset_name, expected_count, kind):
                     checked_media['masks'] += 1
                     counts[field] += 1
                     media.setdefault('mask', (sample['id'], f'{field}.maskPath'))
-                    if metadata.get('rotation_applied'):
+                    if metadata.get('rotation'):
                         media.setdefault('rotated_mask', (sample['id'], f'{field}.maskPath'))
             media.setdefault('image', (sample['id'], 'filepath'))
-            if metadata.get('rotation_applied'):
+            if metadata.get('rotation'):
                 media.setdefault('rotated_image', (sample['id'], 'filepath'))
             if metadata['captions']:
-                caption = metadata['captions'][0][:40]
+                caption = metadata['captions'].split('\n')[0][:40]
         after_id = page['items'][-1]['id']
     assert len(parents) == expected_count, len(parents)
     assert len(objects) == sum(len(s['metadata']['detections']) for s in parents.values())
     links = set()
-    flag, source_flag = ('is_crowd', 'iscrowd') if kind == 'coco' else ('is_group_of', 'IsGroupOf')
+    flag = 'is_crowd' if kind == 'coco' else 'is_group_of'
     for obj in objects:
         metadata = obj['metadata']
         parent = parents[metadata['parent_id']]
         detection = next(d for d in parent['metadata']['detections'] if d['id'] == metadata['detection_id'])
         assert metadata['crop_bbox'] == detection['bbox']
         assert metadata['label'] == detection['label']
-        assert obj['tags'] == [metadata['label']]
-        assert metadata[flag] is bool(detection[source_flag])
+        assert obj['tags'] == []
+        assert metadata[flag] is detection[flag]
         links.add((parent['id'], metadata['detection_id']))
     assert len(links) == len(objects)
     filters = {}
@@ -173,14 +173,14 @@ def verify_objects(client, dataset_name, expected_count, kind):
     found = client.query_samples(
         dataset_id,
         limit=1,
-        filters={'field': 'caption_text', 'operator': 'contains', 'value': caption},
+        filters={'field': 'captions', 'operator': 'contains', 'value': caption},
     )
     assert found['total'] > 0
     # Negative control proves the search is applied, rather than merely accepting a field.
     absent = client.query_samples(
         dataset_id,
         limit=1,
-        filters={'field': 'caption_text', 'operator': 'contains', 'value': 'cx_smoke_absent_8fbdcd28'},
+        filters={'field': 'captions', 'operator': 'contains', 'value': 'cx_smoke_absent_8fbdcd28'},
     )
     assert absent['total'] == 0
     inventory = client.get_embedding_field_inventory(dataset_id)
@@ -273,7 +273,6 @@ def verify_gps(client, args):
     points = {p["id"]: (p["lon"], p["lat"]) for p in geo["items"]}
     for sample in samples:
         assert points[sample["id"]] == tuple(sample["location"]["coordinates"])
-        assert points[sample["id"]] == (sample["metadata"]["longitude"], sample["metadata"]["latitude"])
     inventory = client.get_embedding_field_inventory(dataset_id)
     assert {f["field_name"]: f["count"] for f in inventory}["clip"] == args.expected_count
     media = client.session.get(f"{client.base_url}/samples/{samples[0]['id']}/media")
@@ -545,11 +544,12 @@ def verify_kitti(client, args):
                     box,
                     [value / scale for value, scale in zip(extent, (width, height, width, height))],
                 )
-        if metadata.get('gps_available'):
+        if sample['location']:
             gps_count += 1
-            assert sample['location'] and 0 <= sample['location']['heading'] < 360
+            assert 0 <= sample['location']['heading'] < 360
             assert datetime.fromisoformat(metadata['captured_at'].replace('Z', '+00:00')).tzinfo is not None
-            assert metadata['oxts_timestamp_raw'].endswith(' (Europe/Berlin local)')
+        for box in detections + cuboids:
+            assert box['occluded'] in ('none', 'partly', 'largely', 'unknown', None), box['occluded']
         if 'lidar' in metadata:
             lidar_count += 1
             assert metadata['lidar']['frame'] == 'lidar' and metadata['lidar']['num_points'] > 0
@@ -567,8 +567,9 @@ def verify_kitti(client, args):
         assert metadata['label'] == box['label']
         assert all(abs(a - b) < 1e-10 for a, b in zip(metadata['crop_bbox'], bbox))
         assert sample['location'] == parent['location']
-        for field in ('license', 'attribution', 'captured_at', 'altitude_m', 'speed_kmh'):
-            assert metadata.get(field) == parent['metadata'].get(field)
+        assert sample['tags'] == []
+        # An object holds its own fields only: the frame's stay on the frame.
+        assert not {'license', 'attribution', 'captured_at', 'drive', 'speed_kmh'} & metadata.keys()
     assert actual_links == expected_links.keys()
     schema = {f['name']: f for f in client.get_schema(dataset_id, lightning_mode=False)}
     if cuboid_count:
@@ -580,7 +581,6 @@ def verify_kitti(client, args):
         assert fields['occluded']['type'] == 'enum'
     if gps_count:
         assert schema['captured_at'].get('declared_type', schema['captured_at']['type']) == 'datetime'
-        assert schema['oxts_timestamp_raw'].get('declared_type', schema['oxts_timestamp_raw']['type']) == 'string'
         response = client.session.post(
             f'{client.base_url}/datasets/{dataset_id}/map_points',
             json={'zoom': 12, 'filters': predicate('media_type', '=', 'image')},

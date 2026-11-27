@@ -51,9 +51,9 @@ only images with a selected license. A rerun never deletes rows, so use a new
 Suggested dataset attribution: “Images from the COCO 2017 validation dataset,
 credited to their original Flickr photographers under the license linked on each
 image. Annotations: COCO Consortium, CC BY 4.0. Freedom Ridge generates CLIP
-embeddings and mask visualizations.” Display/link `flickr_url`, `license_name`,
-`license_url` and `coco_url` with each image. The official COCO files do not include
-photographer names; the Flickr landing page supplies that attribution.
+embeddings and mask visualizations.” Display/link `source_url` (the photo's Flickr page), `license`
+and `license_url` with each image. The official COCO files do not include photographer names; the
+Flickr page supplies that attribution.
 
 The exact download URLs in `examples/download_demo_data.py` are:
 
@@ -90,14 +90,15 @@ stops with a clear error on 403. No side asset service is needed.
 
 | Source | Freedom Ridge representation |
 |---|---|
-| Instance boxes | `detections`: normalized `Detection` boxes; category name, stable annotation ID; category ID, supercategory, area, iscrowd retained directly on each label for element filters |
-| Polygon segmentations | `polygons`: closed, filled `Polygon` with all disconnected rings, normalized coordinates and source annotation ID |
+| Instance boxes | `detections`: normalized `Detection` boxes labelled with the category name; `annotation_id`, `supercategory`, `area` and the boolean `is_crowd` on each label for element filters (COCO's category number and 0/1 `iscrowd` are not kept beside them) |
+| Polygon segmentations | `polygons`: closed, filled `Polygon` with all disconnected rings and normalized coordinates; `annotation_id` links it to its detection, which holds the annotation's facts |
 | Crowd RLE (also non-crowd RLE, if present) | Independent `Segmentation` fields `crowd_mask_000`, etc.; indexed PNG masks linked to the matching detection; overlapping masks are never flattened together |
-| Person poses | `keypoints`: every person annotation, including zero-visible-point records; all 17 source names, raw coordinates, visibility 0/1/2 and zero-based skeleton edges retained |
+| Person poses | `keypoints`: every person annotation, including zero-visible-point records; per labelled point its joint name (`names`) and whether it is seen (`visible`: COCO's v=2) or only labelled behind something (v=1); `annotation_id` links it to the person's detection. The raw COCO record is not copied |
 | Visible pose skeleton | `skeletons`: one two-point open polyline per visible bone; visibility=0 points are omitted from rendering, visibility=1 occluded points remain |
-| Captions | `captions`: every caption string (usually five, occasionally more); `caption_text`: newline-joined searchable text |
-| Attribution | `license_id`, `license_name`, `license_url`, `coco_url`, `flickr_url`, plus original image information including capture date |
-| Class facets | Native, indexed arrays `class_names`, `supercategory_names`; `classes`/`supercategories` also retained as metadata lists |
+| Captions | `captions`: one searchable text, a caption per line (usually five, occasionally more) |
+| Image information | `image_id`, `split`, `width`, `height`, `date_captured`; COCO's `file_name` (the filepath has it), `coco_url` and license number are not copied |
+| Attribution | `license` (its name), `license_url`, `source_url` (the photo's Flickr page) |
+| Class facets | Native, indexed arrays `class_names`, `supercategory_names` (not repeated as metadata lists) |
 | Embeddings | Inline normalized CLIP vectors in `clip` (or `--field-name`); model registered for matching text-tower search |
 
 All label IDs are deterministic. Mask slots are per-image overlay positions, not
@@ -149,15 +150,15 @@ image/embedding batch reside in memory. This also handles unsorted annotations.
 Examples using an authenticated SDK client `client` and dataset `ds`:
 
 ```python
-client.query_samples(ds._id, filters={"field": "license_name", "operator": "contains", "value": "Attribution"})
+client.query_samples(ds._id, filters={"field": "license", "operator": "contains", "value": "Attribution"})
 client.query_samples(ds._id, filters={"field": "class_names", "operator": "contains", "value": "person"})
-client.query_samples(ds._id, filters={"field": "caption_text", "operator": "contains", "value": "bicycle"})
+client.query_samples(ds._id, filters={"field": "captions", "operator": "contains", "value": "bicycle"})
 client.query_samples(
     ds._id,
     filters={
         "field": "detections",
         "operator": "match_elements",
-        "value": {"field": "iscrowd", "operator": "=", "value": 1},
+        "value": {"field": "is_crowd", "operator": "=", "value": True},
     },
 )
 ```
@@ -167,8 +168,8 @@ client.query_samples(
 Every box creates an object row **in the same dataset**, after its parent image
 has an ID. This includes crowd regions (`is_crowd=true`). Each object has its own
 JPEG under `derived/objects/<image-id>/<detection-id>.jpg`, `media_type=object`,
-`parent_id`, normalized displayed-frame `crop_bbox`, scalar `label`, source
-attributes and `[label]` tags. Objects carry normalized `clip_obj` vectors and a
+`parent_id`, normalized displayed-frame `crop_bbox`, scalar `label` and the box's
+fields; no tags (its class is its label). Objects carry normalized `clip_obj` vectors and a
 separate UMAP; that field name is reserved and cannot be used for image vectors.
 See [OBJECT_PATCH_VIEW.md](../../docs/OBJECT_PATCH_VIEW.md).
 

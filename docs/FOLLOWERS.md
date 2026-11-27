@@ -175,6 +175,16 @@ up from the change log when it's back. Images the primary serves (**Serve images
   vector fields can be deleted here (`POST /api/datasets/{id}/embeddings/{field}/delete`); the primary's can't. If the
   primary later sends a vector or hash field of the same name as one only this instance had, the primary's replaces
   it, all of it at once, with this instance's map of it: none of this instance's values stay beside the primary's.
+- **List fields** (a list field kept in a column of its own) arrive as the primary holds them: a list, `[]`, or
+  never set (the primary sends `null`). A mirror on an older version stores `[]` for never set until it is upgraded,
+  as it did before. When the primary sends a list field whose column this instance already has (another dataset
+  here made it) and the mirror doesn't have the field yet, the sync first sets the mirror's samples holding `[]`
+  there (an older version's default) to never set, block by block, with how far it is recorded, and registers the
+  field only after that, as the primary does (see [SDK.md](SDK.md#list-fields-in-a-column-of-their-own)). Nothing
+  else of that mirror is applied meanwhile: about four minutes a million samples on a busy machine. If the mirror
+  stops after the walk has ended and before its record of how far it is was kept, the next sync walks again and then
+  applies that page of samples again: until it has, a sample can show never set there where its primary holds `[]`.
+  Nothing is lost.
 - **Sample ids** differ between the two. The sync keeps the mapping, translates an object sample's `parent_id`
   (null until its parent arrives), and translates the sample ids in a shared view's filters (a brushed
   selection). A sample that isn't here matches nothing.

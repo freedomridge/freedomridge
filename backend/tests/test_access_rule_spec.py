@@ -33,7 +33,6 @@ renamed with PATCH /groups/{id} {"name": ...}.
 
 import os
 import secrets
-import subprocess
 from typing import Any, Optional
 
 import asyncpg
@@ -45,7 +44,6 @@ from backend import main
 from backend.crypto import hash_token
 from backend.tests import test_field_registry_postgres, test_upgrade_paths
 from backend.tests.test_field_registry_postgres import ingest
-from backend.tests.test_upgrade_paths import ROOT
 
 registry_database = test_field_registry_postgres.registry_database
 database = test_upgrade_paths.database
@@ -1176,56 +1174,3 @@ def test_with_only_todays_rows_each_role_sees_and_does_what_it_did_before(world)
         assert {grant['user_id'] for grant in grants if grant.get('user_id')} == {POWER, GUEST}
 
     world(scenario)
-
-
-# --- The upgrade ---
-
-RELEASE = 'v2.12.1'  # the last release before access levels
-UPGRADE_SEED = """
-INSERT INTO users (id, username, role) VALUES (10, 'maker', 'power_user'), (11, 'shared', 'power_user'),
-    (12, 'viewer', 'guest');
-INSERT INTO datasets (id, name, is_global, owner_id) VALUES
-    (1, 'made', FALSE, 10),
-    (2, 'made-and-shared', FALSE, 10),
-    (3, 'open', TRUE, NULL),
-    (4, 'shared-only', FALSE, NULL),
-    (5, 'owner-also-shared', FALSE, 11),
-    (6, 'open-and-made', TRUE, 12),
-    (7, 'nobody', FALSE, NULL);
-INSERT INTO dataset_access (dataset_id, user_id) VALUES (2, 11), (4, 12), (5, 11);
-"""
-
-
-@pytest.mark.skipif(not os.getenv('FRIDGE_TEST_POSTGRES_CONTAINER'), reason='Requires the disposable container')
-def test_the_upgrade_makes_owners_and_shares_edit_shares_and_opens_global_datasets_at_edit(database):
-    """Upgrading a database of the last release before levels: every existing share and every owner becomes an edit
-    share (once), and every global dataset gets the everyone level edit, so everyone keeps the access they had. The
-    private ones get view, as does a dataset made after: made global later, either starts at view."""
-    make, psql, _, migrate = database
-    old_schema_sql = subprocess.run(
-        ['git', '-C', str(ROOT), 'show', f'{RELEASE}:backend/db/schema.sql'],
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout
-    name = make(old_schema_sql + UPGRADE_SEED)
-    result = migrate(name)
-    assert result.returncode == 0, f'apply_migrations.sh failed\n{result.stdout}\n{result.stderr}'
-    shares = psql(
-        name,
-        "SELECT string_agg(format('%s/%s/%s', dataset_id, user_id, level), ',' ORDER BY dataset_id, user_id) "
-        'FROM dataset_access',
-    )
-    assert shares == '1/10/3,2/10/3,2/11/3,4/12/3,5/11/3,6/12/3'
-    everyone = psql(
-        name,
-        "SELECT string_agg(format('%s/%s', id, everyone_level), ',' ORDER BY id) FROM datasets WHERE is_global",
-    )
-    assert everyone == '3/3,6/3'
-    private = psql(
-        name,
-        "SELECT string_agg(format('%s/%s', id, everyone_level), ',' ORDER BY id) FROM datasets WHERE NOT is_global",
-    )
-    assert private == '1/1,2/1,4/1,5/1,7/1'
-    made_after = psql(name, "INSERT INTO datasets (id, name) VALUES (8, 'made-after') RETURNING everyone_level")
-    assert made_after == '1'

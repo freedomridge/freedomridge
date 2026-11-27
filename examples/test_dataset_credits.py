@@ -15,7 +15,7 @@ def test_shared_credits_preserve_licenses_and_attribution():
     assert 'annotations CC BY 4.0' in DATASET_CREDITS['coco-val2017']
     assert 'Flickr creators' in DATASET_CREDITS['coco-val2017']
     assert 'annotations CC BY 4.0' in DATASET_CREDITS['open-images-v7-val']
-    assert 'per-image Author, License' in DATASET_CREDITS['open-images-v7-val']
+    assert 'per-image attribution, license' in DATASET_CREDITS['open-images-v7-val']
     assert 'including non-commercial terms' in DATASET_CREDITS['inaturalist-2021-val']
     assert KITTI_ATTRIBUTION in DATASET_CREDITS['kitti']
     assert 'Non-commercial evaluation; crops share alike.' in DATASET_CREDITS['kitti']

@@ -160,7 +160,8 @@ def sync(
                 'location': item.get('location'),
                 'heading': item.get('heading'),
             }
-            arrays = {name: item[name] for name in array_field_names if item.get(name)}
+            # A list, empty or not, is sent; a list field never set (null) is left out, never set on the target too.
+            arrays = {name: item[name] for name in array_field_names if item.get(name) is not None}
             if arrays:
                 row['array_fields'] = arrays
             payload.append(row)

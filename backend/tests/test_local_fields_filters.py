@@ -56,6 +56,9 @@ async def matching(database, node):
 
 
 def test_local_fields_filter_beside_the_primarys(registry_database):
+    """Rewritten for contract g7 (one rule everywhere, rules 1.1 and 1.5): a negation of a local field, and of the local
+    tags, keeps only the samples that have a value, at least one tag (it kept the two with none)."""
+
     async def scenario(database):
         first, second, third, fourth = await mirror_with_local_fields(database)
 
@@ -66,15 +69,15 @@ def test_local_fields_filter_beside_the_primarys(registry_database):
             (leaf('@local.weeds', '>', 3), [second]),
             (leaf('@local.weeds', '=', 3), [first]),
             (leaf('@local.weeds', 'in', [3, 5]), [first, second]),
-            (leaf('@local.weeds', 'not in', [3]), [second, third, fourth]),
-            (leaf('@local.weeds', '!=', 3), [second, third, fourth]),
+            (leaf('@local.weeds', 'not in', [3]), [second]),
+            (leaf('@local.weeds', '!=', 3), [second]),
             (leaf('@local.weeds', 'exists'), [first, second]),
             (leaf('@local.weeds', 'not_exists'), [third, fourth]),
             (leaf('@local.weeds', 'is_null'), [third, fourth]),
             (leaf('@local.kind', 'contains', 'this'), [first]),
             (leaf('@local.tags', '=', 'redo'), [second]),
             (leaf('@local.tags', 'in', ['checked']), [first, second]),
-            (leaf('@local.tags', 'not in', ['redo']), [first, third, fourth]),
+            (leaf('@local.tags', 'not in', ['redo']), [first]),
             (leaf('@local.tags', 'exists'), [first, second]),
             (leaf('@local.tags', 'not_exists'), [third, fourth]),
             # The primary's fields of the same names are untouched by them.
@@ -91,13 +94,74 @@ def test_local_fields_filter_beside_the_primarys(registry_database):
                 await matching(database, leaf(name, '=', 1))
             assert refused.value.status_code == 400
 
-        # Inside the cross-grain link, a negation on one needs that field present, like a metadata field.
-        guarded = datasets._strictify_negations(leaf('@local.weeds', '!=', 3), partner=True, array_columns={'tags'})
-        presence = {'field': '@local.weeds', 'operator': 'exists'}
-        assert guarded == {'logic': 'AND', 'filters': [leaf('@local.weeds', '!=', 3), presence]}
-        assert (
-            datasets._strictify_negations(leaf('@local.tags', '!=', 'x'), partner=True, array_columns={'tags'}) is None
+        # (The check of the cross-grain guard's internals that stood here is asked at the surface, through the page's
+        # wrapping, by test_through_the_page_wrapping_a_local_negation_needs_the_value_and_local_tags_ask_the_own_row.)
+
+    registry_database(scenario)
+
+
+def wrapped(grain: str, base: dict) -> dict:
+    """A grid's filter as the page sends it on a dataset with objects (FilterContext.withGrain)."""
+    node = {'logic': 'AND', 'filters': [base]}
+    partner = 'parent_matches' if grain == 'object' else 'has_matching_object'
+    return {
+        'logic': 'AND',
+        'filters': [
+            {'field': 'media_type', 'operator': '=' if grain == 'object' else '!=', 'value': 'object'},
+            {
+                'logic': 'OR',
+                'filters': [
+                    {'field': '_cgself', 'operator': 'cg_self', 'value': node},
+                    {'field': '_crossgrain', 'operator': partner, 'value': node},
+                ],
+            },
+        ],
+    }
+
+
+def test_through_the_page_wrapping_a_local_negation_needs_the_value_and_local_tags_ask_the_own_row(registry_database):
+    """What the cross-grain guard's internals checked (a negation of a local field needs the field, a local list's
+    negation is answered by the grid's own row), asked as the page wraps the filter on a mirror with objects, by
+    contracts g5 and g7: `@local.weeds != 3` is the NOT of `= 3` for the row as a whole (an image with its objects, an
+    object with its image) and needs a value; `@local.tags not in` asks the grid's own row, which needs a tag."""
+
+    async def scenario(database):
+        await ingest([{'crop': 'a'}, {'crop': 'b'}], dataset_id=2, prefix='s3://images/w')
+        image_a, image_b = [row['id'] for row in await database.fetch('SELECT id FROM samples WHERE dataset_id = 2')]
+        await ingest(
+            [{'parent_id': image_a}, {'parent_id': image_b}, {'parent_id': image_b}],
+            dataset_id=2,
+            prefix='s3://images/v',
         )
+        await database.execute("UPDATE samples SET media_type = 'object' WHERE filepath LIKE 's3://images/v%'")
+        object_a, object_b, bare_b = [
+            row['id'] for row in await database.fetch("SELECT id FROM samples WHERE media_type = 'object' ORDER BY id")
+        ]
+        await database.execute('INSERT INTO mirrors (dataset_id, origin_dataset_id, feed_cursor) VALUES (2, 7, 0)')
+        written = {
+            image_a: ({'weeds': 3}, ['x']),
+            image_b: ({}, ['y']),
+            object_a: ({'weeds': 5}, ['y']),
+            object_b: ({'weeds': 7}, ['z']),
+            bare_b: ({}, ['y']),
+        }
+        async with database.pool.acquire() as connection, connection.transaction():
+            await connection.execute("SELECT set_config('fridge.mirror_local', '2', TRUE)")
+            for sample_id, (local, tags) in written.items():
+                await connection.execute(
+                    'UPDATE samples SET local_metadata = $2, local_tags = $3 WHERE id = $1',
+                    sample_id,
+                    local,
+                    tags,
+                )
+        weeds = {'field': '@local.weeds', 'operator': '!=', 'value': 3}
+        tagged = {'field': '@local.tags', 'operator': 'not in', 'value': ['x']}
+        # Image A has 3, so it is out whatever its object holds; bare_b has no value, nor its image.
+        assert await matching(database, wrapped('image', weeds)) == [image_b]
+        assert await matching(database, wrapped('object', weeds)) == [object_b]
+        # Image A is tagged x, whatever its object's tag; every object has a tag of its own, none x.
+        assert await matching(database, wrapped('image', tagged)) == [image_b]
+        assert await matching(database, wrapped('object', tagged)) == [object_a, object_b, bare_b]
 
     registry_database(scenario)
 

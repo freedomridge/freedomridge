@@ -137,12 +137,16 @@ lies inside the shape: `_polygon_across_leaf` tests each copy of the shape moved
 180, so 176 to 183 holds 177.4 and -178.2, and the same shape one turn on (536 to 543) holds the same samples. Only a
 longitude outside -180 to 180 says "across": a polygon whose longitudes all lie from -180 to 180 runs the same SQL as
 before, and one with points at 170 and -170 stays the shape through longitude 0, as every polygon saved in a view, a
-link or a script is read. The exclude chip removes exactly what the include holds and keeps the samples with no
-location. Each copy is a search of the location index: on a million samples a count in a crossing polygon took
+link or a script is read. The exclude chip keeps the samples with a location that the include doesn't hold: a sample
+with no location is in neither, as for every negation (docs/FILTER_QUERY.md), and was never on the map. Each copy is
+a search of the location index: on a million samples a count in a crossing polygon took
 0.87 ms against 0.79 in one the same size that doesn't cross, and 46 against 45 ms for one 30 by 50 degrees (excluded:
-101 against 92, and 103 against 94 ms). A polygon wider than 60 turns of the globe is refused (400), wider than the
-map's view at its least zoom on a 7,680 px panel. Tests: `backend/tests/test_polygon_across_leaf.py`,
-`backend/tests/test_polygon_across_180_spec.py`, `e2e/polygon-across-180.spec.ts`.
+101 against 92, and 103 against 94 ms). A polygon wider than 10 turns of the globe (3,600 degrees) is refused (400).
+No view reachable in the app holds that much: the world stays at least as tall as the map, so at its least zoom the
+map spans about its width over its height in worlds (measured: 0.7 in the map's panel of a 1920 x 1080 window; 11.5
+only with the map alone in a 3840 x 600 one, at a zoom reached by code). Tests:
+`backend/tests/test_polygon_across_leaf.py`, `backend/tests/test_polygon_across_180_spec.py`,
+`e2e/polygon-across-180.spec.ts`.
 
 ## 9. Loading indicator (initial AND background loads)
 

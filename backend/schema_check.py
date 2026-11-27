@@ -3,9 +3,10 @@ GET /api/health (503 + the lists), so a backend started against a stale database
 deploy checklist / load-balancer health check instead of 500ing one feature at a time:
 
 1. The ``schema_migrations`` ledger. ``schema.sql`` is the full schema and records :data:`BASELINE`
-   (the 1.0.0 schema) plus every migration file; backend/db/migrations/*.sql holds the changes since.
+   (the 2.14.0 schema) plus every migration file; backend/db/migrations/*.sql holds the changes since.
    ``pending_migrations()``: files not recorded yet (a restart onto a database that is missing a
-   migration), or a database not created from ``schema.sql`` at all. ``unknown_migrations()``:
+   migration), a 2.14.0 database whose ledger still lists what :data:`BASELINE` replaced, one from a
+   release before 2.14.0, or a database not created from ``schema.sql`` at all. ``unknown_migrations()``:
    recorded files this code doesn't have, i.e. a database newer than the code (an older version
    started after an upgrade, or a newer backup restored).
 2. ``stale_functions()`` — the body of every function ``schema.sql`` defines vs ``pg_proc``.
@@ -36,9 +37,19 @@ DB_DIR = Path(__file__).resolve().parent / "db"
 MIGRATIONS_DIR = DB_DIR / "migrations"
 SCHEMA_SQL = DB_DIR / "schema.sql"
 FUNCTIONS_SQL = DB_DIR / "functions.sql"
-# The 1.0.0 schema's ledger row. Keep in step with schema.sql's seed and scripts/apply_migrations.sh.
-BASELINE = "0000_baseline.sql"
+# The 2.14.0 schema's ledger row. Keep in step with schema.sql's seed and scripts/apply_migrations.sh.
+BASELINE = "baseline_2.14.0.sql"
+# The release a database must be on before this major version upgrades it, and what its ledger records: the 1.0.0
+# baseline row and the 44 migrations since, which 3.0.0 squashed into BASELINE. scripts/apply_migrations.sh replaces
+# those rows with BASELINE; a database from an older release is upgraded to UPGRADE_STOP first (docs/UPGRADING.md).
+UPGRADE_STOP = "2.14.0"
+STOP_LEDGER = DB_DIR / "ledger_2.14.0.txt"
+V1_BASELINE = "0000_baseline.sql"  # the 1.0.0 schema's row, which every 1.x and 2.x database records
 NOT_FROM_SCHEMA = f"{BASELINE} (this database was not created from backend/db/schema.sql)"
+BEFORE_STOP = (
+    f"{BASELINE} (this database is from a release before {UPGRADE_STOP}: upgrade it to {UPGRADE_STOP} first, "
+    "docs/UPGRADING.md)"
+)
 LEDGER_MISSING = "schema_migrations (ledger table missing: create the database from backend/db/schema.sql)"
 
 # One CREATE [OR REPLACE] FUNCTION statement: name, the dollar-quote tag, the body between the
@@ -63,6 +74,16 @@ def migration_files() -> list[str]:
     return sorted(p.name for p in MIGRATIONS_DIR.glob("*.sql"))
 
 
+def stop_ledger() -> set[str]:
+    """The ledger rows of a database on UPGRADE_STOP, which BASELINE replaces."""
+    return set(STOP_LEDGER.read_text().split())
+
+
+def _at_stop(applied: set[str]) -> bool:
+    """A database on UPGRADE_STOP (or later on its main branch) that the runner hasn't moved to BASELINE yet."""
+    return BASELINE not in applied and stop_ledger() <= applied
+
+
 async def _recorded(db: Any) -> Optional[set[str]]:
     try:
         rows = await db.fetch("SELECT filename FROM schema_migrations")
@@ -73,21 +94,28 @@ async def _recorded(db: Any) -> Optional[set[str]]:
 
 
 async def pending_migrations(db: Any) -> list[str]:
-    """Migration files not recorded as applied. A database without the ledger table, or whose
-    ledger lacks the baseline, was not created from schema.sql: no migration file can fix that."""
+    """Migration files not recorded as applied, BASELINE first on a database still on UPGRADE_STOP's ledger. A
+    database without the ledger table, or whose ledger lacks the baseline, was not created from schema.sql: no
+    migration file can fix that; one from a release before UPGRADE_STOP is upgraded to it first."""
     applied = await _recorded(db)
     if applied is None:
         return [LEDGER_MISSING]
+    if _at_stop(applied):
+        return [BASELINE, *(f for f in migration_files() if f not in applied)]
     if BASELINE not in applied:
-        return [NOT_FROM_SCHEMA]
+        return [BEFORE_STOP] if V1_BASELINE in applied else [NOT_FROM_SCHEMA]
     return [f for f in migration_files() if f not in applied]
 
 
 async def unknown_migrations(db: Any) -> list[str]:
     """Recorded migrations this code doesn't ship: the database is newer than the code. Only for a
-    database on the baseline; one without it is reported by pending_migrations instead."""
+    database on the baseline or UPGRADE_STOP's ledger; any other is reported by pending_migrations instead."""
     applied = await _recorded(db)
-    if applied is None or BASELINE not in applied:
+    if applied is None:
+        return []
+    if _at_stop(applied):
+        return sorted(applied - stop_ledger() - set(migration_files()))
+    if BASELINE not in applied:
         return []
     return sorted(applied - {BASELINE, *migration_files()})
 
@@ -152,6 +180,14 @@ def log_pending(
             f"DATABASE IS NEWER THAN THE CODE: it records {len(unknown)} migration(s) this version doesn't have: "
             f"{', '.join(unknown)}. A newer version ran against it, or a newer backup was restored. Run that "
             "version, or restore a backup taken with this one. Until then GET /api/health returns 503."
+        )
+        logger.error(msg)
+        return msg
+    if pending and pending[0] == BEFORE_STOP:
+        msg = (
+            f"DATABASE IS FROM A RELEASE BEFORE {UPGRADE_STOP}: this version upgrades only a {UPGRADE_STOP} database. "
+            f"Upgrade it to {UPGRADE_STOP} first (check out v{UPGRADE_STOP} and run its scripts/apply_migrations.sh), "
+            "then run this version's (docs/UPGRADING.md). Until then GET /api/health returns 503."
         )
         logger.error(msg)
         return msg

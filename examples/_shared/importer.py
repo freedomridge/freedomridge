@@ -642,12 +642,9 @@ def object_samples(parent, parent_id, assets):
             label=label,
             detection_id=detection['id'],
         )
-        if 'iscrowd' in attrs:
-            attrs['is_crowd'] = bool(attrs['iscrowd'])
-        if 'IsGroupOf' in attrs:
-            attrs['is_group_of'] = bool(attrs['IsGroupOf'])
         path = assets.path(f"objects/{parent.metadata['image_id']}/{detection['id']}.jpg")
-        sample = Sample(str(path), tags=[label], metadata=attrs, location=parent.location)
+        # No tags: the object's class is its label, and tags are left for people's own marks.
+        sample = Sample(str(path), metadata=attrs, location=parent.location)
         sample.media_type = 'object'
         yield sample
 

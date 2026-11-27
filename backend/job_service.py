@@ -24,6 +24,7 @@ from . import (
     index_advisor,
     index_jobs,
     job_queue,
+    list_fields,
     map_placement,
     map_refit,
     patch_import,
@@ -282,6 +283,9 @@ async def run_service(dsn=DATABASE_URL):
     async def handle_index_restore(job):
         return await index_actions.restore_handler(pool)(job)
 
+    async def handle_list_field(job):
+        return await list_fields.handler(pool)(job)
+
     dispatch_after = 0
 
     async def dispatch_concepts():
@@ -319,6 +323,7 @@ async def run_service(dsn=DATABASE_URL):
         follower_sync.KIND: handle_follower_sync,
         index_actions.DROP_KIND: handle_index_drop,
         index_actions.RESTORE_KIND: handle_index_restore,
+        list_fields.KIND: handle_list_field,
     }
     try:
         async with local_runner(
@@ -345,6 +350,7 @@ async def run_service(dsn=DATABASE_URL):
                 follower_sync.KIND: follower_sync.POLICY,
                 index_actions.DROP_KIND: index_actions.POLICY,
                 index_actions.RESTORE_KIND: index_actions.POLICY,
+                list_fields.KIND: list_fields.POLICY,
             },
         ) as runner:
             pool = runner.workers[0].pool

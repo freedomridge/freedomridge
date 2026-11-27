@@ -32,13 +32,15 @@ function guarded(text: string): string {
     return out;
 }
 
-/** `value` as one CSV cell. A number is written as it is, and null or an empty text as an empty cell. Anything else is
- * text (a list joined with `;`, an object as JSON), guarded against formulas, and always in double quotes: a
- * spreadsheet that reads the file with `;` takes a line with no `;` for one cell, with the comma as its decimal mark,
- * so a number followed by an unquoted text could read as one formula. */
+/** `value` as one CSV cell. A number is written as it is, and null (no value: a field the sample doesn't have, a list
+ * never set) or an empty text as an empty cell. An empty list is a value, written `[]`. Anything else is text (a list
+ * joined with `;`, an object as JSON), guarded against formulas, and always in double quotes: a spreadsheet that reads
+ * the file with `;` takes a line with no `;` for one cell, with the comma as its decimal mark, so a number followed by
+ * an unquoted text could read as one formula. */
 export function escapeCsvField(value: unknown): string {
     if (value === null || value === undefined) return '';
     if (typeof value === 'number') return String(value);
+    if (Array.isArray(value) && value.length === 0) return '"[]"';
     const text = Array.isArray(value)
         ? value.map(v => (v === null || v === undefined) ? '' : String(v)).join(';')
         : typeof value === 'object' ? JSON.stringify(value) : String(value);

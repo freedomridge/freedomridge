@@ -39,6 +39,9 @@ async def compiled_ids(database, node):
 
 
 def test_a_numeric_string_matches_alike_everywhere_on_a_promoted_field(registry_database, monkeypatch):
+    """Rewritten for contract g7 (one rule everywhere, rule 1.1): `!=` and `not in` no longer keep the sample with no
+    score, in every reader here (they did). The positive forms, which main answers alike, come first."""
+
     async def scenario(database):
         monkeypatch.setattr(hashes, 'db', database)
         ids = (await ingest([{'score': 1.0}, {'score': 2}, {'score': 1}, {}]))['ids']
@@ -54,8 +57,8 @@ def test_a_numeric_string_matches_alike_everywhere_on_a_promoted_field(registry_
         for node, expected in [
             ({'field': 'score', 'operator': '=', 'value': '1'}, [one, also_one]),
             ({'field': 'score', 'operator': 'in', 'value': ['1', '2']}, [one, two, also_one]),
-            ({'field': 'score', 'operator': '!=', 'value': '1'}, [two, missing]),
-            ({'field': 'score', 'operator': 'not in', 'value': ['2']}, [one, also_one, missing]),
+            ({'field': 'score', 'operator': '!=', 'value': '1'}, [two]),
+            ({'field': 'score', 'operator': 'not in', 'value': ['2']}, [one, also_one]),
         ]:
             assert await grid_ids(node) == expected, node
             assert await compiled_ids(database, node) == expected, node

@@ -138,12 +138,13 @@ def test_real_history_and_global_list_name_submitters_and_page_separately(regist
 def test_real_global_job_list_reads_its_own_index_instead_of_sorting_history(registry_database, monkeypatch):
     async def scenario(database):
         monkeypatch.setattr(jobs, 'db', database)
-        await database.execute("""INSERT INTO jobs(id,kind,state,created_at)
-            SELECT gen_random_uuid(),'selection_cleanup','succeeded',now()-g*interval '5 minutes'
-            FROM generate_series(1,50000) g""")
-        await database.execute("""INSERT INTO jobs(id,kind,dataset_id,state)
-            SELECT gen_random_uuid(),'old_work',1,'succeeded' FROM generate_series(1,50000)""")
-        await database.execute('INSERT INTO job_controls(job_id) SELECT id FROM jobs ON CONFLICT DO NOTHING')
+        async with test_field_registry_postgres.bulk_setup(database) as connection:
+            await connection.execute("""INSERT INTO jobs(id,kind,state,created_at)
+                SELECT gen_random_uuid(),'selection_cleanup','succeeded',now()-g*interval '5 minutes'
+                FROM generate_series(1,50000) g""")
+            await connection.execute("""INSERT INTO jobs(id,kind,dataset_id,state)
+                SELECT gen_random_uuid(),'old_work',1,'succeeded' FROM generate_series(1,50000)""")
+            await connection.execute('INSERT INTO job_controls(job_id) SELECT id FROM jobs ON CONFLICT DO NOTHING')
         await database.execute('ANALYZE jobs; ANALYZE job_controls')
         query = AsyncMock(wraps=database.fetch)
         monkeypatch.setattr(database, 'fetch', query)

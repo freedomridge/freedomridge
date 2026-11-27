@@ -109,7 +109,9 @@ test('a region typed in a filter card is a chip named for it; a click turns it a
     await expect(toggleNamed(page, NOT_KS)).toBeVisible();
     await expect(chips(page)).toHaveCount(1);
     await expect(page.getByTestId('filter-card-query')).toHaveCount(0);  // no editor opens
-    await expectTotal(page, TOTAL - KANSAS);  // the rest, the samples with no location included
+    // The rest that have a location: rewritten for contract g7 (one rule everywhere, rule 1.6), the samples with no
+    // location are no longer counted (they were).
+    await expectTotal(page, TOTAL - KANSAS - NO_LOCATION);
     await expect.poll(() => q(page)).toBe('location not within "US-KS"');
     await toggleNamed(page, NOT_KS).click();
     await expect(toggleNamed(page, KS)).toBeVisible();
@@ -142,8 +144,10 @@ test('a q= link gives one chip per region part, by key or name in any case, writ
 });
 
 test('an f= link, a saved view and saved filters give the same chip; a view of them is a readable q= link', async ({ page }) => {
-    // f=: a stage made elsewhere, as an AND group holding the one region test, its key in lower case.
-    await openDataset(page, `?f=${encodeStages([regionStage('geo_region_exclude', 'us-ks', true)])}`, TOTAL - KANSAS);
+    // f=: a stage made elsewhere, as an AND group holding the one region test, its key in lower case. Not in Kansas: the
+    // samples that have a location outside it (rewritten for contract g7, one rule everywhere, rule 1.6: the samples
+    // with no location are no longer counted).
+    await openDataset(page, `?f=${encodeStages([regionStage('geo_region_exclude', 'us-ks', true)])}`, TOTAL - KANSAS - NO_LOCATION);
     await expect(chips(page).getByRole('button').first()).toHaveAccessibleName(NOT_KS);
     await expect.poll(() => q(page)).toBe('location not within "US-KS"');
 
@@ -687,7 +691,9 @@ test('on a dataset with objects, inside and not inside count the right images an
         const grain = page.getByTestId('grain-toggle');
         for (const [query, imagesText, objectsText] of [
             ['location within "US-KS"', '3 images', '6 objects'],
-            ['location not within "US-KS"', '2 images', '4 objects'],  // the image with no location included
+            // Rewritten for contract g7 (one rule everywhere, rule 1.6): the image with no location, whose objects have
+            // none either, is no longer counted, nor are its objects (they were: 2 images, 4 objects).
+            ['location not within "US-KS"', '1 image', '2 objects'],
         ]) {
             await page.goto(`/datasets/${id}?q=${encodeURIComponent(query)}`);
             await expect(count, query).toHaveText(imagesText, { timeout: 20_000 });

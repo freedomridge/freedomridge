@@ -26,7 +26,7 @@ test('every text is quoted; a number, null and an empty text are written bare', 
     assert.equal(cell(null), '');
     assert.equal(cell(undefined), '');
     assert.equal(cell(''), '');
-    assert.equal(cell([]), '');
+    assert.equal(cell([]), '"[]"'); // an empty list is a value: the text []; null, no value, stays bare
     assert.equal(cell({ a: '=x' }), '"{""a"":""=x""}"');
     assert.equal(cell({ a: 'x;=y' }), `"{""a"":""x;'=y""}"`);
 });

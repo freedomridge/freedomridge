@@ -30,11 +30,12 @@ const NAMES: Record<string, string> = {
     index_drop: 'Removing an index',
     index_restore: 'Restoring an index',
     region_load: 'Loading region boundaries',
+    list_field_registration: 'Adding a list field',
 };
 
 // Jobs whose end changes what the page shows: their completion refreshes the dataset's views,
 // including jobs submitted elsewhere (SDK, another tab) that finish between active-job polls.
-const REFRESHING_KINDS = new Set(['bulk_mutation', 'concept_rescore', 'field_index_build', 'ann_index_build', 'duplicate_maintenance', 'index_drop']);
+const REFRESHING_KINDS = new Set(['bulk_mutation', 'concept_rescore', 'field_index_build', 'ann_index_build', 'duplicate_maintenance', 'index_drop', 'list_field_registration']);
 
 export function jobName(kind: string) {
     return NAMES[kind] || kind.replace(/[_-]+/g, ' ');

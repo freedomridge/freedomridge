@@ -140,7 +140,8 @@ def test_incremental_scoring_does_not_read_unchanged_score_history(registry_data
                 """INSERT INTO embeddings(dataset_id,sample_id,field_name,vector)
                    SELECT dataset_id,id,'clip','[1,0]'::vector FROM samples WHERE dataset_id=1""",
             )
-        await score(database, concept_id, full=True)
+        async with registry_helpers.bulk_setup(database) as connection:  # the history: 100,000 scores written
+            await score(connection, concept_id, full=True)
         await database.execute('ANALYZE embeddings; ANALYZE embedding_concept_scores; ANALYZE samples')
         for table in ('concept_embedding_pending', 'concept_score_pending', 'concept_score_count_deltas'):
             if await database.fetchval('SELECT to_regclass(current_schema()||$1)', '.' + table):

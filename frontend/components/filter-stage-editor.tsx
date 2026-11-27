@@ -5,6 +5,7 @@ import { PlusIcon, TrashIcon, CodeIcon } from '@radix-ui/react-icons';
 import { conceptStage, filterHasConcept, isConceptFilter, offsetOf } from '@/lib/filter-query';
 import { conceptNames } from '@/lib/filter-utils';
 import { utcMinute } from '@/lib/datetimes';
+import { isDerivedLabelField } from '@/lib/labels';
 import { SearchableSelect } from './searchable-select';
 
 // Datetime rule value input. `<input type="datetime-local">` only emits a value once BOTH the
@@ -99,13 +100,20 @@ const OPERATORS: Record<string, string[]> = {
 // segmentation, keypoints) only support presence; other field types get them as extras
 // so "filter by presence" stages (e.g. an overlay's exists filter) are editable instead
 // of falling back to a blank `=`.
-const VALUELESS_OPS = ['exists', 'not_exists', 'is_null', 'is_not_null'];
+const VALUELESS_OPS = ['exists', 'not_exists', 'is_null', 'is_not_null', 'is_empty', 'is_not_empty'];
 // Overlays, and the derived fields (embeddings / hashes / location), have presence only.
 const PRESENCE_ONLY_TYPES = ['heatmap', 'class_probabilities', 'segmentation', 'keypoints', 'cuboids', 'derived'];
-function opsForType(t: string): string[] {
-    return PRESENCE_ONLY_TYPES.includes(t)
-        ? ['exists', 'not_exists']
-        : [...(OPERATORS[t] || OPERATORS.string), 'exists', 'not_exists', 'is_null', 'is_not_null'];
+// `is empty` asks whether a list holds nothing (docs/FILTER_QUERY.md). Offered where `is null` is, but not on a field
+// that holds no list (a sample's own columns, its location) nor on a path through a list (`detections.label`: the
+// server asks for the list itself, `detections is empty`). The server's one list of them is backend/filter_query.py
+// NO_LIST, which refuses the test; this mirrors it for what the builder offers.
+const NO_LIST_FIELDS = ['id', 'filepath', 'media_type', 'created_at', 'last_modified_at', 'location'];
+function opsForType(t: string, field?: string, schema?: SchemaField[]): string[] {
+    if (PRESENCE_ONLY_TYPES.includes(t)) return ['exists', 'not_exists'];
+    const ops = [...(OPERATORS[t] || OPERATORS.string), 'exists', 'not_exists', 'is_null', 'is_not_null'];
+    const holdsNoList = field !== undefined
+        && (NO_LIST_FIELDS.includes(field) || (field !== 'segmentation.labels' && isDerivedLabelField(field, schema)));
+    return holdsNoList ? ops : [...ops, 'is_empty', 'is_not_empty'];
 }
 
 // (MultiValueSelect was replaced by the shared SearchableSelect — cached-first with a
@@ -253,7 +261,7 @@ export function FilterStageEditor({ stage, onSave, onCancel, onDelete, datasetId
                         className="w-full resize-y rounded-lg border border-zinc-800 bg-zinc-900 px-3 py-2 font-mono text-xs leading-relaxed text-zinc-200 placeholder-zinc-600 outline-none focus:border-cyan-600"
                     />
                     <div className="text-[11px] text-zinc-500">
-                        = != &gt; &lt; · in (a b c) · contains · between · exists · is null · concept &quot;name&quot; &gt; 0.5 · AND OR NOT ( ). Values in a list can be
+                        = != &gt; &lt; · in (a b c) · contains · between · exists · is null · is empty · concept &quot;name&quot; &gt; 0.5 · AND OR NOT ( ). Values in a list can be
                         separated by spaces or new lines, so a pasted column works.
                     </div>
                 </div>
@@ -426,7 +434,7 @@ function FilterNode({ node, path, datasetId, schema, onChange, onRemove }: Filte
     // (schema still loading, or the field is missing from it), the type-default list
     // may lack it — and a <select> whose value matches no option silently displays
     // the first one, misrendering e.g. a datetime `>=` rule as `=`.
-    const typeOps = opsForType(fieldType);
+    const typeOps = opsForType(fieldType, node.field, schema);
     const availableOps = node.operator && !typeOps.includes(node.operator) ? [node.operator, ...typeOps] : typeOps;
 
     return (
@@ -439,7 +447,7 @@ function FilterNode({ node, path, datasetId, schema, onChange, onRemove }: Filte
                         const newField = e.target.value;
                         const newDef = schema.find(s => s.name === newField);
                         const newType = newDef?.type || 'string';
-                        const newOps = opsForType(newType);
+                        const newOps = opsForType(newType, newField, schema);
                         // Keep the operator if still valid (e.g. exists when switching
                         // between overlay fields); else default to the new type's first op.
                         // Exception: switching TO a datetime field with the generic '=' default
