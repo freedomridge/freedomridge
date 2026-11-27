@@ -5320,9 +5320,13 @@ def _region_leaf(
 # The widest polygon across the antimeridian a filter takes, in turns of the globe (_polygon_across_leaf). It is tested
 # on one copy per turn it spans, and one more, each a search of the location index: the copies of a polygon trillions
 # of turns wide would never finish being written, so a wider one is refused (400). The limit is for the server's
-# safety, and its size is what one view of the map can hold: at mapbox-gl's least zoom (-2) a world is 128 px wide, so a
-# panel 7,680 px wide shows 60 of them. (The map can be panned while a polygon is drawn, so a wider one can be drawn.)
-_POLYGON_MAX_TURNS = 60
+# safety; its size, 10 turns (3,600 degrees), is the owner's choice (2.14.0 took 60). No view reachable in the app holds
+# that much: mapbox-gl keeps the world at least as tall as the map, so a view spans about its width over its height in
+# worlds. Measured in the app (Playwright) at the least zoom: 0.7 worlds in the map's panel of a 1920 x 1080 window
+# (2.4 with the map alone there), 3.4 in its panel of a 3840 x 600 window, and 11.5 only with the map alone in that
+# window, at a zoom reached by code (the wheel stops at zoom 0, 7.5 worlds). (The map can be panned while a polygon is
+# drawn, so a wider one can be drawn.)
+_POLYGON_MAX_TURNS = 10
 
 
 def _shown(value: Any) -> str:

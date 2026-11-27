@@ -45,6 +45,13 @@ it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
   excluded lasso now has to find which rows have a point on the map: about 0.15 to 0.45 s more per reading, the first
   page 0.14 to 0.66 s where it was 0.02 to 0.30 s. An excluded region or drawn polygon there measured up to about
   twice its time before on some readings.
+- **A change in behaviour: a drawn polygon may be at most 10 turns of the globe wide (3,600 degrees), where 2.14.0 took
+  60** ([SDK.md](docs/SDK.md#geospatial-filtering)). A `geo_polygon` (or its exclusion) whose longitudes span more than
+  3,600 degrees is refused with a 400 that names the limit; one spanning exactly 3,600 degrees is answered. No view
+  reachable in the app holds that much: the map keeps the world at least as tall as itself, so a view spans about its
+  width over its height in worlds (measured at the least zoom: 0.7 in the map's panel of a 1920 x 1080 window; 11.5
+  only with the map alone in a 3840 x 600 one, at a zoom reached by code). A saved view, link or script with a polygon
+  wider than 10 turns now gets the 400.
 
 ## 2.14.0 (2026-11-25)
 

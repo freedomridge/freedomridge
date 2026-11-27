@@ -1518,10 +1518,10 @@ A polygon's points are in one frame, as the map draws them: longitudes past 180 
 antimeridian. A sample is inside when its location, moved east or west by whole turns of 360 degrees, lies inside the
 shape, so 176 to 183 holds samples at 177.4 and at -178.2, and the same shape one turn on (536 to 543) holds the same
 samples. A polygon whose longitudes all lie from -180 to 180 is read as before: points at 170 and -170 make the shape
-through longitude 0. One wider than 60 turns of the globe is refused. A coordinate may be text that reads as a
-number. A value that is not a list of points is refused with a 400 that says what the filter takes, a GeoJSON polygon
-object included (pass its ring, `polygon["coordinates"][0]`); `null`, fewer than three points, or three points of
-which the last is the first again, are no polygon and keep every sample.
+through longitude 0. One wider than 10 turns of the globe (3,600 degrees) is refused. A coordinate may be text that
+reads as a number. A value that is not a list of points is refused with a 400 that says what the filter takes, a
+GeoJSON polygon object included (pass its ring, `polygon["coordinates"][0]`); `null`, fewer than three points, or
+three points of which the last is the first again, are no polygon and keep every sample.
 
 The samples outside a polygon are `~geo_within(polygon)`, or the condition `geo_polygon_exclude` (the map's excluded
 region): those that have a location, outside it. A sample with no location is in neither the polygon nor its

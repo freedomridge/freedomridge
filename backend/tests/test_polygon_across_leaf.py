@@ -63,11 +63,12 @@ def test_a_polygon_on_one_other_copy_of_the_world_is_that_polygon_on_the_first()
 def test_a_polygon_360_degrees_wide_or_more_is_tested_on_each_copy_it_needs():
     """The exclusion's text and arguments it asserted changed with contract g7 (rule 1.6); what a wide exclusion keeps
     is asked as rows by test_the_samples_on_both_sides_are_inside_and_the_exclude_keeps_the_other_located_samples
-    (nothing that has a location, here) and by test_polygon_across_180_spec (WIDE). The copies a polygon 60 turns wide
+    (nothing that has a location, here) and by test_polygon_across_180_spec (WIDE). The copies a polygon 10 turns wide
     is tested on, and the refusal past them, are the polygon's own and stay."""
-    assert len(_where('geo_polygon', [[0, -1], [21600, -1], [21600, 1], [0, 1]])[1]) == 61
+    # The limit is 10 turns, 3,600 degrees (contract g3, rule 1.5, changed 2026-11-26 from 60 turns, 21,600 degrees).
+    assert len(_where('geo_polygon', [[0, -1], [3600, -1], [3600, 1], [0, 1]])[1]) == 11
     with pytest.raises(HTTPException) as refused:
-        _where('geo_polygon', [[0, -1], [21601, -1], [21601, 1], [0, 1]])
+        _where('geo_polygon', [[0, -1], [3601, -1], [3601, 1], [0, 1]])
     assert refused.value.status_code == 400
 
 

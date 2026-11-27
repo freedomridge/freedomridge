@@ -11,11 +11,12 @@ past 180 or below -180; a sample is inside when its location, moved east or west
 inside the shape. A polygon whose longitudes all lie from -180 to 180 means what it means today. The exclusion removes
 exactly what the polygon holds and keeps every other sample that has a location (rewritten for the later contract g7,
 one rule everywhere, rule 1.6: the sample with no location is no longer kept; main kept it). A polygon 360 degrees
-wide or more is no error, up to 60 turns of the globe (21,600 degrees); one wider is refused with a 400 (amended
-2026-11-24). What each other value answers (rule 1.6, amended 2026-11-24): null and a list of fewer than three entries
-keep every sample, and so does a ring with fewer than three points besides its closing point; an open ring is closed
-and a point's entries after its latitude are ignored; a coordinate written as text is read as that number; any other
-value is refused with a 400 naming `geo_polygon` wherever the filter is read at once.
+wide or more is no error, up to 10 turns of the globe (3,600 degrees); one wider is refused with a 400 (amended
+2026-11-24; the limit changed 2026-11-26 from 60 turns to 10, the owner's word). What each other value answers (rule
+1.6, amended 2026-11-24): null and a list of fewer than three entries keep every sample, and so does a ring with fewer
+than three points besides its closing point; an open ring is closed and a point's entries after its latitude are
+ignored; a coordinate written as text is read as that number; any other value is refused with a 400 naming
+`geo_polygon` wherever the filter is read at once.
 
 The samples (section 5.1): two each side of the antimeridian near Fiji (177.4 and 179.2; -179.5 and -178.2, which are
 180.5 and 181.8 in a frame running past 180), three far away (longitude 0, 100 and -100) and one with no location;
@@ -42,10 +43,11 @@ Where the contract leaves something open, these tests read it this way:
   is read as an answer whose text holds `geo_polygon`, `longitude` and `latitude`; "a coordinate that is not a finite
   number" includes text that reads as no finite number (`"NaN"`) and null. The value read as 1.6.1's "a list of fewer
   than three entries" holds whatever its entries are (`[[1]]`, `[1, 2]`).
-- Rule 1.5's limit is a test of its own: a polygon whose longitudes span exactly 21,600 degrees is answered, one
-  spanning more (21,601 degrees, and points at 176 and 1e15) is refused with a 400 whose text names the limit (60
-  turns, or 21,600 degrees). A narrow polygon lying far out (all its longitudes near 1e15) is not asked: the limit is
-  written for a polygon's width.
+- Rule 1.5's limit is a test of its own: a polygon whose longitudes span exactly 3,600 degrees is answered, one
+  spanning more (3,601 degrees, and points at 176 and 1e15) is refused with a 400 whose text names the limit (10
+  turns, or 3,600 degrees). A narrow polygon lying far out (all its longitudes near 1e15) is not asked: the limit is
+  written for a polygon's width. The two pages that name the limit (docs/MAP_REQUIREMENTS.md #8, docs/SDK.md's
+  geospatial section) name 10 turns.
 - "Every reader" (2.1) is samples/query and its count, an export's pages (samples/query with after_id, slim and
   skip_count, as the export dialog pages), aggregate, the histogram, field-stats and a field's autocomplete (the
   sidebar), map_points, map_extent, a selection token and in_selection (Select All), /api/search, a bulk tag (its count
@@ -63,6 +65,8 @@ Where the contract leaves something open, these tests read it this way:
 import asyncio
 import json
 import os
+import re
+from pathlib import Path
 from typing import Any, Optional
 from uuid import uuid4
 
@@ -673,7 +677,8 @@ async def assert_refused(r: Regions, p: Planted, value: Any, words: tuple[str, .
 
 
 SAYS_WHAT_IT_TAKES = ('geo_polygon', 'longitude', 'latitude')
-NAMES_THE_LIMIT = ('60', '21600', '21,600')  # 60 turns, or 21,600 degrees
+# 10 turns, or 3,600 degrees (contract 1.5, changed 2026-11-26 from 60 turns and 21,600 degrees)
+NAMES_THE_LIMIT = re.compile(r'\b10 turns\b|\bten turns\b|\b3,?600\b', re.I)
 
 # 1.6.1: no polygon, as today.
 NO_POLYGON: list[tuple[str, Any]] = [
@@ -834,20 +839,21 @@ def test_any_other_value_is_refused_with_a_400_naming_geo_polygon(regions_world,
     regions_world(scenario)
 
 
-def test_a_polygon_wider_than_60_turns_of_the_globe_is_refused_with_a_400(regions_world):
-    """Contract 1.5's limit (amended 2026-11-24, waiting for the owner's word, so a test of its own): a polygon exactly
-    60 turns wide (21,600 degrees) is answered, holding every sample within its latitudes; one wider (21,601 degrees,
-    and one with a longitude of 1e15) is refused with a 400 that says so, by samples/query, map_extent and map_points.
-    Main answers the wider ones too. Rewritten for the later contract g7 (one rule everywhere, rule 1.6): the exclusion
-    of the polygon 60 turns wide keeps `minus` alone, not `none`, which has no location (main kept it)."""
-    sixty_turns = rect(-10800, -25, 10800, 25)
-    check_expectations([('60 turns wide', sixty_turns, FIJI | {'zero', 'hundred'})])
+def test_a_polygon_wider_than_10_turns_of_the_globe_is_refused_with_a_400(regions_world):
+    """Contract 1.5's limit (changed 2026-11-26, the owner's word: 10 turns, where 2.14.0 shipped 60): a polygon exactly
+    10 turns wide (3,600 degrees) is answered, holding every sample within its latitudes; one wider (3,601 degrees, and
+    one with a longitude of 1e15) is refused with a 400 whose text names the limit, by samples/query, map_extent and
+    map_points. 2.14.0 answers 3,601 degrees, and refuses 1e15 naming 60 turns. By the later contract g7 (one rule
+    everywhere, rule 1.6) the exclusion of the polygon 10 turns wide keeps `minus` alone, not `none`, which has no
+    location."""
+    ten_turns = rect(-1800, -25, 1800, 25)
+    check_expectations([('10 turns wide', ten_turns, FIJI | {'zero', 'hundred'})])
 
     async def scenario(r):
         p = await plant(r)
-        await assert_keeps_at_once(r, p, sixty_turns, FIJI | {'zero', 'hundred'}, {'minus'})
+        await assert_keeps_at_once(r, p, ten_turns, FIJI | {'zero', 'hundred'}, {'minus'})
         for label, polygon in (
-            ('21,601 degrees wide', rect(-10800, -25, 10801, 25)),
+            ('3,601 degrees wide', rect(-1800, -25, 1801, 25)),
             ('a longitude of 1e15', rect(176, -20, 1e15, -14)),
         ):
             for operator in ('geo_polygon', 'geo_polygon_exclude'):
@@ -855,11 +861,23 @@ def test_a_polygon_wider_than_60_turns_of_the_globe_is_refused_with_a_400(region
                 wrong = [
                     f'{route}: {status} {str(text)[:200]}'
                     for route, (status, text) in found.items()
-                    if status != 400 or not any(limit in str(text) for limit in NAMES_THE_LIMIT)
+                    if status != 400 or not NAMES_THE_LIMIT.search(str(text))
                 ]
                 assert not wrong, (label, operator, wrong)
 
     regions_world(scenario)
+
+
+def test_the_pages_that_name_the_limit_name_10_turns():
+    """docs/MAP_REQUIREMENTS.md (#8) and docs/SDK.md (the geospatial section) say a polygon wider than the limit is
+    refused: each names 10 turns of the globe (or 3,600 degrees), and neither still names 60 turns or 21,600 degrees."""
+    root = Path(__file__).resolve().parents[2]
+    for page in ('docs/MAP_REQUIREMENTS.md', 'docs/SDK.md'):
+        text = ' '.join((root / page).read_text().split())
+        limits = [found for found in re.split(r'(?<=[.;:])\s+', text) if re.search(r'\bturns? of the globe\b', found)]
+        assert limits, (page, 'no sentence names the limit')
+        assert all(NAMES_THE_LIMIT.search(found) for found in limits), (page, limits)
+        assert not re.search(r'\b60 turns\b|\bsixty turns\b|\b21,?600\b', text, re.I), page
 
 
 # --- 2.1 ---
