@@ -94,12 +94,15 @@ def test_query_string_filters_hold_one_guard():
 
 def test_the_scatter_rejection_sources_share_one_guard():
     args: list[Any] = [1, 'clip']
-    rejected, _, probed = embeddings._scatter_rejections({'logic': 'AND', 'filters': [exclude(4), exclude(9)]}, args)
+    node = {'logic': 'AND', 'filters': [exclude(4), exclude(9)]}
+    rejected, _, capped, majority = embeddings._scatter_rejections(node, args)
     assert rejected.count('require_concept_scores') == 1, rejected
     guard = re.search(r'\) _rejected WHERE \(SELECT require_concept_scores\(\$(\d+)::int\[\]\)\)$', rejected)
     assert guard, rejected
     assert args[int(guard.group(1)) - 1] == [4, 9]
-    assert not any('require_concept_scores' in shape for shape in probed)
+    # The counted sources, against the 30% cap and against the majority (the concepts' passing scores), none guarded.
+    assert majority, 'the concepts are counted against the majority'
+    assert not any('require_concept_scores' in shape for shape in [*capped, *majority])
 
 
 async def seed(database):
@@ -145,7 +148,9 @@ def test_one_guard_call_per_statement_and_the_parallel_plan_is_kept(registry_dat
             sql, _ = datasets.parse_filter_node(either, args, 2, None, None, 1)
             query = f'SELECT count(*) FROM samples WHERE dataset_id = $1 AND {sql}'
             await connection.execute("SET LOCAL track_functions = 'pl'")
-            assert await connection.fetchval(query, *args) == 3  # images 1 and 3, object 4
+            # Images 1 and 3. Rewritten for contract g7 (one rule everywhere, rule 1.3): object 4 has no score for
+            # concept 9, so its exclude no longer keeps it (it was 3).
+            assert await connection.fetchval(query, *args) == 2
             calls = await connection.fetchval(
                 "SELECT calls FROM pg_stat_xact_user_functions WHERE funcname = 'require_concept_scores'",
             )
@@ -231,6 +236,12 @@ def test_the_broad_scatter_refuses_a_concept_being_rescored(registry_database):
 
     async def scenario(database):
         await populate(database, 40)
+        # Every point scored (the ones populate leaves out low): the exclusion now rejects the points with no score too
+        # (contract g7, rule 1.3), and the path is taken only while what it keeps is most of the points.
+        await database.execute(
+            'INSERT INTO embedding_concept_scores (concept_id, sample_id, score) '
+            'SELECT 1, id, 0.1 FROM samples WHERE dataset_id = 1 ON CONFLICT DO NOTHING',
+        )
         request = embeddings.EmbeddingsRequest(filters=CONCEPT, sample_pct=100)
         assert await embeddings._query_broad_exclusions(1, request) is not None  # the path is taken
         await database.execute('UPDATE embedding_concepts SET scores_ready = FALSE WHERE id = 1')
@@ -262,7 +273,7 @@ def test_a_mixed_case_concept_operator_is_guarded(operator):
 
 def test_the_scatter_rejections_guard_a_mixed_case_exclude():
     args: list[Any] = [1, 'clip']
-    rejected, _, _ = embeddings._scatter_rejections(spelled('CONCEPT_EXCLUDE'), args)
+    rejected, _, _, _ = embeddings._scatter_rejections(spelled('CONCEPT_EXCLUDE'), args)
     assert rejected.count('require_concept_scores') == 1 and args[-1] == [4]
 
 

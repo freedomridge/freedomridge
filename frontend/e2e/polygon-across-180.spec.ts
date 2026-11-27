@@ -9,8 +9,9 @@ import { stamp } from './access-helpers';
 // antimeridian (-179.9) was never inside. By the contract, after a polygon is drawn across the antimeridian the grid
 // shows the samples on both sides, the count is theirs, the map shows them, and the fit that follows the drawing shows
 // both sides; switching the chip between include and exclude gives the two halves (the exclusion keeps every other
-// sample, the one with no location too); and the polygon carried in the page's address finds the same samples when the
-// address is opened again.
+// sample that has a location: rewritten for contract g7, one rule everywhere, rule 1.6, it no longer keeps the one with
+// no location, which it did); and the polygon carried in the page's address finds the same samples when the address is
+// opened again.
 //
 // Written from the contract, not from the code. The map is driven as map-extent-antimeridian.spec.ts drives it: "Zoom to
 // Data" fits it to the samples (a box across the antimeridian for samples either side of it, docs/MAP_REQUIREMENTS.md
@@ -231,8 +232,9 @@ async function drawAndCheck(page: Page, browser: Browser, place: Place) {
         await expect.poll(() => views(seen, drawnFrom).some(asked => polygonIn(asked.body.filters)
             && pairIds.every(pairId => idsIn(asked.answer).includes(pairId))), { timeout: 20_000, message: `the map shows the pair for ${drawn}` }).toBe(true);
 
-        // Applied, the chip's count is the pair's; switched to exclude, every other sample (the corners and the one with
-        // no location); switched back, the pair again. Each opened from its address finds the same.
+        // Applied, the chip's count is the pair's; switched to exclude, every other sample that has a location (the two
+        // corners, not the one with no location); switched back, the pair again. Each opened from its address finds the
+        // same.
         await page.getByTestId('apply-filters').click();
         const chip = page.getByTestId('query-stage-chip').filter({ hasText: 'Map Region' });
         await expect(chip).toHaveCount(1);
@@ -240,10 +242,10 @@ async function drawAndCheck(page: Page, browser: Browser, place: Place) {
         const included = await addressAfter(page, null);
         await chip.click();
         await expect(chip).toContainText('Exclude Map Region');
-        await expectTotal(page, 3);
-        await expect(page.getByTestId('grid-cell')).toHaveCount(3);
+        await expectTotal(page, 2);
+        await expect(page.getByTestId('grid-cell')).toHaveCount(2);
         const excludedAddress = await addressAfter(page, new URL(included).searchParams.get('f'));
-        await expectTotalOpened(browser, excludedAddress, 3);
+        await expectTotalOpened(browser, excludedAddress, 2);
         await chip.click();
         await expect(chip).not.toContainText('Exclude');
         await expectTotal(page, 2);

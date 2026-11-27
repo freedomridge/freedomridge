@@ -7,9 +7,9 @@ import { loadRegionFixture, regionsNotOptedIn } from './regions-fixture';
 // One place exclusion, however the filter card saves it (the backend-fixes contract, section 3.4). Typed in the Query
 // tab and applied, `location not within "US-KS"` is saved bare; typed there, switched to the Builder tab and applied,
 // it is saved as the only rule of an AND group. Both are the chip "Not in Kansas", and on a dataset whose objects
-// carry no location both must keep the same images: the ones outside Kansas and the one with no location, never an
-// image inside Kansas brought back through its location-less object. On a dataset without objects the two shapes
-// already agree (pinned). The boundaries are the region specs' fixture (regions-fixture.ts), loaded only in a run that
+// carry no location both must keep the same images: the ones outside Kansas, never an image inside Kansas brought back
+// through its location-less object. On a dataset without objects the two shapes already agree. Rewritten for contract
+// g7 (one rule everywhere, rule 1.6): the image with no location (nor on its object) is no longer kept (it was). The boundaries are the region specs' fixture (regions-fixture.ts), loaded only in a run that
 // opts in with FRIDGE_E2E_LOAD_REGIONS=1; without it the file skips and creates nothing.
 test.use({ storageState: AUTH_STATE, permissions: ['clipboard-read', 'clipboard-write'] });
 test.skip(regionsNotOptedIn !== null, regionsNotOptedIn ?? '');
@@ -26,7 +26,7 @@ const IMAGES: Array<[string, [number, number] | null]> = [
     ['ne_1', [-98, 41.5]],
     ['nowhere_0', null],
 ];
-const OUTSIDE = IMAGES.filter(([name]) => !name.startsWith('ks_')).map(([name]) => name).sort();
+const OUTSIDE = IMAGES.filter(([name, point]) => point !== null && !name.startsWith('ks_')).map(([name]) => name).sort();
 let cookie = '';
 let notLoaded: string | null = null;
 const made: Record<'plain' | 'objects', number> = { plain: 0, objects: 0 };

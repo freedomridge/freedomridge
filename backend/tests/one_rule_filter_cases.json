@@ -1,0 +1,757 @@
+{
+  "about": [
+    "Filters and the samples each shows on a dataset without objects, by contract g7 (one rule everywhere): a row",
+    "with no value for a field never matches a comparison of it, nor the NOT of one; an empty list in a field is a",
+    "value (changed 2026-11-26), so a negation shows it. Run by the server on a database",
+    "and by the SDK on a sort_by_similarity result, which asks the server (backend/tests/test_one_rule_filter_cases.py,",
+    "contract 2.2, changed 2026-11-25): every case shows the samples named here on both, and none is refused."
+  ],
+  "samples": {
+    "red": {
+      "metadata": {
+        "colour": "red",
+        "n": 1,
+        "detections": [
+          {
+            "label": "car",
+            "confidence": 0.95
+          }
+        ]
+      },
+      "tags": [
+        "rejected"
+      ]
+    },
+    "blue": {
+      "metadata": {
+        "colour": "blue",
+        "n": 2,
+        "detections": [
+          {
+            "label": "truck",
+            "confidence": 0.9
+          }
+        ]
+      },
+      "tags": [
+        "seen"
+      ]
+    },
+    "null": {
+      "metadata": {
+        "colour": null,
+        "n": null,
+        "detections": null
+      },
+      "tags": []
+    },
+    "none": {
+      "metadata": {},
+      "tags": []
+    },
+    "kind": {
+      "metadata": {
+        "colour": 7,
+        "n": "many",
+        "detections": [
+          {
+            "label": "car",
+            "confidence": 0.5
+          },
+          {
+            "label": "truck",
+            "confidence": 0.95
+          }
+        ]
+      },
+      "tags": [
+        "seen",
+        "rejected"
+      ]
+    },
+    "empty": {
+      "metadata": {
+        "colour": "green",
+        "n": 3,
+        "detections": []
+      },
+      "tags": []
+    },
+    "unlabelled": {
+      "metadata": {
+        "colour": "red",
+        "n": 5,
+        "detections": [
+          {
+            "confidence": 0.99
+          }
+        ]
+      },
+      "tags": [
+        "other"
+      ]
+    },
+    "notalist": {
+      "metadata": {
+        "colour": "blue",
+        "detections": "notalist"
+      },
+      "tags": [
+        "seen"
+      ]
+    }
+  },
+  "cases": [
+    {
+      "name": "a text field: =",
+      "filter": {
+        "field": "colour",
+        "operator": "=",
+        "value": "red"
+      },
+      "shows": [
+        "red",
+        "unlabelled"
+      ]
+    },
+    {
+      "name": "a text field: !=, the number 7 a value of another kind",
+      "filter": {
+        "field": "colour",
+        "operator": "!=",
+        "value": "red"
+      },
+      "shows": [
+        "blue",
+        "empty",
+        "kind",
+        "notalist"
+      ]
+    },
+    {
+      "name": "a text field: in",
+      "filter": {
+        "field": "colour",
+        "operator": "in",
+        "value": [
+          "red",
+          "green"
+        ]
+      },
+      "shows": [
+        "empty",
+        "red",
+        "unlabelled"
+      ]
+    },
+    {
+      "name": "a text field: not in",
+      "filter": {
+        "field": "colour",
+        "operator": "not in",
+        "value": [
+          "red",
+          "green"
+        ]
+      },
+      "shows": [
+        "blue",
+        "kind",
+        "notalist"
+      ]
+    },
+    {
+      "name": "a text field: contains",
+      "filter": {
+        "field": "colour",
+        "operator": "contains",
+        "value": "re"
+      },
+      "shows": [
+        "empty",
+        "red",
+        "unlabelled"
+      ]
+    },
+    {
+      "name": "a text field: >= (text order)",
+      "filter": {
+        "field": "colour",
+        "operator": ">=",
+        "value": "c"
+      },
+      "shows": [
+        "empty",
+        "red",
+        "unlabelled"
+      ]
+    },
+    {
+      "name": "a text field: > (text order)",
+      "filter": {
+        "field": "colour",
+        "operator": ">",
+        "value": "b"
+      },
+      "shows": [
+        "blue",
+        "empty",
+        "notalist",
+        "red",
+        "unlabelled"
+      ]
+    },
+    {
+      "name": "a text field: exists, a JSON null under the key counts",
+      "filter": {
+        "field": "colour",
+        "operator": "exists",
+        "value": null
+      },
+      "shows": [
+        "blue",
+        "empty",
+        "kind",
+        "notalist",
+        "null",
+        "red",
+        "unlabelled"
+      ]
+    },
+    {
+      "name": "a number field: =",
+      "filter": {
+        "field": "n",
+        "operator": "=",
+        "value": 2
+      },
+      "shows": [
+        "blue"
+      ]
+    },
+    {
+      "name": "a number field: !=, the text many a value of another kind",
+      "filter": {
+        "field": "n",
+        "operator": "!=",
+        "value": 2
+      },
+      "shows": [
+        "empty",
+        "kind",
+        "red",
+        "unlabelled"
+      ]
+    },
+    {
+      "name": "a number field: in",
+      "filter": {
+        "field": "n",
+        "operator": "in",
+        "value": [
+          1,
+          2
+        ]
+      },
+      "shows": [
+        "blue",
+        "red"
+      ]
+    },
+    {
+      "name": "a number field: not in",
+      "filter": {
+        "field": "n",
+        "operator": "not in",
+        "value": [
+          1,
+          2
+        ]
+      },
+      "shows": [
+        "empty",
+        "kind",
+        "unlabelled"
+      ]
+    },
+    {
+      "name": "a number field: contains, the number written as text",
+      "filter": {
+        "field": "n",
+        "operator": "contains",
+        "value": "1"
+      },
+      "shows": [
+        "red"
+      ]
+    },
+    {
+      "name": "a number field: >",
+      "filter": {
+        "field": "n",
+        "operator": ">",
+        "value": 2
+      },
+      "shows": [
+        "empty",
+        "unlabelled"
+      ]
+    },
+    {
+      "name": "a number field: <=",
+      "filter": {
+        "field": "n",
+        "operator": "<=",
+        "value": 2
+      },
+      "shows": [
+        "blue",
+        "red"
+      ]
+    },
+    {
+      "name": "a number field: exists, a JSON null under the key counts",
+      "filter": {
+        "field": "n",
+        "operator": "exists",
+        "value": null
+      },
+      "shows": [
+        "blue",
+        "empty",
+        "kind",
+        "null",
+        "red",
+        "unlabelled"
+      ]
+    },
+    {
+      "name": "tags: = holds for a list holding it",
+      "filter": {
+        "field": "tags",
+        "operator": "=",
+        "value": "rejected"
+      },
+      "shows": [
+        "kind",
+        "red"
+      ]
+    },
+    {
+      "name": "tags: != needs a tag, none of them it",
+      "filter": {
+        "field": "tags",
+        "operator": "!=",
+        "value": "rejected"
+      },
+      "shows": [
+        "blue",
+        "notalist",
+        "unlabelled"
+      ]
+    },
+    {
+      "name": "tags: in",
+      "filter": {
+        "field": "tags",
+        "operator": "in",
+        "value": [
+          "rejected",
+          "other"
+        ]
+      },
+      "shows": [
+        "kind",
+        "red",
+        "unlabelled"
+      ]
+    },
+    {
+      "name": "tags: not in needs a tag, none of them named",
+      "filter": {
+        "field": "tags",
+        "operator": "not in",
+        "value": [
+          "rejected"
+        ]
+      },
+      "shows": [
+        "blue",
+        "notalist",
+        "unlabelled"
+      ]
+    },
+    {
+      "name": "tags: contains",
+      "filter": {
+        "field": "tags",
+        "operator": "contains",
+        "value": "seen"
+      },
+      "shows": [
+        "blue",
+        "kind",
+        "notalist"
+      ]
+    },
+    {
+      "name": "tags: exists, at least one tag",
+      "filter": {
+        "field": "tags",
+        "operator": "exists",
+        "value": null
+      },
+      "shows": [
+        "blue",
+        "kind",
+        "notalist",
+        "red",
+        "unlabelled"
+      ]
+    },
+    {
+      "name": "a list of labels: =",
+      "filter": {
+        "field": "detections.label",
+        "operator": "=",
+        "value": "car"
+      },
+      "shows": [
+        "kind",
+        "red"
+      ]
+    },
+    {
+      "name": "a list of labels: != shows an empty list, not a list of unlabelled elements",
+      "filter": {
+        "field": "detections.label",
+        "operator": "!=",
+        "value": "car"
+      },
+      "shows": [
+        "blue",
+        "empty"
+      ]
+    },
+    {
+      "name": "a list of labels: in",
+      "filter": {
+        "field": "detections.label",
+        "operator": "in",
+        "value": [
+          "car",
+          "truck"
+        ]
+      },
+      "shows": [
+        "blue",
+        "kind",
+        "red"
+      ]
+    },
+    {
+      "name": "a list of labels: not in",
+      "filter": {
+        "field": "detections.label",
+        "operator": "not in",
+        "value": [
+          "car"
+        ]
+      },
+      "shows": [
+        "blue",
+        "empty"
+      ]
+    },
+    {
+      "name": "a list of labels: is null shows the rows with no label in the list",
+      "filter": {
+        "field": "detections.label",
+        "operator": "is_null",
+        "value": null
+      },
+      "shows": [
+        "empty",
+        "none",
+        "notalist",
+        "null",
+        "unlabelled"
+      ]
+    },
+    {
+      "name": "a list: is null asked of the field does not show an empty list",
+      "filter": {
+        "field": "detections",
+        "operator": "is_null",
+        "value": null
+      },
+      "shows": [
+        "none",
+        "null"
+      ]
+    },
+    {
+      "name": "an element match",
+      "filter": {
+        "field": "detections",
+        "operator": "match_elements",
+        "value": {
+          "logic": "AND",
+          "filters": [
+            {
+              "field": "label",
+              "operator": "=",
+              "value": "car"
+            },
+            {
+              "field": "confidence",
+              "operator": ">",
+              "value": 0.9
+            }
+          ]
+        }
+      },
+      "shows": [
+        "red"
+      ]
+    },
+    {
+      "name": "an element match, spelled elem_match",
+      "filter": {
+        "field": "detections",
+        "operator": "elem_match",
+        "value": {
+          "logic": "AND",
+          "filters": [
+            {
+              "field": "label",
+              "operator": "=",
+              "value": "car"
+            },
+            {
+              "field": "confidence",
+              "operator": ">",
+              "value": 0.9
+            }
+          ]
+        }
+      },
+      "shows": [
+        "red"
+      ]
+    },
+    {
+      "name": "the NOT of an element match needs a list, empty or not; notalist is no value",
+      "filter": {
+        "logic": "NOT",
+        "filters": [
+          {
+            "field": "detections",
+            "operator": "match_elements",
+            "value": {
+              "logic": "AND",
+              "filters": [
+                {
+                  "field": "label",
+                  "operator": "=",
+                  "value": "car"
+                },
+                {
+                  "field": "confidence",
+                  "operator": ">",
+                  "value": 0.9
+                }
+              ]
+            }
+          }
+        ]
+      },
+      "shows": [
+        "blue",
+        "empty",
+        "kind",
+        "unlabelled"
+      ]
+    },
+    {
+      "name": "NOT around one field",
+      "filter": {
+        "logic": "NOT",
+        "filters": [
+          {
+            "field": "colour",
+            "operator": "=",
+            "value": "red"
+          }
+        ]
+      },
+      "shows": [
+        "blue",
+        "empty",
+        "kind",
+        "notalist"
+      ]
+    },
+    {
+      "name": "NOT around two parts given as two children: the NOT of their AND, each field needed",
+      "filter": {
+        "logic": "NOT",
+        "filters": [
+          {
+            "field": "colour",
+            "operator": "=",
+            "value": "red"
+          },
+          {
+            "field": "n",
+            "operator": "=",
+            "value": 1
+          }
+        ]
+      },
+      "shows": [
+        "blue",
+        "empty",
+        "kind",
+        "unlabelled"
+      ]
+    },
+    {
+      "name": "NOT around an OR, each field needed",
+      "filter": {
+        "logic": "NOT",
+        "filters": [
+          {
+            "logic": "OR",
+            "filters": [
+              {
+                "field": "colour",
+                "operator": "=",
+                "value": "red"
+              },
+              {
+                "field": "n",
+                "operator": "=",
+                "value": 2
+              }
+            ]
+          }
+        ]
+      },
+      "shows": [
+        "empty",
+        "kind"
+      ]
+    },
+    {
+      "name": "a NOT inside a NOT",
+      "filter": {
+        "logic": "NOT",
+        "filters": [
+          {
+            "logic": "NOT",
+            "filters": [
+              {
+                "field": "colour",
+                "operator": "=",
+                "value": "red"
+              }
+            ]
+          }
+        ]
+      },
+      "shows": [
+        "red",
+        "unlabelled"
+      ]
+    },
+    {
+      "name": "an absence test inside a NOT adds no field",
+      "filter": {
+        "logic": "NOT",
+        "filters": [
+          {
+            "logic": "AND",
+            "filters": [
+              {
+                "field": "colour",
+                "operator": "=",
+                "value": "blue"
+              },
+              {
+                "field": "n",
+                "operator": "is_null",
+                "value": null
+              }
+            ]
+          }
+        ]
+      },
+      "shows": [
+        "blue",
+        "empty",
+        "kind",
+        "red",
+        "unlabelled"
+      ]
+    },
+    {
+      "name": "NOT around an absence test alone",
+      "filter": {
+        "logic": "NOT",
+        "filters": [
+          {
+            "field": "colour",
+            "operator": "is_null",
+            "value": null
+          }
+        ]
+      },
+      "shows": [
+        "blue",
+        "empty",
+        "kind",
+        "notalist",
+        "red",
+        "unlabelled"
+      ]
+    },
+    {
+      "name": "NOT around a tags test",
+      "filter": {
+        "logic": "NOT",
+        "filters": [
+          {
+            "field": "tags",
+            "operator": "in",
+            "value": [
+              "rejected"
+            ]
+          }
+        ]
+      },
+      "shows": [
+        "blue",
+        "notalist",
+        "unlabelled"
+      ]
+    },
+    {
+      "name": "NOT around a list of labels",
+      "filter": {
+        "logic": "NOT",
+        "filters": [
+          {
+            "field": "detections.label",
+            "operator": "=",
+            "value": "car"
+          }
+        ]
+      },
+      "shows": [
+        "blue",
+        "empty"
+      ]
+    }
+  ]
+}

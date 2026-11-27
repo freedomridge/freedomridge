@@ -913,22 +913,41 @@ async def _query_embeddings_no_filter(
     )
 
 
+# The membership step's bound: past it more than half the field's points are rejected, the answer isn't broad and the
+# general path answers.
+_MAJORITY_LIMIT = (
+    "LIMIT (SELECT total_points / 2 + 1 FROM embedding_viz_meta WHERE dataset_id = $1 AND field_name = $2)"
+)
+
+
 def _scatter_rejections(node, args):
     """Compile only conjunctions of known exclusions; everything else keeps _fids.
 
-    Sample predicates share the normal compiler, including its NULL semantics.
-    Concept/duplicate leaves read their narrow membership tables directly.
-    """
+    Sample predicates share the normal compiler. Duplicate leaves read their narrow membership table directly, and a
+    rejected sample is looked up in the rank (the membership step). A negation shows only the rows that have a value
+    (backend/negation.py), so:
+    - a concept's exclude rejects the field's points that have no score that keeps them, the unscored included: one
+      anti-join over the rank against the concept's scores, whose rows are rank rows already (`ranked`), so they skip
+      the membership step. Its passing scores are counted first against the majority of the points: more than half
+      of them passing rejects more than half the points, so the general path answers at once. The anti-join stops at
+      that majority too, which covers many unscored points with few passing;
+    - a tags exclusion rejects the untagged samples too. They are often most of a dataset, so the source is counted
+      first, up to the admission's cap, like the probed ones: over it, the general path answers at once.
+    Each source gives (id, ranked). The answer is (rejected, shape, capped, majority): `shape` holds 'ranked' when a
+    source is ranked and 'large' when the tags source is there (its membership is left to the planner); `capped` the
+    sources the admission counts first against the probed sources' cap, `majority` those it counts against the
+    majority of the field's points."""
     from .datasets import parse_filter_node
 
     sources = []
-    probed = []  # index-only shapes of the PK-probed sources, for the admission bound
+    capped: List[str] = []  # counted first against the cap: the PK-probed sources and the tags source
+    majority: List[str] = []  # counted first against the majority of the points: a concept's passing scores
     sample_predicates = []
+    tag_predicates = []
     concept_ids = set()
-    has_tags = False
+    shape = set()
 
     def visit(part):
-        nonlocal has_tags
         if 'logic' in part or 'filters' in part:
             logic = part.get('logic', 'AND').upper()
             children = part.get('filters', [])
@@ -938,8 +957,7 @@ def _scatter_rejections(node, args):
                 child = children[0]
                 if child.get('field') == 'tags' and child.get('operator', '=').lower() in ('in', 'contains'):
                     sql, _ = parse_filter_node(child, args, len(args) + 1)
-                    sample_predicates.append(sql)
-                    has_tags = True
+                    tag_predicates.append(sql)
                     return True
             return False
         op = part.get('operator', '=').lower()
@@ -957,22 +975,29 @@ def _scatter_rejections(node, args):
             idx = len(args) + 1
             args.extend([int(cfg['concept_id']), float(cfg.get('threshold', 0.5))])
             concept_ids.add(int(cfg['concept_id']))
+            # The field's points with no score that keeps them (none, or one that passes the cut): one anti-join over
+            # the rank, which holds every point, cut at the majority (reaching it, the answer isn't broad). On a
+            # million points with 1% unscored it took 0.20 s, where the passing scores' PK probes took 0.21 s and the
+            # two sources with the unscored probed too 0.7 s.
             sources.append(
-                f"SELECT sample_id AS id FROM embedding_concept_scores "
-                f"WHERE concept_id = ${idx} AND score {cmp} ${idx + 1}",
+                f"SELECT id, ranked FROM (SELECT r.sample_id AS id, TRUE AS ranked FROM embedding_viz_rank r "
+                f"WHERE r.dataset_id = $1 AND r.field_name = $2 AND NOT EXISTS (SELECT 1 "
+                f"FROM embedding_concept_scores _s WHERE _s.concept_id = ${idx} AND _s.sample_id = r.sample_id "
+                f"AND NOT (_s.score {cmp} ${idx + 1})) {_MAJORITY_LIMIT}) _ranked{idx}",
             )
-            probed.append(
+            majority.append(
                 f"SELECT 1 FROM embedding_concept_scores WHERE concept_id = ${idx} AND score {cmp} ${idx + 1}",
             )
+            shape.add('ranked')
             return True
         if op == 'collapse_duplicates':
             if value:
                 args.append(value)
                 sources.append(
-                    f"SELECT DISTINCT sample_id AS id FROM sample_dup_secondary "
+                    f"SELECT DISTINCT sample_id AS id, FALSE AS ranked FROM sample_dup_secondary "
                     f"WHERE dataset_id = $1 AND hash_config = ${len(args)}",
                 )
-                probed.append(
+                capped.append(
                     f"SELECT 1 FROM sample_dup_secondary WHERE dataset_id = $1 AND hash_config = ${len(args)}",
                 )
             return True
@@ -980,8 +1005,9 @@ def _scatter_rejections(node, args):
         if part['field'] == 'media_type' and op == '!=' and value == 'object':
             positive = {**part, 'operator': '='}
         elif part['field'] == 'tags' and op == 'not in':
-            has_tags = True
-            positive = {**part, 'operator': 'in'}
+            sql, _ = parse_filter_node({**part, 'operator': 'in'}, args, len(args) + 1)
+            tag_predicates.append(sql)
+            return True
         if positive is None:
             return False
         sql, _ = parse_filter_node(positive, args, len(args) + 1)
@@ -991,21 +1017,33 @@ def _scatter_rejections(node, args):
     if not visit(node):
         return None
     if sample_predicates:
-        sources.append('SELECT id FROM samples WHERE dataset_id = $1 AND (' + ' OR '.join(sample_predicates) + ')')
+        sources.append(
+            'SELECT id, FALSE AS ranked FROM samples WHERE dataset_id = $1 AND ('
+            + ' OR '.join(sample_predicates)
+            + ')',
+        )
+    if tag_predicates:
+        # The samples a tags exclusion rejects: those with a tag it names, and those with no tags.
+        tagged = ' OR '.join([*tag_predicates, 'array_length(tags, 1) IS NULL'])
+        sources.append(f'SELECT id, FALSE AS ranked FROM samples WHERE dataset_id = $1 AND ({tagged})')
+        capped.append(f'SELECT 1 FROM samples WHERE dataset_id = $1 AND ({tagged})')
+        shape.add('large')
     if not sources:
         return None
-    # UNION makes overlapping rejections unique. The final rank membership lookup
-    # scopes every source to the requested dataset/field and excludes missing coords.
+    # UNION makes overlapping rejections unique. The final rank membership lookup scopes every source that isn't
+    # ranked to the requested dataset/field and excludes missing coords; a ranked source is rank rows of it already.
     rejected = ' UNION '.join(sources)
     if concept_ids:
         # One guard for every concept, outside the sources (as parse_filter_node places it). That they are the
         # dataset's is checked before the statement runs (_query_broad_exclusions).
         args.append(sorted(concept_ids))
-        rejected = f"SELECT id FROM ({rejected}) _rejected WHERE (SELECT require_concept_scores(${len(args)}::int[]))"
-    return rejected, has_tags, probed
+        rejected = (
+            f"SELECT id, ranked FROM ({rejected}) _rejected WHERE (SELECT require_concept_scores(${len(args)}::int[]))"
+        )
+    return rejected, frozenset(shape), capped, majority
 
 
-# Probing the rank primary key once per concept/duplicate rejection only beats the general
+# Probing the rank primary key once per duplicate rejection only beats the general
 # path while those rejections are a modest share of the field. The admission threshold
 # limits random index probes; larger sources go straight to the general path.
 PROBED_REJECTION_SHARE = 0.30
@@ -1018,47 +1056,51 @@ async def _query_broad_exclusions(dataset_id, request):
     compiled = _scatter_rejections(request.filters, args)
     if compiled is None:
         return None
-    rejected, has_tags, probed = compiled
+    rejected, shape, capped, majority = compiled
     # The concepts are the dataset's (a 400), before the statement's readiness guard could name another dataset's.
     from .datasets import require_known_concepts
 
     await require_known_concepts(request.filters, dataset_id)
     pct = max(0, min(100, request.sample_pct))
-    # Admission: a bounded index-only count of each probed source, before any probe runs. The
-    # sum bounds the probes (overlaps count twice, which only makes the bound stricter). Over
-    # the cap, the meta row is filtered out, nothing below runs, and the caller falls back.
+    # Admission: a bounded count of each counted source (the probed ones, index-only, and the tags source), before
+    # any probe runs. The sum bounds the probes and the tags source's size (overlaps count twice, which only makes the
+    # bound stricter). A concept's passing scores are counted against the majority of the points instead (each is a
+    # rejected point when it is on the map; scores off the map only fall back sooner). Over a bound, the meta row is
+    # filtered out, nothing below runs, and the caller falls back.
+    checks = []
+    if capped:
+        bound = ' + '.join(
+            f'(SELECT count(*) FROM ({source} LIMIT (SELECT n + 1 FROM cap)) c{i})' for i, source in enumerate(capped)
+        )
+        checks.append(f'{bound} <= n')
+    checks += [
+        f'(SELECT count(*) FROM ({source} LIMIT (SELECT half + 1 FROM cap)) m{i}) <= half'
+        for i, source in enumerate(majority)
+    ]
     admission = ''
     admitted = ''
-    if probed:
-        bound = ' + '.join(
-            f'(SELECT count(*) FROM ({source} LIMIT (SELECT n + 1 FROM cap)) c{i})' for i, source in enumerate(probed)
-        )
+    if checks:
         admission = f"""cap AS MATERIALIZED (
-            SELECT floor(total_points * {PROBED_REJECTION_SHARE})::bigint AS n
+            SELECT floor(total_points * {PROBED_REJECTION_SHARE})::bigint AS n, total_points / 2 AS half
             FROM embedding_viz_meta WHERE dataset_id = $1 AND field_name = $2
-        ), admitted AS MATERIALIZED (SELECT {bound} <= n AS ok FROM cap),
+        ), admitted AS MATERIALIZED (SELECT {' AND '.join(checks)} AS ok FROM cap),
         """
         admitted = ' AND (SELECT ok FROM admitted)'
-    # Narrow membership sources benefit from PK probes; tag rejection can be much
-    # larger, so leave its join strategy to the planner (as in the measured queries).
-    membership_offset = '' if has_tags else ' OFFSET 0'
-    # Stop small-source PK probes once a majority is rejected. A LIMIT biases
-    # tag membership toward nested loops, so let its larger join complete before
-    # assessing selectivity. Only the broad branch consumes the total below.
-    membership_limit = (
-        ''
-        if has_tags
-        else ('LIMIT (SELECT total_points / 2 + 1 FROM embedding_viz_meta WHERE dataset_id = $1 AND field_name = $2)')
+    # The membership step: narrow sources benefit from PK probes, and they stop once a majority is rejected (only the
+    # broad branch consumes the total below). The tags source can be larger, so its join strategy is left to the
+    # planner (as in the measured queries; a LIMIT biases it toward nested loops). A ranked source's rows are rank rows
+    # already and skip the step.
+    large = 'large' in shape
+    limit = _MAJORITY_LIMIT
+    membership = (
+        "SELECT j.id FROM rejected j CROSS JOIN LATERAL (SELECT 1 FROM embedding_viz_rank r "
+        f"WHERE r.dataset_id = $1 AND r.field_name = $2 AND r.sample_id = j.id{'' if large else ' OFFSET 0'}) matched"
+        f"{' WHERE NOT j.ranked' if 'ranked' in shape else ''}{'' if large else ' ' + limit}"
     )
+    excluded = f"SELECT id FROM rejected WHERE ranked UNION ({membership})" if 'ranked' in shape else membership
     rows = await db.fetch(
         f"""WITH {admission}rejected AS MATERIALIZED ({rejected}),
-        excluded AS MATERIALIZED (
-            SELECT j.id FROM rejected j CROSS JOIN LATERAL (
-                SELECT 1 FROM embedding_viz_rank r
-                WHERE r.dataset_id = $1 AND r.field_name = $2 AND r.sample_id = j.id{membership_offset}
-            ) matched
-            {membership_limit}
-        ), meta AS MATERIALIZED (
+        excluded AS MATERIALIZED ({excluded}), meta AS MATERIALIZED (
             SELECT total_points, occupied_cells, total_points - (SELECT count(*) FROM excluded) AS total
             FROM embedding_viz_meta WHERE dataset_id = $1 AND field_name = $2 AND occupied_cells > 0{admitted}
         ), budget AS MATERIALIZED (

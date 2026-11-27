@@ -29,16 +29,12 @@ def _where(op, value):
 
 
 def test_a_polygon_within_180_compiles_as_it_always_did():
+    """The polygon's own text. Its exclusion's text changed with contract g7 (one rule everywhere, rule 1.6), so it is
+    no longer asserted: what the exclusion keeps is asked as rows below and in test_polygon_across_180_spec."""
     within = ' WHERE dataset_id = $1 AND ST_Within(location, ST_GeomFromText($2, 4326))'
-    without = ' WHERE dataset_id = $1 AND (location IS NULL OR NOT ST_Within(location, ST_GeomFromText($2, 4326)))'
     # Points at 170 and -170 are the shape through longitude 0, as before; an open ring is closed with its first point.
     through_zero = [[170, -20], [-170, -20], [-170, -15], [170, -15]]
     assert _where('geo_polygon', through_zero) == (within, ['POLYGON((170 -20, -170 -20, -170 -15, 170 -15, 170 -20))'])
-    edges = [[-180, -20], [180, -20], [180, -15], [-180, -15], [-180, -20]]
-    assert _where('geo_polygon_exclude', edges) == (
-        without,
-        ['POLYGON((-180 -20, 180 -20, 180 -15, -180 -15, -180 -20))'],
-    )
     # A point's further entries are ignored, and a ring closed with its first point but for a further entry is closed
     # again, as before.
     assert _where('geo_polygon', [[1, 2, 5], [3, 2], [3, 4], [1, 2, 6]]) == (
@@ -52,33 +48,23 @@ def test_a_polygon_across_180_is_tested_on_its_two_copies_on_any_copy_of_the_wor
     shape = [[lon + 360 * turns, lat] for lon, lat in ACROSS]
     either = '(ST_Within(location, ST_GeomFromText($2, 4326)) OR ST_Within(location, ST_GeomFromText($3, 4326)))'
     assert _where('geo_polygon', shape) == (f' WHERE dataset_id = $1 AND {either}', COPIES)
-    # The exclude tests the two copies as one MULTIPOLYGON, one test a sample, behind their boxes.
-    where, args = _where('geo_polygon_exclude', shape)
-    assert where == (
-        ' WHERE dataset_id = $1 AND (location IS NULL OR NOT (location && ST_GeomFromText($2, 4326) '
-        'OR location && ST_GeomFromText($3, 4326)) OR NOT ST_Within(location, ST_GeomFromText($4, 4326)))'
-    )
-    assert args == [*COPIES, f"MULTIPOLYGON({', '.join(copy.removeprefix('POLYGON') for copy in COPIES)})"]
+    # The exclusion's text changed with contract g7 (rule 1.6) and is no longer asserted: its rows are asked by
+    # test_the_samples_on_both_sides_are_inside_and_the_exclude_keeps_the_other_located_samples, on every copy.
 
 
 def test_a_polygon_on_one_other_copy_of_the_world_is_that_polygon_on_the_first():
+    """The polygon's own text; its exclusion's text changed with contract g7 (rule 1.6) and is asked as rows in
+    test_polygon_across_180_spec (an excluded polygon on another copy of the world)."""
     within = ' WHERE dataset_id = $1 AND ST_Within(location, ST_GeomFromText($2, 4326))'
-    without = ' WHERE dataset_id = $1 AND (location IS NULL OR NOT ST_Within(location, ST_GeomFromText($2, 4326)))'
     copy = ['POLYGON((10.0 -20.0, 20.0 -20.0, 20.0 -15.0, 10.0 -20.0))']
     assert _where('geo_polygon', [[370, -20], [380, -20], [380, -15]]) == (within, copy)
-    assert _where('geo_polygon_exclude', [[-350, -20], [-340, -20], [-340, -15]]) == (without, copy)
 
 
 def test_a_polygon_360_degrees_wide_or_more_is_tested_on_each_copy_it_needs():
-    where, args = _where('geo_polygon_exclude', [[176, -30], [536, -30], [536, 50], [176, 50]])
-    assert where == (
-        ' WHERE dataset_id = $1 AND (location IS NULL OR NOT (ST_Within(location, ST_GeomFromText($2, 4326)) '
-        'OR ST_Within(location, ST_GeomFromText($3, 4326))))'
-    )
-    assert args == [
-        'POLYGON((176.0 -30.0, 536.0 -30.0, 536.0 50.0, 176.0 50.0, 176.0 -30.0))',
-        'POLYGON((-184.0 -30.0, 176.0 -30.0, 176.0 50.0, -184.0 50.0, -184.0 -30.0))',
-    ]
+    """The exclusion's text and arguments it asserted changed with contract g7 (rule 1.6); what a wide exclusion keeps
+    is asked as rows by test_the_samples_on_both_sides_are_inside_and_the_exclude_keeps_the_other_located_samples
+    (nothing that has a location, here) and by test_polygon_across_180_spec (WIDE). The copies a polygon 60 turns wide
+    is tested on, and the refusal past them, are the polygon's own and stay."""
     assert len(_where('geo_polygon', [[0, -1], [21600, -1], [21600, 1], [0, 1]])[1]) == 61
     with pytest.raises(HTTPException) as refused:
         _where('geo_polygon', [[0, -1], [21601, -1], [21601, 1], [0, 1]])
@@ -146,7 +132,10 @@ def test_a_coordinate_may_be_text_that_reads_as_a_number():
 
 
 @postgres
-def test_the_samples_on_both_sides_are_inside_and_the_exclude_keeps_the_rest(registry_database):
+def test_the_samples_on_both_sides_are_inside_and_the_exclude_keeps_the_other_located_samples(registry_database):
+    """Rewritten for contract g7 (one rule everywhere, rule 1.6): the exclude keeps the other samples that have a
+    location, not `nowhere` (it did)."""
+
     places = {
         'west': (177.4, -17.6),
         'on 180': (180.0, -17.0),
@@ -177,12 +166,12 @@ def test_the_samples_on_both_sides_are_inside_and_the_exclude_keeps_the_rest(reg
         for turns in (0, 1, -1):
             shape = [[lon + 360 * turns, lat] for lon, lat in ACROSS]
             assert await found('geo_polygon', shape) == fiji
-            assert await found('geo_polygon_exclude', shape) == ['far', 'nowhere', 'zero']
+            assert await found('geo_polygon_exclude', shape) == ['far', 'zero']
         # The halves as ordinary polygons hold one side each, as before.
         assert await found('geo_polygon', [[176, -20], [180, -20], [180, -15], [176, -15]]) == ['west']
         wide = [[176, -30], [536, -30], [536, 50], [176, 50]]
         assert await found('geo_polygon', wide) == sorted([*fiji, 'far', 'zero'])
-        assert await found('geo_polygon_exclude', wide) == ['nowhere']
+        assert await found('geo_polygon_exclude', wide) == []
         # Text that reads as a number is that number: "183" is past 180.
         assert await found('geo_polygon', [[str(lon), str(lat)] for lon, lat in ACROSS]) == fiji
 

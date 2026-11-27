@@ -85,6 +85,7 @@ from .. import (
     job_queue,
     job_wait,
     local_writes,
+    negation,
     regions,
     stale_lassos,
     statistics,
@@ -212,16 +213,12 @@ _BUILTIN_ARRAY_COLUMNS = frozenset({'tags'})
 # Classification-list vocabularies follow the discovered shape, including ground_truth/predictions.
 _LABEL_ARRAY_FIELDS = LEGACY_GEOMETRY_FIELDS
 # Equality/membership operators handled by the JSONB-containment fast path for label
-# arrays (`<field>.label` / `segmentation.labels`). Negative ops mean "contains NONE",
-# i.e. NOT(containment); anything outside this set (exists/is_null/comparisons) falls
+# arrays (`<field>.label` / `segmentation.labels`); anything outside this set (exists/is_null/comparisons) falls
 # through to the generic per-element EXISTS handler.
-# Include both 'not in' (the space form the frontend emits for facet/multi-select excludes) and
-# 'not_in'/'nin' so a label exclusion is recognized however it's spelled.
-_LABEL_NEG_OPS = ('!=', '<>', 'not in', 'not_in', 'nin')
-_LABEL_EQ_OPS = ('=', '==', 'in') + _LABEL_NEG_OPS
-# List-valued label ops (value is a list of labels); scalar ops (=, !=) wrap their single value.
-# 'not in' (space) is list-valued like 'in' — omitting it wraps the list and 500s the @> build.
-_LABEL_LIST_OPS = ('in', 'not in', 'not_in', 'nin')
+_LABEL_EQ_OPS = ('=', '==', 'in')
+# The spellings of a negation a list of labels takes: `!=` and `not in`, as every field does, and `<>`, `not_in` and
+# `nin`. Each is the NOT of one of the operators above (backend/negation.py), compiled as a NOT before it gets there.
+_LABEL_NEG_OPS = (*negation.NEGATIONS, *negation.LABEL_NEGATIONS)
 
 
 async def get_dataset_array_columns(dataset_id: int, source=None) -> DatasetArrayColumns:
@@ -4160,13 +4157,14 @@ def _element_predicate_sql(key: str, op: str, val, args: List[Any], arg_idx: int
         args.append([str(v) for v in values])
         sql = f"{base} = ANY(${arg_idx}::text[])"
         return sql, arg_idx + 1
-    if op in ('not_in', 'nin'):
+    if op in ('not in', 'not_in', 'nin'):  # every spelling the filter language and the SDK (F(...).not_in) have
         values = val if isinstance(val, list) else [val]
         if not values:
-            return "TRUE", arg_idx
+            return f"{base} IS NOT NULL", arg_idx
         args.append([str(v) for v in values])
-        # NULL-aware: an element whose key is absent is "not in" the set.
-        sql = f"({base} IS NULL OR NOT ({base} = ANY(${arg_idx}::text[])))"
+        # An element with no value for the key is never "not in" the set, as `!=` (below) never holds for it: the rule
+        # for a missing value (backend/negation.py), within a match_elements condition.
+        sql = f"({base} IS NOT NULL AND NOT ({base} = ANY(${arg_idx}::text[])))"
         return sql, arg_idx + 1
     if op == 'contains':
         args.append(f"%{_escape_like(val)}%")
@@ -4322,11 +4320,11 @@ def _datetime_window(value) -> Optional[tuple[datetime.datetime, datetime.dateti
 
 def _datetime_leaf_sql(field, col, op, val, args, arg_idx, indexed) -> Optional[tuple[str, int]]:
     """A comparison on a field declared datetime, by instant: `=` is the window the value was written to (a whole
-    UTC day for a date), `!=` its complement, `in` any of them, `not in` none, and a range starts or ends where the
-    value's unit does. Every predicate is TRUE or FALSE, never NULL, so a complement includes the samples without a
-    datetime, as `!=` always has. A promoted field is compared through its index. Returns None for comparisons the
-    field makes as any other does: equality with a value that isn't a datetime compares text (a stray "unknown"
-    can still be found), with a JSON number, numbers."""
+    UTC day for a date), `in` any of them, and a range starts or ends where the value's unit does. `!=` and `not in`
+    are their NOT (backend/negation.py): a sample with a value that isn't in the window, a value that isn't a datetime
+    included. A promoted field is compared through its index. Returns None for comparisons the field makes as any
+    other does: equality with a value that isn't a datetime compares text (a stray "unknown" can still be found), with
+    a JSON number, numbers."""
 
     next_idx = arg_idx
 
@@ -4357,13 +4355,12 @@ def _datetime_leaf_sql(field, col, op, val, args, arg_idx, indexed) -> Optional[
             upper=bound(upper) if upper is not None else None,
         )
         return sql, next_idx
-    if op in ('=', '!='):
+    if op == '=':
         window = _datetime_window(val)
         if window is None:
             return None
-        sql = window_sql(col, indexed, lower=bound(window[0]), upper=bound(window[1]))
-        return (sql if op == '=' else f"(NOT {sql})"), next_idx
-    if op in ('in', 'not in'):
+        return window_sql(col, indexed, lower=bound(window[0]), upper=bound(window[1])), next_idx
+    if op == 'in':
         values = val if isinstance(val, list) else [val]
         windows = [window for window in map(_datetime_window, values) if window is not None]
         if not windows:
@@ -4372,8 +4369,7 @@ def _datetime_leaf_sql(field, col, op, val, args, arg_idx, indexed) -> Optional[
         others = [_text_value(value) for value in values if _datetime_window(value) is None]
         if others:
             clauses.append(f"COALESCE({col} = ANY({param(others)}::text[]), FALSE)")
-        sql = f"({' OR '.join(clauses)})"
-        return (sql if op == 'in' else f"(NOT {sql})"), next_idx
+        return f"({' OR '.join(clauses)})", next_idx
     return None
 
 
@@ -4721,169 +4717,9 @@ async def get_promoted_numeric_fields(dataset_id: int, source=None) -> set:
     return {r['field_name'] for r in rows}
 
 
-# Ops that match by their OWN machinery (embeddings, region tokens, parent links, geo) or that
-# legitimately want missing-key rows (is_null / the "(no value)" filter) — a leaf using one
-# never vacuously leaks the whole grain, so the cross-grain presence guard must NOT suppress it.
-_CROSSGRAIN_SKIP_OPS = {
-    'embedding_polygon',
-    'embedding_polygon_exclude',
-    'in_selection',
-    'concept_select',
-    'concept_exclude',
-    'geo_polygon',
-    'geo_polygon_exclude',
-    'geo_near',
-    'geo_region',
-    'geo_region_exclude',
-    'collapse_duplicates',
-    'cg_self',
-    'parent_matches',
-    'has_matching_object',
-    unlinked_objects.OPERATOR,
-    'is_null',
-    'exists',
-    'not_exists',
-}
-# Native columns that exist on every row (no JSONB-presence check needed).
+# Native columns every row has a value for: a test of one needs no value (backend/negation.py), and on a dataset with
+# objects a hiding test of one is answered by the grid's own row (backend/grain_reading.py).
 _CROSSGRAIN_NATIVE_FIELDS = {'id', 'filepath', 'created_at', 'last_modified_at', 'media_type'}
-# All negation operators, however spelled: the frontend emits 'not in' (with a space) for facet /
-# multi-select excludes; the dotted-label/array path also accepts 'not_in'/'nin'.
-_STRICT_NEG_OPS = {'!=', '<>', 'not in', 'not_in', 'nin'}
-
-
-def _top_field(field: str) -> str:
-    """The field a filter leaf's presence depends on: a dotted metadata path's top key, or a whole `@local.` name."""
-    return field if field.startswith(LOCAL_PREFIX) else field.split('.', 1)[0]
-
-
-def _collect_top_meta_fields(node: Dict[str, Any], array_columns: Optional[set] = None) -> set:
-    """Distinct top-level METADATA field names `node` references (excluding native columns and
-    virtual ops). Used to attach a field-presence check to a NOT group."""
-    fields: set = set()
-    arrays = array_columns if array_columns is not None else _get_array_columns_sync()
-
-    def walk(n: Any) -> None:
-        if not isinstance(n, dict):
-            return
-        if 'filters' in n or 'logic' in n:
-            for c in n.get('filters', []):
-                walk(c)
-            return
-        if str(n.get('operator', '=')).lower() in _CROSSGRAIN_SKIP_OPS:
-            return
-        f = n.get('field')
-        if isinstance(f, str):
-            top = _top_field(f)
-            if (
-                top not in _CROSSGRAIN_NATIVE_FIELDS
-                and top not in arrays
-                and top != LOCAL_TAGS
-                and _queryable_field(top)
-            ):
-                fields.add(top)
-
-    walk(node)
-    return fields
-
-
-def _id_text_test(node: Any) -> bool:
-    """`id contains ...`, or an AND / OR of such tests only (the sidebar's several typed terms)."""
-    if not isinstance(node, dict):
-        return False
-    if 'filters' in node or 'logic' in node:
-        children = node.get('filters') or []
-        return (
-            str(node.get('logic', 'AND')).upper() in ('AND', 'OR')
-            and bool(children)
-            and all(map(_id_text_test, children))
-        )
-    return node.get('field') == 'id' and str(node.get('operator', '=')).lower() == 'contains'
-
-
-def _strictify_negations(node: Any, partner: bool = False, array_columns: Optional[set] = None) -> Any:
-    """Transform `node` for use inside the cross-grain link so a NULL-tolerant negation can't
-    vacuously match a row that lacks the field. PER-LEAF (correct even inside an OR — unlike a
-    single whole-filter guard, which a present-key positive in a sibling arm defeats): each
-    metadata negation (!=, not in, not_in, ...) is ANDed with an existence check on ITS OWN
-    field. NATIVE-column exclusions (id/filepath/... — always present, so an exists check can't
-    help) are DROPPED in the partner subquery (`partner=True`): a same-grain row-identity
-    exclusion has no meaning for the cross-grain partner, which would otherwise trivially satisfy
-    it and leak the whole grain (e.g. the duplicates "collapse" id-not-in). In the self branch
-    (`partner=False`) native exclusions are kept (they apply to the same grain). Positive filters,
-    the lasso, selections, and is_null pass through unchanged.
-
-    Returns a filter dict, or a sentinel: True (reduced to no constraint) / False (no match) /
-    None (drop this leaf — a partner-mode native exclusion). Callers handle the sentinels."""
-    if not isinstance(node, dict):
-        return node
-    arrays = array_columns if array_columns is not None else _get_array_columns_sync()
-    if 'filters' in node or 'logic' in node:
-        logic = str(node.get('logic', 'AND')).upper()
-        kids = [_strictify_negations(c, partner, array_columns) for c in node.get('filters', [])]
-        kids = [k for k in kids if k is not None]
-        if logic == 'NOT':
-            # A NOT group (e.g. the sidebar's exclude-contains / exclude-range) is NULL-tolerant
-            # too; if it concerns exactly one metadata field, require that field present.
-            real = [k for k in kids if not isinstance(k, bool)]
-            if not real:
-                return None
-            if partner and all(_id_text_test(k) for k in real):
-                # "id does not contain": a row-identity exclusion like `id != 5`, dropped for the partner (above).
-                return None
-            rebuilt = {'logic': 'NOT', 'filters': real}
-            fields = _collect_top_meta_fields(node, array_columns)
-            if len(fields) == 1:
-                only = next(iter(fields))
-                return {'logic': 'AND', 'filters': [rebuilt, {'field': only, 'operator': 'exists'}]}
-            return rebuilt
-        if logic == 'OR':
-            if any(k is True for k in kids):
-                return True
-            kept = [k for k in kids if k is not False]
-            return {'logic': 'OR', 'filters': kept} if kept else False
-        # AND (and an implicit-AND node carrying `filters` but no explicit logic)
-        if any(k is False for k in kids):
-            return False
-        kept = [k for k in kids if k is not True]
-        return {'logic': 'AND', 'filters': kept} if kept else True
-    op = str(node.get('operator', '=')).lower()
-    f = node.get('field')
-    if op in _STRICT_NEG_OPS and isinstance(f, str):
-        top = _top_field(f)
-        if top in _CROSSGRAIN_NATIVE_FIELDS or top in arrays or top == LOCAL_TAGS:
-            return None if partner else node
-        if _queryable_field(top):
-            return {'logic': 'AND', 'filters': [node, {'field': top, 'operator': 'exists'}]}
-    # Absence ops (is_null / not_exists) are NULL-tolerant the same way: rendered against the
-    # cross-grain PARTNER — the other grain, which lacks the field — they are vacuously TRUE and
-    # leak the whole partner grain (an image-grid "(no value)" filter would match every image that
-    # merely HAS a child object). Drop them from the partner subquery (None → the partner arm
-    # contributes no match), leaving the self branch (the row's own grain) intact. Native columns
-    # exist on both grains, so keep those. (The exists-guard rewrite used for !=/not in would be
-    # contradictory for an absence op, hence a drop.) NOTE: this fixes the partner leak; the
-    # symmetric self case — an image-only field's absence on the OBJECT grid still matching every
-    # object — is a known limitation that needs per-grain field-presence to resolve.
-    if partner and op in ('is_null', 'not_exists') and isinstance(f, str):
-        top = _top_field(f)
-        if top not in _CROSSGRAIN_NATIVE_FIELDS:
-            return None
-    # concept_exclude is a NULL-tolerant negation too (NOT EXISTS a passing score row): on a row
-    # whose grain doesn't OWN this concept's embedding field there is no score row at all, so the
-    # exclude vacuously matches and leaks the whole grain across the cross-grain link. Require the
-    # concept PRESENT (a score row exists for this row) in BOTH branches: the off-grain row — be it
-    # the SELF row (opposite-grain concept on this grid) or the PARTNER row (same-grain concept, so
-    # the partner is off-grain) — then can't vacuously satisfy the NOT EXISTS. When the row's grain
-    # DOES own the concept the presence guard is simply TRUE, so the exclude is unchanged.
-    if op == 'concept_exclude':
-        cval = node.get('value')
-        cfg = cval if isinstance(cval, dict) else {}
-        cid = cfg.get('concept_id')
-        if cid is not None:
-            return {
-                'logic': 'AND',
-                'filters': [node, {'field': '_cpresent', 'operator': 'concept_present', 'value': {'concept_id': cid}}],
-            }
-    return node
 
 
 def _record_name(field: Any, arrays: Any) -> Optional[str]:
@@ -4956,6 +4792,70 @@ def _grid_kind(filters: Any) -> Optional[str]:
     return kinds.pop() if len(kinds) == 1 else None
 
 
+def _scored(concept: Any) -> dict:
+    """The test that a row has a score for the concept (any score: a concept's exclude and a NOT around its show need
+    one, backend/negation.py)."""
+    return {'field': '_cpresent', 'operator': 'concept_present', 'value': {'concept_id': concept}}
+
+
+_PATCH_FIELD = re.compile(r'_patch_\d+x\d+$')  # a patch-scale embedding field (clip_patch_4x4)
+
+
+def _lasso_field_match(field: str, args: List[Any], arg_idx: int) -> tuple[str, int]:
+    """The test of an embedding_coordinates row (`ep`) for a lasso's map: a patch-scale field (clip_patch_4x4) is stored
+    as one row per tile (clip_patch_4x4_r0c0), matched by its prefix; any other field exactly."""
+    if _PATCH_FIELD.search(field):
+        args.append(field + '_%')
+        return f"ep.field_name LIKE ${arg_idx}", arg_idx + 1
+    args.append(field)
+    return f"ep.field_name = ${arg_idx}", arg_idx + 1
+
+
+def _nonempty_list_sql(json: str) -> str:
+    """The JSON value is a list with at least one element (FALSE for no value, a JSON null, anything not a list)."""
+    return f"(CASE WHEN jsonb_typeof({json}) = 'array' THEN jsonb_array_length({json}) > 0 ELSE FALSE END)"
+
+
+def _list_sql(json: str) -> str:
+    """The JSON value is a list, empty or not: TRUE or FALSE, never NULL (FALSE for no key, a JSON null, anything not a
+    list), so a caller may negate it."""
+    return f"(jsonb_typeof({json}) IS NOT DISTINCT FROM 'array')"
+
+
+def _labels_valued_sql(parent: str, key: str) -> str:
+    """A list of labels (`detections.label`: the metadata list `parent`, each element's `key`) has a value, as a NOT
+    needs it: the list is there, and empty or holding a label. A list whose elements have no label at all has none
+    (something was found and what it is isn't known); an empty one does (nothing was found)."""
+    _validate_field_name(parent)
+    _validate_field_name(key)
+    json = f"metadata->'{parent}'"
+    elements = f"(CASE WHEN jsonb_typeof({json}) = 'array' THEN {json} ELSE '[]'::jsonb END)"
+    return (
+        f"({_list_sql(json)} AND (jsonb_array_length({elements}) = 0 OR EXISTS (SELECT 1 FROM "
+        f"jsonb_array_elements({elements}) AS elem WHERE elem->>'{key}' IS NOT NULL)))"
+    )
+
+
+def _elements_sql(field: str) -> str:
+    """The row's field (a metadata key, or a mirror's own `@local.` field) is a list, empty or not: what a NOT around an
+    element match needs (backend/negation.py). The name is checked as the compiler checks it."""
+    try:
+        local = local_field(field)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from None
+    if local is None:
+        _validate_field_name(field)
+    source, key = ('local_metadata', local.name) if local is not None else (_metadata_source(field), field)
+    return _list_sql(f"{source}->'{key}'")
+
+
+def _points_sql(field: str, id_col: str, args: List[Any], arg_idx: int) -> tuple[str, int]:
+    """The row (its id column `id_col`) has a point on the field's embedding map: what an excluded lasso, and a NOT
+    around a lasso, need (backend/negation.py)."""
+    match, arg_idx = _lasso_field_match(field, args, arg_idx)
+    return f"EXISTS (SELECT 1 FROM embedding_coordinates ep WHERE ep.sample_id = {id_col} AND {match})", arg_idx
+
+
 class _GrainRows:
     """The compiler's side of backend/grain_reading.py: the SQL for a row's tests, its objects and an object's image.
     The partners' subqueries are the lone operators' (has_matching_object, parent_matches, below): each an EXISTS
@@ -5020,7 +4920,8 @@ class _GrainRows:
     def _held_name(self, node: Any) -> Optional[str]:
         """The record's name for the field a test never holds without (a row with no such key or location reads NULL
         or FALSE: a comparison, a presence test, a place), else None: a range with no value and a polygon that is
-        none filter nothing, and an exclusion keeps the rows without a location."""
+        none filter nothing, and an exclusion is read as the NOT of its place (grain_reading), or is no polygon and
+        keeps every row."""
         if isinstance(node, dict) and 'field' not in node and str(node.get('logic', 'AND')).upper() == 'AND':
             children = node.get('filters')
             if not isinstance(children, list) or not children:
@@ -5080,26 +4981,78 @@ class _GrainRows:
             return self._skipped(node, row)
         return self._compiled(node, row)
 
-    def has(self, field: str, row: _GrainRow, presence: bool = False) -> str:
-        """The row has a value for the field: there, and not a JSON null. `presence`: for `is null`, where `location` is
-        the sample's own location; otherwise it is a field compared with an operator other than a place's, the
-        metadata field named location. A metadata key's test (`?`) goes first: the same rows, found through the
-        metadata index where few rows have the key."""
+    def has(self, field: str, row: _GrainRow, presence: bool = False, keyed: bool = True) -> str:
+        """The row has a value for the field: there, and not a JSON null; a list (`tags`, a list in a column of its own,
+        `@local.tags`) at least one element, a list of labels (`detections.label`, `segmentation.labels`) at least one
+        label: the rows `is not null` finds. `presence`: for `is null`, where `location` is the sample's own location;
+        otherwise it is a field compared with an operator other than a place's, the metadata field named location. With
+        `keyed`, a metadata key's test (`?`) goes first: the same rows, found through the metadata index where few rows
+        have the key. A NOT read on one row (_compile_not) leaves it out: there the row is a scan's, which the key's
+        test only slows (a count of a NOT over two fields on a million samples: 125 ms with it, 100 without)."""
         if self._skip(self.record_name(field), row):
             return 'FALSE'
         if field == 'location' and not presence:
             return f"({_metadata_source(field)}->>'location' IS NOT NULL)"
-        if field == 'segmentation.labels':
-            field = 'segmentation'
         value = self.test({'field': field, 'operator': 'is_not_null'}, row)
         keyed = (
-            _is_safe_field_name(field)
+            keyed
+            and _is_safe_field_name(field)
             and '.' not in field
             and field not in RESERVED_METADATA_KEYS
             and _derived_field(field) is None
             and self.row_field(field) is None
         )
         return f"({self.test({'field': field, 'operator': 'exists'}, row)} AND {value})" if keyed else value
+
+    def has_need(self, need: negation.Need, row: _GrainRow, keyed: bool = True) -> str:
+        """The row has what a NOT needs (backend/negation.py): a field's value, the sample's own location, a point on an
+        embedding field's map, or a score for a concept. `keyed`: as for `has`."""
+        kind = need[0]
+        if kind == 'value':
+            return self.valued(need[1], row, keyed=keyed)
+        if kind == 'location':
+            return self.has('location', row, presence=True)
+        if kind == 'points':
+            sql, self.arg_idx = _points_sql(need[1], row.id_col, self.args, self.arg_idx)
+            return sql
+        if kind == 'elements':
+            return 'FALSE' if self._skip(self.record_name(need[1]), row) else _elements_sql(need[1])
+        return self.test(_scored(need[1]), row)
+
+    def valued(self, field: str, row: _GrainRow, keyed: bool = True) -> str:
+        """The row has a value for the field, as a NOT needs it (backend/negation.py): `has`, except where an empty list
+        written in a field is a value: a list of labels (`detections.label`) is a list, empty or holding a label, and
+        `segmentation.labels` a list. A list kept in a column of its own (`tags`, `@local.tags`, a registered array
+        field) is `has`'s, at least one element: every sample holds the column, the empty list until one is written, so
+        an empty one can't be told from one never set, and has no value."""
+        if field == 'segmentation.labels':
+            return (
+                'FALSE' if self._skip(self.record_name(field), row) else _list_sql("metadata->'segmentation'->'labels'")
+            )
+        labels = label_path(field, self.arrays)
+        if labels is not None:
+            return 'FALSE' if self._skip(self.record_name(field), row) else _labels_valued_sql(*labels)
+        return self.has(field, row, keyed=keyed)
+
+    def builtin(self, field: Any) -> bool:
+        return self.row_field(field) == 'builtin'
+
+    def filters_nothing(self, node: Any) -> bool:
+        """A test that compares nothing: a range with no value, a place or a lasso whose value is no polygon, a
+        geo_near with no point. It keeps every row or none, whatever the row's values (the compiler's TRUE or FALSE)."""
+        if not isinstance(node, dict) or 'logic' in node or 'filters' in node:
+            return False
+        operator, value = str(node.get('operator', '=')).lower(), node.get('value')
+        if operator in _RANGE_OPS:
+            return value is None or (isinstance(value, str) and not value.strip())
+        if operator in ('geo_polygon', 'geo_polygon_exclude'):
+            return _polygon_points(operator, value) is None
+        if operator == 'geo_near':
+            point = value.get('point') if isinstance(value, dict) else None
+            return not (isinstance(point, (list, tuple)) and len(point) >= 2)
+        if operator in ('embedding_polygon', 'embedding_polygon_exclude'):
+            return not isinstance(value, list) or len(value) < 3
+        return False
 
     def keyed(self, node: Any, row: _GrainRow) -> str:
         """A test asked of a partner row (an image's object, an object's image), with its metadata key's test first: the
@@ -5216,6 +5169,51 @@ def _grain_pairs(filters: Any) -> tuple[list[tuple[str, Any]], Any]:
     return pairs, [node for k, node in enumerate(filters) if k not in used]
 
 
+def _negated_pair(sub_filters: Any) -> Optional[tuple[str, Any]]:
+    """The page's wrapping of a filter B alone under a NOT, `NOT (cg_self(B) OR partner(B))`, as withGrain and the
+    assistant's image_grain write an excluded region: (the grid, B), else None. A NOT with the pair and another part
+    beside it, `NOT (pair(B), C)`, which only a hand-written filter holds, is not taken: it goes to _compile_not, whose
+    needs don't look inside cg_self (B's fields are not needed there)."""
+    if not isinstance(sub_filters, list) or len(sub_filters) != 1:
+        return None
+    only = sub_filters[0]
+    if not isinstance(only, dict) or 'field' in only or str(only.get('logic', '')).upper() != 'OR':
+        return None
+    pairs, rest = _grain_pairs(only.get('filters'))
+    return pairs[0] if len(pairs) == 1 and not rest else None
+
+
+def _compile_not(sub_filters: list, rows: _GrainRows) -> tuple[str, int]:
+    """NOT (X), X the AND of `sub_filters`, read on one row (rows.outer()): the row has a value for everything X
+    compares (backend/negation.py), and X doesn't hold for it (a part that is NULL for the row counts as not holding).
+    Returns (sql, next_arg_idx)."""
+    inner = {'logic': 'AND', 'filters': sub_filters}
+    row, mark = rows.outer(), rows.mark()
+    guards = []
+    for need in negation.needs(inner, rows):
+        sql = rows.has_need(need, row, keyed=False)
+        if sql == 'FALSE':  # skipped for the row's kind (backend/field_kinds.py): no row of that kind has a value
+            rows.rollback(mark)
+            return rows._skipped(inner, row), rows.arg_idx
+        guards.append(sql)
+    child_sqls = []
+    for child in sub_filters:
+        sql, rows.arg_idx = _compile_filter_node(
+            child,
+            rows.args,
+            rows.arg_idx,
+            rows.field_mapping,
+            rows.numeric_indexed_fields,
+            rows.dataset_id,
+            array_columns=rows.array_columns,
+            concepts=rows.concepts,
+            outer_kind=rows.outer_kind,
+        )
+        child_sqls.append(sql)
+    negated = f"NOT (COALESCE({' AND '.join(child_sqls)}, FALSE))"
+    return (f"({' AND '.join([*guards, negated])})" if guards else negated), rows.arg_idx
+
+
 def _filter_concept_ids(node: Any) -> set:
     """Concept ids a filter tree names, including cross-grain sub-filters, for the sidebar's up-front
     check. A compiled filter is guarded by the ids its compiler collects, not by this walk."""
@@ -5301,10 +5299,10 @@ def _region_leaf(
     join: Optional[tuple[str, Optional[int]]] = None,
 ) -> tuple[str, int]:
     """A geo_region / geo_region_exclude leaf: its value is a region's key (backend/regions.py), in any case. A key
-    no loaded set has is a 400, never a filter that matches nothing. Exclude removes what is inside and keeps
-    everything else, samples with no location included, as geo_polygon_exclude does. `join` (the id column and the
-    dataset) tests an exclude ANDed at the top of a statement on the samples table as an anti-join from the region's
-    pieces; any other leaf tests the row's own location."""
+    no loaded set has is a 400, never a filter that matches nothing. Exclude is the NOT of the region
+    (backend/negation.py): a sample with a location, not inside, as geo_polygon_exclude is. `join` (the id column and
+    the dataset) tests an exclude ANDed at the top of a statement on the samples table as an anti-join from the
+    region's pieces; any other leaf tests the row's own location."""
     op, field, val = str(node.get('operator')).lower(), node.get('field'), node.get('value')
     if field != 'location':
         raise HTTPException(status_code=400, detail=f"{op} applies to the field 'location', not {field!r}")
@@ -5314,9 +5312,9 @@ def _region_leaf(
     key = f'${arg_idx}'
     if join is not None:
         inside = regions.joined_inside_sql(key, *join)
-        return (f'NOT {inside}' if op == 'geo_region_exclude' else inside), arg_idx + 1
+        return (f'(location IS NOT NULL AND NOT {inside})' if op == 'geo_region_exclude' else inside), arg_idx + 1
     inside = regions.row_inside_sql(key)
-    return (f'(location IS NULL OR NOT {inside})' if op == 'geo_region_exclude' else inside), arg_idx + 1
+    return (f'(location IS NOT NULL AND NOT {inside})' if op == 'geo_region_exclude' else inside), arg_idx + 1
 
 
 # The widest polygon across the antimeridian a filter takes, in turns of the globe (_polygon_across_leaf). It is tested
@@ -5403,9 +5401,10 @@ def _polygon_across_leaf(
 
     A shape on one copy only (370 to 380) is the statement a polygon within -180 to 180 makes, on that copy. Of two or
     more, the include tests each on its own, each a search of the location index (a BitmapOr): about two searches where
-    a polygon that doesn't cross costs one. The exclude, which no index serves, removes exactly what the include holds
-    and keeps samples with no location. Of a shape narrower than 360 degrees, whose two copies are apart, it tests them
-    as one MULTIPOLYGON, one test a sample as for any polygon, behind a test of the copies' boxes, so PostgreSQL counts
+    a polygon that doesn't cross costs one. The exclude, which no index serves, is the include's NOT: a sample with a
+    location that the include doesn't hold (backend/negation.py). Of a shape narrower than 360 degrees, whose two
+    copies are apart, it tests them as one MULTIPOLYGON, one test a sample as for any polygon, behind a test of the
+    copies' boxes, so PostgreSQL counts
     on the samples in the copies and not the band between them. On a million samples, the plain NOT of the include's
     two tests, or the MULTIPOLYGON alone, made it plan the grid's first page in parallel: 13 to 15 ms instead of 0.3.
     Wider copies overlap or touch, which makes no valid MULTIPOLYGON: the exclude of a wider shape is the include's
@@ -5432,12 +5431,12 @@ def _polygon_across_leaf(
         '((' + ', '.join(f'{lon - 360.0 * k!r} {lat!r}' for lon, lat in ring) + '))' for k in range(first, last + 1)
     ]
     if not copies:  # no width, on the antimeridian of another world copy (540): nothing is inside it
-        return ('TRUE' if op == 'geo_polygon_exclude' else 'FALSE'), arg_idx
+        return ('location IS NOT NULL' if op == 'geo_polygon_exclude' else 'FALSE'), arg_idx
     exclude = op == 'geo_polygon_exclude'
     if len(copies) == 1:
         args.append(f'POLYGON{copies[0]}')
         within = f"ST_Within(location, ST_GeomFromText(${arg_idx}, 4326))"
-        return (f"(location IS NULL OR NOT {within})" if exclude else within), arg_idx + 1
+        return (f"(location IS NOT NULL AND NOT {within})" if exclude else within), arg_idx + 1
     tests, boxes = [], []
     for copy in copies:
         args.append(f'POLYGON{copy}')
@@ -5447,9 +5446,9 @@ def _polygon_across_leaf(
     if exclude and east - west < 360.0:
         args.append(f"MULTIPOLYGON({', '.join(copies)})")
         whole = f"ST_Within(location, ST_GeomFromText(${arg_idx}, 4326))"
-        return f"(location IS NULL OR NOT ({' OR '.join(boxes)}) OR NOT {whole})", arg_idx + 1
+        return f"(location IS NOT NULL AND (NOT ({' OR '.join(boxes)}) OR NOT {whole}))", arg_idx + 1
     inside = f"({' OR '.join(tests)})"
-    return (f"(location IS NULL OR NOT {inside})" if exclude else inside), arg_idx
+    return (f"(location IS NOT NULL AND NOT {inside})" if exclude else inside), arg_idx
 
 
 # The `field_mapping` every caller that queries `FROM samples s JOIN ...` must pass.
@@ -5622,11 +5621,33 @@ def _compile_filter_node(
         if logic == 'NOT':
             if not sub_filters:
                 return "TRUE", arg_idx
-
-            child_sqls = []
-            for f in sub_filters:
-                sql, arg_idx = _compile_filter_node(
-                    f,
+            rows = _GrainRows(
+                args,
+                arg_idx,
+                field_mapping,
+                numeric_indexed_fields,
+                dataset_id,
+                array_columns,
+                concepts,
+                outer_kind,
+            )
+            pair = _negated_pair(sub_filters)
+            if pair is not None:
+                # NOT around the page's wrapping alone (an excluded region, withGrain): the row as a whole has a value
+                # for what the wrapped filter compares, and the filter, read for it, doesn't hold
+                # (backend/grain_reading.py).
+                grid, base = pair
+                sql = grain_reading.read_not(base, grid, rows)
+                return sql, rows.arg_idx
+            lone = sub_filters[0] if len(sub_filters) == 1 and isinstance(sub_filters[0], dict) else {}
+            while ('logic' in lone or 'filters' in lone) and str(lone.get('logic', 'AND')).upper() == 'AND':
+                inner = lone.get('filters')  # through AND groups of one rule, as the page's soleRule reads them
+                lone = inner[0] if isinstance(inner, list) and len(inner) == 1 and isinstance(inner[0], dict) else {}
+            if str(lone.get('operator', '')).lower() == 'embedding_polygon':
+                # NOT around a lasso alone is the excluded lasso (the same rows), whose one probe keeps the plan:
+                # a guard beside NOT (EXISTS ...) can turn the count into a probe per point.
+                return _compile_filter_node(
+                    {**lone, 'operator': 'embedding_polygon_exclude'},
                     args,
                     arg_idx,
                     field_mapping,
@@ -5636,18 +5657,13 @@ def _compile_filter_node(
                     concepts=concepts,
                     outer_kind=outer_kind,
                 )
-                child_sqls.append(sql)
-
-            combined = " AND ".join(child_sqls)
-            # COALESCE→FALSE so a child that is NULL for missing-key rows still
-            # falls into the NOT complement, consistent with != / not in.
-            return f"NOT (COALESCE({combined}, FALSE))", arg_idx
+            return _compile_not(sub_filters, rows)
 
         else:  # AND / OR
             if not sub_filters:
                 return "TRUE", arg_idx
 
-            child_sqls = []
+            child_sqls: list[str] = []
             if logic == 'AND':
                 sub_filters, child_sqls, arg_idx = _merge_datetime_ranges(
                     sub_filters,
@@ -5760,19 +5776,18 @@ def _compile_filter_node(
             args.append(int(cid))
             args.append(threshold)
             concepts.add(int(cid))
-            # No guard in here: parse_filter_node puts one for every concept in front of the whole filter.
-            inner = (
-                f"SELECT 1 FROM embedding_concept_scores _cs "
+            # No guard in here: parse_filter_node puts one for every concept in front of the whole filter. The exclude
+            # is the NOT of the show with the score as the value (backend/negation.py): the sample has a score, and it
+            # doesn't pass. A sample has at most one score per concept (its key), never NULL, so that is one row's test.
+            passes = f"_cs.score {cmp} ${arg_idx + 1}"
+            return (
+                f"EXISTS (SELECT 1 FROM embedding_concept_scores _cs "
                 f"WHERE _cs.sample_id = {id_col} AND _cs.concept_id = ${arg_idx} "
-                f"AND _cs.score {cmp} ${arg_idx + 1}"
-            )
-            exists = f"EXISTS ({inner})" if op == 'concept_select' else f"NOT EXISTS ({inner})"
-            return exists, arg_idx + 2
+                f"AND {passes if op == 'concept_select' else f'NOT ({passes})'})"
+            ), arg_idx + 2
 
-        # Presence-only concept guard (internal; emitted by _strictify_negations for the cross-grain
-        # SELF branch). Does THIS row have ANY score for the concept? Pairs with concept_exclude so a
-        # row whose grain doesn't own the concept's embedding field (and thus has no score rows)
-        # can't vacuously satisfy the NOT EXISTS and leak the whole grain.
+        # Does THIS row have ANY score for the concept? What a NOT around a concept's test needs (backend/negation.py,
+        # _scored); internal, never written by the filter text.
         if op == 'concept_present':
             cfg = val if isinstance(val, dict) else {}
             cid = cfg.get('concept_id')
@@ -5802,20 +5817,15 @@ def _compile_filter_node(
         # it (field-stats, map, selection_token), args[0] — every dataset-scoped query seeds args
         # with [dataset_id], so args[0] is reliably it. Without either, an image's objects are
         # found by its own dataset_id, still one probe of (dataset_id, parent_id).
-        # cg_self: the cross-grain link's SAME-grain branch — render the sub-filter (with each
-        # negation strictified PER-LEAF so an exclusion on a metadata field this grain LACKS can't
-        # vacuously match every row, the whole-grain leak) against the current row. Positive
-        # filters, the lasso, selections, and is_null pass through _strictify_negations unchanged.
+        # Paired (cg_self with has_matching_object or parent_matches, the page's wrapping), they are read together by
+        # backend/grain_reading.py, above. Standing alone, each reads its sub-filter on one row, by the same rule as any
+        # filter (a negation needs a value, backend/negation.py): cg_self on the current row, has_matching_object on an
+        # image's objects, parent_matches on an object's image.
         if op == 'cg_self':
             if not isinstance(val, dict):
                 return "TRUE", arg_idx
-            strict = _strictify_negations(val, partner=False, array_columns=array_columns)
-            if strict is False:
-                return "FALSE", arg_idx
-            if not isinstance(strict, dict):  # True / None -> no constraint on the same-grain row
-                return "TRUE", arg_idx
             sub_sql, arg_idx = _compile_filter_node(
-                strict,
+                val,
                 args,
                 arg_idx,
                 field_mapping,
@@ -5829,11 +5839,8 @@ def _compile_filter_node(
         if op in ('parent_matches', 'has_matching_object'):
             if not isinstance(val, dict):
                 return "TRUE", arg_idx
-            # Strictify for the PARTNER: drops same-grain-only (native id/filepath) exclusions that
-            # have no cross-grain meaning. If nothing partner-meaningful remains, no partner matches.
-            strict = _strictify_negations(val, partner=True, array_columns=array_columns)
-            if not isinstance(strict, dict):
-                return "FALSE", arg_idx
+            if not val.get('filters') and 'field' not in val:
+                return "FALSE", arg_idx  # an empty sub-filter asks nothing of a partner: no partner matches
             ds = dataset_id if dataset_id is not None else (args[0] if args and isinstance(args[0], int) else None)
             id_col = (field_mapping or {}).get('id', 'samples.id')
             outer_tbl = id_col.rsplit('.', 1)[0] if '.' in id_col else 'samples'
@@ -5849,7 +5856,7 @@ def _compile_filter_node(
                 # IMAGE row matches if its id is the parent of an object satisfying the sub-filter.
                 sub_map = {**_realiased(field_mapping, 'o'), 'id': 'o.id'}
                 sub_sql, arg_idx = _compile_filter_node(
-                    strict,
+                    val,
                     args,
                     arg_idx,
                     sub_map,
@@ -5859,7 +5866,7 @@ def _compile_filter_node(
                     concepts=concepts,
                 )
                 scope = int(ds) if ds is not None else f"{outer_tbl}.dataset_id"
-                ids = _id_list_bound(strict)
+                ids = _id_list_bound(val)
                 if ds is None or ids is None or len(ids) > _IMAGES_OF_LISTED_OBJECTS_MAX:
                     return (
                         f"EXISTS (SELECT 1 FROM samples o WHERE o.dataset_id = {scope} AND o.parent_id = {id_col} "
@@ -5878,7 +5885,7 @@ def _compile_filter_node(
             ds_scope = f"s2.dataset_id = {int(ds)} AND " if ds is not None else ""
             sub_map = {**_realiased(field_mapping, 's2'), 'id': 's2.id'}
             sub_sql, arg_idx = _compile_filter_node(
-                strict,
+                val,
                 args,
                 arg_idx,
                 sub_map,
@@ -5900,7 +5907,7 @@ def _compile_filter_node(
             # NULL: an unlinked object's NULL = ANY(...) is ANDed with its FALSE EXISTS. The list is a constant, so
             # a plan that still reads every object looks it up in a hash table. has_matching_object can't say its
             # images without a sub-query, and an array from one is searched element by element on every row.
-            ids = _id_list_bound(strict)
+            ids = _id_list_bound(val)
             if ids is None:
                 return link, arg_idx
             args.append(ids)
@@ -5921,6 +5928,26 @@ def _compile_filter_node(
         json_source, json_key = (
             ('local_metadata', local.name) if local is not None else (_metadata_source(field), field)
         )
+
+        # A negation of a field is the NOT of its comparison (backend/negation.py): `f != v` is NOT (f = v), `f not in`
+        # NOT (f in), and so shows only the rows that have a value for `f`. On a list of labels `<>`, `not_in` and `nin`
+        # are taken too. The built-in columns every row has keep their own SQL below.
+        labels = field == 'segmentation.labels' or bool(label_path(field, array_columns))
+        if op in (_LABEL_NEG_OPS if labels else negation.NEGATIONS) and not (
+            field in ('id', 'filepath', 'media_type', *_NATIVE_TIMESTAMPS) or (field_mapping and field in field_mapping)
+        ):
+            positive = negation.NEGATIONS.get(op) or negation.LABEL_NEGATIONS[op]
+            return _compile_filter_node(
+                {'logic': 'NOT', 'filters': [{**node, 'operator': positive}]},
+                args,
+                arg_idx,
+                field_mapping,
+                numeric_indexed_fields,
+                dataset_id,
+                array_columns=array_columns,
+                concepts=concepts,
+                outer_kind=outer_kind,
+            )
 
         # Derived fields: an embedding or hash (rows in their own tables, not metadata keys) or the
         # location, named `embeddings.<field>` / `hashes.<field>` / `location`. They answer presence
@@ -5993,17 +6020,14 @@ def _compile_filter_node(
             and all(isinstance(item, str) for item in (val if isinstance(val, list) else [val]))
         ):
             # JSONB containment avoids expanding each object: metadata->'detections' @> [{"label": V}].
-            # =/in -> contains ANY of the values; !=/not_in -> contains NONE of them
-            # (NULL-aware via coalesce, so a sample with no detections joins the negative
-            # set). Other operators (exists/is_null/comparison) are NOT matched here and
-            # fall through to the generic dotted handler below.
+            # =/in -> contains ANY of the values. Other operators (exists/is_null/comparison) are NOT matched
+            # here and fall through to the generic dotted handler below.
             parent = field.rsplit('.', 1)[0]
-            negate = op in _LABEL_NEG_OPS
-            values = val if op in _LABEL_LIST_OPS else [val]
+            values = val if op == 'in' else [val]
             if not isinstance(values, list):
                 values = [values]
             if not values:
-                return ("TRUE" if negate else "FALSE"), arg_idx
+                return "FALSE", arg_idx
             or_clauses = []
             for v in values:
                 args.append(v)
@@ -6011,47 +6035,42 @@ def _compile_filter_node(
                     f"coalesce(metadata->'{parent}','[]'::jsonb) @> jsonb_build_array(jsonb_build_object('label', ${arg_idx}::text))",  # noqa: E501
                 )
                 arg_idx += 1
-            inner = f"({' OR '.join(or_clauses)})"
-            return (f"(NOT {inner})" if negate else inner), arg_idx
+            return f"({' OR '.join(or_clauses)})", arg_idx
 
         elif field == 'segmentation.labels':
             # metadata->'segmentation'->'labels' is a string array ["a","b"]; `?` tests
-            # array membership. =/in -> contains ANY; !=/not_in -> contains NONE (NULL-aware).
-            negate = op in _LABEL_NEG_OPS
-            values = val if op in _LABEL_LIST_OPS else [val]
+            # array membership. =/in -> contains ANY. `is not null`: at least one label; `is null`: none (no
+            # segmentation, no list, an empty list), the rows a negation of the labels doesn't show.
+            labels_json = "metadata->'segmentation'->'labels'"
+            if op in ('is_null', 'is_not_null'):
+                some = _nonempty_list_sql(labels_json)
+                return (some if op == 'is_not_null' else f"NOT {some}"), arg_idx
+            values = val if op == 'in' else [val]
             if not isinstance(values, list):
                 values = [values]
             if not values:
-                return ("TRUE" if negate else "FALSE"), arg_idx
+                return "FALSE", arg_idx
             or_clauses = []
             for v in values:
                 args.append(v)
-                or_clauses.append(f"coalesce(metadata->'segmentation'->'labels','[]'::jsonb) ? ${arg_idx}::text")
+                or_clauses.append(f"coalesce({labels_json},'[]'::jsonb) ? ${arg_idx}::text")
                 arg_idx += 1
-            inner = f"({' OR '.join(or_clauses)})"
-            return (f"(NOT {inner})" if negate else inner), arg_idx
+            return f"({' OR '.join(or_clauses)})", arg_idx
 
         elif label_path(field, array_columns):
             # Dotted per-object convenience, e.g. "detections.confidence" > 0.9 or
             # "ground_truth.label" = "car": EXISTS over the array with a predicate on the
-            # element key. Negative ops (!=/not_in) mean the sample contains NO matching
-            # element -> NOT EXISTS(positive predicate), so a sample without the field is
-            # included (NULL-aware), matching the @> handlers above.
+            # element key. `is null` is the list's: no element has a value for the key (no list, an empty list, or
+            # elements without it), the rows a negation of it doesn't show; `is not null` at least one element has one.
             arr, sub = field.rsplit('.', 1)
-            negate = op in _LABEL_NEG_OPS
-            # Every spelling in _LABEL_NEG_OPS must map to its positive form. 'not in' (with the
-            # space) is the one the FRONTEND actually emits for facet / multi-select excludes
-            # (filter-utils.ts) and for histogram double-click-to-exclude; omitting it meant it
-            # reached _element_predicate_sql unmapped and raised HTTP 400 on ground_truth.label /
-            # predictions.label while detections.label (its own @> branch above) worked fine.
-            pos_op = {'!=': '=', '<>': '=', 'not in': 'in', 'not_in': 'in', 'nin': 'in'}.get(op, op)
-            inner, arg_idx = _element_predicate_sql(sub, pos_op, val, args, arg_idx)
+            absent = op == 'is_null'
+            inner, arg_idx = _element_predicate_sql(sub, 'is_not_null' if absent else op, val, args, arg_idx)
             exists = (
                 f"EXISTS (SELECT 1 FROM jsonb_array_elements("
                 f"CASE WHEN jsonb_typeof(metadata->'{arr}') = 'array' "
                 f"THEN metadata->'{arr}' ELSE '[]'::jsonb END) AS elem WHERE {inner})"
             )
-            return (f"(NOT {exists})" if negate else exists), arg_idx
+            return (f"(NOT {exists})" if absent else exists), arg_idx
 
         else:
             # Metadata field
@@ -6086,9 +6105,9 @@ def _compile_filter_node(
                 return compiled
 
         # A date / datetime given to day, minute or second precision means that whole unit
-        #: `=` is the unit, `!=` its complement, `<=` ends where the next unit
+        #: `=` is the unit (`!=` is its NOT, above), `<=` ends where the next unit
         # starts and `>` starts there. (`>=` and `<` are already right at the unit's start.)
-        if op in ('=', '!=', '<=', '>') and not is_array and field not in ('id', 'media_type', 'filepath'):
+        if op in ('=', '<=', '>') and not is_array and field not in ('id', 'media_type', 'filepath'):
             window = _iso_unit_window(val)
             if window is not None:
                 lo, hi = window
@@ -6102,8 +6121,7 @@ def _compile_filter_node(
                     args.append(bounds[1])
                     return f"{col} >= ${arg_idx}", arg_idx + 1
                 args.extend(bounds)
-                in_unit = f"({col} >= ${arg_idx} AND {col} < ${arg_idx + 1})"
-                return (in_unit if op == '=' else f"({col} IS NULL OR NOT {in_unit})"), arg_idx + 2
+                return f"({col} >= ${arg_idx} AND {col} < ${arg_idx + 1})", arg_idx + 2
 
         # created_at is timestamptz; coerce string values to datetime so asyncpg binds
         # them as timestamps (a raw string param errors: `timestamp = text`). Applies to
@@ -6146,25 +6164,10 @@ def _compile_filter_node(
                 return f"{col} = ${arg_idx}", arg_idx + 1
 
         elif op == '!=':
-            if is_array:
-                args.append(val)
-                # Include rows with no/empty array value in the complement.
-                return f"(NOT (${arg_idx} = ANY({arr})) OR {arr} IS NULL)", arg_idx + 1
-            elif field in ['id', *_NATIVE_TIMESTAMPS]:
-                # Native typed columns — bind as-is (int / coerced datetime). _text_value
-                # would stringify and break `integer/timestamp IS DISTINCT FROM text`.
-                args.append(val)
-                return f"{col} IS DISTINCT FROM ${arg_idx}", arg_idx + 1
-            elif field in ['media_type', 'filepath']:
-                args.append(str(val))
-                return f"{col} IS DISTINCT FROM ${arg_idx}", arg_idx + 1
-            # IS DISTINCT FROM so rows missing the field (NULL) are part of the
-            # complement; _text_value handles booleans.
-            num = _equality_number(val, numeric_strings)
-            if num is not None:  # numeric, as for `=`; non-numeric rows are NULL here -> included
-                args.append(num)
-                return f"{numeric_col} IS DISTINCT FROM ${arg_idx}", arg_idx + 1
-            args.append(_text_value(val))
+            # Only a built-in column gets here: a negation of any other field is the NOT of its comparison (above).
+            # Native typed columns bind as-is (int / coerced datetime): _text_value would stringify and break
+            # `integer/timestamp IS DISTINCT FROM text`.
+            args.append(val if field in ['id', *_NATIVE_TIMESTAMPS] else str(val))
             return f"{col} IS DISTINCT FROM ${arg_idx}", arg_idx + 1
 
         elif op in ('>', '>=', '<', '<='):
@@ -6250,28 +6253,11 @@ def _compile_filter_node(
                 return f"{col} = ANY(${arg_idx}::text[])", arg_idx + 1
 
         elif op == 'not in':
-            if not isinstance(val, list):
-                val = [val]
-            if is_array:
-                args.append(val)
-                # Include rows with no/empty array value in the complement.
-                return f"(NOT ({arr} && ${arg_idx}::text[]) OR {arr} IS NULL)", arg_idx + 1
-            elif field in ['media_type', 'filepath', 'id', *_NATIVE_TIMESTAMPS]:
-                # Native columns — compare WITHOUT the ::text[] cast, mirroring `in`
-                # above. id is integer / created_at is timestamp; a text[] cast here
-                # produced `integer = text` and broke every `id not in [...]` (e.g.
-                # excluding a selection). NULL-aware so missing rows join the complement.
-                args.append(val)
-                return f"({col} IS NULL OR NOT ({col} = ANY(${arg_idx})))", arg_idx + 1
-            # NULL-aware + text-typed to mirror `in`: rows missing the field are
-            # part of the complement; _text_value handles booleans.
-            nums = [_equality_number(v, numeric_strings) for v in val]
-            if val and all(n is not None for n in nums):  # numeric, as for `in`
-                args.append(nums)
-                return f"({numeric_col} IS NULL OR NOT ({numeric_col} = ANY(${arg_idx}::float8[])))", arg_idx + 1
-            str_vals = [_text_value(v) for v in val]
-            args.append(str_vals)
-            return f"({col} IS NULL OR NOT ({col} = ANY(${arg_idx}::text[])))", arg_idx + 1
+            # Only a built-in column gets here: a negation of any other field is the NOT of its comparison (above).
+            # Compared WITHOUT the ::text[] cast, mirroring `in` above: id is integer / created_at is timestamp, and a
+            # text[] cast here produced `integer = text` and broke every `id not in [...]` (e.g. excluding a selection).
+            args.append(val if isinstance(val, list) else [val])
+            return f"({col} IS NULL OR NOT ({col} = ANY(${arg_idx})))", arg_idx + 1
 
         elif op == 'is_null':
             if is_array:
@@ -6333,11 +6319,11 @@ def _compile_filter_node(
 
             wkt = f"POLYGON(({coords}))"
             args.append(wkt)
-            # Include path uses ST_Within (spatial index). Exclude removes what is inside and keeps everything
-            # else, samples with no location included (NOT ST_Within alone is NULL for them, which drops them).
+            # Include path uses ST_Within (spatial index). Exclude is its NOT (backend/negation.py): a sample with a
+            # location, not inside.
             if op == 'geo_polygon_exclude':
                 return (
-                    f"(location IS NULL OR NOT ST_Within(location, ST_GeomFromText(${arg_idx}, 4326)))",
+                    f"(location IS NOT NULL AND NOT ST_Within(location, ST_GeomFromText(${arg_idx}, 4326)))",
                     arg_idx + 1,
                 )
             return f"ST_Within(location, ST_GeomFromText(${arg_idx}, 4326))", arg_idx + 1
@@ -6411,15 +6397,9 @@ def _compile_filter_node(
             layout = node.get('layout_id')
             if layout is not None and (not isinstance(layout, str) or len(layout) > 64):
                 raise HTTPException(status_code=400, detail="embedding_polygon layout_id must be a string or null")
-            if re.search(r'_patch_\d+x\d+$', field):
-                args.append(field + '_%')
-                field_match = f"ep.field_name LIKE ${arg_idx}"
-            else:
-                args.append(field)
-                field_match = f"ep.field_name = ${arg_idx}"
-            arg_idx += 1
-            bbox = (
-                f"AND ep.x BETWEEN {min(xs)} AND {max(xs)} AND ep.y BETWEEN {min(ys)} AND {max(ys)} "  # bbox pre-filter (index)  # noqa: E501
+            field_match, arg_idx = _lasso_field_match(field, args, arg_idx)
+            in_polygon = (
+                f"ep.x BETWEEN {min(xs)} AND {max(xs)} AND ep.y BETWEEN {min(ys)} AND {max(ys)} "  # bbox pre-filter (index)  # noqa: E501
                 f"AND ST_Contains(ST_GeomFromText('{wkt}', 0), ST_SetSRID(ST_MakePoint(ep.x, ep.y), 0))"
             )
             # Match samples whose embedding point for `field` is inside the polygon. This
@@ -6429,13 +6409,20 @@ def _compile_filter_node(
             # is NOT duplicated here.
             inside = (
                 f"EXISTS (SELECT 1 FROM embedding_coordinates ep WHERE ep.sample_id = {outer_id} "
-                f"AND {field_match} AND ep.x IS NOT NULL {bbox})"
+                f"AND {field_match} AND ep.x IS NOT NULL AND {in_polygon})"
             )
             if op == 'embedding_polygon_exclude':
-                # Exclude removes what is inside the polygon and keeps everything else, samples with no point on
-                # this map included (as geo_polygon_exclude keeps samples with no location). The inside test keeps
-                # its bbox index.
-                return f"(NOT {inside})", arg_idx
+                # Exclude is the NOT of the lasso (backend/negation.py): a sample with a point on this map, none of
+                # its points inside (as geo_polygon_exclude needs a location). A whole-image or object field has one
+                # point per sample (the table's key is the sample and the field), so that is one probe: its point,
+                # outside the polygon. A patch-scale field has a point per tile: one of them, and none inside.
+                if not _PATCH_FIELD.search(field):
+                    return (
+                        f"EXISTS (SELECT 1 FROM embedding_coordinates ep WHERE ep.sample_id = {outer_id} "
+                        f"AND {field_match} AND NOT ({in_polygon}))"
+                    ), arg_idx
+                has_point, arg_idx = _points_sql(field, outer_id, args, arg_idx)
+                return f"({has_point} AND NOT {inside})", arg_idx
             return inside, arg_idx
 
         else:

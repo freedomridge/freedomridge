@@ -56,7 +56,7 @@ A query is an AND of parts. In the SDK and the API, each top-level `AND` part be
 | `between A and B` | `>= A` and `<= B`, as one part | numbers, dates |
 | `contains "x"` (also `like "%x%"`) | case-insensitive substring | text, lists, `id` |
 | `exists`, `not exists` | the field is present, or absent | all |
-| `is null`, `is not null` | no value (absent or null), or a value | all |
+| `is null`, `is not null` | no value (absent or null; for `tags`, a list field kept in a column of its own, `@local.tags` and a list of labels such as `detections.label`, an empty list too), or a value | all |
 
 `id contains "12"` keeps the samples whose id, written in decimal, contains `12` (12, 112, 1203, ...), and
 `NOT (id contains "12")` every other sample. Text that isn't digits matches no sample.
@@ -66,10 +66,40 @@ starts a [concept part](#concept-scores): followed by a name (quoted, or a plain
 followed by an operator it is a field named concept. `within` counts as an operator there, so `concept within "US-KS"`
 is the [region form](#regions)'s mistake (`within` applies only to `location`).
 
-A negation of a field (`!=`, `not in`, or a `NOT` around one field's tests) keeps the samples with another value. On
-a dataset without objects it keeps the samples without the field too: `split != "train"` keeps the samples that have
-no `split`. On a dataset with objects it keeps only the samples that have the field, and a `NOT` around tests of
-several fields only those that have every one of them ([below](#on-a-dataset-with-objects)).
+**A sample with no value for a field never matches a comparison of that field, and never matches the `NOT` of one.**
+Only `is null` and `not exists` find it. So a negation of a field (`!=`, `not in`, or a `NOT` around the field's
+tests) keeps only the samples that have the field, with another value: `split != "train"` keeps the samples whose
+`split` is something else, and not those that have no `split`. A `NOT` around tests of several fields keeps only the
+samples that have every one of them. This is one rule for every dataset, with objects or without
+([below](#on-a-dataset-with-objects) for how a dataset with objects asks it), and for every reader: the app, the SDK,
+the API and the assistant.
+
+- **A value is there and isn't `null`, and an empty list written in a field is a value**: it says the list was looked
+  at and holds nothing. A list kept in a column of its own (`tags`, a mirror's `@local.tags`, and a list field a
+  dataset adds) has a value when it has at least one element: every sample holds the column, the empty list until
+  one is written, so its empty list can't be told from one never set. So `tags not in (rejected)` keeps the samples
+  that have a tag, none of them `rejected`. A list of labels (`detections.label`) has a value when the list is there
+  and is empty or holds a label: `detections.label != "car"` keeps the samples whose detections hold no car, an empty
+  list among them, but not those whose detections have no label at all (something was found, and what it is isn't
+  known), nor those with no `detections`. A `NOT` around an element match (`match_elements`, the SDK's
+  `match_elements("detections", ...)`) keeps the samples whose field is a list, empty or not, none of whose elements
+  meets the condition (an element without the keys the condition reads counts, and never meets it).
+  `detections.label is null` asks what the list holds: the samples with no label in it (no list, an empty list, or
+  detections without a label). `detections is null` asks for the field, and doesn't find a sample whose
+  `detections` is `[]`.
+- **A value of another kind is a value.** `n != 2` keeps a sample whose `n` is the text `"abc"`, and `colour != "red"`
+  one whose `colour` is the number `7`.
+- **Inside a `NOT`, an absence test adds no field**: `NOT (score < 0.2 OR note exists)` needs a `score`, not a `note`.
+- **A place, a lasso and a concept follow it too.** `location not within R` (and a map region or a drawn polygon
+  excluded, and `NOT (location within R)`) keeps the samples that have a location outside R; a lasso excluded the
+  samples that have a point on that map, none inside; `not concept "x" > 0.62` the samples that have a score, at or
+  below 0.62.
+- **The samples with no value are written out when they are wanted**: `split != "train" OR split is null`,
+  `tags not in (rejected) OR tags is null`, `location not within "US-KS" OR location is null`.
+- The built-in fields every sample has (`id`, `filepath`, `media_type`, `created_at`, `last_modified_at`) always have
+  a value, so `id not in (...)` keeps every other sample.
+
+A saved view, a link or a script keeps its filter and reads it by this rule.
 
 ## Concept scores
 
@@ -78,10 +108,11 @@ samples by that score, as the Concepts panel's **show only** and **exclude** do:
 
 - `concept "equipment" > 0.62` keeps the samples whose score for the dataset's concept named `equipment` passes the
   comparison: `>`, `>=`, `<` or `<=`.
-- `not concept "equipment" > 0.62` hides them and keeps the rest, as the panel's exclude does. On a dataset without
-  objects the rest includes the samples the concept has no score for; on a dataset with objects it is only the
-  samples that have a score, here those at or below 0.62 ([below](#on-a-dataset-with-objects)).
-  `NOT (concept "equipment" > 0.62)` is the same filter. A `NOT` around more than the one concept part, such as
+- `not concept "equipment" > 0.62` hides them, as the panel's exclude does, and keeps only the samples that have a
+  score, here those at or below 0.62, on every dataset, with objects or without
+  ([negation](#operators); [below](#on-a-dataset-with-objects)). A sample the concept has not scored yet (one added
+  since its scores were last computed) is hidden too until it is scored. `NOT (concept "equipment" > 0.62)` is the
+  same filter. A `NOT` around more than the one concept part, such as
   `NOT (concept "equipment" > 0.62 AND split = "train")`, is a `NOT` of its parts.
 - `concept "equipment"`, with no comparison, takes the concept's saved threshold with `>`, as it is when the text is
   read. The text the app and `format` write always has the comparison, so a link keeps its meaning when the saved
@@ -121,9 +152,11 @@ location not within US:midwest
 location within Kansas AND split = train
 ```
 
-- **`location within R`** keeps the samples located inside R; **`location not within R`** keeps every other sample,
-  samples with no location included (on a dataset with objects, see [below](#on-a-dataset-with-objects)). They are the
-  filters `geo_region` and `geo_region_exclude`.
+- **`location within R`** keeps the samples located inside R; **`location not within R`** keeps the samples located
+  outside R, and not those with no location ([negation](#operators); on a dataset with objects, see
+  [below](#on-a-dataset-with-objects)). They are the filters `geo_region` and `geo_region_exclude`.
+- **`location is null`** (and `is not null`, `exists`, `not exists`) asks whether a sample has a location, so
+  `location not within "US-KS" OR location is null` keeps the samples outside Kansas and those with no location.
 - **R is a key or a name, in any case,** quoted or not: `"US-KS"`, `us-ks`, `Kansas`, `"New South Wales"` (a name
   with spaces needs quotes). The text is always written back with the key: `location within "US-KS"`.
 - **A name that several regions have is a mistake** whose suggestions are their keys, with their kinds and countries
@@ -134,8 +167,8 @@ location within Kansas AND split = train
   (suggestions `US-KS`, `US-KY`, `KZ-KUS`).
 - **`within` and `not within` after `location` are the region form; `location` with any other operator is the
   dataset's own field named `location`,** as it was before regions: `location = "north field"` filters that field. On a
-  dataset with no such field, `location = ...` is a mistake that points to `within`. `within` applies only to
-  `location`.
+  dataset with no such field, `location = ...` is a mistake that points to `within` and to `is null`. `within` applies
+  only to `location`.
 
 ## On a dataset with objects
 
@@ -143,7 +176,8 @@ On a dataset with object rows (each naming its image in `parent_id`), an image a
 the images have `colour`, say, and the objects `label`. The dataset's page reads a filter on an image together with
 its objects, and on an object together with its image, and never asks a row about a field it has no value for (a
 value is there and isn't `null`). The assistant reads filters the same way. A filter sent without the page's wrapping
-(from the SDK, say) reads each sample on its own values, as on a dataset without objects.
+(from the SDK, say) reads each sample on its own values, as on a dataset without objects, by the same rule
+([negation](#operators)).
 
 - **A test is met when either row meets it.** The images' grid shows an image when the filter is met by its own
   values together with those of one of its objects, or by its own values alone. So tests joined by `AND` are met with
@@ -153,14 +187,15 @@ value is there and isn't `null`). The assistant reads filters the same way. A fi
   images. An object with no image has only its own values, and so has an image with no objects. The two bounds of a
   range (`between`, a slider, a histogram's bar) are one test, met by one row's value. `is not null` and `exists` are
   tests like any other.
-- **A negation keeps only the rows that have the fields it compares.** `NOT (X)` shows a row when the row has a value
-  for every field compared inside X, and X doesn't show it (X read as above, with one object). On the images' grid
-  both are asked of the image as a whole, its own values and those of any of its objects; on the objects' grid, of
-  the object with its image. `colour != "red"` is `NOT (colour = "red")`, `label not in (car)` is `NOT (label in
-  (car))`, and `not concept "equipment" > 0.62` keeps only the rows that have a score. So on the images' grid `label
-  != "car"` shows the images whose objects are labelled and none is a car; `NOT (label = "car" AND score > 0.9)`
-  hides an image that has a car with that score, and shows one whose car scores lower and whose truck higher; and a
-  field that both kinds have hides a row when either it or its partner has the value.
+- **A negation keeps only the rows that have the fields it compares**, as on any dataset; what is particular here is
+  which rows are asked. `NOT (X)` shows a row when the row has a value for every field compared inside X, and X
+  doesn't show it (X read as above, with one object). On the images' grid both are asked of the image as a whole, its
+  own values and those of any of its objects; on the objects' grid, of the object with its image. `colour != "red"`
+  is `NOT (colour = "red")`, `label not in (car)` is `NOT (label in (car))`, and `not concept "equipment" > 0.62`
+  keeps only the rows that have a score. So on the images' grid `label != "car"` shows the images whose objects are
+  labelled and none is a car; `NOT (label = "car" AND score > 0.9)` hides an image that has a car with that score,
+  and shows one whose car scores lower and whose truck higher; and a field that both kinds have hides a row when
+  either it or its partner has the value.
 - **`is null` and `not exists` show the rows with nothing for the field**: no value for `is null` (absent or `null`),
   no key for `not exists` (a `null` under the key counts as there). On the images' grid neither the image nor any of
   its objects may have one; on the objects' grid, neither the object nor its image. On `location` these tests are
@@ -188,19 +223,19 @@ red with no objects.
 | `colour is null` | 4 | the car of 4 | |
 | `label is null` | 5 | none | |
 
-- **An excluded place or lasso** (`location not within`, a map region or a lasso excluded) leaves out an image when
-  it or one of its objects is inside, and an object when it or its image is inside. The rows with no location (or no
-  point on the lasso's map) stay, as on a dataset without objects. It reads the same as a chip of its own, sharing a
-  filter card with another test, inside an `OR`, or written as `NOT (location within "US-KS")`.
+- **An excluded place or lasso** (`location not within`, a map region or a lasso excluded) is the `NOT` of the place:
+  an image shows when it or one of its objects has a location (a point on the lasso's map) and none of them is
+  inside, and an object when it or its image has one and neither is inside. It reads the same as a chip of its own,
+  sharing a filter card with another test, inside an `OR`, or written as `NOT (location within "US-KS")`.
 - **A hiding test of a field every row has**, `id`, `filepath`, `media_type`, `created_at` or `last_modified_at`
-  (`id not in (...)`, `filepath != "..."`), or of a list (`tags`, or a list field kept in a column of its own, which
-  keep the samples with no value: `tags not in (rejected)` keeps the samples without tags), is answered by the grid's
-  own row: the row it names isn't shown, whichever row meets the rest of the filter. `NOT (tags in (rejected))` is the
-  same filter as `tags not in (rejected)`. The app's collapse of duplicates is read the same way: a duplicate image it
-  hides doesn't come back through its objects, and on the objects' grid an object is hidden only when it is a
-  duplicate itself, whatever its image. A `NOT` around tests of the
-  built-in fields alone reads each row on its own: on the images' grid `NOT (filepath contains "x")` also shows an
-  image whose path holds `x` when one of its objects' paths doesn't.
+  (`id not in (...)`, `filepath != "..."`), or of a list (`tags`, or a list field kept in a column of its own), is
+  answered by the grid's own row: the row it names isn't shown, whichever row meets the rest of the filter. A list's
+  needs a value there, as everywhere: `tags not in (rejected)` shows the rows of the grid that have a tag, none of
+  them `rejected`. `NOT (tags in (rejected))` is the same filter as `tags not in (rejected)`. The app's collapse of
+  duplicates is read the same way: a duplicate image it hides doesn't come back through its objects, and on the
+  objects' grid an object is hidden only when it is a duplicate itself, whatever its image. A `NOT` around tests of
+  the built-in fields alone reads each row on its own: on the images' grid `NOT (filepath contains "x")` also shows
+  an image whose path holds `x` when one of its objects' paths doesn't.
 
 ### What the server skips
 
@@ -225,14 +260,14 @@ after the upgrade; until then nothing is skipped.
 - **Text:** `"double"` or `'single'` quotes, with `\"`, `\\`, `\n` and `\t` escapes. A plain word needs no quotes: `split = train`. `and`, `or`, `not`, `in`, `contains`, `exists`, `is`, `null`, `between` and `like` always need quotes. `within` is a keyword only after `location`: a field or a value named within needs none. `concept`, a keyword only before a concept's name, doesn't need them either.
 - **Numbers:** `12`, `-1.5`, `1e3`. A number too large for a double, such as `1e999`, is an error: `'1e999' is out of range for a number`.
 - **Dates:** ISO text, quoted or not: `created_at >= 2026-01-01T00:00:00Z`. Text that isn't an ISO date and time is an error.
-  On `created_at`, `last_modified_at` and any field declared `datetime`, dates compare as moments: `2026-01-01T10:00:00+02:00` is the same
-  moment as `2026-01-01T08:00:00Z`, and a date or time written without an offset is UTC. A value written to the day,
-  minute or second means that whole unit: `captured_at = 2026-01-01` is the whole UTC day, `captured_at <=
-  2026-01-01T10:00` ends where 10:01 UTC starts, and `captured_at > 2026-01-01` starts on 2 January UTC; `in` and
-  `not in` take each value's unit too, and a value written with a fraction of a second is that exact moment. One rule
-  for every datetime, `created_at` and `last_modified_at` included. A sample
-  whose value isn't a date and time never matches a range, and `!=` and `not in` include it. To filter by the
-  clock time where a picture was taken, store that time as its own field without an offset (see
+  On `created_at`, `last_modified_at` and any field declared `datetime`, dates compare as moments:
+  `2026-01-01T10:00:00+02:00` is the same moment as `2026-01-01T08:00:00Z`, and a date or time written without an offset
+  is UTC. A value written to the day, minute or second means that whole unit: `captured_at = 2026-01-01` is the whole
+  UTC day, `captured_at <= 2026-01-01T10:00` ends where 10:01 UTC starts, and `captured_at > 2026-01-01` starts on 2
+  January UTC; `in` and `not in` take each value's unit too, and a value written with a fraction of a second is that
+  exact moment. One rule for every datetime, `created_at` and `last_modified_at` included. A sample whose value isn't a
+  date and time never matches a range, and `!=` and `not in` include it (it has a value, of another kind). To filter by
+  the clock time where a picture was taken, store that time as its own field without an offset (see
   [Dataset management](DATASET_MANAGEMENT.md#dates-and-times)).
 - **Booleans:** `true` and `false`.
 - **Lists:** brackets, `(...)` or `[...]`, with commas, spaces or newlines between values. A column of serial numbers pasted between `(` and `)` works as it is, and so does a JSON list.

@@ -344,10 +344,13 @@ def test_concept_preview_counts_exactly_and_shows_the_nearest_for_the_whole_data
             assert math.isclose(item['score'], SCORES[farm.ids.index(item['id'])], abs_tol=1e-6)
             assert parse_qs(urlsplit(item['link']).query) == {'sample': [str(item['id'])]}
         assert (preview['keep'], preview['remove']) == ('concept "scrap" > 0.5', 'not concept "scrap" > 0.5')
-        # The remove text removes exactly the images above the cut.
+        # The remove text removes exactly the images above the cut, and those with no score. Rewritten for contract g7
+        # (one rule everywhere, rules 1.3 and 2.1): the view keeps the images at or below the cut, the count preview
+        # gave for them (it kept the two unscored images too).
         whole = await ok(POWER, 'make_view', dataset=d)
         removed = await ok(POWER, 'refine_view', view=whole['view'], add=preview['remove'])
-        assert await ids_of(POWER, removed['view']) == farm.of(lambda n: n not in above)
+        assert await ids_of(POWER, removed['view']) == farm.of(lambda n: n in below)
+        assert removed['count'] == preview['below']
         # A view with no stages is the whole dataset; another cut.
         lower = await ok(POWER, 'concept_preview', view=whole['view'], concept='scrap', threshold=0.3)
         assert lower['above'] == sum(1 for value in SCORES.values() if value > 0.3)

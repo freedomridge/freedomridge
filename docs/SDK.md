@@ -367,9 +367,10 @@ view = dataset.query("filepath CONTAINS 'img_00'")
 # Missing or empty: IS NULL / IS NOT NULL, EXISTS / NOT EXISTS
 view = dataset.query("reviewed IS NULL")
 
-# NOT and <> (same as !=)
+# NOT and <> (same as !=): samples with another scene, not those with no scene
 view = dataset.query("NOT scene = 'highway'")
 view = dataset.query("scene <> 'highway'")
+view = dataset.query("scene != 'highway' OR scene IS NULL")  # ... and those with no scene
 
 # Complex
 view = dataset.query("""
@@ -404,8 +405,8 @@ view = dataset.filter(tags__contains="validated")     # contains
 |--------|---------|
 | (none) | equals |
 | `__gt`, `__gte`, `__lt`, `__lte` | numeric or date comparison |
-| `__ne` | not equal (samples without the field are included) |
-| `__in`, `__nin` (or `__not_in`) | in / not in a list |
+| `__ne` | not equal: samples with another value (a sample with no value for the field matches neither `=` nor `!=`) |
+| `__in`, `__nin` (or `__not_in`) | in / not in a list (`not in`, like `!=`, needs a value) |
 | `__contains` | case-insensitive substring on text; membership on `tags` and other array fields |
 | `__exists=True/False` | the metadata key is present / absent |
 | `__is_null=True/False` | the value is null or missing / has a value |
@@ -1522,6 +1523,18 @@ number. A value that is not a list of points is refused with a 400 that says wha
 object included (pass its ring, `polygon["coordinates"][0]`); `null`, fewer than three points, or three points of
 which the last is the first again, are no polygon and keep every sample.
 
+The samples outside a polygon are `~geo_within(polygon)`, or the condition `geo_polygon_exclude` (the map's excluded
+region): those that have a location, outside it. A sample with no location is in neither the polygon nor its
+exclusion, as for every negation ([FILTER_QUERY.md](FILTER_QUERY.md#operators)); ask for it with `location is null`:
+
+```python
+from fridge import Condition
+
+outside = s[~geo_within(polygon)]                                    # located elsewhere
+outside = s[Condition("location", "geo_polygon_exclude", polygon)]   # the same samples
+unlocated = dataset.query("location is null")
+```
+
 ---
 
 ## Similarity Search
@@ -1560,8 +1573,16 @@ for sample in similar:
 ```
 
 The result is a chainable view: you can further `filter`/`order_by`/`limit` it
-and call aggregations — all evaluated in-memory over the results, preserving the
-distance ordering:
+and call aggregations. A filter is read by the server, in one request for the
+results' ids (one per 1,000 results), so it shows what the same filter shows
+anywhere ([FILTER_QUERY.md](FILTER_QUERY.md#operators)); the results keep their
+order and distances. Filtering a result needs the server, which answers on the
+samples' values now, while the kept samples show the values they had at the
+search: a sample edited since can be kept on its new value, and a deleted one
+drops out. Sorting, `limit`/`skip` and the aggregations work in memory over the
+results. `distance` is not a field of the dataset: a filter that names it raises
+`NotImplementedError`; compare `sample.distance` in Python
+(`[s for s in similar if s.distance < 0.3]`).
 
 ```python
 similar = (dataset.all()
@@ -2211,7 +2232,7 @@ print(f"Total samples: {dataset.all().count()}")
 The filter system supports nested logic. Name metadata fields **without** a
 `metadata.` prefix (`"brightness"`, not `"metadata.brightness"`): a prefixed name
 is looked up as a key literally called `metadata.brightness`, so it matches
-nothing (or, with `!=`, everything) and no error is raised.
+nothing (with `!=` too) and no error is raised.
 
 ```python
 # AND: All conditions must match
@@ -2260,19 +2281,20 @@ and `dataset.samples[...]` all produce them.
 | Operator | Description | Example |
 |----------|-------------|---------|
 | `=` | Equals | `{"field": "category", "operator": "=", "value": "cat"}` |
-| `!=` | Not equals (samples without the field are included) | `{"field": "category", "operator": "!=", "value": "dog"}` |
+| `!=` | Not equals: samples that have the field with another value (one with no value matches neither `=` nor `!=`; add `OR category is null` for those) | `{"field": "category", "operator": "!=", "value": "dog"}` |
 | `>` | Greater than | `{"field": "brightness", "operator": ">", "value": 0.5}` |
 | `<` | Less than | `{"field": "brightness", "operator": "<", "value": 0.8}` |
 | `>=` | Greater or equal | `{"field": "score", "operator": ">=", "value": 7.0}` |
 | `<=` | Less or equal | `{"field": "score", "operator": "<=", "value": 9.0}` |
 | `in` | Value in list | `{"field": "tags", "operator": "in", "value": ["validated"]}` |
-| `not in` | Value not in list | `{"field": "tags", "operator": "not in", "value": ["rejected"]}` |
+| `not in` | Value not in list: samples that have a value, none of them listed (`tags not in` needs at least one tag) | `{"field": "tags", "operator": "not in", "value": ["rejected"]}` |
 | `contains` | Case-insensitive substring on text; membership on array fields | `{"field": "filename", "operator": "contains", "value": "cat"}` |
 | `exists` / `not_exists` | The metadata key is present / absent | `{"field": "reviewed", "operator": "exists"}` |
 | `is_null` / `is_not_null` | The value is null or missing / has a value | `{"field": "score", "operator": "is_null"}` |
 | `geo_polygon` | Location inside a polygon given as a list of `[lon, lat]` points (not a GeoJSON object). Longitudes past 180 or below -180 make a shape across the antimeridian (176 to 183 holds 177.4 and -178.2); a polygon within -180 to 180 is read as before. A value that is not a list of points, a GeoJSON object included, is refused (400) ([Geospatial filtering](#geospatial-filtering)) | `{"field": "location", "operator": "geo_polygon", "value": [[-122.5, 37.7], [-122.35, 37.7], [-122.35, 37.82], [-122.5, 37.82]]}` |
 | `geo_near` | Location within `max_distance` metres of a point | `{"field": "location", "operator": "geo_near", "value": {"point": [-122.42, 37.77], "max_distance": 5000}}` |
-| `geo_region` / `geo_region_exclude` | Location inside a loaded region (a country, a state or province, or a group of them, by its key: [REGIONS.md](REGIONS.md)) / every other sample, those with no location included | `{"field": "location", "operator": "geo_region", "value": "US-KS"}` |
+| `geo_polygon_exclude` | Location outside the polygon: a sample with no location matches neither `geo_polygon` nor its exclude | `{"field": "location", "operator": "geo_polygon_exclude", "value": [[-122.5, 37.7], [-122.35, 37.7], [-122.35, 37.82], [-122.5, 37.82]]}` |
+| `geo_region` / `geo_region_exclude` | Location inside a loaded region (a country, a state or province, or a group of them, by its key: [REGIONS.md](REGIONS.md)) / outside it (a sample with no location is in neither) | `{"field": "location", "operator": "geo_region", "value": "US-KS"}` |
 
 ### Custom Embeddings
 

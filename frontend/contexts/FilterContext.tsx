@@ -354,9 +354,10 @@ export function withGrain(
     if (baseFilters.length === 0) {
         return { logic: 'AND', filters: grainPredicate(grain, pivot) };
     }
-    // A dataset with no object rows can't cross-link, so emit the plain grain-filtered query —
-    // this keeps NULL-tolerant negation intact for ordinary image datasets and only
-    // applies the cross-grain link (with its presence guard) where objects actually exist.
+    // A dataset with no object rows can't cross-link, so emit the plain grain-filtered query: each
+    // row is read on its own, by the same rule for a missing value as the wrapped form below (a
+    // negation shows only the rows that have a value, docs/FILTER_QUERY.md), and the cross-grain
+    // link is applied only where objects actually exist.
     if (!hasObjects) {
         return { logic: 'AND', filters: [...grainPredicate(grain, pivot), ...baseFilters] };
     }
@@ -372,10 +373,9 @@ export function withGrain(
     const fieldGrain = (f: string | undefined): Grain => (f === 'clip_obj' ? 'object' : 'image');
     const isOffGrainEmb = (f: ComplexFilter): boolean =>
         f.operator === 'embedding_polygon' && fieldGrain(f.field) !== grain;
-    // An excluded region (a map region, a named region or a lasso, excluded) keeps the rows with no location or no
-    // point on its map. Coupled like the other leaves, such a row on the partner grain (an object with no point on an
-    // image map) would vacuously let its partner through. So it is coupled as NOT (the row or its partner is inside the
-    // region).
+    // An excluded region (a map region, a named region or a lasso, excluded) is coupled as NOT (the row or its partner
+    // is inside the region), which the server reads for the row as a whole: it or its partner has a location (or a
+    // point on the region's map) and neither is inside (backend/grain_reading.py).
     // A filter card saved from its Builder tab wraps the exclusion in an AND group of one rule: it is the same filter and
     // the same chip, so it is coupled as the bare one is (soleRule).
     const isRegionExclude = (f: ComplexFilter): boolean => {

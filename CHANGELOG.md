@@ -4,6 +4,48 @@ Freedom Ridge has one version for the server, the web app and the Python SDK (th
 file), following [Semantic Versioning](https://semver.org). A release lists **upgrade notes** when
 it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
 
+## Unreleased
+
+- **A change in behaviour: a sample with no value for a field never matches a comparison of that field, and never
+  matches the `NOT` of one, on every dataset and through every reader** ([FILTER_QUERY.md](docs/FILTER_QUERY.md#operators)).
+  Only `is null` and `not exists` find it. Before, three places kept the samples with no value, and now show fewer
+  rows:
+  - on a dataset without objects, and in any filter read on one sample (the SDK, the API without the page's wrapping,
+    a version's query), `colour != "red"`, `colour not in (...)` and `NOT (colour = "red")` kept the samples with no
+    `colour`, or a `null` one; a `NOT` around several fields kept the samples missing any of them;
+    `not concept "x" > 0.62` (the Concepts panel's exclude) kept the samples the concept has no score for, a sample
+    added since the concept was last scored included; `detections.label != "car"` kept the samples with no
+    `detections` and those whose detections have no label, and the `NOT` of an element match the samples with no
+    list;
+  - an excluded place (`location not within`, a map region or a drawn polygon excluded, `NOT (location within ...)`)
+    kept the samples with no location, and an excluded lasso the samples with no point on its map;
+  - `tags not in ("rejected")` (and `tags != ...`, `NOT (tags in ...)`) kept the samples with no tags, and so did the
+    same test of a list field kept in a column of its own and of `@local.tags`.
+
+  An empty list written in a field is a value, so a `NOT` shows its sample: `detections.label != "car"` and the `NOT`
+  of an element match keep a sample whose list is empty. A sample with no tags has no value for `tags`, and the same
+  holds for any list kept in a column of its own: every sample holds the column, the empty list until one is written.
+  To keep the old meaning, write the samples with no value out:
+  `colour != "red" OR colour is null`, `tags not in ("rejected") OR tags is null`, `location not within "US-KS" OR
+  location is null`. The filter text now takes `location is null`, `is not null`, `exists` and `not exists` for that.
+  `detections.label is null` (and the same test of any list of labels) now shows the samples with no label in the
+  list (no list, an empty list, or detections without a label); it showed the samples with a detection that has no
+  label. A value of another kind than the one compared is still a value: `n != 2` keeps a sample whose `n` is the
+  text `"abc"`. **Saved views, links and the dataset's default view are not rewritten**: they
+  keep their filters and read them by the new rule, so one that used `!=`, `not in`, an excluded region or a concept's
+  exclude may show fewer samples. A mirror on an older version reads the old way (including a patch search its
+  primary relays to it) until it is upgraded. The assistant's tools follow the same rule; `concept_preview`'s `remove`
+  keeps only the scored images at or below the cut on every dataset. The SDK's filter of a similarity result
+  (`sort_by_similarity(...).filter(...)`) is read by the server now, in one request for the results' ids (one per
+  1,000 results), and shows what the same filter shows anywhere, in the results' order with their distances. Before,
+  it read the filter in Python: it compared `tags` as a whole list, read only the first part of a `NOT`, and read
+  `distance`, which is no field of the dataset and is refused now (`NotImplementedError`: compare `sample.distance` in
+  Python). On a dataset without objects of a million samples the readings this changes measured 0.87 to 1.21 times
+  their time before (a count of `NOT (a = x AND b = y)`: 82 to 98 ms). On a dataset with objects of a million rows an
+  excluded lasso now has to find which rows have a point on the map: about 0.15 to 0.45 s more per reading, the first
+  page 0.14 to 0.66 s where it was 0.02 to 0.30 s. An excluded region or drawn polygon there measured up to about
+  twice its time before on some readings.
+
 ## 2.14.0 (2026-11-25)
 
 This release adds an AI assistant: Claude Code and other MCP clients answer questions about a server's datasets

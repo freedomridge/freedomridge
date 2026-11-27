@@ -12,7 +12,6 @@ import pytest
 from fridge.core.client import Client
 from fridge.core.dataset import Dataset
 from fridge.core.sample import Sample
-from fridge.core.view import _matches_filter
 
 from backend.routers import embeddings as embeddings_router
 from backend.routers import hashes as hashes_router
@@ -36,6 +35,28 @@ def _as_api_row(row):
     if row.get("location") and heading is not None:
         row["location"] = {**row["location"], "heading": heading}
     return row
+
+
+def _shows(row, node):
+    """Whether a stored row passes a filter, for the few filters this file's views and the copy send (and
+    test_add_samples_from_objects', which serves its source from this fake): `=`, `!=`, `in` and `contains` (text,
+    in any case) on a column or a metadata key, and their AND. A row with no value matches none of them, as the server
+    reads them. Any other filter is a test that needs more of the server than this fake has."""
+    if "logic" in node:
+        assert node["logic"] == "AND", node
+        return all(_shows(row, part) for part in node["filters"])
+    field, operator, value = node["field"], node["operator"], node["value"]
+    held = row[field] if field in row else row["metadata"].get(field)
+    if held is None:
+        return False
+    if operator == "=":
+        return held == value
+    if operator == "!=":
+        return held != value
+    if operator == "contains":
+        return str(value).lower() in str(held).lower()
+    assert operator == "in", node
+    return held in value
 
 
 class FakeServer:
@@ -82,7 +103,7 @@ class FakeServer:
         if url.endswith("/samples/query"):
             rows = [r for _, r in sorted(self.rows[d].items()) if r["id"] > (json.get("after_id") or 0)]
             if json.get("filters"):
-                rows = [r for r in rows if _matches_filter(Sample.from_row(r), json["filters"])]
+                rows = [r for r in rows if _shows(r, json["filters"])]
             return FakeResponse({"items": [_as_api_row(r) for r in rows[: json["limit"]]], "total": len(rows)})
         if url.endswith("/embeddings/vectors/by-ids"):
             items = [

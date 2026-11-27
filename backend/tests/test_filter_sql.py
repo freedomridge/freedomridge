@@ -7,6 +7,13 @@ fixes:
   * is_null/is_not_null on native columns must check the column, not metadata->>,
   * unknown operators on a label element must 400, not silently match,
   * a malformed created_at must 400, not pass a bad string to Postgres (→ 500).
+
+Rewritten for contract g7 (one rule everywhere): the SQL text of a negation changed, so what the negations here
+pinned as text is asked as rows, on a disposable database (registry_database): a label list's negation keeps the
+rows whose list is there and holds none of them named, the empty list included (rule 1.4, changed 2026-11-26); a
+number's and a date's `!=` and `not in` keep the rows
+that have a value which isn't it, a value of another kind included (rules 1.1 and 1.7). The showing forms keep their
+text.
 """
 
 import os
@@ -17,6 +24,7 @@ import pytest
 from fastapi import HTTPException
 
 from backend.label_fields import DatasetArrayColumns
+from backend.routers import datasets
 from backend.routers.datasets import (
     _LABEL_ARRAY_FIELDS,
     _LABEL_NEG_OPS,
@@ -24,9 +32,21 @@ from backend.routers.datasets import (
     _element_predicate_sql,
     parse_filter_node,
 )
+from backend.tests.test_field_registry_postgres import ingest, registry_database
+
+__all__ = ['registry_database']
+needs_postgres = pytest.mark.skipif(not os.getenv('FRIDGE_TEST_POSTGRES_DSN'), reason='Requires disposable PostgreSQL')
 
 # The positive spellings _element_predicate_sql accepts, for the mirror-case test below.
 _LABEL_POS_OPS_FOR_TEST = ('=', '==', 'in')
+
+
+async def rows_of(names: list[str], node: dict) -> set[str]:
+    """The names (in ingest order) of the rows dataset 1 lists for the filter, its count agreeing."""
+    stored = await datasets.list_samples_post(1, datasets.SamplesRequest(filters=node, limit=100))
+    assert stored['total'] == len(stored['items'])
+    by_path = {f'sample-{index}.jpg': name for index, name in enumerate(names)}
+    return {by_path[item['filepath']] for item in stored['items']}
 
 
 def _sql(field, operator, value=None):
@@ -60,39 +80,46 @@ def test_detections_label_in_ors_each_value():
     assert args == ["car", "bus"]
 
 
-# ---- the headline bug: negation must wrap, not flip ----
-
-
-@pytest.mark.parametrize("field", ["detections.label", "polygons.label"])
-def test_label_neq_is_negated_containment(field):
-    sql, args = _sql(field, "!=", "car")
-    assert sql.lstrip().startswith("(NOT "), sql
-    assert "@>" in sql
-    assert args == ["car"]
-
-
-@pytest.mark.parametrize("field", ["detections.label", "polygons.label"])
-def test_label_not_in_is_negated_containment(field):
-    sql, args = _sql(field, "not_in", ["car", "bus"])
-    assert sql.lstrip().startswith("(NOT "), sql
-    assert sql.count("@>") == 2
-    assert args == ["car", "bus"]
-
-
-# ---- EVERY negation spelling must work on EVERY label field ----
+# ---- the headline bug: negation must wrap, not flip; EVERY spelling on EVERY label field ----
 # `_LABEL_NEG_OPS` lists five spellings, but the generic dotted-label branch's pos_op map only
 # handled four — and the missing one, 'not in' (with a space), is exactly what the frontend emits
 # for facet/multi-select excludes (filter-utils.ts) and histogram double-click-to-exclude. So
 # `ground_truth.label not in [...]` raised HTTP 400 from _element_predicate_sql while
 # `detections.label` (which has its own @> branch) worked, making the failure look arbitrary.
-# The old tests covered 'not_in' and '!=' only, i.e. 2 of the 5 spellings.
+# Rewritten for contract g7 (rule 1.4), as rows instead of the negation's text (`(NOT ... @> ...)`, which changed):
+# each spelling, on each label field, keeps the rows whose list is there and holds no car, the empty list included
+# (changed 2026-11-26: nothing was found, so no car), and never the opposite rows. The rows: a car, a truck, both, an
+# empty list and no list (the last it kept before).
+
+LABELLED_AS = {'car': ['car'], 'truck': ['truck'], 'both': ['car', 'truck'], 'empty': [], 'none': None}
 
 
-@pytest.mark.parametrize("field", _LABEL_ARRAY_FIELDS)
+def _element(field: str, label: str) -> dict:
+    if field == 'detections':
+        return {'label': label, 'bounding_box': [0.1, 0.1, 0.2, 0.2]}
+    if field == 'polygons':
+        return {'label': label, 'points': [[0.1, 0.1], [0.4, 0.1], [0.4, 0.4]]}
+    return {'label': label}  # a classification list (ground_truth, predictions)
+
+
+@needs_postgres
 @pytest.mark.parametrize("op", _LABEL_NEG_OPS)
-def test_every_label_negation_spelling_negates(field, op):
-    sql, _ = _sql(f"{field}.label", op, ["car"])
-    assert sql.lstrip().startswith("(NOT "), f"{field}.label {op!r} did not negate: {sql!r}"
+@pytest.mark.parametrize("field", [*sorted(_LABEL_ARRAY_FIELDS), 'ground_truth', 'predictions'])
+def test_every_label_negation_spelling_keeps_the_lists_holding_none_of_them_named(registry_database, field, op):
+    async def scenario(database):
+        names = list(LABELLED_AS)
+        await ingest(
+            [
+                {} if labels is None else {field: [_element(field, label) for label in labels]}
+                for labels in LABELLED_AS.values()
+            ],
+        )
+        await datasets._get_dataset_field_stats_impl(1, None)  # discovers the label fields
+        value: Any = ['car'] if op in ('not in', 'not_in', 'nin') else 'car'
+        assert await rows_of(names, {'field': f'{field}.label', 'operator': '=', 'value': 'car'}) == {'car', 'both'}
+        assert await rows_of(names, {'field': f'{field}.label', 'operator': op, 'value': value}) == {'truck', 'empty'}
+
+    registry_database(scenario)
 
 
 @pytest.mark.parametrize("field", _LABEL_ARRAY_FIELDS)
@@ -104,11 +131,30 @@ def test_every_label_positive_spelling_stays_positive(field, op):
     assert not sql.lstrip().startswith("(NOT "), f"{field}.label {op!r} was negated: {sql!r}"
 
 
-def test_segmentation_labels_neq_is_negated():
-    sql, args = _sql("segmentation.labels", "!=", "road")
-    assert sql.lstrip().startswith("(NOT "), sql
-    assert "?" in sql
-    assert args == ["road"]
+@needs_postgres
+def test_segmentation_labels_neq_keeps_the_lists_holding_no_road(registry_database):
+    """Rewritten for contract g7 (rule 1.4, changed 2026-11-26), as rows instead of the negation's text:
+    `segmentation.labels != "road"` keeps the rows whose list of labels is there and holds no road, the empty list
+    included (it kept the row with no list too)."""
+
+    async def scenario(database):
+        names = ['road', 'car', 'empty', 'none']
+        await ingest(
+            [
+                {'segmentation': {'labels': ['road']}},
+                {'segmentation': {'labels': ['car']}},
+                {'segmentation': {'labels': []}},
+                {},
+            ],
+        )
+        await datasets._get_dataset_field_stats_impl(1, None)
+        assert await rows_of(names, {'field': 'segmentation.labels', 'operator': '=', 'value': 'road'}) == {'road'}
+        assert await rows_of(names, {'field': 'segmentation.labels', 'operator': '!=', 'value': 'road'}) == {
+            'car',
+            'empty',
+        }
+
+    registry_database(scenario)
 
 
 # ---- generic dotted path (ground_truth / predictions) ----
@@ -117,12 +163,6 @@ def test_segmentation_labels_neq_is_negated():
 def test_ground_truth_label_eq_is_containment():
     sql, args = _sql("ground_truth.label", "=", "car")
     assert "@>" in sql and "EXISTS" not in sql
-    assert args == ["car"]
-
-
-def test_ground_truth_label_neq_is_negated_containment():
-    sql, args = _sql("ground_truth.label", "!=", "car")
-    assert sql.startswith("(NOT ") and "@>" in sql
     assert args == ["car"]
 
 
@@ -468,16 +508,36 @@ def test_number_equality_compares_numerically(val):
     sql, args = _sql("aspect_ratio", "=", val)
     assert "::float" in sql and "->>'aspect_ratio' = $1" not in sql
     assert args == [float(val)]
-    sql, args = _sql("aspect_ratio", "!=", val)
-    assert "::float" in sql and "IS DISTINCT FROM $1" in sql
-    assert args == [float(val)]
 
 
 def test_number_list_ops_compare_numerically():
     sql, args = _sql("aspect_ratio", "in", [1, 2])
     assert sql.endswith("= ANY($1::float8[])") and args == [[1.0, 2.0]]
-    sql, args = _sql("aspect_ratio", "not in", [1])
-    assert "IS NULL OR NOT" in sql and "::float8[]" in sql and args == [[1.0]]
+
+
+@needs_postgres
+@pytest.mark.parametrize(("operator", "value"), [("!=", 1), ("!=", 1.0), ("not in", [1]), ("not in", [1.0])])
+def test_number_negations_compare_numerically(registry_database, operator, value):
+    """`!=` and `not in` of a number compare as a number: a stored 1.0 is 1 (rows instead of the text, which changed).
+    Rewritten for contract g7 (rules 1.1 and 1.7): they keep the rows that have a value which isn't 1, a text value
+    included (it is a value of another kind), and no longer the rows with a JSON null or no key."""
+
+    async def scenario(database):
+        names = ['one-float', 'one', 'two', 'text', 'null', 'none']
+        await ingest(
+            [
+                {'aspect_ratio': 1.0},
+                {'aspect_ratio': 1},
+                {'aspect_ratio': 2},
+                {'aspect_ratio': 'one'},
+                {'aspect_ratio': None},
+                {},
+            ],
+        )
+        assert await rows_of(names, {'field': 'aspect_ratio', 'operator': '=', 'value': 1}) == {'one-float', 'one'}
+        assert await rows_of(names, {'field': 'aspect_ratio', 'operator': operator, 'value': value}) == {'two', 'text'}
+
+    registry_database(scenario)
 
 
 def test_promoted_numeric_field_equality_rides_the_float_index():
@@ -520,9 +580,31 @@ def test_partial_datetime_equality_is_the_whole_unit(val, lo, hi):
     sql, args = _sql("datetime", "=", val)
     assert sql == "(metadata->>'datetime' >= $1 AND metadata->>'datetime' < $2)"
     assert args == [lo, hi]
-    sql, args = _sql("datetime", "!=", val)
-    assert sql == "(metadata->>'datetime' IS NULL OR NOT (metadata->>'datetime' >= $1 AND metadata->>'datetime' < $2))"
-    assert args == [lo, hi]
+
+
+@needs_postgres
+@pytest.mark.parametrize(
+    "val, lo, hi",
+    [
+        ("2023-08-14", "2023-08-14", "2023-08-15"),
+        ("2023-08-14T17:39", "2023-08-14T17:39", "2023-08-14T17:40"),
+        ("2023-08-14 23:59", "2023-08-14 23:59", "2023-08-15 00:00"),
+        ("2023-08-14T17:39:32", "2023-08-14T17:39:32", "2023-08-14T17:39:33"),
+        ("2024-02-28", "2024-02-28", "2024-02-29"),
+    ],
+)
+def test_partial_datetime_inequality_is_outside_the_whole_unit(registry_database, val, lo, hi):
+    """`!=` of a date written to a unit keeps the rows outside the whole unit (rows instead of the text, which
+    changed). Rewritten for contract g7 (rules 1.1 and 1.7): a value that isn't a date is a value and is kept; a JSON
+    null and no key no longer are."""
+
+    async def scenario(database):
+        names = ['start', 'next', 'unknown', 'null', 'none']
+        await ingest([{'datetime': lo}, {'datetime': hi}, {'datetime': 'unknown'}, {'datetime': None}, {}])
+        assert await rows_of(names, {'field': 'datetime', 'operator': '=', 'value': val}) == {'start'}
+        assert await rows_of(names, {'field': 'datetime', 'operator': '!=', 'value': val}) == {'next', 'unknown'}
+
+    registry_database(scenario)
 
 
 @pytest.mark.parametrize("val", ["2023-08-14T17:39:32.5", "2023-08-14T17:39:32+00:00", "2024-02-30", "2023-8-14"])

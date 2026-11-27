@@ -30,9 +30,11 @@ module's own DATABASE_URL if it keeps one).
 Where the contract leaves something open, these tests read it this way: the loaded sha256 is the loaded file's; a
 region read without ?outline=true has no outline; a lookup by key needs a signed-in user like the search; with no set
 loaded a region filter's 400 says no boundary set is loaded (its prefix isn't asserted); NOT around a region keeps the
-samples it doesn't, those with no location included (the language's NOT is a complement), the same as the exclude;
-an ambiguous or unknown name's 400 points at the name. The POST that loads a set is checked by its answer and the
-queued job only: no job runner runs in these tests, so nothing is downloaded.
+samples it doesn't, the same as the exclude; an ambiguous or unknown name's 400 points at the name. Rewritten for the
+later contract g7 (one rule everywhere, rule 1.6): the exclude, and a NOT around a region, keep only the samples that
+have a location (they kept the two with none, p21 and p22, too); the tests that pinned that say so where they are.
+The POST that loads a set is checked by its answer and the queued job only: no job runner runs in these tests, so
+nothing is downloaded.
 """
 
 import asyncio
@@ -719,6 +721,9 @@ def test_a_region_is_read_by_its_key_in_any_case_with_an_outline_on_request(regi
 
 
 def test_inside_and_outside_select_exactly_the_samples_of_each_region(regions_world):
+    """Rewritten for contract g7 (one rule everywhere, rule 1.6): outside a region are the other samples that have a
+    location; p21 and p22, which have none, are in neither (main kept them outside every region)."""
+
     async def scenario(r):
         await farm(r)
         await loaded(r)
@@ -726,8 +731,8 @@ def test_inside_and_outside_select_exactly_the_samples_of_each_region(regions_wo
         for key in KEYS:
             expected = r.of(inside(key))
             assert await selected(r, keep(key)) == expected, key
-            assert await selected(r, drop(key)) == r.everything - expected, key
-            assert no_location <= await selected(r, drop(key)), key
+            assert await selected(r, drop(key)) == r.of(LOCATED) - expected, key
+            assert not no_location & await selected(r, drop(key)), key
         for asked, key in (
             ('xa-nm', 'XA-NM'),
             ('xa:MIDLANDS', 'XA:midlands'),
@@ -781,6 +786,9 @@ def test_an_unknown_key_a_bad_value_or_another_field_is_a_400(regions_world):
 
 
 def test_the_filter_holds_in_every_reader_of_filters(regions_world):
+    """Rewritten for contract g7 (one rule everywhere, rule 1.6): the exclude keeps the other samples that have a
+    location, in every reader, and a bulk tag by it tags those (main kept p21 and p22, which have none)."""
+
     async def scenario(r):
         await farm(r)
         vectors = [{'sample_id': r.ids[name], 'vector': [1.0, i / 100, 0.0, 0.0]} for i, name in enumerate(NAMES)]
@@ -791,7 +799,7 @@ def test_the_filter_holds_in_every_reader_of_filters(regions_world):
         for node, names in (
             (keep('XA'), inside('XA')),
             (keep('XA-IS'), inside('XA-IS')),
-            (drop('XA'), set(NAMES) - inside('XA')),
+            (drop('XA'), LOCATED - inside('XA')),
             (keep('XC:iles-du-sud'), inside('XC:iles-du-sud')),
         ):
             ids = r.of(names)
@@ -838,13 +846,16 @@ def test_the_filter_holds_in_every_reader_of_filters(regions_world):
             if tagged.status_code == 202:  # a job: run it here, as the runner would
                 await finish(r.database)
             rows = await r.database.fetch('SELECT id FROM samples WHERE dataset_id = $1 AND $2 = ANY(tags)', D, tag)
-            expected = inside('XA:midlands') if tag == 'midlands' else set(NAMES) - inside('XA')
+            expected = inside('XA:midlands') if tag == 'midlands' else LOCATED - inside('XA')
             assert {row['id'] for row in rows} == r.of(expected), tag
 
     regions_world(scenario)
 
 
 def test_a_version_answers_by_the_locations_it_saved(regions_world):
+    """Rewritten for contract g7 (one rule everywhere, rule 1.6): a version's exclude keeps the other samples that had a
+    location (main kept p21 and p22, which have none)."""
+
     async def scenario(r):
         await farm(r)
         made = await post(r, f'/api/datasets/{D}/versions', {'name': 'before the move'})
@@ -861,7 +872,7 @@ def test_a_version_answers_by_the_locations_it_saved(regions_world):
         await loaded(r)
         assert await selected(r, keep('XA-NM')) == r.of(inside('XA-NM') - {'p01'})
         base = f'/api/datasets/{D}/versions/{version}'
-        for node, names in ((keep('XA-NM'), inside('XA-NM')), (drop('XA-NM'), set(NAMES) - inside('XA-NM'))):
+        for node, names in ((keep('XA-NM'), inside('XA-NM')), (drop('XA-NM'), LOCATED - inside('XA-NM'))):
             rows = await post(r, f'{base}/samples/query', {'filters': node, 'limit': 1000})
             assert rows.status_code == 200, rows.text
             assert {item['id'] for item in rows.json()['items']} == r.of(names), node
@@ -877,19 +888,24 @@ def test_a_version_answers_by_the_locations_it_saved(regions_world):
 
 
 def test_the_filter_combines_under_and_or_and_not(regions_world):
+    """Rewritten for contract g7 (one rule everywhere, rule 1.6): a NOT around a region and the exclude keep the samples
+    outside it that have a location (main kept p21 and p22, which have none). The combinations main answers alike come
+    first."""
+
     async def scenario(r):
         await farm(r)
         await loaded(r)
         grp_a = r.of({name for rank, name in enumerate(NAMES, start=1) if rank % 2})
+        located = r.of(LOCATED)
         a = {'field': 'grp', 'operator': '=', 'value': 'a'}
         b = {'field': 'grp', 'operator': '=', 'value': 'b'}
         cases = [
             ({'logic': 'AND', 'filters': [keep('XA'), a]}, r.of(inside('XA')) & grp_a),
             ({'logic': 'OR', 'filters': [keep('XA-IS'), b]}, r.of(inside('XA-IS')) | (r.everything - grp_a)),
             ({'logic': 'OR', 'filters': [keep('XA-IS'), keep('XB')]}, r.of(inside('XA-IS') | inside('XB'))),
-            ({'logic': 'NOT', 'filters': [keep('XA')]}, r.everything - r.of(inside('XA'))),
             ({'logic': 'NOT', 'filters': [drop('XA')]}, r.of(inside('XA'))),
-            ({'logic': 'AND', 'filters': [drop('XA'), a]}, (r.everything - r.of(inside('XA'))) & grp_a),
+            ({'logic': 'NOT', 'filters': [keep('XA')]}, located - r.of(inside('XA'))),
+            ({'logic': 'AND', 'filters': [drop('XA'), a]}, (located - r.of(inside('XA'))) & grp_a),
             (
                 {'logic': 'OR', 'filters': [{'logic': 'AND', 'filters': [keep('XA:midlands'), b]}, keep('XDD')]},
                 (r.of(inside('XA:midlands')) - grp_a) | r.of(inside('XDD')),
@@ -939,7 +955,9 @@ async def assert_every_reader(r: Regions, node: dict[str, Any], names: set[str])
 
 def test_a_region_round_the_pole_and_one_wider_than_half_the_globe_hold_in_every_position(regions_world):
     """A sample is inside exactly when its point lies in the shape, wherever the filter sits: near longitude 0 and
-    180, at the pole, past the ends of a 340-degree band."""
+    180, at the pole, past the ends of a 340-degree band. Rewritten for contract g7 (one rule everywhere, rule 1.6):
+    outside, the exclude and a NOT around the region, are the samples that have a location and are not inside (main
+    kept p21 and p22, which have none); the region itself is asked first, as main answers it."""
 
     async def scenario(r):
         await farm(r)
@@ -956,12 +974,14 @@ def test_a_region_round_the_pole_and_one_wider_than_half_the_globe_hold_in_every
         one = {'field': 'plot', 'operator': '=', 'value': 'p01'}
         for key in ROUND_KEYS:
             names = inside(key)
-            ids, outside = r.of(names), r.everything - r.of(names)
+            ids, outside = r.of(names), located - r.of(names)
             assert names and names <= LOCATED, key
-            # The two forms: complements over the samples with a location; the exclude keeps those without one.
-            kept, dropped = await selected(r, keep(key)), await selected(r, drop(key))
-            assert (kept, dropped) == (ids, outside), key
-            assert kept | (dropped & located) == located and not kept & dropped, key
+            # The two forms: complements over the samples with a location; the exclude keeps no sample without one.
+            kept = await selected(r, keep(key))
+            assert kept == ids, key
+            dropped = await selected(r, drop(key))
+            assert dropped == outside, key
+            assert kept | dropped == located and not kept & dropped, key
             # Under AND, OR and NOT, and as text.
             for node, expected in (
                 ({'logic': 'AND', 'filters': [keep(key), a]}, ids & grp_a),
@@ -981,7 +1001,7 @@ def test_a_region_round_the_pole_and_one_wider_than_half_the_globe_hold_in_every
                 assert await selected(r, {'logic': 'AND', 'filters': await nodes(r, query)}) == expected, query
             # Every reader of filters.
             await assert_every_reader(r, keep(key), names)
-            await assert_every_reader(r, drop(key), set(NAMES) - names)
+            await assert_every_reader(r, drop(key), LOCATED - names)
             # Its bounding box holds each sample inside it.
             box = (await region(r, key)).json()['bbox']
             west, south, east, north = box
@@ -1007,7 +1027,7 @@ def test_a_region_round_the_pole_and_one_wider_than_half_the_globe_hold_in_every
         assert moved.status_code == 200, moved.text
         assert await selected(r, keep('XE-PL')) == r.of(inside('XE-PL') - {'p23'})
         for key in ROUND_KEYS:
-            for node, names in ((keep(key), inside(key)), (drop(key), set(NAMES) - inside(key))):
+            for node, names in ((keep(key), inside(key)), (drop(key), LOCATED - inside(key))):
                 rows = await post(
                     r,
                     f'/api/datasets/{D}/versions/{version}/samples/query',

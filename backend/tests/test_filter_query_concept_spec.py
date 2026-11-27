@@ -6,8 +6,10 @@ filter_query/format and samples/query), signed in with a real API token, on the 
 - `concept "equipment" > 0.62` keeps the samples whose score for the dataset's concept named equipment passes the
   comparison: >, >=, < or <=. The name is quoted, or bare when it is a plain word.
 - `not concept "equipment" > 0.62`, and `NOT (concept "equipment" > 0.62)` (brackets around a lone concept test), are
-  ONE concept_exclude node: it hides those samples and keeps the rest, samples the concept has no score for included,
-  as the hide filter does. A NOT around anything larger is a NOT of its parts.
+  ONE concept_exclude node: it hides those samples and keeps the rest of the samples the concept scored, as the hide
+  filter does. A NOT around anything larger is a NOT of its parts. (Rewritten for the later contract g7, one rule
+  everywhere, rules 1.2 and 1.3: the hide filter, and a NOT around concept tests, keep only the samples that have a
+  score for each concept, and a value for each field, they compare; they kept the unscored samples too.)
 - `concept "equipment"` alone means the concept's saved comparison and threshold at the moment the text is parsed. A
   concept stores only a threshold, and the app compares with `>`, so it is `> <the saved threshold>`.
 - parse returns the nodes the app makes from ids, {field: "_concept", operator: concept_select | concept_exclude,
@@ -97,6 +99,10 @@ class Farm:
     @property
     def everything(self) -> set[int]:
         return set(self.ids.values())
+
+    def scored(self, concept: str) -> set[int]:
+        """The farm's samples that have a score for `concept`."""
+        return self.of(set(SCORES[concept]))
 
     def passing(self, concept: str, op: str, threshold: float) -> set[int]:
         """The farm's samples whose score for `concept` passes `op threshold`; a sample with no score never does."""
@@ -407,17 +413,20 @@ def test_the_bare_form_takes_the_saved_comparison_and_threshold_when_parsed(worl
 
 
 def test_keep_and_hide_select_the_samples_the_filters_from_ids_select(world):
+    """Rewritten for contract g7 (one rule everywhere, rule 1.3): hide keeps the scored samples keep doesn't, and not s4
+    and s5, which have no score (it kept them). Each keep is asked first, as main answers it."""
+
     async def scenario(w):
         f = await farm(w)
         equipment = f.concepts['equipment']
         unscored = f.of({'s4', 's5'})  # equipment has no score for them
+        assert f.everything - f.scored('equipment') == unscored
         cases = [(op, threshold) for op in OPS for threshold in (0.625, 0.5, 0.125)]
         # The filters made from ids select what the seeded scores say.
         for op, threshold in cases:
             kept = f.passing('equipment', op, threshold)
             assert await selected(w, keep(equipment, op, threshold)) == kept, (op, threshold)
-            assert unscored <= f.everything - kept
-            assert await selected(w, hide(equipment, op, threshold)) == f.everything - kept, (op, threshold)
+            assert await selected(w, hide(equipment, op, threshold)) == f.scored('equipment') - kept, (op, threshold)
         # The text selects the same.
         for op, threshold in cases:
             kept = f.passing('equipment', op, threshold)
@@ -426,7 +435,7 @@ def test_keep_and_hide_select_the_samples_the_filters_from_ids_select(world):
                 f'not concept "equipment" {op} {threshold}',
                 f'NOT (concept equipment {op} {threshold})',
             ):
-                assert await selected_by(w, query) == f.everything - kept, query
+                assert await selected_by(w, query) == f.scored('equipment') - kept, query
         # > and >= differ on a score equal to the threshold.
         assert f.ids['s1'] not in await selected_by(w, 'concept "equipment" > 0.625')
         assert f.ids['s1'] in await selected_by(w, 'concept "equipment" >= 0.625')
@@ -434,22 +443,33 @@ def test_keep_and_hide_select_the_samples_the_filters_from_ids_select(world):
     world(scenario)
 
 
-def test_a_not_around_more_than_one_concept_test_is_the_complement_of_its_parts(world):
+def test_a_not_around_more_than_one_concept_test_needs_a_score_and_a_value_for_each_test_inside(world):
+    """Rewritten for contract g7 (one rule everywhere, rules 1.2 and 1.3): a NOT around more than one concept test
+    keeps the samples that have a score for each concept and a value for each field inside, which the inside doesn't
+    keep (it was the complement of its parts); and the hide filter inside keeps only scored samples. Every sample has a
+    split. The insides main answers alike are asked first."""
+
     async def scenario(w):
         f = await farm(w)
-        for inner, expected in (
-            ('concept "equipment" > 0.5 AND split = "train"', f.passing('equipment', '>', 0.5) & f.split('train')),
+        for inner, expected, having in (
+            (
+                'concept "equipment" > 0.5 AND split = "train"',
+                f.passing('equipment', '>', 0.5) & f.split('train'),
+                f.scored('equipment'),
+            ),
             (
                 'concept equipment >= 0.625 OR concept weeds < 0.5',
                 f.passing('equipment', '>=', 0.625) | f.passing('weeds', '<', 0.5),
+                f.scored('equipment') & f.scored('weeds'),
             ),
             (
                 'not concept "weeds" > 0.5 AND split = "val"',
-                (f.everything - f.passing('weeds', '>', 0.5)) & f.split('val'),
+                (f.scored('weeds') - f.passing('weeds', '>', 0.5)) & f.split('val'),
+                f.scored('weeds'),
             ),
         ):
             assert await selected_by(w, f'({inner})') == expected, inner
-            assert await selected_by(w, f'NOT ({inner})') == f.everything - expected, inner
+            assert await selected_by(w, f'NOT ({inner})') == having - expected, inner
             assert len(await nodes(w, f'NOT ({inner})')) == 1, inner
             await assert_written_back(w, f'NOT ({inner})')
 
@@ -465,10 +485,12 @@ def test_a_concept_part_combines_with_and_or_and_brackets(world):
         assert body['filters'] == [train, hide(equipment, '>', 0.62)]
         assert body['parts'] == ['split = "train"', 'not concept "equipment" > 0.62']
 
+        # Rewritten for contract g7 (one rule everywhere, rule 1.3): the hide filter keeps only scored samples (the
+        # first, fourth and fifth cases kept unscored ones too).
         cases = [
             (
                 'split = "train" AND not concept "equipment" > 0.625',
-                f.split('train') - f.passing('equipment', '>', 0.625),
+                (f.split('train') & f.scored('equipment')) - f.passing('equipment', '>', 0.625),
                 2,
             ),
             ('concept "equipment" >= 0.625 OR split = "val"', f.passing('equipment', '>=', 0.625) | f.split('val'), 1),
@@ -479,12 +501,13 @@ def test_a_concept_part_combines_with_and_or_and_brackets(world):
             ),
             (
                 'concept "equipment" > 0.125 AND not concept "weeds" > 0.5',
-                f.passing('equipment', '>', 0.125) - f.passing('weeds', '>', 0.5),
+                (f.passing('equipment', '>', 0.125) & f.scored('weeds')) - f.passing('weeds', '>', 0.5),
                 2,
             ),
             (
                 'concept "equipment" > 0.5  # parked machines\nOR (not concept weeds <= 0.5 AND split = "train")',
-                f.passing('equipment', '>', 0.5) | ((f.everything - f.passing('weeds', '<=', 0.5)) & f.split('train')),
+                f.passing('equipment', '>', 0.5)
+                | ((f.scored('weeds') - f.passing('weeds', '<=', 0.5)) & f.split('train')),
                 1,
             ),
         ]

@@ -8,29 +8,45 @@ interpolated, so an unknown op must 400 rather than reach SQL).
 Pure function — the concept branch returns before any DB access, so no DB / no async.
 """
 
+import os
 from typing import Any
 
 import pytest
 from fastapi import HTTPException
 
 from backend.routers.datasets import parse_filter_node
+from backend.tests import test_field_registry_postgres
+
+registry_database = test_field_registry_postgres.registry_database
 
 
-def test_concept_exclude_bare_id_unaliased():
-    args: list[Any] = []
-    sql, idx = parse_filter_node(
-        {'field': '_concept', 'operator': 'concept_exclude', 'value': {'concept_id': 7, 'op': '>', 'threshold': 0.8}},
-        args,
-        1,
-    )
-    # One guard for the statement's concepts in front, then the anti-join.
-    assert sql.startswith('((SELECT require_concept_scores($3::int[])) AND (NOT EXISTS')
-    assert 'embedding_concept_scores' in sql
-    assert '_cs.sample_id = id' in sql  # bare id (FROM samples, unaliased)
-    assert '_cs.concept_id = $1' in sql
-    assert '_cs.score > $2' in sql
-    assert args == [7, 0.8, [7]]
-    assert idx == 4
+@pytest.mark.skipif(not os.getenv('FRIDGE_TEST_POSTGRES_DSN'), reason='Requires disposable PostgreSQL')
+def test_concept_exclude_bare_id_unaliased(registry_database):
+    """The exclude on the unaliased samples query reads each sample's own score. Its text changed with contract g7
+    (one rule everywhere, rule 1.3), so it is asked as rows: it hides the samples above the cut and, now, the samples
+    the concept has no score for (it kept those); the concept and the threshold are its own (another concept's
+    scores change nothing)."""
+
+    async def scenario(database):
+        await database.execute("""
+            INSERT INTO samples (id, dataset_id, filepath, media_type) VALUES
+                (1, 1, 'high', 'image'), (2, 1, 'low', 'image'), (3, 1, 'at', 'image'), (4, 1, 'unscored', 'image');
+            INSERT INTO embedding_concepts (id, dataset_id, name, embedding_field, kind, weight) VALUES
+                (7, 1, 'sky', 'clip', 'seed', '[1,0]'), (8, 1, 'road', 'clip', 'seed', '[0,1]');
+            INSERT INTO embedding_concept_scores (concept_id, sample_id, score) VALUES
+                (7, 1, 0.9), (7, 2, 0.5), (7, 3, 0.75), (8, 4, 0.1), (8, 2, 0.95);
+        """)
+        args: list[Any] = [1]
+        node = {
+            'field': '_concept',
+            'operator': 'concept_exclude',
+            'value': {'concept_id': 7, 'op': '>', 'threshold': 0.8},
+        }
+        sql, _ = parse_filter_node(node, args, 2, None, None, 1)
+        rows = await database.fetch(f'SELECT filepath FROM samples WHERE dataset_id = $1 AND {sql} ORDER BY id', *args)
+        assert [row['filepath'] for row in rows] == ['low', 'at']
+
+    registry_database(scenario)
 
 
 def test_concept_select_mapped_id_joined_context():

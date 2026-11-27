@@ -445,10 +445,12 @@ def test_cross_grain_concept_and_duplicate_filters(registry_database):
                 1,
                 [0, 0],
             ),
+            # Rewritten for contract g7 (one rule everywhere, rule 1.3): the exclude keeps only the scored sample at or
+            # below the cut (it kept the two unscored objects too: 3, from 10 to 30).
             (
                 {'field': '_concept', 'operator': 'concept_exclude', 'value': {'concept_id': 1, 'threshold': 0.5}},
-                3,
-                [10, 30],
+                1,
+                [10, 10],
             ),
             ({'field': '_collapse_duplicates', 'operator': 'collapse_duplicates', 'value': '_any'}, 3, [0, 30]),
         ]

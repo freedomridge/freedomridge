@@ -13,7 +13,8 @@ express (drawn map regions and lassos, selections, similarity, a concept that no
 stay chips.
 
 `location within "US-KS"` names a loaded region (backend/regions.py) by its key or its name. The caller looks up
-what region_names finds in the text and hands parse_query the answers.
+what region_names finds in the text and hands parse_query the answers. On a dataset with no field named `location`,
+`location is null`, `is not null`, `exists` and `not exists` ask whether a sample has a location.
 """
 
 import contextlib
@@ -315,9 +316,15 @@ class _Parser:
         kind = self.fields.get(field)
         if kind is None:
             if field == 'location':
+                # The sample's own location: `is null`, `is not null`, `exists` and `not exists` ask whether it has
+                # one, as their filters do, so the samples an excluded place doesn't show can be found.
+                if self.peek().keyword('exists', 'is') or (
+                    self.peek().keyword('not') and self.peek(1).keyword('exists')
+                ):
+                    return {'field': field, 'operator': _TO_FILTER[self.operator(field)], 'value': None}
                 raise self.fail(
-                    f"'location' takes within or not within and a region, such as location within \"US-KS\"; "
-                    f'found {_show(self.peek())}',
+                    f"'location' takes within or not within and a region, such as location within \"US-KS\", or is "
+                    f'null, is not null, exists or not exists; found {_show(self.peek())}',
                     self.peek(),
                 )
             hint = "; a concept's score is written concept \"name\" > 0.5" if token.keyword('concept') else ''

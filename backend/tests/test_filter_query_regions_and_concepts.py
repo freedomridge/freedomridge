@@ -329,15 +329,17 @@ def test_a_region_and_a_concept_under_one_or_select_exactly_their_samples(regist
 
         either = {'logic': 'OR', 'filters': [IN_KS, concept('concept_select')]}
         assert await selected(either) == {0, 1, 2, 4}
+        # Rewritten for contract g7 (one rule everywhere, rules 1.2, 1.3 and 1.6): the exclusions keep only the samples
+        # that have a location, or a score (they kept 4 and 5, which have no location, and 5, which has no score).
         neither = {'logic': 'OR', 'filters': [OUT_KS, concept('concept_exclude')]}
-        assert await selected(neither) == {1, 2, 3, 4, 5}
+        assert await selected(neither) == {1, 2, 3}
 
         # The same through the text, as the app and the SDK send it.
         for written, expected in (
             ('(location within "US-KS" OR concept "equipment" > 0.5) AND idx >= 1', {1, 2, 4}),
             ('location within Kansas AND not concept equipment > 0.5', {1}),
-            ('NOT (location within "US-KS" AND concept "equipment" > 0.5)', {1, 2, 3, 4, 5}),
-            ('location not within "US-KS" AND not concept "equipment" > 0.5', {3, 5}),
+            ('NOT (location within "US-KS" AND concept "equipment" > 0.5)', {1, 2, 3}),
+            ('location not within "US-KS" AND not concept "equipment" > 0.5', {3}),
         ):
             parsed = await endpoints.parse_filter_query(1, endpoints.FilterQueryParse(query=written))
             assert await selected(parsed['filter']) == expected, written

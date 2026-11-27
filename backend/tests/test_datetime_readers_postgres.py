@@ -76,6 +76,10 @@ async def setup(database, indexed):
 
 @pytest.mark.parametrize('indexed', [False, True], ids=['unindexed', 'indexed'])
 def test_filters_compare_instants(registry_database, indexed):
+    """Rewritten for contract g7 (one rule everywhere, rules 1.1, 1.2 and 1.7): `!=`, `not in` and a NOT around a
+    range no longer keep the samples with no value (`null`, `missing`); a value that isn't a datetime (text, a number,
+    the empty text) is a value, and they keep it as before."""
+
     async def scenario(database):
         await setup(database, indexed)
         moment = {'a', 'b', 'c', 'd'}
@@ -84,7 +88,8 @@ def test_filters_compare_instants(registry_database, indexed):
         assert set(await names(leaf('=', '2026-01-01T10:00+02:00'))) == moment | {'i'}  # a whole minute, offset
         day = moment | {'g', 'i'}
         assert set(await names(leaf('=', '2026-01-01'))) == day  # the whole UTC day
-        assert set(await names(leaf('!=', '2026-01-01'))) == set(VALUES) - day  # those without a datetime too
+        no_value = {'null', 'missing'}
+        assert set(await names(leaf('!=', '2026-01-01'))) == set(VALUES) - day - no_value  # the other values too
         assert set(await names(leaf('>=', '2026-01-01T00:00:00Z'))) == day | {'h'}
         assert set(await names(leaf('>', '2026-01-01'))) == {'h'}  # after the whole day
         assert set(await names(leaf('<=', '2026-01-01T08:00'))) == moment | {'e', 'f', 'g', 'i'}  # the whole minute
@@ -94,8 +99,16 @@ def test_filters_compare_instants(registry_database, indexed):
         empty = {'logic': 'AND', 'filters': [leaf('>', '2026-01-02'), leaf('<', '2026-01-01')]}
         assert await names(empty) == []
         assert set(await names(leaf('in', ['2026-01-01', 'unknown']))) == day | {'unknown'}
-        assert set(await names(leaf('not in', ['2026-01-01', 'unknown']))) == set(VALUES) - day - {'unknown'}
-        assert set(await names({'logic': 'NOT', 'filters': [leaf('>=', '2026-01-01')]})) == {'e', 'f', *NOT_DATETIMES}
+        assert set(await names(leaf('not in', ['2026-01-01', 'unknown']))) == set(VALUES) - day - {'unknown'} - no_value
+        assert (
+            set(await names({'logic': 'NOT', 'filters': [leaf('>=', '2026-01-01')]}))
+            == {
+                'e',
+                'f',
+                *NOT_DATETIMES,
+            }
+            - no_value
+        )
         # A value that isn't a datetime: equality compares the text, a range is refused, an empty one ignored.
         assert await names(leaf('=', 'unknown')) == ['unknown']
         assert set(await names(leaf('=', 12345))) == {'number'}

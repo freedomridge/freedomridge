@@ -20,7 +20,8 @@ What is tested, rule by rule:
   (the migrations up to the newest on the base only), where no read fails; and the record's migration, run a second
   time after the upgrade, changes nothing.
 - 1.6: `location` and a concept's scores, written to an object for the first time, are found at once by a place and
-  a concept filter (pins; the contract leaves to the implementer which of them the record covers).
+  a concept filter (pins; the contract leaves to the implementer which of them the record covers). The place's test
+  is no longer a pin: its exclusions follow the later contract g7 (one rule everywhere, rule 1.6), see its docstring.
 
 How the expectations are made. After each write the grids are asked first; only then is the dataset read back (its
 rows, kinds, image links, metadata, `@local.` values, locations and concept scores, read from the samples' own
@@ -988,9 +989,12 @@ async def ingest_a_located_object(r: Regions, w: Kinds) -> None:
 
 
 @pytest.mark.parametrize('act', [locate_an_object, ingest_a_located_object], ids=['sample-patch', 'ingest'])
-def test_1_6_pin_a_first_location_on_an_object_is_found_at_once_by_a_place_on_both_grids(regions_world, act):
+def test_1_6_a_first_location_on_an_object_is_found_at_once_by_a_place_on_both_grids(regions_world, act):
     """No object has a location until car-4 (or a new object of img-4) gets one inside SQUARE: img-4 is inside
-    through it at once, and its exclusion leaves img-4 out at once."""
+    through it at once, and its exclusion leaves img-4 out at once. Rewritten for the later contract g7 (one rule
+    everywhere, rule 1.6), through the shared reference (test_objects_filter_reading_spec.Reading): the exclusion and
+    the NOT around the place show only the rows that have a location, the row as a whole, so img-3, img-5 and truck-3
+    (no location on them or their partner) are out, which main shows; it was a pin, and now fails on main for that."""
 
     async def scenario(r):
         w = await plant(r)

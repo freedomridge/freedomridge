@@ -10,64 +10,43 @@ its objects, or for an object together with its image. A row is never asked abou
 - A test (a comparison, a place, a lasso, a concept's show, a selection) is met when either of the two rows meets it.
   On the images' grid the two are the image and ONE of its objects (or the image alone), so tests joined by AND are
   met with the same object; on the objects' grid they are the object and its image.
-- `NOT (X)` holds when the row as a whole has a value for every field compared inside X and X does not hold for it.
+- `NOT (X)` holds when the row as a whole has a value for everything X compares and X does not hold for it (what X
+  compares: backend/negation.py, the one place that knows it, which the compiler asks for a NOT on one row too).
   `!=` and `not in` are the NOT of `=` and `in`; a concept's exclude is the NOT of its show, with the score as the
-  value. "As a whole" is the image with all its objects on the images' grid, the object with its image on the
-  objects' grid. A NOT inside a larger filter is read first, for the row as a whole.
+  value; an excluded place or lasso is the NOT of the place or the lasso, so the row as a whole has a location (or a
+  point on that map) and neither it nor a partner is inside. "As a whole" is the image with all its objects on the
+  images' grid, the object with its image on the objects' grid. A NOT inside a larger filter is read first, for the
+  row as a whole.
 - `is null` holds when neither the row nor any of those partners has a value (absent or a JSON null), `not exists`
   when none has the key (a JSON null under it counts as there): both read first and for the row as a whole, like a
   NOT. `is not null` and `exists` are showing tests like any other.
-- An excluded place or lasso leaves out the row when it or a partner is inside, and keeps the rows with no location
-  or no point, as the exclusion standing alone does.
-- A hiding test of a field every row has (the built-in columns, a list such as `tags`), and the duplicates' collapse,
-  are answered by the grid's own row, as before. A NOT around tests of built-in fields only keeps the reading it had:
-  each row on its own (`NOT (id contains ...)`: the grid's row).
+- A hiding test of a field every row has (the built-in columns) or of a list (`tags`), and the duplicates' collapse,
+  are answered by the grid's own row, as before; a list's needs at least one element there. A NOT around tests of
+  built-in fields only keeps the reading it had: each row on its own (`NOT (id contains ...)`: the grid's row).
 
 Every rule reads the values. For speed only, the compiler's `Rows` may skip a kind of row for a field that kind has
 never been seen with (backend/field_kinds.py): its `test`, `keyed` and `has` then answer FALSE without reading the row,
 and a partner whose test is FALSE is not looked up. The parts below fold such constants as SQL's three-valued logic
 does (x OR FALSE is x, x AND FALSE is FALSE, NOT FALSE is TRUE), building the parts in order, so the answer is the one
 the full statement gives. The SQL is built through the `Rows` the compiler passes (`test` compiles a plain filter node
-against a row, `keyed` the same for a partner row with the metadata key's test first; `objects` and `parent` reach a
-row's objects and an object's image, each as one EXISTS the planner can run as a hashed set).
+against a row, `keyed` the same for a partner row with the metadata key's test first, `has_need` that a row has what a
+NOT needs; `objects` and `parent` reach a row's objects and an object's image, each as one EXISTS the planner can run
+as a hashed set).
 """
 
 from functools import partial
 from typing import Any, Callable, Iterable, Optional, Protocol
 
-# A filter node's place in the reading: ('test', node), ('not', unit, fields, concepts), ('absent', what it is the
-# absence of: a test, or ('has', field) for a value), ('exclude', node), ('own', node), ('and', units), ('or', units).
+from . import negation
+from .negation import Need
+
+# A filter node's place in the reading: ('test', node), ('not', unit, needs), ('absent', what it is the absence of: a
+# test, or ('has', field) for a value), ('own', node), ('and', units), ('or', units).
 Unit = tuple
 
-_NEGATIONS = {'!=': '=', 'not in': 'in'}
-# The compiler takes these spellings of a negation on a label path only; elsewhere they are refused, as before.
-_LABEL_NEGATIONS = {'<>': '=', 'not_in': 'in', 'nin': 'in'}
 _RANGES = {'>', '>=', '<', '<='}
-_COMPARISONS = {
-    '=',
-    '==',
-    '!=',
-    '<>',
-    'in',
-    'not in',
-    'not_in',
-    'nin',
-    '<',
-    '<=',
-    '>',
-    '>=',
-    'contains',
-    'match_elements',
-    'elem_match',
-}
-_EXCLUDES = {
-    'geo_polygon_exclude': 'geo_polygon',
-    'geo_region_exclude': 'geo_region',
-    'embedding_polygon_exclude': 'embedding_polygon',
-}
 _ABSENT = {'is_null', 'not_exists'}
 _PRESENT = {'is_not_null', 'exists'}
-_CONCEPTS = {'concept_select', 'concept_exclude'}
 # Answered by the grid's own row: the duplicates' collapse (a hiding of row identities, as `id not in` is), the
 # unlinked objects' finder, and a wrapping operator found inside a wrapped filter (each reaches across on its own).
 _OWN = {'collapse_duplicates', 'unlinked_object', 'cg_self', 'has_matching_object', 'parent_matches'}
@@ -81,6 +60,12 @@ class Rows(Protocol):
     def test(self, node: Any, row: Any) -> str: ...
 
     def has(self, field: str, row: Any, presence: bool = False) -> str: ...
+
+    def has_need(self, need: Need, row: Any) -> str: ...
+
+    def builtin(self, field: Any) -> bool: ...
+
+    def filters_nothing(self, node: Any) -> bool: ...
 
     def keyed(self, node: Any, row: Any) -> str: ...
 
@@ -106,6 +91,18 @@ def read(base: Any, grid: str, rows: Rows) -> str:
     unit = reader.unit(base)
     row = rows.outer()
     return reader.image(unit, row) if grid == 'image' else reader.object(unit, row)
+
+
+def read_not(base: Any, grid: str, rows: Rows) -> str:
+    """SQL for NOT (the page's wrapping of `base`), as withGrain and the assistant write an excluded region: the row as
+    a whole has a value for everything `base` compares (negation.needs) and `base`, read for the row as `read` reads it,
+    doesn't hold. With nothing compared (tests of built-in fields only) it is the plain NOT of that reading."""
+    reader = _Reader(rows)
+    unit = reader.unit(base)
+    row = rows.outer()
+    read, having = (reader.image, reader.image_needs) if grid == 'image' else (reader.object, reader.object_needs)
+    needs = [partial(having, need, row) for need in negation.needs(base, rows)]
+    return reader.all_of([*needs, lambda: _not(read(unit, row))])
 
 
 _CONSTANTS = ('TRUE', 'FALSE')
@@ -230,19 +227,24 @@ class _Reader:
             return ('and', self.grouped(children))
         operator, field = _operator(node), node.get('field')
         row_field = self.rows.row_field(field)
-        if operator in _NEGATIONS or (operator in _LABEL_NEGATIONS and self.rows.label_path(field)):
+        labels = field == 'segmentation.labels' or self.rows.label_path(field)
+        if operator in negation.NEGATIONS or (operator in negation.LABEL_NEGATIONS and labels):
             if row_field or not isinstance(field, str):
                 return ('own', node)
-            positive = {**node, 'operator': _NEGATIONS.get(operator) or _LABEL_NEGATIONS[operator]}
-            return ('not', ('test', positive), [field], [])
+            positive = {**node, 'operator': negation.NEGATIONS.get(operator) or negation.LABEL_NEGATIONS[operator]}
+            return ('not', ('test', positive), negation.needs(positive, self.rows))
         if operator == 'concept_exclude':
             value = node.get('value')
             concept = value.get('concept_id') if isinstance(value, dict) else None
             if concept is None:
                 return ('own', node)  # no concept: no condition, as the compiler reads it
-            return ('not', ('test', {**node, 'operator': 'concept_select'}), [], [concept])
-        if operator in _EXCLUDES:
-            return ('exclude', node)
+            positive = {**node, 'operator': 'concept_select'}
+            return ('not', ('test', positive), negation.needs(positive, self.rows))
+        if operator in negation.EXCLUSIONS:
+            if self.rows.filters_nothing(node):
+                return ('own', node)  # no polygon: no condition, as the compiler reads it
+            positive = {**node, 'operator': negation.EXCLUSIONS[operator]}
+            return ('not', ('test', positive), negation.needs(positive, self.rows))
         if operator in _ABSENT or operator in _PRESENT:
             if row_field == 'builtin' or not isinstance(field, str):
                 return ('own', node)  # every row has its built-in fields
@@ -278,29 +280,19 @@ class _Reader:
         leaves = _leaves(inner)
         kinds = [self.rows.row_field(leaf.get('field')) if isinstance(leaf, dict) else None for leaf in leaves]
         if leaves and all(
-            isinstance(leaf, dict) and _operator(leaf) in _COMPARISONS and kind for leaf, kind in zip(leaves, kinds)
+            isinstance(leaf, dict) and _operator(leaf) in negation.COMPARISONS and kind
+            for leaf, kind in zip(leaves, kinds)
         ):
-            # Tests of fields every row has, only: as before. A NOT of built-in tests asks each row on its own (the
-            # grid's row alone for `id contains`, the sidebar's typed terms); a list's, the grid's row, as `not in`.
+            # Tests of built-in fields and lists only: as before. A NOT of built-in tests asks each row on its own (the
+            # grid's row alone for `id contains`, the sidebar's typed terms); a list's, the grid's row, as `not in`,
+            # which needs at least one element there.
             if all(kind == 'builtin' for kind in kinds):
                 id_text = all(leaf.get('field') == 'id' and _operator(leaf) == 'contains' for leaf in leaves)
                 if id_text and all(self._and_or(child) for child in children):
                     return ('own', node)
                 return ('test', node)
             return ('own', node)
-        fields: dict[str, None] = {}
-        concepts: dict[Any, None] = {}
-        for leaf in leaves:
-            if not isinstance(leaf, dict):
-                continue
-            operator, field = _operator(leaf), leaf.get('field')
-            if operator in _COMPARISONS and isinstance(field, str) and not self.rows.row_field(field):
-                fields[field] = None
-            elif operator in _CONCEPTS and isinstance(leaf.get('value'), dict):
-                concept = leaf['value'].get('concept_id')
-                if concept is not None:
-                    concepts[concept] = None
-        return ('not', self.unit(inner), list(fields), list(concepts))
+        return ('not', self.unit(inner), negation.needs(inner, self.rows))
 
     @staticmethod
     def _and_or(node: Any) -> bool:
@@ -325,16 +317,13 @@ class _Reader:
                 [partial(rows.test, test, row), lambda: rows.objects(row, lambda o: rows.keyed(test, o), test)],
             )
         if kind == 'not':
-            _, inner, fields, concepts = unit
-            having = [partial(self.image_has, field, row) for field in fields]
-            having += [partial(self.image_scored, concept, row) for concept in concepts]
+            _, inner, needs = unit
+            having = [partial(self.image_needs, need, row) for need in needs]
             return self.all_of([*having, lambda: _not(self.image(inner, row))])
         if kind == 'absent':
             return self.image_absent(unit[1], row)
         if kind == 'has':
             return self.image_has(unit[1], row, presence=True)
-        if kind == 'exclude':
-            return self.excluded(unit[1], row, rows.objects)
         return rows.test(unit[1], row)
 
     def image_absent(self, unit: Unit, row: Any) -> str:
@@ -366,9 +355,12 @@ class _Reader:
             ],
         )
 
-    def image_scored(self, concept: Any, row: Any) -> str:
-        rows, node = self.rows, _scored(concept)
-        return self.any_of([partial(rows.test, node, row), lambda: rows.objects(row, lambda o: rows.test(node, o))])
+    def image_needs(self, need: Need, row: Any) -> str:
+        """The image as a whole has what a NOT needs: it or one of its objects."""
+        rows = self.rows
+        return self.any_of(
+            [partial(rows.has_need, need, row), lambda: rows.objects(row, lambda o: rows.has_need(need, o))],
+        )
 
     def image_and(self, units: list, row: Any) -> str:
         """The row-level parts each for the image; the tests together, with the same object."""
@@ -456,16 +448,13 @@ class _Reader:
                 [partial(rows.test, test, row), lambda: rows.parent(row, lambda p: rows.keyed(test, p), test)],
             )
         if kind == 'not':
-            _, inner, fields, concepts = unit
-            having = [partial(self.object_has, field, row) for field in fields]
-            having += [partial(self.object_scored, concept, row) for concept in concepts]
+            _, inner, needs = unit
+            having = [partial(self.object_needs, need, row) for need in needs]
             return self.all_of([*having, lambda: _not(self.object(inner, row))])
         if kind == 'absent':
             return self.object_absent(unit[1], row)
         if kind == 'has':
             return self.object_has(unit[1], row, presence=True)
-        if kind == 'exclude':
-            return self.excluded(unit[1], row, rows.parent)
         return rows.test(unit[1], row)
 
     def object_absent(self, unit: Unit, row: Any) -> str:
@@ -493,23 +482,9 @@ class _Reader:
             ],
         )
 
-    def object_scored(self, concept: Any, row: Any) -> str:
-        rows, node = self.rows, _scored(concept)
-        return self.any_of([partial(rows.test, node, row), lambda: rows.parent(row, lambda p: rows.test(node, p))])
-
-    # --- Both ---
-
-    def excluded(self, node: dict, row: Any, partners: Callable[..., str]) -> str:
-        """An excluded place or lasso: the row's own exclusion (which keeps a row with no location or no point), and no
-        partner inside. An exclusion that excludes nothing (fewer than three points) stays so."""
-        own = self.rows.test(node, row)
-        if own == 'TRUE':
-            return own
-        inside = {**node, 'operator': _EXCLUDES[_operator(node)]}
-        # Neither part comes out FALSE (an exclusion keeps the rows with no location; a partner's EXISTS is never TRUE
-        # alone), so nothing built is left out but a constant.
-        return _and([own, _neg(partners(row, lambda r: self.rows.test(inside, r)))])
-
-
-def _scored(concept: Any) -> dict:
-    return {'field': '_cpresent', 'operator': 'concept_present', 'value': {'concept_id': concept}}
+    def object_needs(self, need: Need, row: Any) -> str:
+        """The object with its image has what a NOT needs: it or its image."""
+        rows = self.rows
+        return self.any_of(
+            [partial(rows.has_need, need, row), lambda: rows.parent(row, lambda p: rows.has_need(need, p))],
+        )

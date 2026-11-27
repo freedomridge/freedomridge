@@ -522,7 +522,11 @@ async def converse(s: Script, *, private: bool = False, concept: bool = True) ->
             expected_final = await s.page_shows(bright, preview['remove'])
             assert unscored <= lit - expected_final, (unscored, len(expected_final))
         else:
-            expected_final = lit - above_ids
+            # Rewritten for contract g7 (one rule everywhere, rules 1.3 and 2.1): the exclusion keeps only the images
+            # that have a score, at or below the cut, on this dataset too (it kept the unscored ones), and their count
+            # is the one concept_preview gave.
+            expected_final = lit - above_ids - unscored
+            assert expected_final == below_ids and len(expected_final) == preview['below'], preview
         await s.shows(final, expected_final, refined=bright['view'])
     else:
         assert named_equipment == [], known
