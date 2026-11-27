@@ -769,18 +769,24 @@ class Dataset:
             except Exception as e:
                 raise RuntimeError(f"Failed to create dataset: {e}")
 
-    def create_array_field(self, name: str):
-        """Create a new tag-like array field for this dataset.
+    def create_array_field(self, name: str, *, timeout: float = 3600):
+        """Create a list field kept in a column of its own for this dataset.
 
-        Creates a real TEXT[] column with a GIN index on the samples table.
-        Once created, you can set it on samples: sample.my_field = ["val1", "val2"]
+        Creates a real TEXT[] column with a GIN index on the samples table, or registers one another dataset made.
+        Once created, you can set it on samples: sample.my_field = ["val1", "val2"]. A sample never given a list holds
+        no value for it: ``sample.my_field`` is None, apart from an empty list ([]).
+
+        When another dataset made the column and this dataset is large, the server makes the field this dataset's in a
+        job (its empty lists from before become never set first): this waits for it, up to ``timeout`` seconds.
 
         Example:
             dataset.create_array_field("inferred_tags")
             sample.inferred_tags = ["ANIMAL:DOG", "VEHICLE:TRUCK"]
         """
-        result = self.client.create_array_field(self._id, name)
+        result = self.client.create_array_field(self._id, name, timeout=timeout)
         Sample._known_array_fields.add(name)
+        if name not in self._array_field_names:
+            self._array_field_names.append(name)
         return result
 
     def list_array_fields(self) -> list:
@@ -886,10 +892,11 @@ class Dataset:
             heading = row["location"].get("heading")  # the samples endpoints nest it in location
         if heading is not None:
             sample.heading = heading
-        # Populate array fields (uses the cached names — no extra network call)
+        # Populate array fields (uses the cached names — no extra network call): a list, or None for one never set.
         for af in self._array_field_names:
             if af != 'tags' and af in row:
-                sample.array_fields[af] = row[af] or []
+                sample.array_fields[af] = row[af]
+        sample._loaded_unset_arrays = {name for name, value in sample.array_fields.items() if value is None}
         return sample
 
     def get_or_create(self, filepath: str, **kwargs) -> tuple:
@@ -1294,6 +1301,14 @@ class Dataset:
                 groups: Dict[Tuple[bool, bool], List[Dict[str, Any]]] = {}
                 for sample in batch:
                     row = sample.to_dict()
+                    # The source's list fields only (a version's rows carry every list column of the server), each a
+                    # list or, when never set, left out: never set here too (to_dict).
+                    lists = {
+                        name: value for name, value in (row.get("array_fields") or {}).items() if name in array_names
+                    }
+                    row.pop("array_fields", None)
+                    if lists:
+                        row["array_fields"] = lists
                     row["embeddings"] = vectors.get(sample.id)
                     row["hashes"] = hash_values.get(sample.id)
                     moved = orphan = False

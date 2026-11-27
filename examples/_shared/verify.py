@@ -101,7 +101,9 @@ def verify_objects(client, dataset_name, expected_count, kind):
             assert not metadata.get('caption_annotations')
             assert all('label' not in x for x in metadata.get('verified_absent', []))
             for field in ('negative_classes', 'negative_parent_classes'):
-                assert all(isinstance(x, str) for x in sample.get('array_fields', {}).get(field, sample.get(field, [])))
+                # A list field never set comes back null: no list.
+                values = sample.get('array_fields', {}).get(field, sample.get(field)) or []
+                assert all(isinstance(x, str) for x in values)
             for instance in metadata.get('mask_instances', []):
                 assert any(d['id'] == instance['detection_id'] for d in metadata['detections'])
             fetch(sample['id'])
@@ -115,7 +117,7 @@ def verify_objects(client, dataset_name, expected_count, kind):
                 counts[field] += len(metadata[field])
             for field in array_fields:
                 assert field in schema, field
-                values = sample.get('array_fields', {}).get(field, sample.get(field, []))
+                values = sample.get('array_fields', {}).get(field, sample.get(field)) or []  # null: never set
                 if values:
                     arrays.setdefault(field, values[0])
             for field, value in metadata.items():

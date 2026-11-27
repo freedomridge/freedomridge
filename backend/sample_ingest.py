@@ -21,6 +21,62 @@ def media_type(filepath):
     return 'unknown'
 
 
+def _insert_query(array_fields, on_duplicate, replace_tags):
+    """The insert of a chunk of samples. A list field is written as sent: a list, or no value (NULL) for null or for a
+    field the sample leaves out. Added again (update), a sample keeps each stored list field it sends no list for: one
+    it leaves out keeps what is stored (docs/SDK.md, add_samples), whatever the other samples of the request name. An
+    explicit null unsets it, by a statement of its own after this one (_unset_query)."""
+    columns = ''.join(f', "{name}"' for name in array_fields)
+    values = ''.join(
+        f", CASE WHEN jsonb_typeof(payload.array_fields->'{name}') = 'array' "
+        f"THEN ARRAY(SELECT jsonb_array_elements_text(payload.array_fields->'{name}')) END"
+        for name in array_fields
+    )
+    conflict = 'DO NOTHING'
+    if on_duplicate == 'update':
+        assignments = [
+            'media_type = EXCLUDED.media_type',
+            "tags = ARRAY(SELECT DISTINCT tag FROM unnest("
+            + ("" if replace_tags else "COALESCE(samples.tags, '{}') || ")
+            + "EXCLUDED.tags) tag ORDER BY tag)",
+            'metadata = EXCLUDED.metadata',
+            'location = EXCLUDED.location',
+            'heading = EXCLUDED.heading',
+            'last_modified_at = now()',
+            *(f'"{name}" = COALESCE(EXCLUDED."{name}", samples."{name}")' for name in array_fields),
+        ]
+        conflict = 'DO UPDATE SET ' + ', '.join(assignments)
+    return f"""
+        INSERT INTO samples
+            (dataset_id, filepath, media_type, tags, metadata, location, heading, created_at{columns})
+        SELECT $1, payload.filepath, payload.media_type, payload.tags, payload.metadata,
+            CASE WHEN payload.location->'coordinates' IS NOT NULL
+                 THEN ST_SetSRID(ST_MakePoint((payload.location->'coordinates'->>0)::float8,
+                                             (payload.location->'coordinates'->>1)::float8), 4326) END,
+            payload.heading, COALESCE(payload.created_at, now()){values}
+        FROM jsonb_to_recordset($2::jsonb) AS payload(
+            filepath text, media_type text, tags text[], metadata jsonb, location jsonb,
+            heading float8, created_at timestamptz, array_fields jsonb, position integer)
+        ORDER BY payload.position
+        ON CONFLICT (dataset_id, filepath) {conflict}
+        RETURNING id, filepath
+    """
+
+
+def _unset_query(names):
+    """Samples added again (update) that sent null for a list field of `names` (the key there, its value null): the
+    field becomes never set where it holds a list. $1: the dataset; $2: [{id, unset: [the names it sent null for]}]."""
+    assignments = ', '.join(
+        f'"{name}" = CASE WHEN \'{name}\' = ANY(unsets.unset) THEN NULL ELSE samples."{name}" END' for name in names
+    )
+    holds = ' OR '.join(f'(\'{name}\' = ANY(unsets.unset) AND samples."{name}" IS NOT NULL)' for name in names)
+    return f"""
+        UPDATE samples SET {assignments}
+        FROM jsonb_to_recordset($2::jsonb) AS unsets(id integer, unset text[])
+        WHERE samples.id = unsets.id AND samples.dataset_id = $1 AND ({holds})
+    """
+
+
 async def insert_samples(connection, dataset_id, samples, on_duplicate, array_fields, replace_tags=False):
     """replace_tags (update mode only): an existing sample's tags become the ones sent, instead of both."""
     previous_keys = set()
@@ -48,43 +104,12 @@ async def insert_samples(connection, dataset_id, samples, on_duplicate, array_fi
                 row['tags'] = sorted(set(previous['tags'] or []) | set(row['tags'] or []))
             row['embeddings'] = {**(previous['embeddings'] or {}), **(row['embeddings'] or {})}
             row['hashes'] = {**(previous['hashes'] or {}), **(row['hashes'] or {})}
+            # A list field the later copy leaves out keeps what the earlier one wrote, as a stored one is kept.
+            if previous.get('array_fields') or row.get('array_fields'):
+                row['array_fields'] = {**(previous.get('array_fields') or {}), **(row.get('array_fields') or {})}
             grouped[sample.filepath] = row
 
-    columns = ', '.join(f'"{name}"' for name in array_fields)
-    extra_columns = ', ' + columns if columns else ''
-    extra_values = ''.join(
-        f", ARRAY(SELECT jsonb_array_elements_text(COALESCE(payload.array_fields->'{name}', '[]'::jsonb)))"
-        for name in array_fields
-    )
-    conflict = 'DO NOTHING'
-    if on_duplicate == 'update':
-        assignments = [
-            'media_type = EXCLUDED.media_type',
-            "tags = ARRAY(SELECT DISTINCT tag FROM unnest("
-            + ("" if replace_tags else "COALESCE(samples.tags, '{}') || ")
-            + "EXCLUDED.tags) tag ORDER BY tag)",
-            'metadata = EXCLUDED.metadata',
-            'location = EXCLUDED.location',
-            'heading = EXCLUDED.heading',
-            'last_modified_at = now()',
-            *(f'"{name}" = EXCLUDED."{name}"' for name in array_fields),
-        ]
-        conflict = 'DO UPDATE SET ' + ', '.join(assignments)
-    query = f"""
-        INSERT INTO samples
-            (dataset_id, filepath, media_type, tags, metadata, location, heading, created_at{extra_columns})
-        SELECT $1, payload.filepath, payload.media_type, payload.tags, payload.metadata,
-            CASE WHEN payload.location->'coordinates' IS NOT NULL
-                 THEN ST_SetSRID(ST_MakePoint((payload.location->'coordinates'->>0)::float8,
-                                             (payload.location->'coordinates'->>1)::float8), 4326) END,
-            payload.heading, COALESCE(payload.created_at, now()){extra_values}
-        FROM jsonb_to_recordset($2::jsonb) AS payload(
-            filepath text, media_type text, tags text[], metadata jsonb, location jsonb,
-            heading float8, created_at timestamptz, array_fields jsonb, position integer)
-        ORDER BY payload.position
-        ON CONFLICT (dataset_id, filepath) {conflict}
-        RETURNING id, filepath
-    """
+    query = _insert_query(array_fields, on_duplicate, replace_tags)
     written = {}
     rows = list(grouped.values())
     # The samples insert and its row triggers never read embeddings, so a generic plan can't lock its partitions:
@@ -102,6 +127,21 @@ async def insert_samples(connection, dataset_id, samples, on_duplicate, array_fi
         inserted = await connection.fetch(query, dataset_id, payloads)
         written.update({row['filepath']: row['id'] for row in inserted})
     await connection.execute('SET LOCAL plan_cache_mode = DEFAULT')
+    if on_duplicate == 'update':
+        # A sample added again that sent null for a list field: the insert kept its stored list (COALESCE), and null
+        # unsets it (rule 1.5). Only when a sample of the request did: one statement more, in the same transaction.
+        unsets = []
+        for filepath, row in grouped.items():
+            unset = sorted(
+                name
+                for name, value in (row.get('array_fields') or {}).items()
+                if value is None and name in array_fields
+            )
+            if unset and filepath in written:
+                unsets.append({'id': written[filepath], 'unset': unset})
+        if unsets:
+            names = sorted({name for entry in unsets for name in entry['unset']})
+            await connection.execute(_unset_query(names), dataset_id, unsets)
 
     existing = {}
     if on_duplicate == 'error':
@@ -142,7 +182,7 @@ async def insert_samples(connection, dataset_id, samples, on_duplicate, array_fi
                     if name == 'media_type'
                     else (grouped[filepath]['tags'] or [])
                     if name == 'tags'
-                    else (grouped[filepath].get('array_fields') or {}).get(name, [])
+                    else (grouped[filepath].get('array_fields') or {}).get(name) or []
                 )
             },
         )

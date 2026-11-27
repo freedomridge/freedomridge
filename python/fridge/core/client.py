@@ -164,7 +164,9 @@ class _Session(requests.Session):
             # A map re-fit swapping its new map in holds the dataset for at most this many more seconds
             # (the server ends the swap by then): keep retrying until it is over, not just the usual window.
             # Taken once, so a server that keeps answering never extends the wait.
-            swap = resp.headers.get("X-Map-Swap-Seconds")
+            # A job holding the write back (a list field being made the dataset's) says when it is expected to end, in
+            # the same way: keep retrying until then, and the usual window after it.
+            swap = resp.headers.get("X-Map-Swap-Seconds") or resp.headers.get("X-Job-End-Seconds")
             if swap is not None and not swap_seen:
                 swap_seen = True
                 deadline = max(deadline, time.monotonic() + float(swap) + self.busy_retry_seconds)
@@ -1920,14 +1922,17 @@ class Client:
 
     # --- Array fields ---
 
-    def create_array_field(self, dataset_id, name) -> dict:
-        """Create a new TEXT[] array field on the samples table."""
+    def create_array_field(self, dataset_id, name, *, wait=True, timeout=3600) -> dict:
+        """Create a list field kept in a column of its own (a TEXT[] column of samples), or register one another
+        dataset made. When another dataset made it and this one is large, the server makes it this dataset's in a job
+        (its empty lists from before become never set first); this waits for the job and returns {message, created}.
+        ``wait=False`` returns the Job instead when the server answers with one."""
         resp = self.session.post(
             f"{self.base_url}/datasets/{dataset_id}/array-fields",
             json={"field_name": name},
+            params=self._wait_params(wait, timeout),
         )
-        _raise_for_status(resp)
-        return resp.json()
+        return self._job_result(resp, wait=wait, timeout=timeout)
 
     def list_array_fields(self, dataset_id) -> list:
         """List all dynamic array fields on a dataset."""

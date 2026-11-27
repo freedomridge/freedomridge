@@ -190,9 +190,10 @@ dataset.created_at     # Creation timestamp (ISO-8601 string)
 Add samples to the dataset. Always takes a **list** (there is no `add_sample`
 singular — wrap a single sample in a list). Returns a dict including the created
 sample `ids`. `on_duplicate` is one of `"error"` (default), `"skip"`, or
-`"update"`. In `"update"` mode, `metadata`/`location`/array fields are **replaced**
-(the uploader owns derived data) but `tags` are **merged** (union) — re-ingesting a
-sample never erases tags added in the app. Use a sample `save()` or bulk-set to
+`"update"`. In `"update"` mode, `metadata` and `location` are **replaced**
+(the uploader owns derived data), a list field the sample names is replaced and one it
+leaves out is kept ([list fields](#list-fields-in-a-column-of-their-own)), and `tags` are
+**merged** (union) — re-ingesting a sample never erases tags added in the app. Use a sample `save()` or bulk-set to
 deliberately clear tags, or pass `replace_tags=True` with `on_duplicate="update"` to make
 an existing sample's tags exactly the ones sent, removing any others (tags added in the app too).
 
@@ -412,7 +413,7 @@ view = dataset.filter(tags__contains="validated")     # contains
 | `__in`, `__nin` (or `__not_in`) | in / not in a list (`not in`, like `!=`, needs a value) |
 | `__contains` | case-insensitive substring on text; membership on `tags` and other array fields |
 | `__exists=True/False` | the metadata key is present / absent |
-| `__is_null=True/False` | no value (the key is missing or null) / has a value; an empty list is a value, except in `tags` and the other lists kept in a column of their own |
+| `__is_null=True/False` | no value (the key is missing or null, a list field never set) / has a value; an empty list is a value, except in `tags` (and a mirror's `@local.tags`) |
 | `__is_empty=True/False` | the value is an empty list / a value that isn't one (on `tags`: no tags / at least one) |
 
 An unknown suffix (for example `brightness__between=[0.3, 0.8]`) raises
@@ -1804,43 +1805,92 @@ To compute the same metrics for one PIL image yourself (for example before uploa
 `fridge.compute_image_metrics(img)`. It returns the dict of eight floats that `compute_metrics()`
 stores per sample, and needs the same optional dependencies (`pip install "freedomridge[all]"`).
 
-## Array Fields (Dynamic Tag-Like Fields)
+## List Fields in a Column of Their Own
 
-Freedom Ridge supports creating any number of tag-like array fields beyond the built-in `tags`. These are stored as native PostgreSQL `TEXT[]` columns with GIN indexes — same performance as tags.
+Freedom Ridge supports creating any number of list fields beyond the built-in `tags`. Each is stored as a native PostgreSQL `TEXT[]` column of the samples table with a GIN index: the same performance as tags. (They are also called array fields: `create_array_field`, `array_fields`.)
 
-### Creating an Array Field
+### Creating a list field
 
 ```python
-# Create a new filterable array field
+# Create a new filterable list field
 dataset.create_array_field("inferred_tags")
 dataset.create_array_field("categories")
 
-# List all array fields
+# List all list fields
 fields = dataset.list_array_fields()
 # ['tags', 'inferred_tags', 'categories']
 ```
 
-### Setting Array Field Values
+The column is shared by every dataset that adds a field of that name. When another dataset made it first, the
+dataset's samples from before hold an empty list there from an older version (which stored `[]` for a sample written
+without the field); those empty lists become never set before the field is the dataset's, so every sample it had is
+never set. A dataset of at most 1,000 samples is done within the call. A larger one is done by a job of the server
+(`list_field_registration`, shown under Background jobs): `create_array_field` waits for it (up to `timeout`, an hour
+by default). Until the job ends the field isn't the dataset's: `list_array_fields` doesn't list it, and a write that
+names it (adding or updating a sample with it, a bulk edit of it) is refused with a 409 that names the job, with
+`Retry-After` and `X-Job-End-Seconds` (when the job is expected to end); the SDK keeps retrying that long. Samples can be
+added meanwhile without the field, and a version can't be restored meanwhile. Measured on a table of 2.1 million rows,
+a million samples took about 4 minutes; a dataset whose samples were all written by this version takes seconds.
+
+A dataset that had the field under an older version, lost it (a version restored that knew the name as a metadata
+field, or a mirror whose primary stopped listing it) and adds it again gets the same: its empty lists from before
+become never set, and its lists with elements come back.
+
+### Never set, empty, and a list
+
+A list field holds one of three things for a sample: **never set** (no value: the sample was never given a list), an
+**empty list** (`[]`: a value, looked at and nothing found), or a list with elements.
 
 ```python
-# At creation time
-sample = Sample(
-    filepath="/path/to/image.jpg",
-    tags=["training"],
-    array_fields={
-        "inferred_tags": ["OBJECT:CAR", "OBJECT:SIGN"],
-        "categories": ["outdoor", "coastal"],
-    }
-)
-dataset.add_samples([sample])
+sample = Sample(filepath="/path/to/a.jpg", array_fields={"inferred_tags": ["OBJECT:CAR"]})  # a list
+sample = Sample(filepath="/path/to/b.jpg", array_fields={"inferred_tags": []})              # the empty list
+sample = Sample(filepath="/path/to/c.jpg")                                                 # never set
+sample = Sample(filepath="/path/to/d.jpg", array_fields={"inferred_tags": None})           # never set too
+dataset.add_samples([...])
 
-# Or via attribute assignment (after array field is created)
+# Or via attribute assignment (after the field is created), then save()
 sample.inferred_tags = ["OBJECT:CAR", "OBJECT:SIGN"]
+sample.inferred_tags = None   # unset: never set again
+sample.save()
 ```
 
-### Bulk Updating Array Fields
+Reading a sample's field gives the list, `[]`, or `None` when it was never set. A script that treats the two alike
+writes `sample.inferred_tags or []`. (`sample["inferred_tags"]` reads metadata keys only, not list fields.) `save()`
+writes back the list fields it holds, but never a `None` it read: a field never set stays as the server has it, so a
+list written meanwhile isn't erased.
 
-The bulk-tag call works for any array field:
+On the API, `array_fields` on a sample (adding, `PATCH`) takes a list, or `null` for never set (on an update, `null`
+unsets the field). A field left out is never set on a new sample and left as it is on an update. Added again with
+`on_duplicate="update"`, a sample keeps each list field it doesn't name, whatever the other samples of the request
+name; one it names takes the list sent, and `null` unsets it (never set afterwards), as on an update. The SDK's
+`add_samples` leaves a field that is `None` out (an older server refuses `null` there), so a sample added again
+through it keeps its list: to unset one, set it to `None` on the loaded sample and `save()`. The samples query gives
+each list field of the dataset back under its name: the list, `[]`, or `null` when never set; so do a version's rows
+(as the version had the field: [versions](#list-fields-in-a-version)), a mirror's sync and the assistant's samples.
+The app's sample view leaves a field never set out, and its CSV export writes it as an empty cell and an empty list as
+`[]`.
+
+#### List fields in a version
+
+A version holds a dataset's list fields as the dataset had them when it was made: a field the dataset had then holds
+the version's list (or never set), also when the dataset has dropped the field since; a field the dataset added since
+is never set in the version; a list column the dataset neither had then nor has now is no field of the version. The
+version's rows read this way wherever a version is read: browsed, queried (`dataset.version()`), filtered and
+counted, compared with the live samples (`diff()`, the status of which version the dataset is at, the lists of
+changed samples), compared with another version (each by what it had), and restored (`revert()`). So after a revert
+the diff against the version reverted to is empty, and after a dataset adds a field another dataset made first (its
+empty lists from before becoming never set) no version from before reports its samples modified, and their rows give
+the field as `null` where they gave `[]`. A version made before versions recorded the dataset's fields counts a field
+as the dataset's when the dataset added it before the version.
+
+Against an older server (one where a sample written without a list field held `[]`), the SDK leaves a field that is
+`None` out when it adds a sample, and that server stores `[]`; an update that sends `None` gets its 422. An older SDK
+reads `null` as `[]`, and its `save()` writes back every list field it read: a script on an older SDK that loads and
+saves samples turns never set into `[]`. Upgrade the SDK with the server.
+
+### Bulk Updating List Fields
+
+The bulk-tag call works for any list field:
 
 ```python
 # Add values to inferred_tags for specific samples
@@ -1852,14 +1902,22 @@ dataset.client.bulk_tag_samples(
 )
 ```
 
+Adding a value to a sample never set makes a list of it; taking the last value out leaves `[]`, a value.
+
 ### Filtering
 
-Array fields appear in the UI filter sidebar automatically with multi-select checkboxes. In the SDK:
+List fields appear in the UI filter sidebar automatically with multi-select checkboxes, and a "(no value)" tick for
+the samples never set. In the SDK:
 
 ```python
-# Filter by array field values
+# Filter by list field values
 view = dataset.filter(inferred_tags__contains="OBJECT:CAR")
+view = dataset.filter(inferred_tags__is_null=True)    # never set
+view = dataset.filter(inferred_tags__is_empty=True)   # []
 ```
+
+A list field is read as a list in a field ([FILTER_QUERY.md](FILTER_QUERY.md#operators)): a `NOT` (`not in`, `!=`)
+shows a sample whose list is there, empty or not, and not one never set.
 
 ---
 
@@ -2583,8 +2641,8 @@ class Dataset:
     def compute_visualization(field_name="clip", fit_sample_size="auto", method="umap") -> dict
     def refresh_stats(*, wait=True, timeout=1800, force=False) -> dict | Job
 
-    # Array fields
-    def create_array_field(name: str) -> dict
+    # List fields kept in a column of their own (array fields)
+    def create_array_field(name: str, *, timeout: float = 3600) -> dict  # waits for a registration job
     def list_array_fields() -> list[str]
 
     # Versioning
@@ -2672,7 +2730,7 @@ class Sample:
         heading: float = None,
         embeddings: dict[str, list[float]] = None,
         hashes: dict[str, str] = None,
-        array_fields: dict[str, list[str]] = None,
+        array_fields: dict[str, list[str] | None] = None,  # None: never set (left out when added)
     )
     
     # Properties
@@ -2685,7 +2743,7 @@ class Sample:
     heading: float | None      # Compass heading in degrees
     embeddings: dict[str, list[float]]  # to upload; empty on samples read back
     hashes: dict[str, str]     # {field_name: hash_hex}; to upload, empty on samples read back
-    array_fields: dict[str, list[str]]  # Dynamic array fields (e.g., inferred_tags)
+    array_fields: dict[str, list[str] | None]  # list fields (e.g., inferred_tags); None when never set
     distance: float | None     # Set for similarity search results
     created_at: str            # ISO-8601
     last_modified_at: str      # ISO-8601

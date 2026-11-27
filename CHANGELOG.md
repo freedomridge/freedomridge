@@ -23,9 +23,10 @@ it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
     same test of a list field kept in a column of its own and of `@local.tags`.
 
   An empty list written in a field is a value, so a `NOT` shows its sample: `detections.label != "car"` and the `NOT`
-  of an element match keep a sample whose list is empty. A sample with no tags has no value for `tags`, and the same
-  holds for any list kept in a column of its own: every sample holds the column, the empty list until one is written.
-  To keep the old meaning, write the samples with no value out:
+  of an element match keep a sample whose list is empty. A sample with no tags has no value for `tags` (and the same
+  holds for `@local.tags`): every sample holds them, the empty list until a tag is written. A list field kept in a
+  column of its own is a list in a field like any other, and can now hold no value apart from `[]` (the item on list
+  fields below). To keep the old meaning, write the samples with no value out:
   `colour != "red" OR colour is null`, `tags not in ("rejected") OR tags is null`, `location not within "US-KS" OR
   location is null`. The filter text now takes `location is null`, `is not null`, `exists` and `not exists` for that.
   `detections.label is null` (and the same test of any list of labels) now shows the samples with no list, a `null`
@@ -61,13 +62,78 @@ it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
   metadata key sample by sample, and is refused (400) on the built-in fields, `location` and a path through a list:
   `detections.label is empty` names `detections is empty` instead. **Tags don't change**: a sample with no tags has no
   value for `tags`, so `tags is null` still finds the untagged samples, and `tags is empty` finds the same ones; the
-  same holds for `@local.tags` and a list field kept in a column of its own. Nothing saved is rewritten. An older
+  same holds for `@local.tags`. A list field kept in a column of its own answers as a list in a field does (the next
+  item). Nothing saved is rewritten. An older
   server, or a mirror on an older version, refuses a filter with the new tests (400 `Unknown filter operator`), except
   on `segmentation.labels`: there it answers `is empty` and `is not empty` with no sample and no error. A patch search
   a primary relays to a mirror on an older version is refused there with any of them. A mirror on an older version
   reads `detections.label is null` the old way until it is upgraded. On a dataset without
   objects of a million samples the new tests measured 0.87 to 1.10 times the absence test of the same field, and
   `detections.label is null` 0.44 times its time before (a count: 230 ms where it was 525 ms).
+- **A change in behaviour: a list field kept in a column of its own can hold no value apart from the empty list**
+  ([SDK.md](docs/SDK.md#list-fields-in-a-column-of-their-own), [FILTER_QUERY.md](docs/FILTER_QUERY.md#operators)).
+  Such a field (`dataset.create_array_field(...)`, `POST /api/datasets/{id}/array-fields`, the owner's
+  `inferred_tags`) is now read as a list in a field: never set is no value, `[]` is a value (looked at, nothing found).
+  - **A sample written without the field holds no value for it, where it held `[]`.** `null` is taken for it where it
+    was refused (422): on a new sample it is never set, on an update (`PATCH`) it unsets the field. The columns lose
+    their default (migration `0045`, a change of the catalog only, a few milliseconds whatever the table's size; it
+    waits at most 2 s for its lock behind a long query, and if it gives up the upgrade stops with nothing changed:
+    run it again); `tags` and `@local.tags` keep theirs and don't change at all.
+  - **What comes back:** the samples query, a version's rows, a mirror's sync and the assistant's samples give a field
+    never set as `null` under its name, and `[]` for the empty list. The SDK's sample gives `None`
+    (`sample.inferred_tags or []` treats the two alike), never writes back a `None` it read, and leaves a `None` field
+    out when it adds a sample. The app's sample view leaves a field never set out. The app's CSV export writes an
+    empty list as `[]` where it wrote an empty cell, for a list in the metadata too; no value, and tags with none,
+    stay an empty cell.
+  - **Filters:** `inferred_tags is null` and `not exists` find the samples never set, `is empty` those holding `[]`,
+    `is not null` and `exists` both; `inferred_tags not in ("car")` and `NOT (inferred_tags contains "car")` show the
+    samples whose list is there, empty or not, without `car`. Until now they were read as tags are (an empty list was
+    no value). The sidebar now offers its "(no value)" tick for such a field, for the samples never set.
+  - **Rows written before keep `[]`**: a sample that held `[]` holds it still, so a `NOT` shows it and `is empty`
+    finds it, and `is null` doesn't. No row is rewritten by the upgrade.
+  - **Adding a sample again** with `on_duplicate="update"` and without the field keeps its list, whatever the other
+    samples of the request name; it got `[]` when another sample of the same request named the field. `null` for the
+    field unsets it, as on an update (the SDK's `add_samples` leaves a `None` out, so through it the list is kept).
+    (A metadata key left out is still removed: a list field is a field of the dataset, not a key of the sample's
+    metadata.)
+  - **Adding a field another dataset made first** makes the dataset's samples from before never set: their `[]`, the
+    old default, is set to no value before the field is the dataset's (lists with elements are kept). Within the call
+    for a dataset of up to 1,000 samples; otherwise in a job (`list_field_registration`), during which the field isn't
+    listed, a write that names it gets a 409 with `Retry-After` and `X-Job-End-Seconds` (the SDK keeps retrying until
+    then), and a version can't be restored. On a table of 2.1 million rows of about 950 bytes, a million samples took
+    215 s and wrote 10.9 GB of WAL, and the table and its indexes grew 1.18 GB (space reused later, not given back);
+    100,000 samples took 22 s, 1.5 GB, 0.14 GB. A dataset that had the field under an older version, lost it and adds it
+    again gets the same: its empty lists from before become never set.
+  - **A version's restore** writes a list field only where the version had it as the dataset's: one the dataset added
+    since is never set afterwards (a version made before versions recorded the dataset's fields counts a field as the
+    dataset's when it was added before the version). Before, a restore wrote every list column of the server and kept a
+    list written since. **Every reading of a version takes a list field the same way**
+    ([SDK.md](docs/SDK.md#list-fields-in-a-version)): the status of which version the dataset is at, the diff of the
+    live samples against a version and its lists of changed samples, the compare of two versions (each by what it had),
+    and a version's samples as browsed, queried, filtered and counted. So after a restore the diff against the version
+    restored is empty, where it could count samples modified by a list column the dataset doesn't have; and after a
+    dataset adds a field another dataset made first, no version from before reports its samples modified, where every
+    sample whose `[]` became never set was, and the version's rows give the field as `null` where they gave `[]`. A list
+    column the dataset neither had at the version nor has now is no longer compared, nor given back with the version's
+    rows.
+  - **Mirrors and older SDKs:** the primary sends `null` for never set; a mirror on an older version stores `[]` for it
+    until it is upgraded. An older SDK reads `null` as `[]`: its `save()` writes back every list it read, and its
+    `add_samples_from` copies never set as `[]`, so a script on an older SDK that loads and saves samples, or copies a
+    dataset, turns never set into `[]`: **upgrade the SDK with the server.** The SDK against an older server leaves a
+    never-set field out when it adds a sample (that server stores `[]`); unsetting a field there gets its 422.
+    `python/fridge/sync_between_instances.py` now sends `[]` and leaves never set out (it dropped both). A sync from
+    FiftyOne written outside this repository should do the same: send `[]` for an empty list and leave out a field that
+    is `None`.
+
+  On a million samples with such a field (half never set, a quarter `[]`, a quarter with elements) in a table of two
+  million, the first page and the count of `not in`, `NOT (... contains ...)`, `is null`, `is not null` and `is empty`
+  measured 0.86 to 1.15 times their time before (counts 170 to 190 ms), and an ingest of 10,000 samples without the
+  field 0.90 times (3.4 s where it was 3.7 s). Adding 10,000 samples again with `on_duplicate="update"` (in requests of
+  1,000, every second sample or every one naming the field, all there already or none) measured 1.02 to 1.05 times (2.6
+  to 3.0 s); a request in which samples send `null` for the field takes one statement more (every second of 10,000
+  samples there already: 3.7 s, where 2.9 s naming a list). On a version of 100,000 samples with two such fields, the
+  status, the diffs, the lists of changed samples and the version's pages, queries and counts measured 0.75 to 1.07
+  times their time before.
 - **A change in behaviour: a drawn polygon may be at most 10 turns of the globe wide (3,600 degrees), where 2.14.0 took
   60** ([SDK.md](docs/SDK.md#geospatial-filtering)). A `geo_polygon` (or its exclusion) whose longitudes span more than
   3,600 degrees is refused with a 400 that names the limit; one spanning exactly 3,600 degrees is answered. No view

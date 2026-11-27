@@ -44,7 +44,13 @@ _STATUS = {
 
 # These operations can join another submitter's job. Their results and input refusals are public
 # to authorized dataset readers; internal failures remain private to the submitter and admins.
-_JOINED_KINDS = ('field_index_build', 'ann_index_build', 'duplicate_maintenance', 'index_drop')
+_JOINED_KINDS = (
+    'field_index_build',
+    'ann_index_build',
+    'duplicate_maintenance',
+    'index_drop',
+    'list_field_registration',
+)
 
 
 def job_outcome(job, user: dict) -> dict:

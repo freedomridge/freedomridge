@@ -20,23 +20,27 @@ changes them too (routers/datasets.py unless named):
 - `concept_exclude`: a score that doesn't pass;
 - the broad scatter's rejected set (routers/embeddings.py `_scatter_rejections`).
 
-An empty list written in a field is a value: it says the list was looked at and holds nothing. A list kept in a column
-of its own (`tags`, `@local.tags`, a registered array field) is another matter: every sample holds the column, the
-empty list until one is written, so its empty list can't be told from one never set, and is no value. So:
+An empty list written in a field is a value: it says the list was looked at and holds nothing. A sample's own tags
+(`tags`, and `@local.tags` on a mirror) are the one exception: every sample holds them, the empty list until one is
+written, so an empty one can't be told from one never set, and is no value (EMPTY_IS_NO_VALUE, the one place that says
+which lists these are). A list field kept in a column of its own is like a list in the metadata: a sample written
+without it holds no value for it (NULL), and its empty list is a value. So:
 - ('value', field): a value of the field, the rows `is not null` shows: what the compiler's `_value_sql` says, the one
-  place that knows it for each kind of list (there and not a JSON null; for a list kept in a column of its own at
-  least one element; for a list of labels, `detections.label`, a list that is empty or holds a label).
+  place that knows it for each kind of list (there and not a JSON null or a NULL column; for tags at least one element;
+  for a list of labels, `detections.label`, a list that is empty or holds a label).
 - ('elements', field): the field is a list, empty or not (an element match, `match_elements`).
 - ('location',): the sample's own location (a place: `location within`, a drawn polygon, `geo_near`).
 - ('points', field): a point on that embedding field's map (a lasso).
 - ('score', concept id): a score for the concept.
 
 `is empty` asks whether a field's value is a list that holds nothing, and `is not empty` is its NOT: a test of the
-value, so a NOT around it needs a value. On a list kept in a column of its own, whose empty list is no value, they are
-`is null` and `is not null` (EMPTINESS), and add nothing.
+value, so a NOT around it needs a value. On tags, whose empty list is no value, they are `is null` and `is not null`
+(EMPTINESS), and add nothing.
 """
 
 from typing import Any, Protocol, TypeAlias
+
+from .local_fields import LOCAL_TAGS
 
 Need: TypeAlias = tuple
 
@@ -69,8 +73,20 @@ COMPARISONS = {
 }
 # A condition on each element of a list: met by one of them, so its NOT needs the list (an empty one included).
 ELEMENT_MATCHES = {'match_elements', 'elem_match'}
-# `is empty` and `is not empty`, and what each is on a list kept in a column of its own (its empty list is no value).
+# `is empty` and `is not empty`, and what each is on a list whose empty list is no value (EMPTY_IS_NO_VALUE).
 EMPTINESS = {'is_empty': 'is_null', 'is_not_empty': 'is_not_null'}
+# The lists that hold no value when they are empty: a sample's own tags and a mirror's own tags. The one place that
+# says it: the compiler's `_value_sql`, its `is empty` and its `exists` read it (empty_is_no_value), and so does
+# `needs` below. Every other list, a list field kept in a column of its own included, has a value when it is there,
+# empty or not (docs/FILTER_QUERY.md).
+EMPTY_IS_NO_VALUE = frozenset({'tags', LOCAL_TAGS})
+
+
+def empty_is_no_value(field: Any) -> bool:
+    """Whether the field is a list whose empty list is no value (EMPTY_IS_NO_VALUE)."""
+    return isinstance(field, str) and field in EMPTY_IS_NO_VALUE
+
+
 PLACES = {'geo_polygon', 'geo_polygon_exclude', 'geo_region', 'geo_region_exclude', 'geo_near'}
 LASSOS = {'embedding_polygon', 'embedding_polygon_exclude'}
 CONCEPTS = {'concept_select', 'concept_exclude'}
@@ -96,9 +112,9 @@ class Fields(Protocol):
 
 def needs(node: Any, fields: Fields) -> list[Need]:
     """What `NOT (node)` needs a row to have a value for: every field compared inside it, nested NOTs included. An
-    absence test (`is null`, `is not null`, `exists`, `not exists`, and `is empty` / `is not empty` of a list kept in a
-    column of its own) adds nothing, nor does a test of a built-in field, a selection, the duplicates' collapse or a
-    wrapping operator (it reaches across on its own)."""
+    absence test (`is null`, `is not null`, `exists`, `not exists`, and `is empty` / `is not empty` of tags) adds
+    nothing, nor does a test of a built-in field, a selection, the duplicates' collapse or a wrapping operator (it
+    reaches across on its own)."""
     found: dict[Need, None] = {}
 
     def walk(item: Any) -> None:
@@ -126,8 +142,9 @@ def needs(node: Any, fields: Fields) -> list[Need]:
                 found[('elements', field)] = None
         elif operator in COMPARISONS and isinstance(field, str) and not fields.builtin(field):
             found[('value', field)] = None
-        elif operator in EMPTINESS and isinstance(field, str) and fields.row_field(field) is None:
-            found[('value', field)] = None
+        elif operator in EMPTINESS and isinstance(field, str) and not empty_is_no_value(field):
+            if fields.row_field(field) != 'builtin':
+                found[('value', field)] = None
 
     walk(node)
     return list(found)

@@ -3,10 +3,11 @@
     "Filters and the samples each shows on a dataset without objects, by contract g7 (one rule everywhere): a row",
     "with no value for a field never matches a comparison of it, nor the NOT of one; an empty list in a field is a",
     "value (changed 2026-11-26), so a negation shows it; and by contract g9: `is null` shows the rows with no value,",
-    "so not an empty list (but for tags), and `is empty` the rows whose list holds nothing. Run by the server on a",
-    "database and by the SDK on a sort_by_similarity result, which asks the server",
-    "(backend/tests/test_one_rule_filter_cases.py, contract 2.2, changed 2026-11-25): every case shows the samples",
-    "named here on both, and none is refused."
+    "so not an empty list (but for tags), and `is empty` the rows whose list holds nothing. By contract g10 a list",
+    "field kept in a column of its own (`pests`, made with array-fields; a sample's `array_fields` here, a sample",
+    "without one never set) is read as a list in a field is. Run by the server on a database and by the SDK on a",
+    "sort_by_similarity result, which asks the server (backend/tests/test_one_rule_filter_cases.py, contract 2.2,",
+    "changed 2026-11-25): every case shows the samples named here on both, and none is refused."
   ],
   "samples": {
     "red": {
@@ -22,7 +23,12 @@
       },
       "tags": [
         "rejected"
-      ]
+      ],
+      "array_fields": {
+        "pests": [
+          "aphid"
+        ]
+      }
     },
     "blue": {
       "metadata": {
@@ -37,7 +43,12 @@
       },
       "tags": [
         "seen"
-      ]
+      ],
+      "array_fields": {
+        "pests": [
+          "mite"
+        ]
+      }
     },
     "null": {
       "metadata": {
@@ -45,7 +56,10 @@
         "n": null,
         "detections": null
       },
-      "tags": []
+      "tags": [],
+      "array_fields": {
+        "pests": []
+      }
     },
     "none": {
       "metadata": {},
@@ -69,7 +83,13 @@
       "tags": [
         "seen",
         "rejected"
-      ]
+      ],
+      "array_fields": {
+        "pests": [
+          "aphid",
+          "mite"
+        ]
+      }
     },
     "empty": {
       "metadata": {
@@ -77,7 +97,10 @@
         "n": 3,
         "detections": []
       },
-      "tags": []
+      "tags": [],
+      "array_fields": {
+        "pests": []
+      }
     },
     "unlabelled": {
       "metadata": {
@@ -100,7 +123,12 @@
       },
       "tags": [
         "seen"
-      ]
+      ],
+      "array_fields": {
+        "pests": [
+          "rust"
+        ]
+      }
     }
   },
   "cases": [
@@ -950,6 +978,181 @@
       "shows": [
         "blue",
         "empty"
+      ]
+    },
+    {
+      "name": "a list column: in",
+      "filter": {
+        "field": "pests",
+        "operator": "in",
+        "value": [
+          "aphid"
+        ]
+      },
+      "shows": [
+        "kind",
+        "red"
+      ]
+    },
+    {
+      "name": "a list column: not in shows an empty list, not a sample never set",
+      "filter": {
+        "field": "pests",
+        "operator": "not in",
+        "value": [
+          "aphid"
+        ]
+      },
+      "shows": [
+        "blue",
+        "empty",
+        "notalist",
+        "null"
+      ]
+    },
+    {
+      "name": "a list column: != shows an empty list too",
+      "filter": {
+        "field": "pests",
+        "operator": "!=",
+        "value": "aphid"
+      },
+      "shows": [
+        "blue",
+        "empty",
+        "notalist",
+        "null"
+      ]
+    },
+    {
+      "name": "a list column: the NOT of contains needs a list, empty or not",
+      "filter": {
+        "logic": "NOT",
+        "filters": [
+          {
+            "field": "pests",
+            "operator": "contains",
+            "value": "aphid"
+          }
+        ]
+      },
+      "shows": [
+        "blue",
+        "empty",
+        "notalist",
+        "null"
+      ]
+    },
+    {
+      "name": "a list column: is null shows the samples never set",
+      "filter": {
+        "field": "pests",
+        "operator": "is_null",
+        "value": null
+      },
+      "shows": [
+        "none",
+        "unlabelled"
+      ]
+    },
+    {
+      "name": "a list column: is not null shows an empty list too",
+      "filter": {
+        "field": "pests",
+        "operator": "is_not_null",
+        "value": null
+      },
+      "shows": [
+        "blue",
+        "empty",
+        "kind",
+        "notalist",
+        "null",
+        "red"
+      ]
+    },
+    {
+      "name": "a list column: is empty",
+      "filter": {
+        "field": "pests",
+        "operator": "is_empty",
+        "value": null
+      },
+      "shows": [
+        "empty",
+        "null"
+      ]
+    },
+    {
+      "name": "a list column: is not empty",
+      "filter": {
+        "field": "pests",
+        "operator": "is_not_empty",
+        "value": null
+      },
+      "shows": [
+        "blue",
+        "kind",
+        "notalist",
+        "red"
+      ]
+    },
+    {
+      "name": "a list column: exists answers as is not null",
+      "filter": {
+        "field": "pests",
+        "operator": "exists",
+        "value": null
+      },
+      "shows": [
+        "blue",
+        "empty",
+        "kind",
+        "notalist",
+        "null",
+        "red"
+      ]
+    },
+    {
+      "name": "a list column: not exists answers as is null",
+      "filter": {
+        "field": "pests",
+        "operator": "not_exists",
+        "value": null
+      },
+      "shows": [
+        "none",
+        "unlabelled"
+      ]
+    },
+    {
+      "name": "a NOT around a list column and a text field needs both",
+      "filter": {
+        "logic": "NOT",
+        "filters": [
+          {
+            "logic": "OR",
+            "filters": [
+              {
+                "field": "pests",
+                "operator": "in",
+                "value": [
+                  "aphid"
+                ]
+              },
+              {
+                "field": "colour",
+                "operator": "=",
+                "value": "red"
+              }
+            ]
+          }
+        ]
+      },
+      "shows": [
+        "blue",
+        "empty",
+        "notalist"
       ]
     }
   ]

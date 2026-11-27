@@ -76,10 +76,12 @@ samples that have every one of them. This is one rule for every dataset, with ob
 the API and the assistant.
 
 - **A value is there and isn't `null`, and an empty list written in a field is a value**: it says the list was looked
-  at and holds nothing. A list kept in a column of its own (`tags`, a mirror's `@local.tags`, and a list field a
-  dataset adds) has a value when it has at least one element: every sample holds the column, the empty list until
-  one is written, so its empty list can't be told from one never set. So `tags not in (rejected)` keeps the samples
-  that have a tag, none of them `rejected`. A list of labels (`detections.label`) has a value when the list is there
+  at and holds nothing. A list field a dataset adds in a column of its own (`dataset.create_array_field(...)`) is
+  read so too: a sample never given a list there has no value, and one given `[]` has one. A sample's own tags
+  (`tags`, and a mirror's `@local.tags`) have a value when they have at least one tag: every sample holds them, the
+  empty list until one is written, so an empty one can't be told from one never set. So `tags not in (rejected)`
+  keeps the samples that have a tag, none of them `rejected`, and `inferred_tags not in ("car")` keeps the samples
+  whose `inferred_tags` is a list, empty or not, without `car`. A list of labels (`detections.label`) has a value when the list is there
   and is empty or holds a label: `detections.label != "car"` keeps the samples whose detections hold no car, an empty
   list among them, but not those whose detections have no label at all (something was found, and what it is isn't
   known), nor those with no `detections`. A `NOT` around an element match (`match_elements`, the SDK's
@@ -114,7 +116,8 @@ a field, every sample is in exactly one of three: no value, an empty list, or a 
 - `is not null` shows the last two together.
 
 A list of labels has no key of its own to look for, so on `detections.label` (and any path through a list) and on
-`segmentation.labels`, `exists` and `not exists` answer as `is not null` and `is null`: an empty list exists.
+`segmentation.labels`, `exists` and `not exists` answer as `is not null` and `is null`: an empty list exists. So they
+do on a list field kept in a column of its own: `inferred_tags exists` shows the samples given a list, empty or not.
 
 `is empty` reads any key of the metadata sample by sample: a value that is no list (text, a number) is never empty, so
 `note is not empty` shows a sample whose `note` is the text `"ok"`. It is refused, with a message that says what to ask
@@ -123,11 +126,17 @@ instead, on a field that can hold no list (the built-in fields and `location`) a
 the server knows as a list (the label fields, and any list field of the dataset), the same paths a comparison reads
 element by element.
 
-**A sample's own tags are the one kind of list where empty is no value**, and so are `@local.tags` on a mirror and a
-list field stored in a column of its own (`dataset.create_array_field(...)`). Every sample holds such a list, the empty
-one until something is written, so an empty one can't be told from one never set. There `tags is null` and
-`tags is empty` both show the samples with no tags, and `tags is not null` and `tags is not empty` those with at least
-one.
+**A sample's own tags are the one kind of list where empty is no value**, and so are `@local.tags` on a mirror. Every
+sample holds them, the empty list until a tag is written, so an empty one can't be told from one never set. There
+`tags is null` and `tags is empty` both show the samples with no tags, `tags is not null` and `tags is not empty`
+those with at least one, and `tags exists` those with at least one too.
+
+A list field stored in a column of its own (`dataset.create_array_field(...)`) is a list in a field like any other:
+a sample never given a list there has no value for it (`is null`, `not exists`), `[]` is a value (`is empty`), and a
+`NOT` shows a sample whose list is empty. A sample an older version wrote without the field holds `[]` there (that
+version stored `[]` for a sample written without it), so a `NOT` shows it and `is empty` finds it, and `is null`
+doesn't. A dataset's samples from before it added the field are never set:
+see [SDK.md](SDK.md#list-fields-in-a-column-of-their-own).
 
 ## Concept scores
 
@@ -263,7 +272,10 @@ red with no objects.
   (`id not in (...)`, `filepath != "..."`), or of a list (`tags`, or a list field kept in a column of its own), is
   answered by the grid's own row: the row it names isn't shown, whichever row meets the rest of the filter. A list's
   needs a value there, as everywhere: `tags not in (rejected)` shows the rows of the grid that have a tag, none of
-  them `rejected`. `NOT (tags in (rejected))` is the same filter as `tags not in (rejected)`. The app's collapse of
+  them `rejected`, and `inferred_tags not in ("car")` the rows whose own list is there, empty or not, without `car`.
+  `is not empty` of a list field (the `NOT` of `is empty`) is a hiding test of it too; its `is empty`, `in`,
+  `contains`, `is not null` and `exists` are met by the row or a partner, and its `is null` and `not exists` are read
+  for the row as a whole, as tags' are. `NOT (tags in (rejected))` is the same filter as `tags not in (rejected)`. The app's collapse of
   duplicates is read the same way: a duplicate image it hides doesn't come back through its objects, and on the
   objects' grid an object is hidden only when it is a duplicate itself, whatever its image. A `NOT` around tests of
   the built-in fields alone reads each row on its own: on the images' grid `NOT (filepath contains "x")` also shows

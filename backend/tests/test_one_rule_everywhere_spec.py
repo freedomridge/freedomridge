@@ -5,13 +5,13 @@ contract, not from the code.
 
 The rule: a row with no value for a field never matches a comparison of that field, and never matches the NOT of one;
 only `is null` and `not exists` find it. A row has a value when the value is there and isn't a JSON null. Tags (and
-`@local.tags`), the lists every sample has, have one when they hold at least one tag, and so has a list field kept
-in a column of its own, which is read as tags are (rule 1.5). A list in the metadata (such as `detections`) has one
-when it is there, empty or not: an empty list says the list was looked at and holds nothing (Words, changed
-2026-11-26, the owner's decision and his last word on tags). A list of labels (`detections.label`) has one when the
-list is there and is empty or has a label; a list whose elements have no label at all has none (rule 1.4). A
-concept's score is a row's value for the concept, its location its value for a place, its point on an embeddings map
-its value for a lasso drawn on that map.
+`@local.tags`), the lists every sample has, have one when they hold at least one tag (rule 1.5). A list in the
+metadata (such as `detections`) has one when it is there, empty or not: an empty list says the list was looked at and
+holds nothing (Words, changed 2026-11-26, the owner's decision and his last word on tags); so has a list field kept in
+a column of its own, which rule 1.5 read as tags are until contract g10 let it hold "never set". A list of labels
+(`detections.label`) has one when the list is there and is empty or has a label; a list whose elements have no label at
+all has none (rule 1.4). A concept's score is a row's value for the concept, its location its value for a place, its
+point on an embeddings map its value for a lasso drawn on that map.
 
 The fixture (section 7.1). PLAIN is a dataset without objects of ten rows, `r0` to `r9`, each with a `plot` and a
 `rank`, and for each field a value, another value, a JSON null and no key, spread so that no two fields have their gaps
@@ -61,8 +61,9 @@ Where the contract leaves a point open, these tests read it this way, and stay a
 - The empty list in a field (7.7, added 2026-11-26): LABELLED and the file of cases hold no key, a JSON null, `[]`, a
   list with the value, a list without it and a list whose elements have no label. A list field kept in a column of
   its own (rule 1.5's last paragraph, the owner's `inferred_tags`) is made as the app makes one, through the API, on
-  a dataset of its own, ARRAY_FIELD, and read as tags are: a sample added without it and one given `[]` have no
-  value, nor has a column written NULL.
+  a dataset of its own, ARRAY_FIELD. Rewritten for contract g10 (a list column can hold "never set"): a sample added
+  without it, and a column written NULL, are never set and have no value; one given `[]` has one, as a list in the
+  metadata has (backend/tests/test_list_column_never_set_spec.py holds the rest of g10).
 - Each test that holds new behaviour asks something main answers first, as a control, so a failure on main is the
   rule's. The pins (sections 7.4 and 7.6, rule 2.3) pass on main and after.
 """
@@ -1660,16 +1661,19 @@ PESTS: dict[str, Optional[list[str]]] = {
     'a-mite': ['mite'],
     'a-null': ['mite'],
 }
-NO_PEST = {'a-unset', 'a-empty', 'a-null'}  # no element: no value, as tags (rule 1.5's last paragraph)
+# Never set, and so no value (contract g10, rule 3.1): added without the field, or the column written NULL. a-empty's
+# `[]` is a value, as an empty list in the metadata is.
+NEVER_SET = {'a-unset', 'a-null'}
 
 
-def test_7_7_a_list_field_in_a_column_of_its_own_is_read_as_tags_are_an_empty_list_is_no_value(regions_world):
-    """Rule 1.5's last paragraph (changed 2026-11-26, twice) on ARRAY_FIELD: the field made as the app makes it (POST
-    array-fields, a `TEXT[] DEFAULT '{}'` column, as `dataset.create_array_field` does), the samples added through the
-    API with their lists. The server cannot tell a sample added without the field from one given `[]`, so the column
-    is read as tags are: neither has a value, nor has a column written NULL. A negation shows only the row whose list
-    holds other values; `is null` and `is not null` answer as main does (the rows with no element; the rows with at
-    least one). The shows and the absence tests are asked first."""
+def test_7_7_a_list_field_in_a_column_of_its_own_is_read_as_a_list_in_a_field_an_empty_list_is_a_value(regions_world):
+    """Rule 1.5's last paragraph, rewritten for contract g10 (a list column can hold "never set"; rules 1.4 and 3.1)
+    on ARRAY_FIELD: the field made as the app makes it (POST array-fields, as `dataset.create_array_field` does), the
+    samples added through the API with their lists. A sample added without the field is never set, as is a column
+    written NULL: neither has a value. The one given `[]` has one, as a list in the metadata has. So a negation shows
+    the rows whose list is there, empty or not, and holds none of the named (a-empty and a-mite); `is null` shows the
+    rows never set and `is not null` the others. Main read the column as tags are (the empty list no value). The shows
+    are asked first."""
 
     async def scenario(r):
         await r.dataset(ARRAY_FIELD)
@@ -1692,8 +1696,11 @@ def test_7_7_a_list_field_in_a_column_of_its_own_is_read_as_tags_are_an_empty_li
         for node, names in (
             (leaf('pests', 'in', ['aphid']), {'a-aphid'}),
             (leaf('pests', 'contains', 'mite'), {'a-mite'}),
-            (leaf('pests', 'is_null'), NO_PEST),
-            (leaf('pests', 'is_not_null'), {'a-aphid', 'a-mite'}),
+        ):
+            assert await shown(r, p, node) == names, node
+        for node, names in (
+            (leaf('pests', 'is_null'), NEVER_SET),
+            (leaf('pests', 'is_not_null'), set(PESTS) - NEVER_SET),
         ):
             assert await shown(r, p, node) == names, node
         for node in (
@@ -1702,7 +1709,7 @@ def test_7_7_a_list_field_in_a_column_of_its_own_is_read_as_tags_are_an_empty_li
             negated(leaf('pests', 'in', ['aphid'])),
             negated(leaf('pests', 'contains', 'aphid')),
         ):
-            assert await shown(r, p, node) == {'a-mite'}, node
+            assert await shown(r, p, node) == {'a-empty', 'a-mite'}, node
 
     regions_world(scenario)
 

@@ -24,7 +24,7 @@ import httpx
 import numpy as np
 from fastapi import HTTPException
 
-from . import job_heartbeat, job_queue, patch_search
+from . import job_heartbeat, job_queue, list_fields, patch_search
 from .assistant.rule import NEW_DATASET_CLOSED_SQL
 from .crypto import decrypt_secret
 from .diskspace import INGEST_ROW_BYTES, require_free_space
@@ -44,6 +44,7 @@ POLICY = job_queue.JobPolicy(max_unit_seconds=1800, max_failures=5, retry_second
 RANK_SECONDS = 1500
 BLOCK = followers.BLOCK
 COPY_BLOCKS = 2  # blocks per step: up to 8192 samples and their vectors; one after a step of two outran BLOCK_SECONDS
+WALK_BLOCKS = 8  # blocks of ids per step of a list field's walk (list_walk_step): ~7 s on a busy machine
 # A step that writes blocks writes them in a transaction of its own (write_in_step), each statement bounded by this,
 # not in the job's publication, which has 5 s (job_queue.PUBLISH_TIMEOUT_SECONDS): two blocks of dense COCO samples
 # took 7 s on a desktop.
@@ -300,6 +301,89 @@ async def fetch_vector_pairs(client, origin: int, pairs: list) -> list:
     return found
 
 
+class ListWalkFirst(Exception):
+    """The primary has list fields this mirror holds in columns that were here before, unregistered on this mirror: its
+    rows holding the empty list there (the old default) become never set before anything of the primary's is written
+    (list_walk_step). Raised before a step writes; the step is taken again after the walk."""
+
+    def __init__(self, names: list):
+        super().__init__(f"List fields to walk first: {', '.join(names)}")
+        self.names = names
+
+
+async def require_list_walks(pool, mirror, names: list, checkpoint: dict) -> None:
+    """Raise ListWalkFirst for those of the primary's list fields `names` that need the walk here: a column that was
+    here already, not yet registered on this mirror, on a mirror with samples, and not walked in this job. A column
+    made now holds no value in any row: nothing to walk. Run before ensure_array_columns, which makes the missing
+    ones."""
+    dataset_id = mirror['dataset_id']
+    walked = set(checkpoint.get('list_walked', {}).get(str(dataset_id), []))
+    candidates = [name for name in names if name not in walked]
+    if not candidates:
+        return
+    rows = await pool.fetch(
+        """SELECT r.column_name FROM sample_array_columns r WHERE r.column_name = ANY($2::text[])
+             AND NOT EXISTS (SELECT 1 FROM dataset_fields f WHERE f.dataset_id = $1 AND f.field_name = r.column_name
+                             AND f.origin = 'native_array')
+             AND EXISTS (SELECT 1 FROM samples WHERE dataset_id = $1)""",
+        dataset_id,
+        candidates,
+    )
+    if rows:
+        raise ListWalkFirst(sorted(row['column_name'] for row in rows))
+
+
+def list_walks_pending(checkpoint: dict, mirror) -> dict:
+    return checkpoint.get('list_walks', {}).get(str(mirror['dataset_id'])) or {}
+
+
+def start_list_walks(before: dict, mirror, names: list) -> StepResult:
+    """The step that found list fields to walk first, taken back: the checkpoint from before it, with the walks."""
+    checkpoint = copy.deepcopy(before)
+    walks = checkpoint.setdefault('list_walks', {}).setdefault(str(mirror['dataset_id']), {})
+    for name in names:
+        walks.setdefault(name, 0)
+    return StepResult(
+        checkpoint=checkpoint,
+        message=f"Setting the empty lists from before of {', '.join(names)} to never set first",
+    )
+
+
+async def list_walk_step(pool, mirror, checkpoint: dict) -> StepResult:
+    """One step of a list field's walk on this mirror (backend/list_fields.py): the next WALK_BLOCKS blocks of the
+    mirror's ids, their rows holding the empty list set to never set, written with how far the walk is in one commit
+    (write_in_step). The field is registered here only by a later write_fields, after the walk: so a sync stopped in
+    between takes the walk up again and never finds the field registered with the old empty lists still in its rows.
+    Nothing else of this mirror is applied meanwhile (about 4 minutes a million samples on a busy machine)."""
+    dataset_id = mirror['dataset_id']
+    walks = checkpoint['list_walks'][str(dataset_id)]
+    name = sorted(walks)[0]
+    start = await pool.fetchval(
+        'SELECT min(id) FROM samples WHERE dataset_id = $1 AND id >= $2',
+        dataset_id,
+        walks[name],
+    )
+    if start is None:
+        del walks[name]
+        if not walks:
+            del checkpoint['list_walks'][str(dataset_id)]
+        checkpoint.setdefault('list_walked', {}).setdefault(str(dataset_id), []).append(name)
+        return StepResult(checkpoint=checkpoint, message=f'The empty lists from before of {name} are never set now')
+    stop = start + WALK_BLOCKS * BLOCK
+    walks[name] = stop
+
+    async def publish(connection):
+        await begin_mirror_write(connection, dataset_id)
+        await list_fields.empty_to_never_set(connection, dataset_id, name, start, stop)
+
+    return OwnWrite(
+        checkpoint=checkpoint,
+        message=f'Setting the empty lists from before of {name} to never set',
+        publish=publish,
+        what=f'Setting the empty lists of {name} to never set',
+    )
+
+
 async def ensure_array_columns(pool, dataset_id: int, names: list) -> None:
     """The primary's array fields need their physical column here before samples carrying them are written."""
     if not names:
@@ -411,10 +495,12 @@ async def write_samples(connection, dataset_id: int, blocks: list, data: dict) -
                         ELSE ST_SetSRID(ST_MakePoint(i.lon, i.lat), 4326) END AS local_location
             FROM incoming i LEFT JOIN mirror_samples p ON p.dataset_id = $1 AND p.origin_id = i.origin_parent
         )"""
-    array_set = ''.join(f', "{name}" = COALESCE(t."{name}", \'{{}}\')' for name in arrays)
+    # A list field as the primary sends it: a list, or null for never set (an older primary sends the empty list for
+    # it, which is what it holds there). Left out of a sample, it is never set too.
+    array_set = ''.join(f', "{name}" = t."{name}"' for name in arrays)
     array_old = ''.join(f', s."{name}"' for name in arrays)
-    array_new = ''.join(f', COALESCE(t."{name}", \'{{}}\')' for name in arrays)
-    array_fresh = ''.join(f', COALESCE(fresh."{name}", \'{{}}\')' for name in arrays)
+    array_new = ''.join(f', t."{name}"' for name in arrays)
+    array_fresh = ''.join(f', fresh."{name}"' for name in arrays)
     # Which samples are here already, asked once by the key: each statement then gets only its own rows (the
     # connection's jsonb codec encodes them). With all of them, the insert found its new rows with an anti join the
     # planner can't estimate (one row, for thousands), and joined what it inserted back to them in a nested loop:
@@ -796,7 +882,10 @@ async def write_fields(connection, dataset_id: int, fields: list) -> None:
                      description text, unit text)
            ON CONFLICT (dataset_id, field_name) DO UPDATE
            SET field_type = EXCLUDED.field_type, origin = EXCLUDED.origin, display_type = EXCLUDED.display_type,
-               overlay_config = EXCLUDED.overlay_config, description = EXCLUDED.description, unit = EXCLUDED.unit
+               overlay_config = EXCLUDED.overlay_config, description = EXCLUDED.description, unit = EXCLUDED.unit,
+               -- since when a list field is the dataset's (list_fields.register)
+               created_at = CASE WHEN EXCLUDED.origin = 'native_array' AND dataset_fields.origin <> 'native_array'
+                                 THEN CURRENT_TIMESTAMP ELSE dataset_fields.created_at END
            WHERE (dataset_fields.field_type, dataset_fields.origin, dataset_fields.display_type,
                   dataset_fields.overlay_config, dataset_fields.description, dataset_fields.unit)
                  IS DISTINCT FROM (EXCLUDED.field_type, EXCLUDED.origin, EXCLUDED.display_type,
@@ -1551,11 +1640,9 @@ async def apply_state(pool, link, client, mirror, checkpoint: dict, *, views: bo
     """Fields and settings (and the shared views once the samples are all here) from the primary's state."""
     dataset_id, origin = mirror['dataset_id'], mirror['origin_dataset_id']
     state = await call(client, 'GET', f'/follower/datasets/{origin}/state')
-    await ensure_array_columns(
-        pool,
-        dataset_id,
-        [field['field_name'] for field in state['fields'] if field['origin'] == 'native_array'],
-    )
+    native = [field['field_name'] for field in state['fields'] if field['origin'] == 'native_array']
+    await require_list_walks(pool, mirror, native, checkpoint)
+    await ensure_array_columns(pool, dataset_id, native)
 
     if views:
         # Once the samples are all here, and with each later state: the maps to re-rank where the primary did.
@@ -1579,12 +1666,22 @@ async def apply_state(pool, link, client, mirror, checkpoint: dict, *, views: bo
     )
 
 
-async def apply_blocks(pool, client, mirror, blocks: list, after_write=None, *, new_only: bool = False) -> tuple:
+async def apply_blocks(
+    pool,
+    client,
+    mirror,
+    blocks: list,
+    after_write=None,
+    *,
+    new_only: bool = False,
+    checkpoint: dict | None = None,
+) -> tuple:
     """Fetch these blocks' samples, hashes and vectors from the primary, and a publish that writes them. From the
     feed (new_only), only the vectors of samples new here: the feed's vector log carries every change to the others,
     and re-reading a block whose samples were tagged mustn't download all their vectors again."""
     dataset_id, origin = mirror['dataset_id'], mirror['origin_dataset_id']
     data = await fetch_blocks(client, origin, blocks)
+    await require_list_walks(pool, mirror, data['array_fields'], checkpoint or {})
     await ensure_array_columns(pool, dataset_id, data['array_fields'])
     origin_ids = [sample['id'] for sample in data['samples']]
     wanted = origin_ids
@@ -1647,7 +1744,7 @@ async def copy_step(pool, link, client, mirror, checkpoint: dict) -> StepResult:
             rest,
         )
 
-    count, publish = await apply_blocks(pool, client, mirror, blocks, progress)
+    count, publish = await apply_blocks(pool, client, mirror, blocks, progress, checkpoint=checkpoint)
     done = mirror['copy_total'] - len(rest)
     return OwnWrite(
         checkpoint=checkpoint,
@@ -1786,7 +1883,7 @@ async def feed_step(pool, link, client, mirror, checkpoint: dict) -> StepResult:
     if page['blocks']:
         size = step_blocks(checkpoint, mirror)
         blocks, page['blocks'] = page['blocks'][:size], page['blocks'][size:]
-        count, publish = await apply_blocks(pool, client, mirror, blocks, new_only=True)
+        count, publish = await apply_blocks(pool, client, mirror, blocks, new_only=True, checkpoint=checkpoint)
         return OwnWrite(
             checkpoint=checkpoint,
             message=f'Applied {count:,} changed samples',
@@ -2189,10 +2286,14 @@ def handler(pool):
                 # The steps change the checkpoint in place: this is the one to go back to if the mirror fails.
                 before = copy.deepcopy(checkpoint)
                 try:
-                    if mirror['state'] == 'copying':
+                    if list_walks_pending(checkpoint, mirror):
+                        result = await list_walk_step(pool, mirror, checkpoint)
+                    elif mirror['state'] == 'copying':
                         result = await copy_step(pool, link, client, mirror, checkpoint)
                     else:
                         result = await feed_step(pool, link, client, mirror, checkpoint)
+                except ListWalkFirst as walk:
+                    return isolated(mirror, before, start_list_walks(before, mirror, walk.names))
                 except PrimaryUnavailable:
                     raise  # every mirror of this primary waits for it
                 except Exception as error:

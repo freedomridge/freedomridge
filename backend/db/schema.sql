@@ -1808,7 +1808,8 @@ CREATE TABLE IF NOT EXISTS version_snapshots (
 );
 CREATE INDEX IF NOT EXISTS idx_version_snapshots_version ON version_snapshots(version_id);
 
--- Dynamic array field registry: tracks which TEXT[] columns exist on samples
+-- Dynamic array field registry: tracks which TEXT[] columns exist on samples. Such a column has no default (0045): a
+-- sample written without the field holds no value for it (NULL), apart from the empty list. tags keeps its default.
 CREATE TABLE IF NOT EXISTS sample_array_columns (
     column_name TEXT PRIMARY KEY,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
@@ -4021,5 +4022,6 @@ INSERT INTO schema_migrations (filename) VALUES
     ('0041_jobs_across_datasets.sql'),
     ('0042_protected_metadata_keys.sql'),
     ('0043_reserved_names_never_fields.sql'),
-    ('0044_field_kinds.sql')
+    ('0044_field_kinds.sql'),
+    ('0045_list_columns_hold_never_set.sql')
 ON CONFLICT (filename) DO NOTHING;

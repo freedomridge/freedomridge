@@ -20,10 +20,13 @@ its objects, or for an object together with its image. A row is never asked abou
 - `is null` holds when neither the row nor any of those partners has a value (absent or a JSON null; an empty list
   written in a field is a value), `not exists` when none has the key (a JSON null under it counts as there): both read
   first and for the row as a whole, like a NOT. `is not null` and `exists` are showing tests like any other, and so is
-  `is empty` (a list that holds nothing); `is not empty` is its NOT. On a list kept in a column of its own (`tags`)
-  `is empty` and `is not empty` are `is null` and `is not null`.
-- A hiding test of a field every row has (the built-in columns) or of a list (`tags`), and the duplicates' collapse,
-  are answered by the grid's own row, as before; a list's needs at least one element there. A NOT around tests of
+  `is empty` (a list that holds nothing); `is not empty` is its NOT. On tags (`tags`, `@local.tags`: their empty list
+  is no value) `is empty` and `is not empty` are `is null` and `is not null`; on a list field kept in a column of its
+  own `is not empty`, written so or as `NOT (f is empty)`, is a hiding test of a list, below: answered by the grid's
+  own row.
+- A hiding test of a field every row has (the built-in columns) or of a list kept in a column of its own (`tags`, a
+  list field), and the duplicates' collapse, are answered by the grid's own row, as before; a list's needs a value
+  there (for tags at least one element, for a list field a list, empty or not). A NOT around tests of
   built-in fields only keeps the reading it had: each row on its own (`NOT (id contains ...)`: the grid's row).
 
 Every rule reads the values. For speed only, the compiler's `Rows` may skip a kind of row for a field that kind has
@@ -248,8 +251,12 @@ class _Reader:
             positive = {**node, 'operator': negation.EXCLUSIONS[operator]}
             return ('not', ('test', positive), negation.needs(positive, self.rows))
         if operator in negation.EMPTINESS and isinstance(field, str) and row_field != 'builtin':
-            if row_field == 'list':  # its empty list is no value: `is null` / `is not null`
+            if row_field == 'list' and negation.empty_is_no_value(field):  # tags: `is null` / `is not null`
                 return self.unit({**node, 'operator': negation.EMPTINESS[operator]})
+            if row_field == 'list':
+                # A list field kept in a column of its own: answered as its comparisons are, `is empty` (showing) by the
+                # row or a partner, `is not empty` (hiding, the guarded NOT the compiler makes) by the grid's own row.
+                return ('own', node) if operator == 'is_not_empty' else ('test', node)
             if operator == 'is_not_empty' and not self.rows.label_path(field):
                 # The NOT of `is empty`, as `!=` is of `=`. (The compiler refuses a path through a list, in its words.)
                 positive = {**node, 'operator': 'is_empty'}
@@ -290,12 +297,14 @@ class _Reader:
         leaves = _leaves(inner)
         kinds = [self.rows.row_field(leaf.get('field')) if isinstance(leaf, dict) else None for leaf in leaves]
         if leaves and all(
-            isinstance(leaf, dict) and _operator(leaf) in negation.COMPARISONS and kind
+            isinstance(leaf, dict)
+            and kind
+            and (_operator(leaf) in negation.COMPARISONS or self._list_emptiness(leaf, kind))
             for leaf, kind in zip(leaves, kinds)
         ):
             # Tests of built-in fields and lists only: as before. A NOT of built-in tests asks each row on its own (the
             # grid's row alone for `id contains`, the sidebar's typed terms); a list's, the grid's row, as `not in`,
-            # which needs at least one element there.
+            # which needs a value there.
             if all(kind == 'builtin' for kind in kinds):
                 id_text = all(leaf.get('field') == 'id' and _operator(leaf) == 'contains' for leaf in leaves)
                 if id_text and all(self._and_or(child) for child in children):
@@ -303,6 +312,13 @@ class _Reader:
                 return ('test', node)
             return ('own', node)
         return ('not', self.unit(inner), negation.needs(inner, self.rows))
+
+    @staticmethod
+    def _list_emptiness(leaf: dict, kind: Optional[str]) -> bool:
+        """`is empty` of a list field kept in a column of its own: inside a NOT it is answered as the list's comparisons
+        are, by the grid's own row, so `NOT (f is empty)` reads as `f is not empty` (a list with an element there). Not
+        of tags, whose `is empty` is `is null`."""
+        return kind == 'list' and _operator(leaf) == 'is_empty' and not negation.empty_is_no_value(leaf.get('field'))
 
     @staticmethod
     def _and_or(node: Any) -> bool:

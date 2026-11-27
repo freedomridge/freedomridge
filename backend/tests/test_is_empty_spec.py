@@ -9,9 +9,10 @@ written in a field is a value: the list was looked at and holds nothing. `f is n
 list is empty or one of its elements has a label, so `detections.label is null` shows the rows with no list and the
 rows whose elements have no label at all, never an empty list. `f is empty` shows the rows whose `f` is a list that
 holds nothing, and `f is not empty` is `NOT (f is empty)`, read as every NOT of a comparison: the rows that have a
-value for `f` which isn't an empty list. The lists every sample holds (`tags`, `@local.tags` and a list field kept in a
-column of its own) don't change: an empty one is no value, `is null` and `is not null` answer as main does, `is empty`
-answers as `is null` and `is not empty` as `is not null` (rule 1.6).
+value for `f` which isn't an empty list. The lists every sample holds (`tags` and `@local.tags`) don't change: an empty
+one is no value, `is null` and `is not null` answer as main does, `is empty` answers as `is null` and `is not empty` as
+`is not null` (rule 1.6). A list field kept in a column of its own was among them until contract g10 let it hold
+"never set": its tests here are rewritten for g10, which reads it as a list in a field is.
 
 The fixtures (section 7.1). EMPTY is a dataset without objects of eight rows, `e0` to `e7`, each with a `plot` and a
 `rank`. It holds a plain list `inferred_tags` (the owner's example of a list someone added) and a list of labels
@@ -567,8 +568,8 @@ def test_rule_1_6_local_tags_is_empty_answers_as_is_null_and_is_not_empty_as_is_
     regions_world(scenario)
 
 
-NO_PEST = one_rule.NO_PEST  # added without the field, given [], and a column written NULL
-PESTERED = set(PESTS) - NO_PEST
+NEVER_SET = one_rule.NEVER_SET  # added without the field, and a column written NULL (contract g10)
+PESTERED = {'a-aphid', 'a-mite'}  # a list with an element; a-empty holds `[]`, a value
 
 
 async def plant_column(r: Regions) -> Planted:
@@ -593,32 +594,42 @@ async def plant_column(r: Regions) -> Planted:
     return p
 
 
-def test_rule_1_6_pin_a_list_field_in_a_column_of_its_own_is_null_and_is_not_null_answer_as_main_does(regions_world):
+def test_rule_1_1_a_list_field_in_a_column_of_its_own_is_null_shows_the_rows_never_set_is_not_null_an_empty_list_too(
+    regions_world,
+):
+    """Rewritten for contract g10 (a list column can hold "never set", rule 3.1): `is null` shows the samples never set
+    (a-unset added without the field, a-null's column written NULL) and `is not null` the samples with a list, the
+    empty list a-empty among them. Main read the column as tags are, a-empty with no value. A show is asked first."""
+
     async def scenario(r):
         p = await plant_column(r)
+        assert await shown(r, p, leaf('pests', 'in', ['aphid', 'mite'])) == PESTERED
         for form, names in (
-            (leaf('pests', 'is_null'), NO_PEST),
-            (leaf('pests', 'is_not_null'), PESTERED),
-            ('pests is null', NO_PEST),
-            ('pests is not null', PESTERED),
+            (leaf('pests', 'is_null'), NEVER_SET),
+            (leaf('pests', 'is_not_null'), PESTERED | {'a-empty'}),
+            ('pests is null', NEVER_SET),
+            ('pests is not null', PESTERED | {'a-empty'}),
         ):
             assert await shown(r, p, form) == names, form
 
     regions_world(scenario)
 
 
-def test_rule_1_6_a_list_field_in_a_column_of_its_own_is_empty_answers_as_is_null(regions_world):
-    """A list field kept in a column of its own is read as tags are: a sample added without it, one given `[]` and a
-    column written NULL have no value, so each is empty; `is not empty` shows the samples with an element."""
+def test_rule_1_4_a_list_field_in_a_column_of_its_own_is_empty_shows_the_empty_list_and_is_not_empty_an_element(
+    regions_world,
+):
+    """Rewritten for contract g10 (rule 3.1): `is empty` of a list column shows the sample whose list is `[]`, not the
+    samples never set; `is not empty` and the NOT of `is empty` the samples with an element. Main answered `is empty`
+    as `is null`. A show is asked first."""
 
     async def scenario(r):
         p = await plant_column(r)
         # Asked first, as main answers it.
         assert await shown(r, p, leaf('pests', 'in', ['aphid', 'mite'])) == PESTERED
         for form, names in (
-            (leaf('pests', 'is_empty'), NO_PEST),
+            (leaf('pests', 'is_empty'), {'a-empty'}),
             (leaf('pests', 'is_not_empty'), PESTERED),
-            ('pests is empty', NO_PEST),
+            ('pests is empty', {'a-empty'}),
             ('pests is not empty', PESTERED),
             ('NOT (pests is empty)', PESTERED),
         ):

@@ -2,9 +2,10 @@
 
 The implementer's tests, beside the spec's. A value is there and isn't a JSON null, and an empty list written in a
 field is a value: the list was looked at and holds nothing. So `is null` shows the rows with no list, `is empty` the
-rows whose list is empty, and `is not empty` (the NOT of `is empty`) the rows whose value isn't an empty list. A list
-kept in a column of its own (`tags`, a registered array field) is the exception: its empty list is no value, and there
-`is empty` and `is not empty` are `is null` and `is not null`.
+rows whose list is empty, and `is not empty` (the NOT of `is empty`) the rows whose value isn't an empty list. Tags
+(`tags`, `@local.tags`) are the exception: their empty list is no value, and there `is empty` and `is not empty` are
+`is null` and `is not null`. A list field kept in a column of its own is read as a list in a field is: never set (NULL)
+is no value, its empty list is one.
 """
 
 import os
@@ -45,7 +46,11 @@ ROWS: dict[str, dict[str, Any]] = {
 }
 EVERY = set(ROWS)
 TAGS = {'one': ['t']}
-PESTS = {'null': [], 'empty': [], 'one': ['x']}  # a list kept in a column of its own; 'none' and 'nolabel' never set
+PESTS = {
+    'null': [],
+    'empty': [],
+    'one': ['x'],
+}  # a list field kept in a column of its own; 'none' and 'nolabel' never set
 
 
 async def plain(database) -> dict[str, int]:
@@ -118,19 +123,27 @@ def test_a_list_of_labels_has_a_value_when_its_list_is_empty_or_holds_a_label(re
 
 
 @needs_database
-def test_tags_and_a_list_column_read_an_empty_list_as_no_value(registry_database):
+def test_tags_read_an_empty_list_as_no_value_and_a_list_column_as_a_list_in_a_field(registry_database):
     async def scenario(database):
         rows = await plain(database)
-        for field in ('tags', 'pests'):
-            untouched = await shown(rows, leaf(field, 'is_null'))
-            assert untouched == EVERY - {'one'}, field
-            assert await shown(rows, leaf(field, 'is_not_null')) == {'one'}, field
-            assert await shown(rows, leaf(field, 'is_empty')) == untouched, field
-            assert await shown(rows, leaf(field, 'is_not_empty')) == {'one'}, field
-            # As `is null` in every respect: inside a NOT it adds no field.
-            assert await shown(rows, NOT(leaf(field, 'is_empty'))) == {'one'}, field
-            assert await shown(rows, NOT(leaf(field, 'is_not_empty'))) == untouched, field
-            assert await shown(rows, NOT(AND(leaf(field, 'is_empty'), eq('seen', 'a')))) == {'empty', 'one', 'nolabel'}
+        untouched = await shown(rows, leaf('tags', 'is_null'))
+        assert untouched == EVERY - {'one'}
+        assert await shown(rows, leaf('tags', 'is_not_null')) == {'one'}
+        assert await shown(rows, leaf('tags', 'is_empty')) == untouched
+        assert await shown(rows, leaf('tags', 'is_not_empty')) == {'one'}
+        # As `is null` in every respect: inside a NOT it adds no field.
+        assert await shown(rows, NOT(leaf('tags', 'is_empty'))) == {'one'}
+        assert await shown(rows, NOT(leaf('tags', 'is_not_empty'))) == untouched
+        assert await shown(rows, NOT(AND(leaf('tags', 'is_empty'), eq('seen', 'a')))) == {'empty', 'one', 'nolabel'}
+        # A list field kept in a column of its own: never set is no value, the empty list is one.
+        assert await shown(rows, leaf('pests', 'is_null')) == {'none', 'nolabel'}
+        assert await shown(rows, leaf('pests', 'is_not_null')) == {'null', 'empty', 'one'}
+        assert await shown(rows, leaf('pests', 'is_empty')) == {'null', 'empty'}
+        assert await shown(rows, leaf('pests', 'is_not_empty')) == {'one'}
+        # A comparison inside a NOT: it needs a value, of both fields.
+        assert await shown(rows, NOT(leaf('pests', 'is_empty'))) == {'one'}
+        assert await shown(rows, NOT(leaf('pests', 'is_not_empty'))) == {'null', 'empty'}
+        assert await shown(rows, NOT(AND(leaf('pests', 'is_empty'), eq('seen', 'a')))) == {'empty', 'one'}
 
     registry_database(scenario)
 
@@ -146,7 +159,7 @@ def test_every_row_is_in_exactly_one_of_null_empty_and_not_empty_and_of_null_and
             value = 1 if field == 'id' else 'a'
             for comparison in (eq(field, value), leaf(field, '!=', value), NOT(eq(field, value))):
                 assert not (await shown(rows, comparison)) & null, (field, comparison)
-        for field in ('seen', 'detections', 'note'):
+        for field in ('seen', 'detections', 'note', 'pests'):
             parts = [await shown(rows, leaf(field, op)) for op in ('is_null', 'is_empty', 'is_not_empty')]
             assert set().union(*parts) == EVERY and sum(map(len, parts)) == len(EVERY), field
 
@@ -232,6 +245,49 @@ def test_through_the_wrapping_is_empty_is_a_test_and_is_not_empty_its_not(regist
     registry_database(scenario)
 
 
+@needs_database
+def test_through_the_wrapping_not_is_empty_of_a_list_column_is_its_is_not_empty_by_the_grids_own_row(
+    registry_database,
+):
+    """Section 9.10: `is not empty` of a list field kept in a column of its own, written so or as `NOT (f is empty)`,
+    is answered by the grid's own row: a list with at least one element there. A partner's list counts for neither."""
+
+    async def scenario(database):
+        await datasets.create_array_field(
+            1,
+            datasets.CreateArrayFieldRequest(field_name='pests'),
+            user=registry_helpers.USER,
+        )
+        await add(1, [(None, {'name': 'i-never'}), (None, {'name': 'i-x'})], 'wrap/img')
+        image_never, image_x = await ids(database, 1, 'wrap/img')
+        await add(
+            1,
+            [
+                ('object', {'parent_id': image_never}),  # holds ['x'] under an image never set
+                ('object', {'parent_id': image_x}),  # holds [] under an image holding ['x']
+                ('object', {'parent_id': image_x}),  # never set under an image holding ['x']
+            ],
+            'wrap/obj',
+        )
+        object_x, object_empty, object_never = await ids(database, 1, 'wrap/obj')
+        await database.execute('UPDATE samples SET pests = $2 WHERE id = $1', image_x, ['x'])
+        await database.execute('UPDATE samples SET pests = $2 WHERE id = $1', object_x, ['x'])
+        await database.execute('UPDATE samples SET pests = $2 WHERE id = $1', object_empty, [])
+        rows = {
+            'i-never': image_never,
+            'i-x': image_x,
+            'o-x': object_x,
+            'o-empty': object_empty,
+            'o-never': object_never,
+        }
+        assert await shown(rows, leaf('pests', 'is_null'), 1) == {'i-never', 'o-never'}
+        for node in (NOT(leaf('pests', 'is_empty')), leaf('pests', 'is_not_empty')):
+            assert await shown(rows, images(node), 1) == {'i-x'}, node
+            assert await shown(rows, objects(node), 1) == {'o-x'}, node
+
+    registry_database(scenario)
+
+
 # --- The text, the NOT's needs and the SDK (no database) ---
 
 KINDS = {'seen': LIST, 'detections': LIST, 'detections.label': TEXT, 'tags': LIST, 'score': NUMBER, 'empty': TEXT}
@@ -287,12 +343,18 @@ class _Fields:
         return False
 
     def row_field(self, field: Any) -> Any:
-        return 'builtin' if field == 'id' else 'list' if field == 'tags' else None
+        return 'builtin' if field == 'id' else 'list' if field in ('tags', 'pests') else None
 
 
-def test_a_not_around_is_empty_needs_a_value_except_of_a_list_in_a_column_of_its_own():
-    node = AND(leaf('seen', 'is_empty'), leaf('parts', 'is_not_empty'), leaf('tags', 'is_empty'), leaf('n', 'is_null'))
-    assert negation.needs(node, _Fields()) == [('value', 'seen'), ('value', 'parts')]
+def test_a_not_around_is_empty_needs_a_value_except_of_tags():
+    node = AND(
+        leaf('seen', 'is_empty'),
+        leaf('parts', 'is_not_empty'),
+        leaf('tags', 'is_empty'),
+        leaf('pests', 'is_empty'),
+        leaf('n', 'is_null'),
+    )
+    assert negation.needs(node, _Fields()) == [('value', 'seen'), ('value', 'parts'), ('value', 'pests')]
 
 
 def test_the_sdk_has_a_condition_for_each_new_test():

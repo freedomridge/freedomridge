@@ -10,7 +10,7 @@ import { useQuery } from '@tanstack/react-query';
 import { useFilters, withGrain } from '@/contexts/FilterContext';
 import { getSamples, type ComplexFilter, type SchemaField, type Dataset } from '@/lib/api';
 import { escapeCsvField } from '@/lib/csv';
-import { isLocalField, localValue, type LocalFieldsHolder } from '@/lib/local-fields';
+import { isLocalField, LOCAL_TAGS, localValue, type LocalFieldsHolder } from '@/lib/local-fields';
 
 const SYSTEM_FIELDS = ['filepath', 'id', 'media_type', 'tags', 'created_at', 'last_modified_at'] as const;
 const SYSTEM_FIELDS_SET = new Set<string>(SYSTEM_FIELDS);
@@ -39,8 +39,16 @@ interface ExportDialogProps {
 // metadata fields nested under `metadata`.
 type ExportItem = { id: number; metadata?: Record<string, unknown> } & Record<string, unknown>;
 
+// A sample's own tags (and a mirror's own `@local.tags`) are the lists whose empty list is no value: none is an
+// empty cell. Any other empty list is a value, written `[]` (escapeCsvField).
+function noTagsIsEmpty(value: unknown): unknown {
+    return Array.isArray(value) && value.length === 0 ? null : value;
+}
+
 function getFieldValue(item: ExportItem, field: string): unknown {
+    if (field === 'tags') return noTagsIsEmpty(item[field]);
     if (SYSTEM_FIELDS_SET.has(field)) return item[field];
+    if (field === LOCAL_TAGS) return noTagsIsEmpty(localValue(item as LocalFieldsHolder, field));
     if (isLocalField(field)) return localValue(item as LocalFieldsHolder, field);  // a mirror's own field
     // Metadata fields live under item.metadata, but native array columns
     // (e.g. inferred_tags) are top-level. Check both.

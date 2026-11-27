@@ -12,7 +12,9 @@ list, empty or not; `exists` asks for the key. By contract g9, `is null` shows t
 empty list in a field (`detections.label is null` neither), and `is empty` the rows whose list holds nothing; `is not
 empty` is its NOT, read as a comparison's; for tags an empty list is no value, so `tags is empty` is `tags is null`.
 The samples hold the rows of section 7.7: no key, a JSON null, `[]`, a list with the value, a list without it, and a
-list whose elements have no label.
+list whose elements have no label. By contract g10 a list field kept in a column of its own (`pests`, made as the app
+makes it, a sample's `array_fields` in the file) holds never set (a sample with no `array_fields`), `[]` or a list, and
+is read as a list in a field is: `exists` and `not exists` of it answer as `is not null` and `is null`.
 
 - `test_the_reference_reads_every_case_as_the_file_says` checks the file against the spec file's reference
   (test_one_rule_everywhere_spec.Reading), so a wrong expectation is the file's own mistake.
@@ -36,6 +38,7 @@ from fridge import Condition, Dataset
 
 from backend.routers import datasets
 from backend.tests import test_one_rule_everywhere_spec as spec
+from backend.tests.test_access_rule_spec import ADMIN
 from backend.tests.test_protected_metadata_keys_spec import sdk
 from backend.tests.test_regions_spec import ADMIN_USER, Regions, post
 
@@ -51,7 +54,11 @@ DATASET = 76
 QUERY = [1.0, 0.0, 0.0, 0.0]
 ORDER = ['notalist', 'kind', 'null', 'blue', 'unlabelled', 'red', 'none', 'empty']  # nearest to QUERY first
 NEAR = 5
-ROWS = {name: spec.Row(dict(held['metadata']), tags=tuple(held['tags'])) for name, held in SAMPLES.items()}
+# For the reference, the list column is read as a key of the row: a sample never set has none.
+ROWS = {
+    name: spec.Row({**held['metadata'], **held.get('array_fields', {})}, tags=tuple(held['tags']))
+    for name, held in SAMPLES.items()
+}
 
 
 class Written(Condition):
@@ -78,10 +85,18 @@ def test_the_nearest_samples_are_a_part_and_cases_show_samples_on_both_sides_of_
 
 
 async def plant(r: Regions) -> spec.Planted:
-    """The file's samples as a dataset without objects, each with a vector (for the similarity search)."""
+    """The file's samples as a dataset without objects, the list column made first, each sample with a vector (for
+    the similarity search)."""
     await r.dataset(DATASET)
+    made = await r.call(ADMIN, 'POST', f'/api/datasets/{DATASET}/array-fields', json={'field_name': 'pests'})
+    assert made.is_success, made.text
     samples = [
-        {'filepath': f'{name}.jpg', 'metadata': held['metadata'], 'tags': held['tags']}
+        {
+            'filepath': f'{name}.jpg',
+            'metadata': held['metadata'],
+            'tags': held['tags'],
+            **({'array_fields': held['array_fields']} if 'array_fields' in held else {}),
+        }
         for name, held in SAMPLES.items()
     ]
     await datasets.add_samples(DATASET, {'samples': samples}, user=ADMIN_USER)

@@ -104,6 +104,8 @@ class Sample:
         # loaded — a slim projection omits `tags`, and `tags` is a full REPLACE on the wire.
         # A sample built here (not hydrated) carries everything its constructor was given.
         self._loaded_fields: set = {"tags", "metadata", "location", "heading"}
+        # List fields read as never set (None): save() leaves them out unless they were given a value since.
+        self._loaded_unset_arrays: set = set()
 
     @classmethod
     def from_row(cls, item: Dict[str, Any], dataset: Optional['Dataset'] = None) -> 'Sample':
@@ -132,6 +134,7 @@ class Sample:
         sample.created_at = item.get("created_at")
         sample.last_modified_at = item.get("last_modified_at")
         sample._snapshot_version_id = item.get("version_id")
+        # A list field never set is None (null on the wire), apart from the empty list.
         sample.array_fields = dict(item.get("array_fields") or {})
         sample.local = dict(item.get("local_metadata") or {})
         if item.get("local_tags") is not None:
@@ -145,10 +148,13 @@ class Sample:
             heading = item["location"].get("heading")  # the samples endpoints nest it in location
         if heading is not None:
             sample.heading = heading
-        # Dynamic array columns (inferred_tags, …) arrive as top-level keys.
+        # Dynamic array columns (inferred_tags, …) arrive as top-level keys: a list, or null for one never set, which
+        # stays None (`sample.f or []` treats the two alike).
         for af in cls._known_array_fields:
             if af != 'tags' and af in item and af not in sample.array_fields:
-                sample.array_fields[af] = item[af] or []
+                sample.array_fields[af] = item[af]
+        # save() never writes back a never-set list field it read: that would erase a list written meanwhile.
+        sample._loaded_unset_arrays = {name for name, value in sample.array_fields.items() if value is None}
         # Snapshot AFTER metadata is populated, so save() can tell deletions from never-present.
         sample._original_metadata_keys = set(sample.metadata)
         # Only the columns the server actually sent. A slim projection (select_fields) omits
@@ -201,6 +207,7 @@ class Sample:
             '_original_metadata_keys',
             '_loaded_fields',
             '_stored_filepath',
+            '_loaded_unset_arrays',
             'distance',
         )
         if name in _core:
@@ -337,11 +344,14 @@ class Sample:
             remove_metadata_keys=removed or None,
             location=self.location,
             heading=self.heading,
-            array_fields=self.array_fields if self.array_fields else None,
+            array_fields=self._array_fields_to_save() or None,
         )
         # The server state now matches ours; re-baseline so a second save() doesn't try to remove
         # keys that are already gone.
         self._original_metadata_keys = set(self.metadata)
+        # And the list fields never set are now the ones that are None here: one given a list and saved, then set to
+        # None, is an unset the next save sends.
+        self._loaded_unset_arrays = {name for name, value in (self.array_fields or {}).items() if value is None}
 
     def add_heatmap(
         self,
@@ -407,8 +417,20 @@ class Sample:
             entry["colormap"] = colormap
         self.metadata[name] = entry
 
+    def _array_fields_to_save(self) -> Dict[str, Any]:
+        """The list fields save() writes: each as it is here, a list, or None to unset one (a server before list
+        fields could be never set refuses None, 422), but never a None read as such: it is unchanged, and writing it
+        back would erase a list written meanwhile."""
+        loaded_unset = self.__dict__.get('_loaded_unset_arrays') or set()
+        return {
+            name: value
+            for name, value in (self.array_fields or {}).items()
+            if value is not None or name not in loaded_unset
+        }
+
     def to_dict(self) -> Dict[str, Any]:
-        """Convert sample to dictionary for API submission."""
+        """Convert sample to dictionary for API submission. A list field that is None (never set) is left out: never
+        set on the server too, on any version (an older server stores the empty list for it)."""
         result = {
             "filepath": self.filepath,
             "media_type": self.media_type,
@@ -419,8 +441,9 @@ class Sample:
             "embeddings": self.embeddings if self.embeddings else None,
             "hashes": self.hashes if self.hashes else None,
         }
-        if self.array_fields:
-            result["array_fields"] = self.array_fields
+        arrays = {name: value for name, value in (self.array_fields or {}).items() if value is not None}
+        if arrays:
+            result["array_fields"] = arrays
 
         # Convert location tuple to GeoJSON if present
         if self.location is not None:

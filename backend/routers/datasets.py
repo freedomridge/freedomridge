@@ -84,6 +84,7 @@ from .. import (
     grain_reading,
     job_queue,
     job_wait,
+    list_fields,
     local_writes,
     negation,
     regions,
@@ -2402,6 +2403,15 @@ async def _get_dataset_field_stats_impl(
     total_count = 0
     if not brief:
         total_count = await db.fetchval("SELECT count(*) FROM samples WHERE dataset_id = $1", id) or 0
+    # A list field kept in a column of its own has the same count: its rows never set (the statistics count an empty
+    # list as a value), for the sidebar's "(no value)" tick, which then shows exactly them (`is null`). Tags, whose
+    # empty list is no value, have no such tick.
+    for entry in schema:
+        name = entry.get('name')
+        stat = get_cached_stat(name) if name in array_cols and not negation.empty_is_no_value(name) else None
+        count = stat.get('sample_count') if stat is not None else None
+        if count is not None and total_count and 0 < count < total_count:
+            entry['null_count'] = total_count - count
 
     async def fill_cached(field_schema: Dict[str, Any], stat, kind: str) -> None:
         """A field's facet the gate does not recompute: the dataset's values."""
@@ -2971,7 +2981,9 @@ async def add_array_column(pool, dataset_id: int, name: str) -> None:
             try:
                 async with conn.transaction():
                     await conn.execute("SET LOCAL lock_timeout = '2s'")
-                    await conn.execute(f"ALTER TABLE samples ADD COLUMN IF NOT EXISTS {name} TEXT[] DEFAULT '{{}}'")
+                    # No default: a sample written without the field holds no value for it (NULL), apart from the
+                    # empty list (0045_list_columns_hold_never_set.sql).
+                    await conn.execute(f"ALTER TABLE samples ADD COLUMN IF NOT EXISTS {name} TEXT[]")
             except asyncpg.LockNotAvailableError:
                 raise HTTPException(
                     status_code=409,
@@ -2997,13 +3009,20 @@ async def create_array_field(
     id: int,
     request: CreateArrayFieldRequest,
     user: dict = Depends(require_level("edit")),
+    wait: bool = True,
 ):
-    """Create a new tag-like array field on the samples table.
+    """Create a list field kept in a column of its own: a TEXT[] column of samples with a GIN index, the same
+    performance as the built-in tags. The column has no default, so a sample written without the field holds no value
+    for it (never set), apart from the empty list.
 
-    This adds a real TEXT[] column with a GIN index — same performance
-    characteristics as the built-in tags field. PostgreSQL 11+ makes
-    ADD COLUMN with a default instant (no table rewrite).
+    The column is shared by every dataset that registers the name. When another dataset made it first, this dataset's
+    rows holding the empty list (the old default, from before the column lost it) become never set before the field is
+    this dataset's (backend/list_fields.py): inside this request for a dataset of at most 1,000 samples; otherwise in a
+    job, and the request answers within five seconds as a promotion does: the final message, or 202 {job_id, state}
+    while the job continues (a second request joins it). Until the job ends the field is not this dataset's, and a write
+    that names it is answered 409 with Retry-After and X-Job-End-Seconds.
     """
+    started = _time.monotonic()
     name = request.field_name.lower().strip()
 
     if not _SAFE_COLUMN_RE.match(name):
@@ -3033,14 +3052,13 @@ async def create_array_field(
     if not already_exists and len(existing) >= 20:
         raise HTTPException(status_code=400, detail="Maximum of 20 array fields reached")
 
-    # Create the physical column + index only when it doesn't exist yet.
+    # Create the physical column + index only when it doesn't exist yet. A column made here has no default: every row
+    # of every dataset holds no value in it, so nothing of this dataset's needs changing.
     if not already_exists:
         assert db.pool is not None  # connected at startup (lifespan)
         await add_array_column(db.pool, id, name)
 
-    # Register the field for THIS dataset regardless of whether the global column
-    # already existed — otherwise a second dataset adopting an existing array column
-    # would never show it in its own list_array_fields / schema.
+    registered_message = {'message': f"Array field '{name}' registered for this dataset", 'created': not already_exists}
     origin_query = 'SELECT origin FROM dataset_fields WHERE dataset_id = $1 AND field_name = $2'
     async with db.pool.acquire() as conn:
         # Already registered here (a sync calls this on every run): the shared gate is enough.
@@ -3048,25 +3066,41 @@ async def create_array_field(
             await lock_field_lifecycle(conn, id, wait=False)
             registered = await conn.fetchval(origin_query, id, name) == 'native_array'
         if registered:
-            return {'message': f"Array field '{name}' registered for this dataset", 'created': not already_exists}
+            return registered_message
+        # Another dataset made the column, and this one is large: a job sets its empty lists to never set and then
+        # makes the field this dataset's (list_fields.handler). One already running for this name is joined, looked
+        # for before the size: whatever the dataset counts now, a second request never registers the field beside
+        # a job that is still walking it.
+        if already_exists and (
+            await list_fields.pending(db, id, [name]) is not None
+            or await _large_bulk_target(id, limit=list_fields.INLINE_SAMPLES)
+        ):
+            try:
+                job = await list_fields.submit(db.pool, id, user['id'], name)
+            except job_queue.QueueBusy as error:
+                raise HTTPException(
+                    status_code=409,
+                    detail='Registration is busy; retry',
+                    headers={'Retry-After': '1'},
+                ) from error
+            if job is None:  # the job ended meanwhile, and the field is this dataset's
+                return registered_message
+            return await job_wait.answer(db.pool, job, started, user=user, wait=wait, failure_status=409)
         # Registering needs the exclusive gate, taken in a new transaction: two callers that each kept
         # the shared one while trying for exclusive blocked each other until both gave up.
         async with conn.transaction():
             await lock_field_lifecycle(conn, id, exclusive=True, wait=False)
             origin = await conn.fetchval(origin_query, id, name)
             if origin == 'native_array':  # another caller registered it meanwhile
-                return {'message': f"Array field '{name}' registered for this dataset", 'created': not already_exists}
+                return registered_message
             if origin == 'metadata':
                 raise HTTPException(status_code=409, detail=f"'{name}' is already a metadata field")
-            await conn.execute(
-                """INSERT INTO dataset_fields (dataset_id, field_name, field_type, origin, is_promoted)
-                   VALUES ($1, $2, 'list', 'native_array', TRUE)
-                   ON CONFLICT (dataset_id, field_name) DO UPDATE SET field_type = 'list',
-                       origin = 'native_array', is_promoted = TRUE""",
-                id,
-                name,
-            )
-            await conn.execute('DELETE FROM dataset_field_stats WHERE dataset_id = $1 AND field_name = $2', id, name)
+            if already_exists:
+                # A small dataset: its rows holding the old default become never set in this same transaction, so
+                # no list of the field can have been written to them before (writes of it are refused until this
+                # commits, and every one after sees the field).
+                await list_fields.empty_to_never_set(conn, id, name)
+            await list_fields.register(conn, id, name)
 
     if already_exists:
         return {"message": f"Array field '{name}' registered for this dataset", "created": False}
@@ -4842,25 +4876,30 @@ def _value_sql(
     """The row has a value for the field (docs/FILTER_QUERY.md, "Operators"), or with `present` False has none: the one
     place that knows it for each kind of list. `is not null` is it and `is null` the other (and so `exists` and
     `not exists` of a list of labels, which has no key to find), the guard of a NOT reads it
-    (`_GrainRows.has`, for backend/negation.py's ('value', field)), and so does `is empty` of a list kept in a column
-    of its own. TRUE or FALSE, never NULL. A value is there and isn't a JSON null, and an empty list written in a field
-    is a value (the list was looked at and holds nothing), except:
-    - a list kept in a column of its own (`tags`, `@local.tags`, a registered array field) has a value when it has an
-      element: every sample holds the column, the empty list until one is written, so its empty list can't be told
-      from one never set, and is no value;
+    (`_GrainRows.has`, for backend/negation.py's ('value', field)), and so do `exists` and `not exists` of a list kept
+    in a column of its own, and `is empty` of tags. TRUE or FALSE, never NULL. A value is there and isn't a JSON null
+    or a NULL column, and an empty list written in a field is a value (the list was looked at and holds nothing), a
+    list field kept in a column of its own included (NULL there is a sample written without it), except:
+    - tags (`tags`, `@local.tags`: negation.EMPTY_IS_NO_VALUE) have a value when they have an element: every sample
+      holds them, the empty list until one is written, so an empty one can't be told from one never set, and is no
+      value;
     - a list of labels (`detections.label`) has a value when the list is there and is empty or holds a label: one whose
       elements have no label at all has none (something was found, and what it is isn't known).
     `local` is the field's `@local.` place (local_field), the name already checked as the compiler checks it."""
     arrays = array_columns if array_columns is not None else _get_array_columns_sync()
     test = 'IS NOT NULL' if present else 'IS NULL'
     if local is not None:
-        return f"array_length({local.column}, 1) {test}" if local.array else f"{local.text} {test}"
+        if not local.array:
+            return f"{local.text} {test}"
+        return (
+            f"array_length({local.column}, 1) {test}" if negation.empty_is_no_value(field) else f"{local.column} {test}"
+        )
     if field_mapping and field in field_mapping:
         return f"{field_mapping[field]} {test}"
     if field in ('media_type', 'filepath', 'id', *_NATIVE_TIMESTAMPS):
         return f"{field} {test}"
     if field in arrays:
-        return f"array_length({field}, 1) {test}"
+        return f"array_length({field}, 1) {test}" if negation.empty_is_no_value(field) else f"{field} {test}"
     labels = label_path(field, arrays)
     if field == 'segmentation.labels':
         listed = _list_sql("metadata->'segmentation'->'labels'")
@@ -4885,10 +4924,13 @@ def _emptiness_refusal(field: str, operator: str, array_columns: Optional[set]) 
     )
 
 
-def _empty_sql(field: str, local: Optional[LocalField]) -> str:
-    """The row's field (a metadata key, a mirror's own `@local.` field, `segmentation.labels`) is a list that holds
-    nothing: NULL where the field has no value, so a NOT around it is guarded as any comparison's is. A list kept in a
-    column of its own is no field of this: its empty list is no value (`is null`)."""
+def _empty_sql(field: str, local: Optional[LocalField], arrays: Optional[set] = None) -> str:
+    """The row's field (a metadata key, a mirror's own `@local.` field, `segmentation.labels`, a list field kept in a
+    column of its own) is a list that holds nothing: NULL where the field has no value, so a NOT around it is guarded as
+    any comparison's is. Tags are no field of this: their empty list is no value (`is null`, the compiler's emptiness
+    branch)."""
+    if local is None and arrays is not None and field in arrays:
+        return f"({field} = '{{}}'::text[])"
     if field == 'segmentation.labels':
         return "((metadata->'segmentation'->'labels') = '[]'::jsonb)"
     source, key = ('local_metadata', local.name) if local is not None else (_metadata_source(field), field)
@@ -5981,14 +6023,14 @@ def _compile_filter_node(
         )
 
         # `is empty`: the field's value is a list that holds nothing; `is not empty` is its NOT (backend/negation.py),
-        # so it shows only the rows that have a value, one that isn't an empty list. A list kept in a column of its own
-        # has no value when it is empty: there they are `is null` and `is not null`, compiled below.
+        # so it shows only the rows that have a value, one that isn't an empty list. Tags have no value when they are
+        # empty (negation.EMPTY_IS_NO_VALUE): there they are `is null` and `is not null`, compiled below.
         if op in negation.EMPTINESS:
             refusal = _emptiness_refusal(field, op, array_columns)
             if refusal is not None:
                 raise HTTPException(status_code=400, detail=refusal)
             arrays = array_columns if array_columns is not None else _get_array_columns_sync()
-            if local.array if local is not None else field in arrays:
+            if negation.empty_is_no_value(field) and (local.array if local is not None else field in arrays):
                 op = negation.EMPTINESS[op]
             elif op == 'is_not_empty':
                 return _compile_filter_node(
@@ -6003,7 +6045,7 @@ def _compile_filter_node(
                     outer_kind=outer_kind,
                 )
             else:
-                return _empty_sql(field, local), arg_idx
+                return _empty_sql(field, local, arrays), arg_idx
 
         # A negation of a field is the NOT of its comparison (backend/negation.py): `f != v` is NOT (f = v), `f not in`
         # NOT (f in), and so shows only the rows that have a value for `f`. On a list of labels `<>`, `not_in` and `nin`
@@ -6337,10 +6379,11 @@ def _compile_filter_node(
 
         elif op == 'exists':
             if is_array:
-                # Native TEXT[] column (tags, ...): "exists" = has >= 1 element. A row with
-                # tags=[] has the column but no tags; NULL/empty -> not exists. (metadata ? field
-                # was wrong here — tags isn't a metadata key, so `exists` matched zero rows.)
-                return f"({arr} IS NOT NULL AND array_length({arr}, 1) > 0)", arg_idx
+                # A list kept in a column of its own has no key to find. Tags (negation.EMPTY_IS_NO_VALUE): at least one
+                # tag, as before. Any other: `is not null` (_value_sql), the rows with a list, empty or not.
+                if negation.empty_is_no_value(field):
+                    return f"({arr} IS NOT NULL AND array_length({arr}, 1) > 0)", arg_idx
+                return _value_sql(field, local, field_mapping, array_columns), arg_idx
             native = ('media_type', 'filepath', 'id', *_NATIVE_TIMESTAMPS)
             if (field_mapping and field in field_mapping) or field in native:
                 # Native scalar column: existence = the column is set.
@@ -6354,8 +6397,8 @@ def _compile_filter_node(
 
         elif op == 'not_exists':
             if is_array:
-                # Inverse of exists: no elements (NULL column or empty array).
-                return f"array_length({arr}, 1) IS NULL", arg_idx
+                # `is null` (_value_sql): never set; for tags, no tag.
+                return _value_sql(field, local, field_mapping, array_columns, present=False), arg_idx
             native = ('media_type', 'filepath', 'id', *_NATIVE_TIMESTAMPS)
             if (field_mapping and field in field_mapping) or field in native:
                 return f"{col} IS NULL", arg_idx
@@ -8325,7 +8368,8 @@ class SampleCreate(BaseModel):
     embedding: Any = None
     embeddings: Optional[Dict[str, List[float]]] = None  # Named embeddings: {"clip": [...], "dinov2": [...]}
     hashes: Optional[Dict[str, str]] = None  # Named hashes (hex): {"phash": "ff00...", "dhash": "0a1b..."}
-    array_fields: Optional[Dict[str, List[str]]] = None  # Dynamic array fields
+    # List fields kept in a column of their own: a list, or null for never set (as leaving the field out).
+    array_fields: Optional[Dict[str, Optional[List[str]]]] = None
 
 
 _HASH_HEX_RE = re.compile(r'^[0-9a-fA-F]+$')
@@ -8445,6 +8489,7 @@ async def add_samples(id: int, payload: Any = Body(...), user: dict = Depends(re
     valid_array_cols = await get_dataset_array_columns(id) - {'tags'}
     requested_array_fields = {name for sample in samples for name in (sample.array_fields or {})}
     if requested_array_fields - valid_array_cols:
+        await list_fields.refuse_while_registering(db, id, requested_array_fields - valid_array_cols)
         raise HTTPException(
             status_code=422,
             detail=f'Unregistered array fields: {sorted(requested_array_fields - valid_array_cols)}',
@@ -8657,7 +8702,20 @@ class SampleUpdate(BaseModel):
     remove_metadata_keys: Optional[List[str]] = None
     location: Optional[Dict[str, Any]] = None
     heading: Optional[float] = None
-    array_fields: Optional[Dict[str, List[str]]] = None
+    # A list field kept in a column of its own: a list replaces it, null unsets it (never set). A mirror's own
+    # `@local.tags` takes a list only, as tags do.
+    array_fields: Optional[Dict[str, Optional[List[str]]]] = None
+
+    @field_validator('array_fields')
+    @classmethod
+    def _array_fields(
+        cls,
+        fields: Optional[Dict[str, Optional[List[str]]]],
+    ) -> Optional[Dict[str, Optional[List[str]]]]:
+        if fields is not None and LOCAL_TAGS in fields and fields[LOCAL_TAGS] is None:
+            raise ValueError(f'{LOCAL_TAGS} takes a list of tags, not null')
+        return fields
+
     # Never written: a sample's path can't be changed (FILEPATH_UNCHANGEABLE). Accepted only as the path the sample
     # has, so a client that sends a whole sample back keeps working.
     filepath: Optional[str] = None
@@ -8748,6 +8806,7 @@ async def update_sample(
         return await _update_local_fields(id, sample_id, local_set, local_remove, local_tags, user)
     valid_cols = await get_dataset_array_columns(id) - {'tags'} if request.array_fields else set()
     if request.array_fields and set(request.array_fields) - valid_cols:
+        await list_fields.refuse_while_registering(db, id, set(request.array_fields) - valid_cols)
         raise HTTPException(
             status_code=422,
             detail=f'Unregistered array fields: {sorted(set(request.array_fields) - valid_cols)}',
@@ -9159,6 +9218,7 @@ async def tag_samples(id: int, request: BulkTagRequest, user: dict, made_by: str
         return await _tag_local(id, request, user)
     array_cols = await get_dataset_array_columns(id)
     if col not in array_cols:
+        await list_fields.refuse_while_registering(db, id, [col])
         raise HTTPException(status_code=400, detail=f"'{col}' is not a registered array field")
 
     overlap = sorted(set(request.add_tags) & set(request.remove_tags))
