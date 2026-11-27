@@ -1,6 +1,8 @@
 """The filter query language (backend/filter_query.py, docs/FILTER_QUERY.md): text to filters, back again,
 and errors that say where and what to write instead."""
 
+import re
+
 import pytest
 
 from backend.filter_query import BOOLEAN, DATETIME, LIST, NUMBER, OBJECT, TEXT, FilterQueryError, format_filter
@@ -116,7 +118,6 @@ def test_every_operator_and_value_form():
         ('split = "a', 1, 9, 'this " has no closing " on its line', []),
         ('split ! a', 1, 7, "'!' on its own isn't an operator", []),
         ('split', 1, 6, "expected an operator after 'split'", []),
-        ('note is nothing', 1, 9, "expected null or not null after is, found 'nothing'", []),
         ('split = and', 1, 9, "expected a value for 'split', found 'and'", []),
         ('AND split = a', 1, 1, "expected a field name, found 'AND'", []),
         ('split = a split = b', 1, 11, "expected AND, OR or the end of the query, found 'split'", []),
@@ -137,6 +138,21 @@ def test_a_mistake_says_where_and_what_to_write(query, line, column, message, su
     assert detail['message'].startswith(message), detail
     assert detail['suggestions'] == suggestions
     assert str(raised.value).startswith(f'line {line}, column {column}: ')
+
+
+def test_a_word_after_is_that_is_no_test_is_a_mistake_that_names_null_not_null_empty_and_not_empty():
+    """After `is` the text takes null, not null, empty and not empty (contract g9, rule 2.1: the messages that list the
+    operators name them). A word that is none of them is a mistake where it stands, naming the four and what it found;
+    the message's other words are not fixed here."""
+    with pytest.raises(FilterQueryError) as raised:
+        parse('note is nothing', FIELDS)
+    detail = raised.value.detail
+    assert (detail['line'], detail['column'], detail['suggestions']) == (1, 9, []), detail
+    message = detail['message']
+    assert "'nothing'" in message, message
+    for named in (r'(?<!not )\bnull\b', r'\bnot null\b', r'(?<!not )\bempty\b', r'\bnot empty\b'):
+        assert re.search(named, message), (named, message)
+    assert str(raised.value).startswith('line 1, column 9: ')
 
 
 ROUND_TRIP = [

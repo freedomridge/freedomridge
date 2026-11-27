@@ -683,13 +683,25 @@ def test_a_field_named_concept_reads_as_it_did_beside_concept_tests(world):
         assert await selected_by(w, query) == expected
         await assert_written_back(w, query)
 
-        # A comparison the text field doesn't take is the same mistake as before.
+        # A comparison the text field doesn't take is the same mistake as before, its list of operators naming the
+        # empty list's two tests too (contract g9, rule 2.1: the messages that list the operators name them).
         error = mistake(await parse(w, 'concept > 0.5'), line=1)
-        assert (error['message'], error['column']) == (
-            "'>' does not apply to the text field 'concept'; use one of: "
-            '=, !=, in, not in, contains, like, exists, not exists, is null, is not null',
-            9,
-        )
+        head = "'>' does not apply to the text field 'concept'; use one of: "
+        assert error['message'].startswith(head) and error['column'] == 9, error
+        assert set(error['message'][len(head) :].split(', ')) == {
+            '=',
+            '!=',
+            'in',
+            'not in',
+            'contains',
+            'like',
+            'exists',
+            'not exists',
+            'is null',
+            'is not null',
+            'is empty',
+            'is not empty',
+        }, error
         # In a dataset with no field named concept, it is an unknown field, as before, at the same place; the message
         # may go on (to say how a concept's score is written).
         error = mistake(await parse(w, 'concept = "a"', OTHER), line=1)

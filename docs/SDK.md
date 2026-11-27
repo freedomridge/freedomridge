@@ -329,6 +329,9 @@ view = s[~(s.scene == "parking")]
 # IN - use is_in()
 view = s[s.scene.is_in(["highway", "city", "residential"])]
 
+# An empty list - use is_empty() / is_not_empty()
+view = s[s.detections.is_empty()]   # looked at, nothing found; `detections is null` finds no list at all
+
 # Complex queries
 view = s[
     ((s.scene == "highway") | (s.scene == "city")) &
@@ -409,7 +412,8 @@ view = dataset.filter(tags__contains="validated")     # contains
 | `__in`, `__nin` (or `__not_in`) | in / not in a list (`not in`, like `!=`, needs a value) |
 | `__contains` | case-insensitive substring on text; membership on `tags` and other array fields |
 | `__exists=True/False` | the metadata key is present / absent |
-| `__is_null=True/False` | the value is null or missing / has a value |
+| `__is_null=True/False` | no value (the key is missing or null) / has a value; an empty list is a value, except in `tags` and the other lists kept in a column of their own |
+| `__is_empty=True/False` | the value is an empty list / a value that isn't one (on `tags`: no tags / at least one) |
 
 An unknown suffix (for example `brightness__between=[0.3, 0.8]`) raises
 `ValueError` instead of being treated as a field name. Conditions can also be
@@ -2289,8 +2293,9 @@ and `dataset.samples[...]` all produce them.
 | `in` | Value in list | `{"field": "tags", "operator": "in", "value": ["validated"]}` |
 | `not in` | Value not in list: samples that have a value, none of them listed (`tags not in` needs at least one tag) | `{"field": "tags", "operator": "not in", "value": ["rejected"]}` |
 | `contains` | Case-insensitive substring on text; membership on array fields | `{"field": "filename", "operator": "contains", "value": "cat"}` |
-| `exists` / `not_exists` | The metadata key is present / absent | `{"field": "reviewed", "operator": "exists"}` |
-| `is_null` / `is_not_null` | The value is null or missing / has a value | `{"field": "score", "operator": "is_null"}` |
+| `exists` / `not_exists` | The metadata key is present / absent (a list of labels, `detections.label`, has no key of its own: there they answer as `is_not_null` / `is_null`) | `{"field": "reviewed", "operator": "exists"}` |
+| `is_null` / `is_not_null` | No value (the key is missing or null) / has a value. An empty list is a value, except in `tags` and the other lists kept in a column of their own ([FILTER_QUERY.md](FILTER_QUERY.md#no-value-and-an-empty-list)) | `{"field": "score", "operator": "is_null"}` |
+| `is_empty` / `is_not_empty` | The value is a list that holds nothing / a value that isn't one (a sample with no value matches neither; on `tags`, no tags / at least one). Refused (400) on the built-in fields, `location` and a path through a list (`detections.label`: ask `detections`) | `{"field": "detections", "operator": "is_empty"}` |
 | `geo_polygon` | Location inside a polygon given as a list of `[lon, lat]` points (not a GeoJSON object). Longitudes past 180 or below -180 make a shape across the antimeridian (176 to 183 holds 177.4 and -178.2); a polygon within -180 to 180 is read as before. A value that is not a list of points, a GeoJSON object included, is refused (400) ([Geospatial filtering](#geospatial-filtering)) | `{"field": "location", "operator": "geo_polygon", "value": [[-122.5, 37.7], [-122.35, 37.7], [-122.35, 37.82], [-122.5, 37.82]]}` |
 | `geo_near` | Location within `max_distance` metres of a point | `{"field": "location", "operator": "geo_near", "value": {"point": [-122.42, 37.77], "max_distance": 5000}}` |
 | `geo_polygon_exclude` | Location outside the polygon: a sample with no location matches neither `geo_polygon` nor its exclude | `{"field": "location", "operator": "geo_polygon_exclude", "value": [[-122.5, 37.7], [-122.35, 37.7], [-122.35, 37.82], [-122.5, 37.82]]}` |

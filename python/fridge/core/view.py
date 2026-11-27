@@ -122,6 +122,7 @@ class FieldExpression:
     - field.is_in([...])
     - field.contains("...")
     - field.exists()
+    - field.is_empty(), field.is_not_empty()
     """
 
     def __init__(self, field_name: str):
@@ -165,6 +166,22 @@ class FieldExpression:
         started matching missing-key rows too — i.e. every sample.)
         """
         return Condition(self.field_name, "exists", None)
+
+    def is_empty(self) -> Condition:
+        """Check if the field is a list that holds nothing: s.detections.is_empty()
+
+        An empty list is a value (the list was looked at and nothing was found), so it is not what
+        ``is null`` finds. A sample's own tags are the exception: ``s.tags.is_empty()`` finds the samples
+        with no tags, as ``tags is null`` does. Not for a path through a list (``detections.label``).
+        """
+        return Condition(self.field_name, "is_empty", None)
+
+    def is_not_empty(self) -> Condition:
+        """Check if the field has a value that is not an empty list: s.detections.is_not_empty()
+
+        The NOT of ``is_empty()``: a sample with no value for the field matches neither.
+        """
+        return Condition(self.field_name, "is_not_empty", None)
 
     def __repr__(self) -> str:
         return f"FieldExpression({self.field_name!r})"

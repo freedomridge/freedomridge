@@ -17,9 +17,11 @@ its objects, or for an object together with its image. A row is never asked abou
   point on that map) and neither it nor a partner is inside. "As a whole" is the image with all its objects on the
   images' grid, the object with its image on the objects' grid. A NOT inside a larger filter is read first, for the
   row as a whole.
-- `is null` holds when neither the row nor any of those partners has a value (absent or a JSON null), `not exists`
-  when none has the key (a JSON null under it counts as there): both read first and for the row as a whole, like a
-  NOT. `is not null` and `exists` are showing tests like any other.
+- `is null` holds when neither the row nor any of those partners has a value (absent or a JSON null; an empty list
+  written in a field is a value), `not exists` when none has the key (a JSON null under it counts as there): both read
+  first and for the row as a whole, like a NOT. `is not null` and `exists` are showing tests like any other, and so is
+  `is empty` (a list that holds nothing); `is not empty` is its NOT. On a list kept in a column of its own (`tags`)
+  `is empty` and `is not empty` are `is null` and `is not null`.
 - A hiding test of a field every row has (the built-in columns) or of a list (`tags`), and the duplicates' collapse,
   are answered by the grid's own row, as before; a list's needs at least one element there. A NOT around tests of
   built-in fields only keeps the reading it had: each row on its own (`NOT (id contains ...)`: the grid's row).
@@ -245,6 +247,14 @@ class _Reader:
                 return ('own', node)  # no polygon: no condition, as the compiler reads it
             positive = {**node, 'operator': negation.EXCLUSIONS[operator]}
             return ('not', ('test', positive), negation.needs(positive, self.rows))
+        if operator in negation.EMPTINESS and isinstance(field, str) and row_field != 'builtin':
+            if row_field == 'list':  # its empty list is no value: `is null` / `is not null`
+                return self.unit({**node, 'operator': negation.EMPTINESS[operator]})
+            if operator == 'is_not_empty' and not self.rows.label_path(field):
+                # The NOT of `is empty`, as `!=` is of `=`. (The compiler refuses a path through a list, in its words.)
+                positive = {**node, 'operator': 'is_empty'}
+                return ('not', ('test', positive), negation.needs(positive, self.rows))
+            return ('test', node)
         if operator in _ABSENT or operator in _PRESENT:
             if row_field == 'builtin' or not isinstance(field, str):
                 return ('own', node)  # every row has its built-in fields

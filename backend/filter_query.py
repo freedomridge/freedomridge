@@ -15,6 +15,9 @@ stay chips.
 `location within "US-KS"` names a loaded region (backend/regions.py) by its key or its name. The caller looks up
 what region_names finds in the text and hands parse_query the answers. On a dataset with no field named `location`,
 `location is null`, `is not null`, `exists` and `not exists` ask whether a sample has a location.
+
+`is null` asks for no value (not looked at); `is empty` for a list that holds nothing, which is a value. `is empty` is
+refused on a field that can hold no list and on a path through a list (`detections.label`: the list is `detections`).
 """
 
 import contextlib
@@ -30,7 +33,10 @@ from .datetimes import literal_window
 # Field kinds: which operators and values a field takes.
 NUMBER, DATETIME, TEXT, LIST, BOOLEAN, OBJECT = 'number', 'datetime', 'text', 'list', 'boolean', 'object'
 
-_PRESENCE = ['exists', 'not exists', 'is null', 'is not null']
+# `is empty` asks whether a list holds nothing. A key of the metadata of any kind is read row by row (a value that is no
+# list is never empty); a field that can hold no list and a path through a list refuse it (emptiness_refusal).
+_EMPTINESS = ['is empty', 'is not empty']
+_PRESENCE = ['exists', 'not exists', 'is null', 'is not null', *_EMPTINESS]
 # `between` and `like` are the SDK's older spellings of a range and of contains; text is never written
 # with them.
 OPERATORS_BY_KIND: Dict[str, List[str]] = {
@@ -43,8 +49,19 @@ OPERATORS_BY_KIND: Dict[str, List[str]] = {
 }
 # A sample's id is a number that also takes contains: its digits, written in decimal, contain the text.
 _ID_TEXT = ['contains', 'like']
+# The fields that can hold no list: a sample's own columns (no metadata key can have their names) and its location. The
+# one list of them: the filter compiler (routers/datasets.py) refuses `is empty` by it too, and the page's query builder
+# mirrors it (frontend/components/filter-stage-editor.tsx NO_LIST_FIELDS) for what it offers.
+NO_LIST = frozenset({'id', 'filepath', 'media_type', 'created_at', 'last_modified_at', 'location'})
 # Query-language operator -> ComplexFilter operator.
-_TO_FILTER = {'exists': 'exists', 'not exists': 'not_exists', 'is null': 'is_null', 'is not null': 'is_not_null'}
+_TO_FILTER = {
+    'exists': 'exists',
+    'not exists': 'not_exists',
+    'is null': 'is_null',
+    'is not null': 'is_not_null',
+    'is empty': 'is_empty',
+    'is not empty': 'is_not_empty',
+}
 # ComplexFilter operator -> query-language operator, for every spelling the server accepts.
 _FROM_FILTER = {
     '=': '=',
@@ -64,6 +81,8 @@ _FROM_FILTER = {
     'not_exists': 'not exists',
     'is_null': 'is null',
     'is_not_null': 'is not null',
+    'is_empty': 'is empty',
+    'is_not_empty': 'is not empty',
 }
 _VALUELESS = set(_PRESENCE)
 _KEYWORDS = {'and', 'or', 'not', 'in', 'contains', 'exists', 'is', 'null', 'between', 'like'}
@@ -207,10 +226,12 @@ class _Parser:
         fields: Dict[str, str],
         regions: Mapping[str, RegionMatch],
         concepts: Sequence[Concept],
+        paths: Mapping[str, str],
     ):
         self.tokens = _tokens(query)
         self.position = 0
         self.fields = fields
+        self.paths = paths
         self.regions = regions
         self.concepts = {concept.name: concept for concept in concepts}
         self.depth = 0
@@ -321,7 +342,10 @@ class _Parser:
                 if self.peek().keyword('exists', 'is') or (
                     self.peek().keyword('not') and self.peek(1).keyword('exists')
                 ):
-                    return {'field': field, 'operator': _TO_FILTER[self.operator(field)], 'value': None}
+                    operator_token = self.peek()
+                    operator = self.operator(field)
+                    self.emptiness(field, operator, operator_token)
+                    return {'field': field, 'operator': _TO_FILTER[operator], 'value': None}
                 raise self.fail(
                     f"'location' takes within or not within and a region, such as location within \"US-KS\", or is "
                     f'null, is not null, exists or not exists; found {_show(self.peek())}',
@@ -331,6 +355,7 @@ class _Parser:
             raise self.fail(f'unknown field {field!r}{hint}', token, _close_names(field, self.fields))
         operator_token = self.peek()
         operator = self.operator(field)
+        self.emptiness(field, operator, operator_token)
         operators = OPERATORS_BY_KIND[kind] + (_ID_TEXT if field == 'id' else [])
         if operator not in operators:
             allowed = ', '.join(operators)
@@ -365,6 +390,14 @@ class _Parser:
                 raise self.fail("like only takes '%text%' (contains text); use contains", value_token)
             operator = 'contains'
         return {'field': field, 'operator': operator, 'value': value}
+
+    def emptiness(self, field: str, operator: str, token: _Token) -> None:
+        """Refuse `is empty` and `is not empty` where they can't be asked (emptiness_refusal), with the list to ask as
+        the suggestion for a path through a list."""
+        through = self.paths.get(field)
+        refusal = emptiness_refusal(field, operator, through=through)
+        if refusal is not None:
+            raise self.fail(refusal, token, [through] if through is not None else [])
 
     def region(self) -> Dict[str, Any]:
         """`location within <region>` or `location not within <region>`, after the field. `within` is a keyword only
@@ -415,6 +448,12 @@ class _Parser:
             value = {'concept_id': concept.id, 'op': '>', 'threshold': float(concept.threshold)}
             return {'field': '_concept', 'operator': 'concept_select', 'value': value}
         self.take()
+        if operator.keyword('is') and (
+            self.peek().keyword('empty') or (self.peek().keyword('not') and self.peek(1).keyword('empty'))
+        ):
+            refusal = emptiness_refusal(None, 'is not empty' if self.peek().keyword('not') else 'is empty')
+            if refusal is not None:
+                raise self.fail(refusal, operator)
         if operator.text not in _CONCEPT_COMPARISONS:
             raise self.fail(
                 f'{operator.text!r} does not apply to the concept {concept.name!r}; use one of: '
@@ -447,15 +486,20 @@ class _Parser:
         if word == 'not' and self.peek().keyword('in', 'exists'):
             return f'not {self.take().text.lower()}'
         if word == 'is':
-            if self.peek().keyword('null'):
+            # `empty` is a plain word everywhere else (a field or a value named empty needs no quotes).
+            if self.peek().keyword('null', 'empty'):
+                return f'is {self.take().text.lower()}'
+            if self.peek().keyword('not') and self.peek(1).keyword('null', 'empty'):
                 self.take()
-                return 'is null'
-            if self.peek().keyword('not') and self.peek(1).keyword('null'):
-                self.take()
-                self.take()
-                return 'is not null'
-            raise self.fail(f'expected null or not null after is, found {_show(self.peek())}', self.peek())
-        operators = '= != > >= < <= in, not in, between, contains, exists, not exists, is null, is not null'
+                return f'is not {self.take().text.lower()}'
+            raise self.fail(
+                f'expected null, not null, empty or not empty after is, found {_show(self.peek())}',
+                self.peek(),
+            )
+        operators = (
+            '= != > >= < <= in, not in, between, contains, exists, not exists, is null, is not null, is empty, '
+            'is not empty'
+        )
         raise self.fail(f'expected an operator after {field!r} ({operators}), found {_show(token)}', token)
 
     def values(self, field: str, kind: str) -> List[Any]:
@@ -503,6 +547,33 @@ class _Parser:
         return text
 
 
+def emptiness_refusal(
+    field: Optional[str],
+    operator: str,
+    *,
+    through: Optional[str] = None,
+    derived: bool = False,
+) -> Optional[str]:
+    """Why `is empty` or `is not empty` (`operator`, `is_empty` or `is empty`) can't be asked of the field, or None (and
+    None for any other operator): the one place for the refusal and its words, which the filter text and the filter
+    compiler both give. Refused: a field that can hold no list (NO_LIST, a concept's score for `field` None, and an
+    embedding's or a hash's presence, `derived`, which only the compiler is asked about: the text knows no such field),
+    and a path through a list, `through` naming its list, which is what to ask. Any other field is read row by row."""
+    words = operator.replace('_', ' ')
+    if words not in _EMPTINESS:
+        return None
+    if through is not None:
+        return (
+            f"{words!r} can't be asked of {field!r}, a path through the list {through!r}: ask it of the list, "
+            f'{through} {words}'
+        )
+    if field is None:
+        return f"{words!r} is a test of a list, and a concept's score is no list: ask it of a list field"
+    if field in NO_LIST or derived:
+        return f'{words!r} is a test of a list, and {field!r} holds no list: ask it of a list field'
+    return None
+
+
 def _close_names(name: str, fields: Collection[str]) -> List[str]:
     same_case = [field for field in fields if field.lower() == name.lower()]
     return same_case or difflib.get_close_matches(name, list(fields), n=3, cutoff=0.6)
@@ -514,11 +585,13 @@ def parse_query(
     *,
     regions: Optional[Mapping[str, RegionMatch]] = None,
     concepts: Sequence[Concept] = (),
+    paths: Optional[Mapping[str, str]] = None,
 ) -> List[Dict[str, Any]]:
     """The query's top-level AND parts as ComplexFilter nodes. `fields` maps each field name to its kind
     (NUMBER, DATETIME, TEXT, LIST, BOOLEAN or OBJECT), `regions` each text region_names found to what it names,
-    and `concepts` are the dataset's, which `concept "name"` names. Raises FilterQueryError at the first mistake."""
-    return _Parser(query, fields, regions or {}, concepts).conjuncts()
+    `concepts` are the dataset's, which `concept "name"` names, and `paths` maps each field that is a path through a
+    list (`detections.label`) to that list (`detections`). Raises FilterQueryError at the first mistake."""
+    return _Parser(query, fields, regions or {}, concepts, paths or {}).conjuncts()
 
 
 def region_names(query: str) -> List[str]:

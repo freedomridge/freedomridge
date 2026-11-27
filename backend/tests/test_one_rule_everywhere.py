@@ -235,14 +235,17 @@ def test_rule_1_4_a_list_of_labels_needs_the_list_empty_or_with_a_label(registry
         assert await shown(rows, NOT(eq('detections.label', 'car'))) == {'w', 'empty'}
         assert await shown(rows, leaf('segmentation.labels', '!=', 'a')) == {'w', 'empty'}
         assert await shown(rows, leaf('segmentation.labels', 'not in', ['a'])) == {'w', 'empty'}
-        # Made exact 2026-11-25, kept 2026-11-26: `is null` is the list's (an empty list among its rows), `is not null`
-        # at least one label; `detections is null`, asked of the field, doesn't show an empty list.
-        no_label = {'null', 'none', 'empty', 'nolabel', 'text'}
+        # Contract g9 rule 1.2 (2026-11-26): `is null` of a list of labels shows the rows with no value for it (no
+        # list, a null, no key, elements none of which has a label), never an empty list; `is not null` the rows `!=`
+        # can show. A list of labels has no key of its own: `exists` and `not exists` are the same two tests (1.7).
+        no_label = {'null', 'none', 'nolabel', 'text'}
+        valued = {'v', 'w', 'empty'}
         assert await shown(rows, leaf('detections', 'is_null')) == {'null', 'none', 'text'}
-        assert await shown(rows, leaf('detections.label', 'is_null')) == no_label
-        assert await shown(rows, leaf('detections.label', 'is_not_null')) == {'v', 'w'}
-        assert await shown(rows, leaf('segmentation.labels', 'is_null')) == no_label
-        assert await shown(rows, leaf('segmentation.labels', 'is_not_null')) == {'v', 'w'}
+        for field in ('detections.label', 'segmentation.labels'):
+            assert await shown(rows, leaf(field, 'is_null')) == no_label, field
+            assert await shown(rows, leaf(field, 'not_exists')) == no_label, field
+            assert await shown(rows, leaf(field, 'is_not_null')) == valued, field
+            assert await shown(rows, leaf(field, 'exists')) == valued, field
         # Inside a match_elements condition, an element with no label is never "not in" a list.
         inner = {'field': 'label', 'operator': 'not_in', 'value': ['car']}
         assert await shown(rows, leaf('detections', 'match_elements', inner)) == {'w'}
@@ -690,6 +693,9 @@ class _Fields:
 
     def filters_nothing(self, node: Any) -> bool:
         return node.get('operator') == '>' and node.get('value') in (None, '')
+
+    def row_field(self, field: Any) -> Any:
+        return 'builtin' if self.builtin(field) else 'list' if field == 'tags' else None
 
 
 def test_the_needs_of_a_not_are_every_field_it_compares():

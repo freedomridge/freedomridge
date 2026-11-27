@@ -50,12 +50,14 @@ Where the contract leaves a point open, these tests read it this way, and stay a
   null`, `exists` and `not exists`, read as their filter nodes are read (rule 1.6, made exact 2026-11-25): a test of
   its own, beside a pin of the dataset that has a metadata field named `location`, where main's text already takes
   them.
-- A list of labels (rule 1.6, made exact 2026-11-25): `detections.label is null` shows the rows with no label in the
-  list (no list, a JSON null, an empty list, or elements none of which has a label), and `is not null` the rows with
-  at least one; a dataset of its own, LABELLED, holds each case. "The one absence test that changes" is read
-  literally: `exists` and `not exists` of a list of labels are pinned as main answers them (an element with, or
-  without, a label), in a pin of their own. The empty list stays among the rows `is null` shows, though `!=` shows it
-  too (2026-11-26); `detections is null`, asked of the field, does not show it, as today.
+- A list of labels (rule 1.6, made exact 2026-11-25, and changed by the next contract, g9 rule 1.2: `is null` means
+  no value): `detections.label is null` shows the rows with no list (no key, a JSON null, a value that is no list) and
+  the rows whose list has elements none of which has a label, not a row whose list is empty; `is not null` shows the
+  rows whose list is empty or has a label. A dataset of its own, LABELLED, holds each case. `exists` and `not exists`
+  of the list of labels' path show the same rows as `is not null` and `is null` (g9 rule 1.7, made exact
+  2026-11-26); of the field, `detections exists` asks for the key, as today. `detections is null`, asked of the field,
+  does not show an empty list, as today. The empty list's own test, `is empty`, is
+  backend/tests/test_is_empty_spec.py's.
 - The empty list in a field (7.7, added 2026-11-26): LABELLED and the file of cases hold no key, a JSON null, `[]`, a
   list with the value, a list without it and a list whose elements have no label. A list field kept in a column of
   its own (rule 1.5's last paragraph, the owner's `inferred_tags`) is made as the app makes one, through the API, on
@@ -284,7 +286,7 @@ PLACE_TESTS = {'geo_polygon', 'geo_region', 'geo_near'}
 LASSOS = {'embedding_polygon'}
 CONCEPTS = {'concept_select'}
 MATCHES = {'match_elements', 'elem_match'}  # an element match compares the field's list (Words, added 2026-11-25)
-# Each hiding test and the show it is the NOT of (rules 1.1, 1.3, 1.6).
+# Each hiding test and the show it is the NOT of (rules 1.1, 1.3, 1.6; and `is not empty`, contract g9 rule 1.4).
 SHOW_OF = {
     '!=': '=',
     'not in': 'in',
@@ -292,7 +294,9 @@ SHOW_OF = {
     'geo_polygon_exclude': 'geo_polygon',
     'geo_region_exclude': 'geo_region',
     'embedding_polygon_exclude': 'embedding_polygon',
+    'is_not_empty': 'is_empty',
 }
+EMPTINESS = {'is_empty'}  # a list that holds nothing (contract g9, rule 1.4): it needs a value, as a comparison does
 ABSENCE = {'is_null', 'is_not_null', 'exists', 'not_exists'}
 
 
@@ -397,21 +401,31 @@ class Reading:
         return found is not None
 
     def filled(self, item: Row, leaf: dict[str, Any]) -> bool:
-        """What `is null` asks of tags and of a list of labels, as today: whether the list holds anything."""
+        """What `exists` asks of tags and of a location, as today: whether the list holds anything, the place is
+        there."""
         found = self.value(item, leaf)
         return found is not None and found != []
 
     def passes(self, item: Row, leaf: dict[str, Any]) -> bool:
-        """A showing test, or an absence test, on the row's own value."""
+        """A showing test, or an absence test, on the row's own value. `is null` and `is not null` ask for a value
+        (contract g9, rule 1.1): a list of labels has one when it is empty or holds a label (g9 1.2), tags when they
+        hold a tag (g9 1.6). `is empty` asks for a list that holds nothing; of tags, which every sample holds, it asks
+        what `is null` asks (g9 1.6)."""
         operator = leaf['operator']
         name = leaf.get('field')
-        held_in_a_list = name == 'tags' or (isinstance(name, str) and name.endswith('.label'))
         if operator in ('exists', 'not_exists'):
-            there = self.filled(item, leaf) if name in ('tags', 'location') else name in item.values
+            # Of a path through a list of labels, a value (g9 rule 1.7, made exact 2026-11-26); of a field, its key.
+            if isinstance(name, str) and name.endswith('.label'):
+                there = self.has(item, leaf)
+            else:
+                there = self.filled(item, leaf) if name in ('tags', 'location') else name in item.values
             return there if operator == 'exists' else not there
         if operator in ('is_null', 'is_not_null'):
-            there = self.filled(item, leaf) if held_in_a_list else self.has(item, leaf)
+            there = self.has(item, leaf)
             return there if operator == 'is_not_null' else not there
+        if operator in EMPTINESS:
+            found = self.value(item, leaf)
+            return not found if name == 'tags' else found == []
         if not self.has(item, leaf):
             return False
         found = self.value(item, leaf)
@@ -432,13 +446,14 @@ class Reading:
         return compare(found, operator, leaf['value'])
 
     def compared(self, node: dict[str, Any]) -> list[dict[str, Any]]:
-        """The tests inside a node that need a value: comparisons, concepts, places and lassos (never an absence)."""
+        """The tests inside a node that need a value: comparisons, concepts, places, lassos and `is empty` (never an
+        absence)."""
         if 'filters' in node or 'logic' in node:
             return [leaf for part in node.get('filters') or [] for leaf in self.compared(part)]
         operator = node['operator']
         if operator in SHOW_OF:
             return [{**node, 'operator': SHOW_OF[operator]}]
-        return [node] if operator in COMPARISONS | PLACE_TESTS | LASSOS | CONCEPTS | MATCHES else []
+        return [node] if operator in COMPARISONS | PLACE_TESTS | LASSOS | CONCEPTS | MATCHES | EMPTINESS else []
 
     def negation(self, item: Row, inside_not: dict[str, Any]) -> bool:
         if self.today:
@@ -1516,7 +1531,9 @@ LABEL_ROWS: dict[str, Row] = {
     **{name: Row({'plot': name, 'detections': held}) for name, held in LABEL_HOLDS.items()},
     'l-none': Row({'plot': 'l-none'}),
 }
-NO_LABEL = {'l-unlabelled', 'l-empty', 'l-null', 'l-none'}
+# No value for the list of labels (contract g9, rule 1.2): no list, or elements none of which has a label. Not the empty
+# list: it is a value (looked at, nothing found).
+NO_LABEL = {'l-unlabelled', 'l-null', 'l-none'}
 WITH_A_CAR = {'l-car', 'l-both', 'l-car-unlabelled'}
 # The list is there and holds no car, and is empty or has a label (rule 1.4, changed 2026-11-26).
 NOT_A_CAR = {'l-truck', 'l-truck-unlabelled', 'l-empty'}
@@ -1533,56 +1550,72 @@ async def plant_labelled(r: Regions) -> Planted:
     return Planted(LABELLED, {row_['filepath'][: -len('.jpg')]: row_['id'] for row_ in stored}, 0)
 
 
-def test_rule_1_6_a_list_of_labels_is_null_shows_the_rows_that_have_no_label_in_it(regions_world):
-    """Made exact 2026-11-25, the one absence test that changes: `detections.label is null` shows the rows with no label
-    in the list (no list, a JSON null, an empty list, or detections none of which has a label), and `is not null` the
-    rows with at least one. Main's `is null` asks for a detection without a label: it shows the rows with an unlabelled
-    detection beside labelled ones, and none of the rows with no list. With rule 1.4, the rows `!=` no longer shows are
-    exactly the rows `is null` shows and the rows that have a car, but for the empty list, which both `is null` and
-    `!=` show (rule 1.4 and the note to 1.6, changed 2026-11-26)."""
+def test_rule_1_6_a_list_of_labels_is_null_shows_the_rows_with_no_list_or_no_label_not_an_empty_list(regions_world):
+    """Rewritten for contract g9 (rule 1.2, `is null` means no value): `detections.label is null` shows the rows with no
+    list (no key, a JSON null) and the rows whose detections have no label at all, and not a row whose list is empty:
+    an empty list is a value (looked at, nothing found). `is not null` shows the rows whose list is empty or has a
+    label. So every row is shown by exactly one of the two, and with rule 1.4 the rows `!=` doesn't show are exactly
+    the rows `is null` shows and the rows that have a car (g9 1.3). Main's `is null` (made exact 2026-11-25) also
+    showed the empty list, and its `is not null` didn't: this fails on main for that row."""
     is_null, is_not_null = leaf('detections.label', 'is_null'), leaf('detections.label', 'is_not_null')
+    valued = set(LABEL_ROWS) - NO_LABEL
+    assert 'l-empty' in valued and 'l-empty' in NOT_A_CAR
     assert RULE.rows(is_null, LABEL_ROWS) == NO_LABEL
-    assert RULE.rows(is_not_null, LABEL_ROWS) == set(LABEL_ROWS) - NO_LABEL
+    assert RULE.rows(is_not_null, LABEL_ROWS) == valued
     assert RULE.rows(leaf('detections.label', '!=', 'car'), LABEL_ROWS) == NOT_A_CAR
 
     async def scenario(r):
         p = await plant_labelled(r)
-        labelled = set(LABEL_ROWS) - NO_LABEL
-        # Asked first, as main answers them: the show, and `is not null`.
-        for form, by_hand in (
+        # Asked first, as main answers them: the show, and `is null` asked of the field.
+        for text, by_hand in (
             ('detections.label = "car"', WITH_A_CAR),
-            ('detections.label is not null', labelled),
-            (is_not_null, labelled),
+            ('detections is null', {'l-null', 'l-none'}),
         ):
-            assert await shown(r, p, form) == by_hand, form
+            assert await shown(r, p, text) == by_hand, text
         for form, by_hand in (
             ('detections.label is null', NO_LABEL),
             (is_null, NO_LABEL),
+            ('detections.label is not null', valued),
+            (is_not_null, valued),
+            ('NOT (detections.label is null)', valued),
             ('detections.label != "car"', NOT_A_CAR),
             ('detections.label not in ("car")', NOT_A_CAR),
         ):
             assert await shown(r, p, form) == by_hand, form
         not_car = await shown(r, p, 'detections.label != "car"')
         no_label, car = await shown(r, p, 'detections.label is null'), await shown(r, p, 'detections.label = "car"')
-        assert not_car & no_label == {'l-empty'} and not no_label & car
-        assert set(LABEL_ROWS) - not_car == (no_label - {'l-empty'}) | car
+        assert not not_car & no_label and not no_label & car
+        assert set(LABEL_ROWS) - not_car == no_label | car
 
     regions_world(scenario)
 
 
-def test_rule_1_7_pin_a_list_of_labels_exists_and_not_exists_answer_as_today(regions_world):
-    """A pin, read literally from "the one absence test that changes" (rule 1.6, made exact 2026-11-25): on a list of
-    labels `exists` and `not exists` answer as main does, a detection with a label, or one without a label. (To be
-    confirmed by the owner: `not exists` asks what `is null` asked before the change.)"""
+def test_rule_1_7_a_list_of_labels_exists_shows_the_rows_is_not_null_shows_and_not_exists_those_is_null_shows(
+    regions_world,
+):
+    """Rewritten for contract g9 (rule 1.7, made exact 2026-11-26): of the path through a list of labels, `exists`
+    shows the rows that have a value for it (an empty list, or a list with a label: the rows of `is not null`) and
+    `not exists` the rows that have none (no list, or elements none of which has a label: the rows of `is null`).
+    Main's `exists` asked for a detection with a label (not the empty list) and its `not exists` for a detection without
+    one (the mixed lists, not the rows with no list): this fails on main for those rows. Of the field itself,
+    `detections exists` asks whether the key is there, as main does, asked first."""
+    valued = set(LABEL_ROWS) - NO_LABEL
+    for operator, names in (('exists', valued), ('not_exists', NO_LABEL)):
+        assert RULE.rows(leaf('detections.label', operator), LABEL_ROWS) == names, operator
 
     async def scenario(r):
         p = await plant_labelled(r)
-        assert await shown(r, p, leaf('detections.label', 'exists')) == set(LABEL_ROWS) - NO_LABEL
-        assert await shown(r, p, leaf('detections.label', 'not_exists')) == {
-            'l-car-unlabelled',
-            'l-truck-unlabelled',
-            'l-unlabelled',
-        }
+        assert await shown(r, p, 'detections exists') == set(LABEL_ROWS) - {'l-none'}
+        assert await shown(r, p, 'detections not exists') == {'l-none'}
+        for form, names in (
+            (leaf('detections.label', 'exists'), valued),
+            (leaf('detections.label', 'not_exists'), NO_LABEL),
+            ('detections.label exists', valued),
+            ('detections.label not exists', NO_LABEL),
+        ):
+            assert await shown(r, p, form) == names, form
+        assert await shown(r, p, 'detections.label exists') == await shown(r, p, 'detections.label is not null')
+        assert await shown(r, p, 'detections.label not exists') == await shown(r, p, 'detections.label is null')
 
     regions_world(scenario)
 
@@ -1591,7 +1624,8 @@ def test_7_7_a_list_of_labels_in_each_state_shows_the_rows_rules_1_4_and_1_6_giv
     """Section 7.7 (added 2026-11-26), on LABELLED, through the samples query and its count: no key (l-none), a JSON
     null (l-null), `[]` (l-empty), a list with the value (l-car), a list without it (l-truck) and a list whose elements
     have no label (l-unlabelled), with the mixed lists beside them. The empty list is a value: a negation shows it, and
-    `detections.label is null` still shows it (no label in it); `detections is null`, asked of the field, does not."""
+    (rewritten for contract g9, rule 1.2) `detections.label is null` doesn't; nor does `detections is null`, asked of
+    the field."""
     match_a_car = leaf('detections', 'match_elements', leaf('label', '=', 'car'))
     by_hand: list[tuple[Any, set[str]]] = [
         # Asked first, as main answers them: the match, and `is null` asked of the field.

@@ -8,8 +8,11 @@ filters, each with the samples it shows by the rule: a row with no value for a f
 that field, nor the NOT of one; a list (tags, a list of labels) compares by its elements; tags have a value when
 they hold one, a list in a field when it is there, empty or not (changed 2026-11-26: an empty list of labels is shown
 by a negation, a list whose elements have no label is not); a NOT reads all its parts; an element match's NOT needs a
-list, empty or not; `exists` asks for the key. The samples hold the rows of section 7.7: no key, a JSON null, `[]`, a
-list with the value, a list without it, and a list whose elements have no label.
+list, empty or not; `exists` asks for the key. By contract g9, `is null` shows the rows that have no value, so not an
+empty list in a field (`detections.label is null` neither), and `is empty` the rows whose list holds nothing; `is not
+empty` is its NOT, read as a comparison's; for tags an empty list is no value, so `tags is empty` is `tags is null`.
+The samples hold the rows of section 7.7: no key, a JSON null, `[]`, a list with the value, a list without it, and a
+list whose elements have no label.
 
 - `test_the_reference_reads_every_case_as_the_file_says` checks the file against the spec file's reference
   (test_one_rule_everywhere_spec.Reading), so a wrong expectation is the file's own mistake.

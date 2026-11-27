@@ -62,7 +62,7 @@ from backend.field_registry import (
     unchanged_column_keys,
     validate_metadata,
 )
-from backend.filter_query import canonical_region_key
+from backend.filter_query import canonical_region_key, emptiness_refusal
 from backend.label_fields import (
     DISCOVERY_TYPES,
     LEGACY_GEOMETRY_FIELDS,
@@ -73,7 +73,7 @@ from backend.label_fields import (
     label_context,
     label_path,
 )
-from backend.local_fields import LOCAL_TAGS, local_field
+from backend.local_fields import LOCAL_TAGS, LocalField, local_field
 from backend.sample_ingest import insert_samples
 
 from .. import (
@@ -213,8 +213,8 @@ _BUILTIN_ARRAY_COLUMNS = frozenset({'tags'})
 # Classification-list vocabularies follow the discovered shape, including ground_truth/predictions.
 _LABEL_ARRAY_FIELDS = LEGACY_GEOMETRY_FIELDS
 # Equality/membership operators handled by the JSONB-containment fast path for label
-# arrays (`<field>.label` / `segmentation.labels`); anything outside this set (exists/is_null/comparisons) falls
-# through to the generic per-element EXISTS handler.
+# arrays (`<field>.label` / `segmentation.labels`); the other comparisons fall through to the generic per-element
+# EXISTS handler (the absence tests are the list's: _value_sql).
 _LABEL_EQ_OPS = ('=', '==', 'in')
 # The spellings of a negation a list of labels takes: `!=` and `not in`, as every field does, and `<>`, `not_in` and
 # `nin`. Each is the NOT of one of the operators above (backend/negation.py), compiled as a NOT before it gets there.
@@ -4768,8 +4768,9 @@ class _GrainRow(NamedTuple):
 # assistant's image_grain): every row it keeps is of that kind.
 _GRID_KINDS = {('=', 'object'): 'object', ('!=', 'object'): 'image'}
 # Comparisons that hold only where the field has a value (a row without the key reads NULL or FALSE), except a range
-# whose value is missing or blank, which filters nothing (TRUE for every row).
-_HOLD_WITH_VALUE = {'=', 'in', 'contains', 'is_not_null', 'exists', 'match_elements', 'elem_match'}
+# whose value is missing or blank, which filters nothing (TRUE for every row). `is empty` of a list kept in a column of
+# its own holds where it has none, but such a list is no field of the record (_record_name).
+_HOLD_WITH_VALUE = {'=', 'in', 'contains', 'is_not_null', 'exists', 'match_elements', 'elem_match', 'is_empty'}
 _RANGE_OPS = {'<', '<=', '>', '>='}
 
 
@@ -4811,11 +4812,6 @@ def _lasso_field_match(field: str, args: List[Any], arg_idx: int) -> tuple[str, 
     return f"ep.field_name = ${arg_idx}", arg_idx + 1
 
 
-def _nonempty_list_sql(json: str) -> str:
-    """The JSON value is a list with at least one element (FALSE for no value, a JSON null, anything not a list)."""
-    return f"(CASE WHEN jsonb_typeof({json}) = 'array' THEN jsonb_array_length({json}) > 0 ELSE FALSE END)"
-
-
 def _list_sql(json: str) -> str:
     """The JSON value is a list, empty or not: TRUE or FALSE, never NULL (FALSE for no key, a JSON null, anything not a
     list), so a caller may negate it."""
@@ -4834,6 +4830,69 @@ def _labels_valued_sql(parent: str, key: str) -> str:
         f"({_list_sql(json)} AND (jsonb_array_length({elements}) = 0 OR EXISTS (SELECT 1 FROM "
         f"jsonb_array_elements({elements}) AS elem WHERE elem->>'{key}' IS NOT NULL)))"
     )
+
+
+def _value_sql(
+    field: str,
+    local: Optional[LocalField],
+    field_mapping: Optional[Dict[str, str]],
+    array_columns: Optional[set],
+    present: bool = True,
+) -> str:
+    """The row has a value for the field (docs/FILTER_QUERY.md, "Operators"), or with `present` False has none: the one
+    place that knows it for each kind of list. `is not null` is it and `is null` the other (and so `exists` and
+    `not exists` of a list of labels, which has no key to find), the guard of a NOT reads it
+    (`_GrainRows.has`, for backend/negation.py's ('value', field)), and so does `is empty` of a list kept in a column
+    of its own. TRUE or FALSE, never NULL. A value is there and isn't a JSON null, and an empty list written in a field
+    is a value (the list was looked at and holds nothing), except:
+    - a list kept in a column of its own (`tags`, `@local.tags`, a registered array field) has a value when it has an
+      element: every sample holds the column, the empty list until one is written, so its empty list can't be told
+      from one never set, and is no value;
+    - a list of labels (`detections.label`) has a value when the list is there and is empty or holds a label: one whose
+      elements have no label at all has none (something was found, and what it is isn't known).
+    `local` is the field's `@local.` place (local_field), the name already checked as the compiler checks it."""
+    arrays = array_columns if array_columns is not None else _get_array_columns_sync()
+    test = 'IS NOT NULL' if present else 'IS NULL'
+    if local is not None:
+        return f"array_length({local.column}, 1) {test}" if local.array else f"{local.text} {test}"
+    if field_mapping and field in field_mapping:
+        return f"{field_mapping[field]} {test}"
+    if field in ('media_type', 'filepath', 'id', *_NATIVE_TIMESTAMPS):
+        return f"{field} {test}"
+    if field in arrays:
+        return f"array_length({field}, 1) {test}"
+    labels = label_path(field, arrays)
+    if field == 'segmentation.labels':
+        listed = _list_sql("metadata->'segmentation'->'labels'")
+    elif labels is not None:
+        listed = _labels_valued_sql(*labels)
+    else:
+        return f"{_metadata_source(field)}->>'{field}' {test}"
+    return listed if present else f"NOT {listed}"
+
+
+def _emptiness_refusal(field: str, operator: str, array_columns: Optional[set]) -> Optional[str]:
+    """Why `is empty` (or `is not empty`) can't be asked of the field, or None, in the words the filter text gives
+    (filter_query.emptiness_refusal, the one place): a path through a list is read so wherever a comparison of it is
+    (label_path, from the dataset's caches), and an embedding's or a hash's presence is a field only this compiler is
+    asked about."""
+    labels = label_path(field, array_columns if array_columns is not None else _get_array_columns_sync())
+    return emptiness_refusal(
+        field,
+        operator,
+        through=labels[0] if labels is not None else None,
+        derived=_derived_field(field) is not None,
+    )
+
+
+def _empty_sql(field: str, local: Optional[LocalField]) -> str:
+    """The row's field (a metadata key, a mirror's own `@local.` field, `segmentation.labels`) is a list that holds
+    nothing: NULL where the field has no value, so a NOT around it is guarded as any comparison's is. A list kept in a
+    column of its own is no field of this: its empty list is no value (`is null`)."""
+    if field == 'segmentation.labels':
+        return "((metadata->'segmentation'->'labels') = '[]'::jsonb)"
+    source, key = ('local_metadata', local.name) if local is not None else (_metadata_source(field), field)
+    return f"(({source}->'{key}') = '[]'::jsonb)"
 
 
 def _elements_sql(field: str) -> str:
@@ -4982,13 +5041,13 @@ class _GrainRows:
         return self._compiled(node, row)
 
     def has(self, field: str, row: _GrainRow, presence: bool = False, keyed: bool = True) -> str:
-        """The row has a value for the field: there, and not a JSON null; a list (`tags`, a list in a column of its own,
-        `@local.tags`) at least one element, a list of labels (`detections.label`, `segmentation.labels`) at least one
-        label: the rows `is not null` finds. `presence`: for `is null`, where `location` is the sample's own location;
-        otherwise it is a field compared with an operator other than a place's, the metadata field named location. With
-        `keyed`, a metadata key's test (`?`) goes first: the same rows, found through the metadata index where few rows
-        have the key. A NOT read on one row (_compile_not) leaves it out: there the row is a scan's, which the key's
-        test only slows (a count of a NOT over two fields on a million samples: 125 ms with it, 100 without)."""
+        """The row has a value for the field: the rows `is not null` finds (_value_sql says what a value is for each
+        kind of list), which is also what a NOT needs (backend/negation.py's ('value', field)). `presence`: for
+        `is null`, where `location` is the sample's own location; otherwise it is a field compared with an operator
+        other than a place's, the metadata field named location. With `keyed`, a metadata key's test (`?`) goes first:
+        the same rows, found through the metadata index where few rows have the key. A NOT read on one row
+        (_compile_not) leaves it out: there the row is a scan's, which the key's test only slows (a count of a NOT over
+        two fields on a million samples: 125 ms with it, 100 without)."""
         if self._skip(self.record_name(field), row):
             return 'FALSE'
         if field == 'location' and not presence:
@@ -5009,7 +5068,7 @@ class _GrainRows:
         embedding field's map, or a score for a concept. `keyed`: as for `has`."""
         kind = need[0]
         if kind == 'value':
-            return self.valued(need[1], row, keyed=keyed)
+            return self.has(need[1], row, keyed=keyed)
         if kind == 'location':
             return self.has('location', row, presence=True)
         if kind == 'points':
@@ -5018,21 +5077,6 @@ class _GrainRows:
         if kind == 'elements':
             return 'FALSE' if self._skip(self.record_name(need[1]), row) else _elements_sql(need[1])
         return self.test(_scored(need[1]), row)
-
-    def valued(self, field: str, row: _GrainRow, keyed: bool = True) -> str:
-        """The row has a value for the field, as a NOT needs it (backend/negation.py): `has`, except where an empty list
-        written in a field is a value: a list of labels (`detections.label`) is a list, empty or holding a label, and
-        `segmentation.labels` a list. A list kept in a column of its own (`tags`, `@local.tags`, a registered array
-        field) is `has`'s, at least one element: every sample holds the column, the empty list until one is written, so
-        an empty one can't be told from one never set, and has no value."""
-        if field == 'segmentation.labels':
-            return (
-                'FALSE' if self._skip(self.record_name(field), row) else _list_sql("metadata->'segmentation'->'labels'")
-            )
-        labels = label_path(field, self.arrays)
-        if labels is not None:
-            return 'FALSE' if self._skip(self.record_name(field), row) else _labels_valued_sql(*labels)
-        return self.has(field, row, keyed=keyed)
 
     def builtin(self, field: Any) -> bool:
         return self.row_field(field) == 'builtin'
@@ -5065,14 +5109,17 @@ class _GrainRows:
         return f"({self.test({'field': key, 'operator': 'exists'}, row)} AND {sql})" if key else sql
 
     def _compared_key(self, node: Any) -> Optional[str]:
-        """The metadata key a test reads (a comparison, `is not null`, or a range of one field), else None."""
+        """The metadata key a test reads (a comparison, `is not null`, `is empty`, or a range of one field), else
+        None."""
         if isinstance(node, dict) and node.get('logic') == 'AND' and node.get('filters'):
             keys = {self._compared_key(child) for child in node['filters']}
             return keys.pop() if len(keys) == 1 else None
         if not isinstance(node, dict) or 'logic' in node or 'filters' in node:
             return None
         field, operator = node.get('field'), str(node.get('operator', '=')).lower()
-        if operator not in ('=', 'in', '<', '<=', '>', '>=', 'contains', 'is_not_null') or not isinstance(field, str):
+        if operator not in ('=', 'in', '<', '<=', '>', '>=', 'contains', 'is_not_null', 'is_empty'):
+            return None
+        if not isinstance(field, str):
             return None
         path = label_path(field, self.arrays)
         key = path[0] if path is not None else 'segmentation' if field == 'segmentation.labels' else field
@@ -5933,6 +5980,31 @@ def _compile_filter_node(
             ('local_metadata', local.name) if local is not None else (_metadata_source(field), field)
         )
 
+        # `is empty`: the field's value is a list that holds nothing; `is not empty` is its NOT (backend/negation.py),
+        # so it shows only the rows that have a value, one that isn't an empty list. A list kept in a column of its own
+        # has no value when it is empty: there they are `is null` and `is not null`, compiled below.
+        if op in negation.EMPTINESS:
+            refusal = _emptiness_refusal(field, op, array_columns)
+            if refusal is not None:
+                raise HTTPException(status_code=400, detail=refusal)
+            arrays = array_columns if array_columns is not None else _get_array_columns_sync()
+            if local.array if local is not None else field in arrays:
+                op = negation.EMPTINESS[op]
+            elif op == 'is_not_empty':
+                return _compile_filter_node(
+                    {'logic': 'NOT', 'filters': [{**node, 'operator': 'is_empty'}]},
+                    args,
+                    arg_idx,
+                    field_mapping,
+                    numeric_indexed_fields,
+                    dataset_id,
+                    array_columns=array_columns,
+                    concepts=concepts,
+                    outer_kind=outer_kind,
+                )
+            else:
+                return _empty_sql(field, local), arg_idx
+
         # A negation of a field is the NOT of its comparison (backend/negation.py): `f != v` is NOT (f = v), `f not in`
         # NOT (f in), and so shows only the rows that have a value for `f`. On a list of labels `<>`, `not_in` and `nin`
         # are taken too. The built-in columns every row has keep their own SQL below.
@@ -5986,6 +6058,13 @@ def _compile_filter_node(
             lookup = f"EXISTS (SELECT 1 FROM {table} _d WHERE {scope}_d.sample_id = {id_col} AND {match})"
             return (lookup if present else f"NOT {lookup}"), arg_idx + 1
 
+        # `is not null`: the row has a value for the field, and `is null` none (_value_sql, for every kind of list). On
+        # a list of labels (`detections.label`, `segmentation.labels`) there is no key to find, so `exists` and
+        # `not exists` are the same two tests: an empty list exists.
+        if op in ('is_null', 'is_not_null') or (labels and op in ('exists', 'not_exists')):
+            present = op in ('is_not_null', 'exists')
+            return _value_sql(field, local, field_mapping, array_columns, present=present), arg_idx
+
         # Per-object match: `field` is an array-of-objects label field and `value`
         # is a (possibly compound) filter node evaluated against each element.
         # Matches the sample if ANY element satisfies it — lets you combine
@@ -6024,8 +6103,8 @@ def _compile_filter_node(
             and all(isinstance(item, str) for item in (val if isinstance(val, list) else [val]))
         ):
             # JSONB containment avoids expanding each object: metadata->'detections' @> [{"label": V}].
-            # =/in -> contains ANY of the values. Other operators (exists/is_null/comparison) are NOT matched
-            # here and fall through to the generic dotted handler below.
+            # =/in -> contains ANY of the values. The other comparisons are NOT matched here and fall
+            # through to the generic dotted handler below.
             parent = field.rsplit('.', 1)[0]
             values = val if op == 'in' else [val]
             if not isinstance(values, list):
@@ -6043,12 +6122,8 @@ def _compile_filter_node(
 
         elif field == 'segmentation.labels':
             # metadata->'segmentation'->'labels' is a string array ["a","b"]; `?` tests
-            # array membership. =/in -> contains ANY. `is not null`: at least one label; `is null`: none (no
-            # segmentation, no list, an empty list), the rows a negation of the labels doesn't show.
+            # array membership. =/in -> contains ANY. (The absence tests: _value_sql, above.)
             labels_json = "metadata->'segmentation'->'labels'"
-            if op in ('is_null', 'is_not_null'):
-                some = _nonempty_list_sql(labels_json)
-                return (some if op == 'is_not_null' else f"NOT {some}"), arg_idx
             values = val if op == 'in' else [val]
             if not isinstance(values, list):
                 values = [values]
@@ -6064,17 +6139,14 @@ def _compile_filter_node(
         elif label_path(field, array_columns):
             # Dotted per-object convenience, e.g. "detections.confidence" > 0.9 or
             # "ground_truth.label" = "car": EXISTS over the array with a predicate on the
-            # element key. `is null` is the list's: no element has a value for the key (no list, an empty list, or
-            # elements without it), the rows a negation of it doesn't show; `is not null` at least one element has one.
+            # element key. `is null`, `is not null`, `exists` and `not exists` are the list's (_value_sql, above).
             arr, sub = field.rsplit('.', 1)
-            absent = op == 'is_null'
-            inner, arg_idx = _element_predicate_sql(sub, 'is_not_null' if absent else op, val, args, arg_idx)
-            exists = (
+            inner, arg_idx = _element_predicate_sql(sub, op, val, args, arg_idx)
+            return (
                 f"EXISTS (SELECT 1 FROM jsonb_array_elements("
                 f"CASE WHEN jsonb_typeof(metadata->'{arr}') = 'array' "
                 f"THEN metadata->'{arr}' ELSE '[]'::jsonb END) AS elem WHERE {inner})"
-            )
-            return (f"(NOT {exists})" if absent else exists), arg_idx
+            ), arg_idx
 
         else:
             # Metadata field
@@ -6262,21 +6334,6 @@ def _compile_filter_node(
             # text[] cast here produced `integer = text` and broke every `id not in [...]` (e.g. excluding a selection).
             args.append(val if isinstance(val, list) else [val])
             return f"({col} IS NULL OR NOT ({col} = ANY(${arg_idx})))", arg_idx + 1
-
-        elif op == 'is_null':
-            if is_array:
-                # Empty tags are stored as '{}', not NULL: `tags IS NULL` matched nothing, so the
-                # "(no value)" filter on an array field was always empty. Same as not_exists.
-                return f"array_length({arr}, 1) IS NULL", arg_idx
-            # `col` resolves to the native column (id/created_at/filepath/media_type),
-            # an array column, or metadata->>'field' — checking the right thing instead
-            # of always probing metadata (which made id/created_at is_null match every row).
-            return f"{col} IS NULL", arg_idx
-
-        elif op == 'is_not_null':
-            if is_array:
-                return f"array_length({arr}, 1) IS NOT NULL", arg_idx
-            return f"{col} IS NOT NULL", arg_idx
 
         elif op == 'exists':
             if is_array:

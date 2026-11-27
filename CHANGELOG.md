@@ -28,10 +28,11 @@ it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
   To keep the old meaning, write the samples with no value out:
   `colour != "red" OR colour is null`, `tags not in ("rejected") OR tags is null`, `location not within "US-KS" OR
   location is null`. The filter text now takes `location is null`, `is not null`, `exists` and `not exists` for that.
-  `detections.label is null` (and the same test of any list of labels) now shows the samples with no label in the
-  list (no list, an empty list, or detections without a label); it showed the samples with a detection that has no
-  label. A value of another kind than the one compared is still a value: `n != 2` keeps a sample whose `n` is the
-  text `"abc"`. **Saved views, links and the dataset's default view are not rewritten**: they
+  `detections.label is null` (and the same test of any list of labels) now shows the samples with no list, a `null`
+  one, or detections none of which has a label, and `detections.label is not null` those whose list is empty or holds
+  a label: the samples a comparison of the labels can show (the next item). `is null` showed the samples with a
+  detection that has no label. A value of another kind than the one compared is still a value: `n != 2` keeps a
+  sample whose `n` is the text `"abc"`. **Saved views, links and the dataset's default view are not rewritten**: they
   keep their filters and read them by the new rule, so one that used `!=`, `not in`, an excluded region or a concept's
   exclude may show fewer samples. A mirror on an older version reads the old way (including a patch search its
   primary relays to it) until it is upgraded. The assistant's tools follow the same rule; `concept_preview`'s `remove`
@@ -45,6 +46,28 @@ it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
   excluded lasso now has to find which rows have a point on the map: about 0.15 to 0.45 s more per reading, the first
   page 0.14 to 0.66 s where it was 0.02 to 0.30 s. An excluded region or drawn polygon there measured up to about
   twice its time before on some readings.
+- **New: `is empty` and `is not empty`, and `is null` means no value for every list in a field**
+  ([FILTER_QUERY.md](docs/FILTER_QUERY.md#no-value-and-an-empty-list)). `is null` finds the samples with no value for
+  a field: no key, or `null`, a field never looked at. An empty list written in a field is a value (looked at, nothing
+  found), which `detections is empty` finds; `detections is not empty`, its `NOT`, finds the samples whose
+  `detections` has a value that isn't an empty list, and a sample with no value matches neither. So every sample is in
+  exactly one of `is null`, `is empty` and `is not empty`, and `detections.label is null` reads as the item above says.
+  A list of labels has no key to look for, so `detections.label exists` and `not exists` now answer as its
+  `is not null` and `is null`, on one sample as through the page's wrapping: on one sample `not exists` showed the
+  samples with a detection that has no label, and `exists` didn't show an empty list. `segmentation.labels exists` and
+  `not exists`, which matched no sample, answer the same way.
+  The filter text, the JSON filters (`is_empty`, `is_not_empty`), every reader of a filter, the app's query builder,
+  the SDK (`s.detections.is_empty()`, `detections__is_empty=True`) and the assistant take them. `is empty` reads any
+  metadata key sample by sample, and is refused (400) on the built-in fields, `location` and a path through a list:
+  `detections.label is empty` names `detections is empty` instead. **Tags don't change**: a sample with no tags has no
+  value for `tags`, so `tags is null` still finds the untagged samples, and `tags is empty` finds the same ones; the
+  same holds for `@local.tags` and a list field kept in a column of its own. Nothing saved is rewritten. An older
+  server, or a mirror on an older version, refuses a filter with the new tests (400 `Unknown filter operator`), except
+  on `segmentation.labels`: there it answers `is empty` and `is not empty` with no sample and no error. A patch search
+  a primary relays to a mirror on an older version is refused there with any of them. A mirror on an older version
+  reads `detections.label is null` the old way until it is upgraded. On a dataset without
+  objects of a million samples the new tests measured 0.87 to 1.10 times the absence test of the same field, and
+  `detections.label is null` 0.44 times its time before (a count: 230 ms where it was 525 ms).
 - **A change in behaviour: a drawn polygon may be at most 10 turns of the globe wide (3,600 degrees), where 2.14.0 took
   60** ([SDK.md](docs/SDK.md#geospatial-filtering)). A `geo_polygon` (or its exclusion) whose longitudes span more than
   3,600 degrees is refused with a 400 that names the limit; one spanning exactly 3,600 degrees is answered. No view

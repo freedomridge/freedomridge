@@ -2,9 +2,11 @@
   "about": [
     "Filters and the samples each shows on a dataset without objects, by contract g7 (one rule everywhere): a row",
     "with no value for a field never matches a comparison of it, nor the NOT of one; an empty list in a field is a",
-    "value (changed 2026-11-26), so a negation shows it. Run by the server on a database",
-    "and by the SDK on a sort_by_similarity result, which asks the server (backend/tests/test_one_rule_filter_cases.py,",
-    "contract 2.2, changed 2026-11-25): every case shows the samples named here on both, and none is refused."
+    "value (changed 2026-11-26), so a negation shows it; and by contract g9: `is null` shows the rows with no value,",
+    "so not an empty list (but for tags), and `is empty` the rows whose list holds nothing. Run by the server on a",
+    "database and by the SDK on a sort_by_similarity result, which asks the server",
+    "(backend/tests/test_one_rule_filter_cases.py, contract 2.2, changed 2026-11-25): every case shows the samples",
+    "named here on both, and none is refused."
   ],
   "samples": {
     "red": {
@@ -464,14 +466,13 @@
       ]
     },
     {
-      "name": "a list of labels: is null shows the rows with no label in the list",
+      "name": "a list of labels: is null shows no list and a list with no label, not an empty list",
       "filter": {
         "field": "detections.label",
         "operator": "is_null",
         "value": null
       },
       "shows": [
-        "empty",
         "none",
         "notalist",
         "null",
@@ -488,6 +489,204 @@
       "shows": [
         "none",
         "null"
+      ]
+    },
+    {
+      "name": "a list of labels: is not null shows an empty list and a list with a label",
+      "filter": {
+        "field": "detections.label",
+        "operator": "is_not_null",
+        "value": null
+      },
+      "shows": [
+        "blue",
+        "empty",
+        "kind",
+        "red"
+      ]
+    },
+    {
+      "name": "a list of labels: exists asks for a value, as is not null does",
+      "filter": {
+        "field": "detections.label",
+        "operator": "exists",
+        "value": null
+      },
+      "shows": [
+        "blue",
+        "empty",
+        "kind",
+        "red"
+      ]
+    },
+    {
+      "name": "a list of labels: not exists shows the rows is null shows",
+      "filter": {
+        "field": "detections.label",
+        "operator": "not_exists",
+        "value": null
+      },
+      "shows": [
+        "none",
+        "notalist",
+        "null",
+        "unlabelled"
+      ]
+    },
+    {
+      "name": "a list: is not null shows an empty list, and a value that is no list",
+      "filter": {
+        "field": "detections",
+        "operator": "is_not_null",
+        "value": null
+      },
+      "shows": [
+        "blue",
+        "empty",
+        "kind",
+        "notalist",
+        "red",
+        "unlabelled"
+      ]
+    },
+    {
+      "name": "a list: is empty",
+      "filter": {
+        "field": "detections",
+        "operator": "is_empty",
+        "value": null
+      },
+      "shows": [
+        "empty"
+      ]
+    },
+    {
+      "name": "a list: is not empty, a value that is no list among them",
+      "filter": {
+        "field": "detections",
+        "operator": "is_not_empty",
+        "value": null
+      },
+      "shows": [
+        "blue",
+        "kind",
+        "notalist",
+        "red",
+        "unlabelled"
+      ]
+    },
+    {
+      "name": "the NOT of is empty is is not empty",
+      "filter": {
+        "logic": "NOT",
+        "filters": [
+          {
+            "field": "detections",
+            "operator": "is_empty",
+            "value": null
+          }
+        ]
+      },
+      "shows": [
+        "blue",
+        "kind",
+        "notalist",
+        "red",
+        "unlabelled"
+      ]
+    },
+    {
+      "name": "a NOT around is empty and a comparison of another field needs both fields",
+      "filter": {
+        "logic": "NOT",
+        "filters": [
+          {
+            "logic": "OR",
+            "filters": [
+              {
+                "field": "detections",
+                "operator": "is_empty",
+                "value": null
+              },
+              {
+                "field": "colour",
+                "operator": "=",
+                "value": "red"
+              }
+            ]
+          }
+        ]
+      },
+      "shows": [
+        "blue",
+        "kind",
+        "notalist"
+      ]
+    },
+    {
+      "name": "a text field: is empty reads each row, and none holds an empty list",
+      "filter": {
+        "field": "colour",
+        "operator": "is_empty",
+        "value": null
+      },
+      "shows": []
+    },
+    {
+      "name": "a text field: is not empty shows each row that has a value",
+      "filter": {
+        "field": "colour",
+        "operator": "is_not_empty",
+        "value": null
+      },
+      "shows": [
+        "blue",
+        "empty",
+        "kind",
+        "notalist",
+        "red",
+        "unlabelled"
+      ]
+    },
+    {
+      "name": "tags: is null, no tag",
+      "filter": {
+        "field": "tags",
+        "operator": "is_null",
+        "value": null
+      },
+      "shows": [
+        "empty",
+        "none",
+        "null"
+      ]
+    },
+    {
+      "name": "tags: is empty answers as is null",
+      "filter": {
+        "field": "tags",
+        "operator": "is_empty",
+        "value": null
+      },
+      "shows": [
+        "empty",
+        "none",
+        "null"
+      ]
+    },
+    {
+      "name": "tags: is not empty answers as is not null",
+      "filter": {
+        "field": "tags",
+        "operator": "is_not_empty",
+        "value": null
+      },
+      "shows": [
+        "blue",
+        "kind",
+        "notalist",
+        "red",
+        "unlabelled"
       ]
     },
     {

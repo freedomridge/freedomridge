@@ -239,7 +239,8 @@ administrator relying on it should know an editor can undo it.
 `salary > 100000` finds every value by halving. So a tool may test a private field only for having a value (`exists`,
 `not_exists`), and for being, or not being, one of the values of a value list the server keeps, which the model holds
 only a handle to. Comparing it with a value the model wrote is refused, even for equality, and so are ranges,
-`contains`, sorting by it, a histogram of it, and its minimum, maximum, mean or quantiles. The refusal says why and
+`contains`, `is empty` (an empty list is one of its values), sorting by it, a histogram of it, and its minimum,
+maximum, mean or quantiles. The refusal says why and
 what works instead, in the same words whatever value was asked about. People in the app are not affected.
 
 What a model can still learn about a private field, by design:
@@ -504,7 +505,10 @@ objects carry has no values.
 
 - **`make_view`** (`dataset`, `filter`): filter text in the [filter language](FILTER_QUERY.md); each top-level AND part
   is a stage. Answers the handle, the exact `count`, `filter` and each stage's `text` as the server read them, and a
-  `link`.
+  `link`. The instructions tell the model that `is null` finds the samples with no value for a field (never set),
+  `is empty` those whose list holds nothing, which is a value (`detections is empty`), and `is not empty` those whose
+  value is not an empty list, and that the samples with no tags are `tags is null`
+  ([no value and an empty list](FILTER_QUERY.md#no-value-and-an-empty-list)).
 - **`refine_view`** (`view`, and any of `add`, `remove`, `negate`, `in_list`, `not_in_list`, applied in that order):
   add text as stages, drop or turn around stages by their number, or keep (or remove) the samples whose field has a
   value in a value list (`{"field", "list"}`). Answers the new view with `from`. Negating twice gives the original.

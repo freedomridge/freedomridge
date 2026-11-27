@@ -56,7 +56,8 @@ A query is an AND of parts. In the SDK and the API, each top-level `AND` part be
 | `between A and B` | `>= A` and `<= B`, as one part | numbers, dates |
 | `contains "x"` (also `like "%x%"`) | case-insensitive substring | text, lists, `id` |
 | `exists`, `not exists` | the field is present, or absent | all |
-| `is null`, `is not null` | no value (absent or null; for `tags`, a list field kept in a column of its own, `@local.tags` and a list of labels such as `detections.label`, an empty list too), or a value | all |
+| `is null`, `is not null` | no value (absent or null: never looked at), or a value; an empty list is a value, except in `tags` and the other [lists kept in a column of their own](#no-value-and-an-empty-list) | all |
+| `is empty`, `is not empty` | a list that holds nothing, or a value that isn't one | all but the built-in fields and `location`; not a path through a list (`detections.label`: ask `detections is empty`) |
 
 `id contains "12"` keeps the samples whose id, written in decimal, contains `12` (12, 112, 1203, ...), and
 `NOT (id contains "12")` every other sample. Text that isn't digits matches no sample.
@@ -84,9 +85,8 @@ the API and the assistant.
   known), nor those with no `detections`. A `NOT` around an element match (`match_elements`, the SDK's
   `match_elements("detections", ...)`) keeps the samples whose field is a list, empty or not, none of whose elements
   meets the condition (an element without the keys the condition reads counts, and never meets it).
-  `detections.label is null` asks what the list holds: the samples with no label in it (no list, an empty list, or
-  detections without a label). `detections is null` asks for the field, and doesn't find a sample whose
-  `detections` is `[]`.
+  `detections.label is null` shows the samples with no list, a `null` one, or detections none of which has a label,
+  and `detections.label is not null` those whose list is empty or holds a label: the samples `!=` can show.
 - **A value of another kind is a value.** `n != 2` keeps a sample whose `n` is the text `"abc"`, and `colour != "red"`
   one whose `colour` is the number `7`.
 - **Inside a `NOT`, an absence test adds no field**: `NOT (score < 0.2 OR note exists)` needs a `score`, not a `note`.
@@ -100,6 +100,34 @@ the API and the assistant.
   a value, so `id not in (...)` keeps every other sample.
 
 A saved view, a link or a script keeps its filter and reads it by this rule.
+
+### No value and an empty list
+
+**`is null` means no value: the field was never looked at.** A sample whose metadata has no such key, or a `null`
+under it, has no value. **An empty list is a value**: the list was looked at and nothing was found. So for a list in
+a field, every sample is in exactly one of three: no value, an empty list, or a value that isn't one.
+
+- `detections is null` shows the samples with no `detections` (no key, or `null`).
+- `detections is empty` shows the samples whose `detections` is `[]`.
+- `detections is not empty` is `NOT (detections is empty)`: the samples whose `detections` has a value that isn't an
+  empty list. Like every `NOT` of a comparison it doesn't show a sample with no value.
+- `is not null` shows the last two together.
+
+A list of labels has no key of its own to look for, so on `detections.label` (and any path through a list) and on
+`segmentation.labels`, `exists` and `not exists` answer as `is not null` and `is null`: an empty list exists.
+
+`is empty` reads any key of the metadata sample by sample: a value that is no list (text, a number) is never empty, so
+`note is not empty` shows a sample whose `note` is the text `"ok"`. It is refused, with a message that says what to ask
+instead, on a field that can hold no list (the built-in fields and `location`) and on a path through a list:
+`detections.label is empty` says to ask `detections is empty`. A path through a list is a dotted name whose first part
+the server knows as a list (the label fields, and any list field of the dataset), the same paths a comparison reads
+element by element.
+
+**A sample's own tags are the one kind of list where empty is no value**, and so are `@local.tags` on a mirror and a
+list field stored in a column of its own (`dataset.create_array_field(...)`). Every sample holds such a list, the empty
+one until something is written, so an empty one can't be told from one never set. There `tags is null` and
+`tags is empty` both show the samples with no tags, and `tags is not null` and `tags is not empty` those with at least
+one.
 
 ## Concept scores
 
@@ -196,9 +224,13 @@ value is there and isn't `null`). The assistant reads filters the same way. A fi
   labelled and none is a car; `NOT (label = "car" AND score > 0.9)` hides an image that has a car with that score,
   and shows one whose car scores lower and whose truck higher; and a field that both kinds have hides a row when
   either it or its partner has the value.
-- **`is null` and `not exists` show the rows with nothing for the field**: no value for `is null` (absent or `null`),
-  no key for `not exists` (a `null` under the key counts as there). On the images' grid neither the image nor any of
-  its objects may have one; on the objects' grid, neither the object nor its image. On `location` these tests are
+- **`is null` and `not exists` show the rows with nothing for the field**: no value for `is null` (absent or `null`;
+  an empty list is a value), no key for `not exists` (a `null` under the key counts as there). On the images' grid
+  neither the image nor any of its objects may have one; on the objects' grid, neither the object nor its image.
+  `is empty` is a test like any other, and `is not empty` its `NOT`: on the images' grid `parts is empty` shows an
+  image whose own `parts` is `[]` or that has an object whose `parts` is, and `parts is not empty` an image that or one
+  of whose objects has a value for `parts`, where neither the image nor any of its objects has an empty list. On
+  `location` these tests are
   about the sample's own location, the one a place tests, read the same way: on the images' grid `location is null`
   shows the images that have no location and none of whose objects has one. The built-in fields (`id`, `filepath`,
   `media_type`, `created_at`, `last_modified_at`) are on every row, so there `is null`, `is not null`, `exists` and
@@ -257,7 +289,7 @@ after the upgrade; until then nothing is skipped.
 
 ## Values
 
-- **Text:** `"double"` or `'single'` quotes, with `\"`, `\\`, `\n` and `\t` escapes. A plain word needs no quotes: `split = train`. `and`, `or`, `not`, `in`, `contains`, `exists`, `is`, `null`, `between` and `like` always need quotes. `within` is a keyword only after `location`: a field or a value named within needs none. `concept`, a keyword only before a concept's name, doesn't need them either.
+- **Text:** `"double"` or `'single'` quotes, with `\"`, `\\`, `\n` and `\t` escapes. A plain word needs no quotes: `split = train`. `and`, `or`, `not`, `in`, `contains`, `exists`, `is`, `null`, `between` and `like` always need quotes. `within` is a keyword only after `location`: a field or a value named within needs none. `concept`, a keyword only before a concept's name, doesn't need them either, and `empty`, a word only after `is`, neither.
 - **Numbers:** `12`, `-1.5`, `1e3`. A number too large for a double, such as `1e999`, is an error: `'1e999' is out of range for a number`.
 - **Dates:** ISO text, quoted or not: `created_at >= 2026-01-01T00:00:00Z`. Text that isn't an ISO date and time is an error.
   On `created_at`, `last_modified_at` and any field declared `datetime`, dates compare as moments:
@@ -339,6 +371,8 @@ Other messages include:
 - `expected ) to close the ( at line 1, column 1`
 - `unknown concept 'equpment'`, with the suggestion `equipment`
 - `'=' does not apply to the concept 'equipment'; use one of: >, >=, <, <=`
+- `'is empty' can't be asked of 'detections.label', a path through the list 'detections': ask it of the list,
+  detections is empty`, with the suggestion `detections`
 
 **`POST /api/datasets/{id}/filter_query/format`**
 

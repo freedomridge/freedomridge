@@ -122,6 +122,8 @@ export function describeFilter(f: ComplexFilter, concepts?: ReadonlyMap<number, 
         case 'not_exists': return `${f.field}: no value`;
         case 'exists':
         case 'is_not_null': return `${f.field}: has a value`;
+        case 'is_empty': return `${f.field}: empty`;
+        case 'is_not_empty': return `${f.field}: not empty`;
         case 'geo_region': return `${f.field} within ${describeValue(f.value)}`;
         case 'geo_region_exclude': return `${f.field} not within ${describeValue(f.value)}`;
         default: return `${f.field} ${symbol[f.operator ?? ''] ?? f.operator} ${describeList(f.value)}`;
