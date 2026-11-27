@@ -4,7 +4,16 @@ Freedom Ridge has one version for the server, the web app and the Python SDK (th
 file), following [Semantic Versioning](https://semver.org). A release lists **upgrade notes** when
 it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
 
-## Unreleased
+## 3.0.0 (2026-11-27)
+
+A major version: the server and the SDK must both be 3.x, and the upgrade starts from 2.14.0. Filters now read one
+way everywhere: a sample with no value for a field never matches a comparison of it, `is null` means no value for
+every list, and the new `is empty` and `is not empty` find an empty list; a list field kept in a column of its own can
+hold never set apart from `[]`. These change what some existing filters find (Changed). Also: the sidebar lists a
+field's values whichever kind of row has the field, a drawn polygon may be at most 10 turns of the globe wide, and the
+demo importers write one field per fact. One migration, `0045`.
+
+### Upgrade notes
 
 - **Upgrade from 2.14.0: the migrations before it are squashed into a new baseline**
   ([From a release before 2.14.0](docs/UPGRADING.md#from-a-release-before-2140)). `0001` to `0044` are now one baseline
@@ -14,6 +23,44 @@ it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
   `/api/health` answers 503 saying so: upgrade it to 2.14.0 first, then to this release. A backup taken before 2.14.0 is
   restored with the 2.14.0 checkout first. The launcher (`npx freedomridge`) upgrades a folder from 2.14.0 only and
   otherwise says to run `npx freedomridge@2.14.0` first.
+- **Upgrade the SDK with the server.** A 3.x server refuses a 2.x SDK (426, naming the version to install), and the
+  3.x SDK refuses a 2.x server: run `pip install "freedomridge==3.0.0"` on every machine that uses the SDK against an
+  upgraded server, compute workers (`python -m fridge.worker`) included. A primary and its followers talk through the
+  follower API, not the SDK, and are still upgraded one at a time, in either order
+  ([Upgrading](docs/UPGRADING.md#primaries-and-followers)); the list field item under Changed says what a follower on
+  2.14.0 shows meanwhile.
+- One migration, `0045_list_columns_hold_never_set.sql`, applied with `scripts/apply_migrations.sh` (step 4 of
+  [Upgrading](docs/UPGRADING.md)). It changes no row: it takes the default off each list column, waiting at most 2 s
+  for a lock; if it gives up, nothing has changed: run step 4 again.
+
+### Added
+
+- **New: `is empty` and `is not empty`, and `is null` means no value for every list in a field**
+  ([FILTER_QUERY.md](docs/FILTER_QUERY.md#no-value-and-an-empty-list)). `is null` finds the samples with no value for
+  a field: no key, or `null`, a field never looked at. An empty list written in a field is a value (looked at, nothing
+  found), which `detections is empty` finds; `detections is not empty`, its `NOT`, finds the samples whose
+  `detections` has a value that isn't an empty list, and a sample with no value matches neither. So every sample is in
+  exactly one of `is null`, `is empty` and `is not empty`, and `detections.label is null` reads as the item above says.
+  A list of labels has no key to look for, so `detections.label exists` and `not exists` now answer as its
+  `is not null` and `is null`, on one sample as through the page's wrapping: on one sample `not exists` showed the
+  samples with a detection that has no label, and `exists` didn't show an empty list. `segmentation.labels exists` and
+  `not exists`, which matched no sample, answer the same way.
+  The filter text, the JSON filters (`is_empty`, `is_not_empty`), every reader of a filter, the app's query builder,
+  the SDK (`s.detections.is_empty()`, `detections__is_empty=True`) and the assistant take them. `is empty` reads any
+  metadata key sample by sample, and is refused (400) on the built-in fields, `location` and a path through a list:
+  `detections.label is empty` names `detections is empty` instead. **Tags don't change**: a sample with no tags has no
+  value for `tags`, so `tags is null` still finds the untagged samples, and `tags is empty` finds the same ones; the
+  same holds for `@local.tags`. A list field kept in a column of its own answers as a list in a field does (the next
+  item). Nothing saved is rewritten. An older
+  server, or a mirror on an older version, refuses a filter with the new tests (400 `Unknown filter operator`), except
+  on `segmentation.labels`: there it answers `is empty` and `is not empty` with no sample and no error. A patch search
+  a primary relays to a mirror on an older version is refused there with any of them. A mirror on an older version
+  reads `detections.label is null` the old way until it is upgraded. On a dataset without
+  objects of a million samples the new tests measured 0.87 to 1.10 times the absence test of the same field, and
+  `detections.label is null` 0.44 times its time before (a count: 230 ms where it was 525 ms).
+
+### Changed
+
 - **A change in behaviour: a sample with no value for a field never matches a comparison of that field, and never
   matches the `NOT` of one, on every dataset and through every reader** ([FILTER_QUERY.md](docs/FILTER_QUERY.md#operators)).
   Only `is null` and `not exists` find it. Before, three places kept the samples with no value, and now show fewer
@@ -55,29 +102,6 @@ it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
   excluded lasso now has to find which rows have a point on the map: about 0.15 to 0.45 s more per reading, the first
   page 0.14 to 0.66 s where it was 0.02 to 0.30 s. An excluded region or drawn polygon there measured up to about
   twice its time before on some readings.
-- **New: `is empty` and `is not empty`, and `is null` means no value for every list in a field**
-  ([FILTER_QUERY.md](docs/FILTER_QUERY.md#no-value-and-an-empty-list)). `is null` finds the samples with no value for
-  a field: no key, or `null`, a field never looked at. An empty list written in a field is a value (looked at, nothing
-  found), which `detections is empty` finds; `detections is not empty`, its `NOT`, finds the samples whose
-  `detections` has a value that isn't an empty list, and a sample with no value matches neither. So every sample is in
-  exactly one of `is null`, `is empty` and `is not empty`, and `detections.label is null` reads as the item above says.
-  A list of labels has no key to look for, so `detections.label exists` and `not exists` now answer as its
-  `is not null` and `is null`, on one sample as through the page's wrapping: on one sample `not exists` showed the
-  samples with a detection that has no label, and `exists` didn't show an empty list. `segmentation.labels exists` and
-  `not exists`, which matched no sample, answer the same way.
-  The filter text, the JSON filters (`is_empty`, `is_not_empty`), every reader of a filter, the app's query builder,
-  the SDK (`s.detections.is_empty()`, `detections__is_empty=True`) and the assistant take them. `is empty` reads any
-  metadata key sample by sample, and is refused (400) on the built-in fields, `location` and a path through a list:
-  `detections.label is empty` names `detections is empty` instead. **Tags don't change**: a sample with no tags has no
-  value for `tags`, so `tags is null` still finds the untagged samples, and `tags is empty` finds the same ones; the
-  same holds for `@local.tags`. A list field kept in a column of its own answers as a list in a field does (the next
-  item). Nothing saved is rewritten. An older
-  server, or a mirror on an older version, refuses a filter with the new tests (400 `Unknown filter operator`), except
-  on `segmentation.labels`: there it answers `is empty` and `is not empty` with no sample and no error. A patch search
-  a primary relays to a mirror on an older version is refused there with any of them. A mirror on an older version
-  reads `detections.label is null` the old way until it is upgraded. On a dataset without
-  objects of a million samples the new tests measured 0.87 to 1.10 times the absence test of the same field, and
-  `detections.label is null` 0.44 times its time before (a count: 230 ms where it was 525 ms).
 - **A change in behaviour: a list field kept in a column of its own can hold no value apart from the empty list**
   ([SDK.md](docs/SDK.md#list-fields-in-a-column-of-their-own), [FILTER_QUERY.md](docs/FILTER_QUERY.md#operators)).
   Such a field (`dataset.create_array_field(...)`, `POST /api/datasets/{id}/array-fields`, the owner's
@@ -176,6 +200,9 @@ it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
   fields until it is imported again; saved views of it that name a field that's gone find nothing for that field.
   iNaturalist keeps `scientific_name` beside the `species` label: a single classification's label can't be filtered
   for an exact value or typed ahead in the sidebar, a string can.
+
+### Fixed
+
 - **The sidebar lists a field's values whichever kind of row has the field, and says so when it can't list them**
   ([FILTER_QUERY.md](docs/FILTER_QUERY.md#a-fields-values)). On a dataset with objects:
   - a field only objects have (the `label` of the Open Images, COCO and KITTI demos) suggested no value as you typed
