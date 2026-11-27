@@ -29,6 +29,9 @@ its objects, or for an object together with its image. A row is never asked abou
   there (for tags at least one element, for a list field a list, empty or not). A NOT around tests of
   built-in fields only keeps the reading it had: each row on its own (`NOT (id contains ...)`: the grid's row).
 
+The sidebar's values of a field read the same pair the other way round (read_partner): an object whose pair with its
+image meets the filter gives its value under the images' kind.
+
 Every rule reads the values. For speed only, the compiler's `Rows` may skip a kind of row for a field that kind has
 never been seen with (backend/field_kinds.py): its `test`, `keyed` and `has` then answer FALSE without reading the row,
 and a partner whose test is FALSE is not looked up. The parts below fold such constants as SQL's three-valued logic
@@ -108,6 +111,16 @@ def read_not(base: Any, grid: str, rows: Rows) -> str:
     read, having = (reader.image, reader.image_needs) if grid == 'image' else (reader.object, reader.object_needs)
     needs = [partial(having, need, row) for need in negation.needs(base, rows)]
     return reader.all_of([*needs, lambda: _not(read(unit, row))])
+
+
+def read_partner(base: Any, rows: Rows) -> str:
+    """SQL for an object (rows.outer(), a row of kind 'object') read together with its image as the images' grid reads
+    the pair: each test of `base` met by the object or by its image, the row-level parts (a NOT, `is null`, ...) by the
+    image as a whole. The images' grid would show the object's image for `base` with a test of the object's own value
+    added, through this object: so the sidebar reads a field's values from such objects under the images' kind
+    (routers/datasets.py, field_value_source). The caller asks that the object has an image."""
+    reader = _Reader(rows)
+    return reader.paired(reader.unit(base), rows.outer())
 
 
 _CONSTANTS = ('TRUE', 'FALSE')

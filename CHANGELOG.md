@@ -168,6 +168,67 @@ it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
   fields until it is imported again; saved views of it that name a field that's gone find nothing for that field.
   iNaturalist keeps `scientific_name` beside the `species` label: a single classification's label can't be filtered
   for an exact value or typed ahead in the sidebar, a string can.
+- **The sidebar lists a field's values whichever kind of row has the field, and says so when it can't list them**
+  ([FILTER_QUERY.md](docs/FILTER_QUERY.md#a-fields-values)). On a dataset with objects:
+  - a field only objects have (the `label` of the Open Images, COCO and KITTI demos) suggested no value as you typed
+    in the sidebar, its list of values was empty, and its range was the whole dataset's, objects with no image
+    included, labelled as kept. On the images' grid it now lists the values of the objects whose pair with their
+    image meets the filter, read as the grid reads it: with `label = "car"` applied, `occluded` offers the cars'
+    values, not a truck's in the same image. On the objects' grid a field only images have lists the values of the
+    images of the objects shown. A field both kinds have lists the values of both (before: the grid's own kind's
+    only), `tags` among them. An object with no image is listed on the objects' grid, never on the images'. The number
+    beside a suggestion counts the rows that have the value among the rows read: objects, not images, for an object's
+    field on the images' grid; images, each once, for an image's field on the objects' grid.
+  - with fast mode off, a selection waiting to be applied (a lasso drawn on the objects' map, a brushed set, a drawn
+    polygon, ticked grid rows) emptied the lists of values: it was sent beside the grid's reading as a test of the
+    image. It is read inside it now, as the grid reads it once applied.
+
+  On every dataset:
+  - a field whose values are nearly all different (a URL, a path, an id) opened a blank picker when its values could
+    not be counted within 2 s, and so did a term most of them hold (`flickr`). The server then reads the values of up
+    to a thousand of the view's rows without counting them, within 1 s of its own: having read every row, it answers
+    as the count would; otherwise it offers some of the values, without numbers. The picker says which: "Could not
+    search all values in time: these are some of them. Type to search; Enter filters by what you typed." with the
+    values, "Could not search all values in time. Type a value and press Enter to filter by it." with none, and "No
+    value for this view." for a complete list with nothing in it ("No matches" with a term). Enter takes the typed term
+    whenever the answer was not complete. The query builder's picker is the same one.
+  - equal counts among the suggestions come in the order of the value, byte by byte, where no order was defined. The
+    values are counted bytewise too, with the same values and counts: a term every value of a million holds took
+    0.9 s, where it took 4.4 s.
+  - a suggestions request the page gives up (a keystroke later) is stopped on the server, as the sidebar's lists'
+    requests already were. Ten keystrokes in two seconds on a field of three million different values kept 15 to 17
+    database processes busy at their peak, each statement running to the end of its 2 s; now one statement at a time
+    (3 processes with its parallel workers), and the last answer comes as soon as before (3.9 s).
+
+  Four changes on a dataset without objects too:
+  - the picker of a field with an applied rule offers the values the view has, those that still show rows when
+    ticked; it offered every value of the field (with `split = "train"` applied, `split` offered `test`, and ticking it
+    showed nothing);
+  - a brushed set, a drawn polygon or a lasso waiting to be applied narrows the picker (fast mode off), as it narrowed
+    the list. Ticked grid rows don't: the grid doesn't filter by them, so a value outside them still shows rows. The
+    picker still opens on the field's list (with rows ticked, their values) and asks the server for a term that list
+    doesn't hold;
+  - a request with no kind (a script calling `POST /api/datasets/{id}/fields/{field}/autocomplete` with a filter)
+    keeps the field's own rule in its filter, where it was left out;
+  - a range the view has no value for is no range: `min` and `max` are null and the sidebar shows "No compatible range
+    available", where the dataset's range was answered, labelled as kept. The dataset's range is kept only where the
+    reading ran out of time or failed, or where fast mode didn't compute the field for the filter.
+
+  The route's answer keeps its shape (`{"values": [{"value", "count"}], "exhaustive"}`); `exhaustive: false` may now
+  come with values that carry no count. Not changed: the histogram panel of a field the other kind has, and the "(no
+  value)" tick. Measured on a dataset shaped like the Open Images demo (41,620 images, 291,586 objects) and on one of
+  200,000 images and 800,000 objects: an object's field's suggestions on the images' grid take 0.06 to 0.16 s and
+  0.13 to 0.41 s, a typed term 0.05 to 0.10 s and 0.13 to 0.25 s, within the 2 s (before, the same request sent with
+  no filter at all, which reads every row: 0.14 s and 0.35 s, typed 0.10 s and 0.26 s); `tags` on the images' grid,
+  which now reads the objects' tags too, 1.2 to 1.9 times its time before for the suggestions (with nothing filtered
+  0.04 s became 0.06 s, and 0.10 s 0.17 s; 0.57 s at most), within the 2 s, and 1.0 to 1.2 times for the opened list,
+  within the 5 s; an opened field's list or range 0.05 to 0.70 s under fast mode's 5 s, its gates unchanged; with fast
+  mode off the whole sidebar on the larger dataset 0.7 to 2.0 s, where it answered the objects' fields with the kept
+  values before (0.6 to 2.2 s); with fast mode on, the sidebar of the demo's shape with nothing filtered 0.36 s (0.22 s
+  before), since its objects' fields are now read. With nothing filtered, an object's image is read from the object
+  alone (its `parent_id`), not looked up. The requests this doesn't mean to change (with no kind, an image's own field,
+  every request on a dataset without objects, up to three million samples) measured 0.93 to 1.14 times their time
+  before.
 
 ## 2.14.0 (2026-11-25)
 

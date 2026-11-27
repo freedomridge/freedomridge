@@ -188,6 +188,7 @@ async def reading(
     *,
     savepoint: Any = None,
     record: Any = UNREAD,
+    always: bool = False,
 ) -> T:
     """Runs `run` (it may run again: a read, or a write in `savepoint`) with the dataset's record for every filter it
     compiles. Refused (retrying), it runs again with the record read again, and the third time without it, which
@@ -195,8 +196,10 @@ async def reading(
     so a refusal is retried before any fallback of the reader's (cached values, an empty list) can see it. Inside a
     reading of the same dataset it runs `run` as it is: that reading retries. `record`: the dataset's record the caller
     already read (the sidebar's request, for on_images and on_objects), for the first attempt; its guard checks it like
-    any other, and the second attempt reads it again."""
-    if not _wrapped(filters) or current(dataset_id) is not None:
+    any other, and the second attempt reads it again. `always`: with the record whatever the filter's form, for a reader
+    that reads the other kind's rows under a filter with nothing wrapped (a field's values on a dataset with objects,
+    routers/datasets.py value_view)."""
+    if not (always or _wrapped(filters)) or current(dataset_id) is not None:
         return await run()
 
     async def attempt(which: str) -> T:

@@ -261,10 +261,13 @@ def test_opened_field_tells_timeout_from_failure(
 def test_opened_field_with_no_filtered_values(registry_database, monkeypatch):  # noqa: F811
     async def scenario(database):
         await seed(database, monkeypatch)
-        # No value in the set: a range keeps the dataset's bounds (so it is not exact) ...
+        # No value in the set: a reading that finished and found none answers no range, the set's own answer, not the
+        # dataset's kept bounds (contract g12 point 16; the kept range is for a reading that ran out of its budget,
+        # failed, or was not attempted, as the tests above pin) ...
         brightness = await opened(BARE, 'brightness')
-        assert (brightness['min'], brightness['max'], brightness['provenance']) == (10, 200, 'cached')
-        # ... while an empty value list is the exact answer.
+        assert (brightness['min'], brightness['max']) == (None, None), brightness
+        assert brightness['provenance'] not in ('cached', 'pending', 'out_of_budget'), brightness
+        # ... and an empty value list is the exact answer.
         color = await opened(BARE, 'color')
         assert (color['values'], color['provenance']) == ([], 'exact')
 

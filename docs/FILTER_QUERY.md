@@ -281,6 +281,62 @@ red with no objects.
   the built-in fields alone reads each row on its own: on the images' grid `NOT (filepath contains "x")` also shows
   an image whose path holds `x` when one of its objects' paths doesn't.
 
+### A field's values
+
+The sidebar lists a field's values, its range, and suggests values as you type. On a dataset with objects these come
+from the rows that have the field for the view, of either kind, read as the grids read a row with its partner:
+
+- **On the images' grid**, a field the objects have lists the values of the objects whose pair, the object and its
+  image, meets the filter: each test met by the image or by that object, a `NOT` read for the image as a whole. So
+  under `label = "car"` the picker of `occluded` offers the cars' values, not a truck's in the same image; under
+  `NOT (label = "car")` it offers the values of every object of the images that have no car; under `colour = "red"`
+  those of the objects of the red images. An object with no image is no image's partner, so its values are not
+  listed there.
+- **On the objects' grid**, a field the images have lists the values of the images of the objects shown. An object
+  with no image is one of that grid's rows, so its own values are listed.
+- **A field both kinds have** lists both: an object's value shows its image, and an image's value its objects.
+
+Each value offered, ticked, shows at least one row; and when the list says it is complete, no value that would show
+a row is missing from it. The view is read as it is sent, on every dataset: a rule of the field itself narrows its
+values too, since a tick is applied as a stage beside it (with `label = "car"` applied, the picker of `label` offers
+`car`). The page leaves out the field's own ticks that aren't applied yet, so several values of one field can be
+ticked together.
+
+The list and the picker read two views, by the page's choice; they differ by the ticks and by the ticked grid rows.
+The list and the range read the applied filters with the four selections waiting to be applied (with fast mode off: a
+brushed set, the grid rows you ticked, a drawn polygon, a lasso), so ticking rows shows their values. The picker reads
+the applied filters with what the grid previews (the brushed set, the polygon, the lasso; not the ticked rows, which
+the grid doesn't filter by, so a value outside them still shows rows) and the other fields' ticks.
+
+Which of the two you are looking at: the picker opens on the field's list. With nothing typed its dropdown shows the
+list's values (the list's view: no ticks, the ticked grid rows in), and a term you type that a complete list holds is
+matched in the page, from that list. The server is asked, under the picker's view, for a term the list does not hold,
+or when the field has no list. So with grid rows ticked the dropdown opens on the ticked rows' values, while a typed
+term the list does not hold is searched in the whole view.
+
+A range the view has no value for is no range, on every dataset: the answer's `min` and `max` are null, the view's own
+answer (not the dataset's range, and not labelled as kept), and the sidebar shows "No compatible range available" for
+the field. The dataset's range is kept only where the reading ran out of time or failed, or where fast mode didn't
+compute the field for the filter.
+
+**The number beside a suggestion** counts the rows that have the value among the rows read: on the images' grid, the
+number beside an object's field's value counts objects, not images; on the objects' grid, the number beside an image's
+field's value counts images, each once however many of its objects are shown; for a field both kinds have, both. Equal
+numbers come in the order of the value, byte by byte. The sidebar's list itself shows no number.
+
+**A field too varied to count in time** (an identifier, a path, a URL: nearly every value different) is still
+answered. When counting runs past its 2 s, the server reads the values of up to a thousand of the view's rows without
+counting them, under 1 s of its own: if those were all the rows, the answer is the counted one; otherwise it offers
+some of the values (up to a hundred, in the order of the value) without numbers. If that runs out of time too, the
+statistics' kept list answers, if they keep one. The picker says which: the values with "Could not search all values
+in time: these are some of them", or, with none, "Could not search all values in time. Type a value and press Enter to
+filter by it"; a typed term still filters (Enter, or Contains). A list that is complete and empty reads "No value for
+this view." (with a term, "No matches").
+
+Not read this way yet: the histogram panel of a field the other kind has (its buckets are empty there, and its
+"missing" counts every row), and the sidebar's "(no value)" tick, which is offered whenever some sample of either kind
+lacks the field.
+
 ### What the server skips
 
 The server notes, for each field of a dataset, whether images and whether objects have been seen with it: its key on a

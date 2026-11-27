@@ -430,6 +430,25 @@ export function withGrain(
     return { logic: 'AND', filters: parts };
 }
 
+// The view every reader of the filter sidebar is given (one way, over withGrain): the applied stages, the pending
+// selections the page passes (with lightning mode off) and, for the value picker, the other fields' unapplied ticks (as
+// convertSimpleFiltersToComplex gives them: one rule, or an AND of several), all inside the image grain's wrapping, as
+// the grid would read them applied. The page passes the list and the range its four pending selections (a brushed set,
+// the ticked grid rows, a drawn polygon, a lasso) and no ticks; the picker what the grid previews (the brushed set, the
+// polygon, the lasso: not the ticked rows, which the grid doesn't filter by) and the ticks.
+// So the grain's kind is at the top of its AND, where the server reads a field's values from the rows that have it
+// (docs/FILTER_QUERY.md, "A field's values"). On a dataset without objects it is the plain AND, as before.
+export function sidebarView(
+    applied: ComplexFilter,
+    pending: ComplexFilter[],
+    ticks: ComplexFilter | null,
+    hasObjects: boolean,
+): ComplexFilter {
+    const anAnd = ticks !== null && ticks.field === undefined && (ticks.logic ?? 'AND') === 'AND';
+    const tickParts = ticks === null ? [] : anAnd ? ticks.filters ?? [] : [ticks];
+    return withGrain({ logic: 'AND', filters: [...(applied.filters || []), ...pending, ...tickParts] }, 'image', null, hasObjects);
+}
+
 // `search`: the query the router opened the page with, read once by the page (not window.location: after login the app
 // navigates here, and the address still shows the login page while this page first renders).
 // `liveAddress` (FRIDGE_LIVE_ADDRESS): false keeps the address at the dataset's alone. The entries are written as with it

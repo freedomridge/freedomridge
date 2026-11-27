@@ -4,7 +4,7 @@ import { isOverlayActive, isDerivedLabelField } from '@/lib/labels';
 
 import { type SchemaField, type Filters, type ComplexFilter, getFieldFacet, isRescoringRefusal, promoteField, rescoringRetryTurn } from '@/lib/api';
 import { SearchableSelect } from './searchable-select';
-import { convertSimpleFiltersToComplex, describeFilter, excludeKeyFor, isTextFilter, type RangeFilter, type TextFilter } from '@/lib/filter-utils';
+import { convertSimpleFiltersToComplex, describeFilter, excludeKeyFor, isTextFilter, parseDraftKey, type RangeFilter, type TextFilter } from '@/lib/filter-utils';
 import { datetimeMs } from '@/lib/datetimes';
 import { filteredFieldNames, readCollapsedFields, readExpandedFields, storeFieldExpanded } from '@/lib/sidebar-sections';
 import { EyeOpenIcon, EyeNoneIcon, MixerHorizontalIcon } from '@radix-ui/react-icons';
@@ -78,6 +78,10 @@ interface Props {
     isLoading?: boolean;
     filters: Filters;
     globalFilters?: ComplexFilter;
+    // The view the value picker of a field reads, given the other fields' unapplied ticks (the page's sidebarView):
+    // the applied view and its pending selections with those ticks, inside the image grain's wrapping. Without it (a
+    // sidebar shown on its own) the picker reads globalFilters with the ticks beside it.
+    pickerView?: (ticks: ComplexFilter | null) => ComplexFilter;
     onChange: (filters: Filters) => void;
     activeOverlayFields?: string[];
     onToggleOverlay?: (field: string) => void;
@@ -161,15 +165,14 @@ function supportsContains(field: SchemaField): boolean {
         && (field.declared_type === 'string' || field.type === 'string');
 }
 
-function SidebarValuePicker({ datasetId, field, filters, globalFilters, onChange, showCachedValues = false }: {
+function SidebarValuePicker({ datasetId, field, filters, pickerView, onChange, showCachedValues = false }: {
     datasetId: number;
     field: SchemaField;
     filters: Filters;
-    globalFilters?: ComplexFilter;
+    pickerView: (ticks: ComplexFilter | null) => ComplexFilter;
     onChange: (filters: Filters) => void;
     showCachedValues?: boolean;
 }) {
-    const excludeKey = excludeKeyFor(field.name);
     const current = filters[field.name];
     const allowContains = supportsContains(field);
     const selection: TextFilter = isTextFilter(current) ? current : {
@@ -184,11 +187,11 @@ function SidebarValuePicker({ datasetId, field, filters, globalFilters, onChange
         else delete next[field.name];
         onChange(next);
     };
-    const otherDrafts = { ...filters };
-    delete otherDrafts[field.name];
-    delete otherDrafts[excludeKey];
-    const draft = convertSimpleFiltersToComplex(otherDrafts);
-    const searchFilters: ComplexFilter = { logic: 'AND', filters: [draft, ...(globalFilters ? [globalFilters] : [])] };
+    // The other fields' unapplied ticks: every draft of this field is left out (its ticks, its exclusion, a contains
+    // term, a range or a bar's bound), so several of its values can be ticked together. Its APPLIED rule stays in the
+    // view, as the grid reads it: a tick is applied as a stage beside it.
+    const otherDrafts = Object.fromEntries(Object.entries(filters).filter(([key]) => parseDraftKey(key).field !== field.name));
+    const searchFilters = pickerView(convertSimpleFiltersToComplex(otherDrafts));
 
     return (
         <SearchableSelect
@@ -214,6 +217,7 @@ export function FilterSidebar({
     isLoading,
     filters,
     globalFilters,
+    pickerView: givenPickerView,
     onChange,
     activeOverlayFields = [],
     onToggleOverlay,
@@ -225,6 +229,8 @@ export function FilterSidebar({
     expandAll: expandAllOnOpen = false,
     level = null,
 }: Props) {
+    const pickerView = givenPickerView
+        ?? ((ticks: ComplexFilter | null): ComplexFilter => ({ logic: 'AND', filters: [...(ticks ? [ticks] : []), ...(globalFilters ? [globalFilters] : [])] }));
     // The fields the sidebar lists: parent_id isn't one (`sidebar: false`); nothing here asks for it.
     const schema = useMemo(() => fullSchema.filter(field => field.sidebar !== false), [fullSchema]);
     const hasActiveFilters = Object.keys(filters).length > 0;
@@ -775,7 +781,11 @@ export function FilterSidebar({
                                 });
                             }
 
-                            if (field.origin === 'metadata' && (field.type === 'number' || field.type === 'datetime') && (field.min == null || field.max == null)) {
+                            // No range to show: a metadata field without one, or a mirror's own field the view has no
+                            // value for (the server answers min and max null; docs/FILTER_QUERY.md, "A field's values").
+                            const noRange = field.origin === 'metadata' ? field.min == null || field.max == null
+                                : field.origin === 'local' && field.min === null && field.max === null;
+                            if ((field.type === 'number' || field.type === 'datetime') && noRange) {
                                 return renderSection(schemaField, index, {
                                     status: <div className="pl-[18px] text-xs text-zinc-500">No compatible range available</div>,
                                     body: () => renderPresenceFilter(field.name),
@@ -873,7 +883,7 @@ export function FilterSidebar({
                                                     datasetId={datasetId}
                                                     field={field}
                                                     filters={filters}
-                                                    globalFilters={globalFilters}
+                                                    pickerView={pickerView}
                                                     onChange={onChange}
                                                     showCachedValues={!useSearchInput}
                                                 />
@@ -1054,7 +1064,7 @@ export function FilterSidebar({
                                                 datasetId={datasetId}
                                                 field={field}
                                                 filters={filters}
-                                                globalFilters={globalFilters}
+                                                pickerView={pickerView}
                                                 onChange={onChange}
                                             />
                                             {renderNoValueToggle(field)}
