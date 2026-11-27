@@ -810,7 +810,7 @@ It stands on `GET /api/admin/jobs/all` (administrators only): `state` (repeatabl
 `field`, `started_by`, `created_at`, `started_at`, `finished_at`, `progress`, `failures`, `max_failures`,
 `cancel_requested` and `error`: no result, and nothing of what a job was asked beyond the dataset it is about, but for
 a `backup` job's `backup`, its own `{"file", "size_bytes", "tables"}`, null until it has succeeded. It reads
-the jobs table through two indexes of its own (migration `0041_jobs_across_datasets.sql`) and never reads samples: on a
+the jobs table through two indexes of its own (added in 2.14.0) and never reads samples: on a
 million jobs it answers a week's window in a few milliseconds and a year's in about a tenth of a second.
 
 ### `index_advice`

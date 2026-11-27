@@ -35,31 +35,20 @@ Control characters are the ones that aren't whitespace (NUL, BEL, ESC, DEL and a
 asserted either way.
 """
 
-import asyncio
 import json
 import os
 import re
-import secrets
-import subprocess
-from pathlib import Path
 from typing import Any, Optional
-from urllib.parse import urlparse
 
-import asyncpg
 import httpx
 import pytest
 
-from backend import database as database_module
-from backend import main
-from backend.crypto import hash_token
-from backend.database import init_connection
 from backend.routers import datasets
 from backend.tests import test_access_rule_spec, test_field_registry_postgres, test_upgrade_paths
 from backend.tests.statistics_helpers import run_refresh
 from backend.tests.test_access_enforcement_spec import DENIED, SEALED, detail, needs, set_share
 from backend.tests.test_access_rule_spec import ADMIN, GUEST, POWER, World
 from backend.tests.test_bulk_jobs import finish
-from backend.tests.test_upgrade_paths import ROOT
 
 registry_database = test_field_registry_postgres.registry_database
 world = test_access_rule_spec.world
@@ -1046,156 +1035,3 @@ def test_a_private_field_that_is_gone_behaves_like_a_name_with_no_field(world):
         assert not differ, '\n'.join(differ)
 
     world(scenario)
-
-
-# --- The upgrade ---
-
-RELEASE = 'v2.13.1'  # the last release before 0035
-UPGRADE_SEED = """
-INSERT INTO datasets (id, name) VALUES (1, 'fields'), (2, 'mirrored');
-SELECT setval(pg_get_serial_sequence('datasets', 'id'), 2);
-ALTER TABLE samples ADD COLUMN labels_x TEXT[];
-INSERT INTO sample_array_columns (column_name) VALUES ('labels_x');
-INSERT INTO samples (dataset_id, filepath, media_type, metadata, labels_x) VALUES
-    (1, 's3://upgrade/a.jpg', 'image',
-     '{"score": 0.5, "label": "cat", "width": 640, "brightness": 101.5, "seen_at": "2026-01-01T00:00:00Z",
-       "box": {"x": 1}}', '{a}'),
-    (1, 's3://upgrade/b.jpg', 'image', '{"score": 0.75, "label": "dog", "width": 320, "brightness": 99.0}', NULL),
-    (2, 's3://upgrade/c.jpg', 'image', '{"crop": "corn"}', NULL);
-INSERT INTO dataset_fields (dataset_id, field_name, field_type, origin, is_promoted, display_type, overlay_config)
-VALUES
-    (1, 'score', 'number', 'metadata', TRUE, 'enum', NULL),
-    (1, 'label', 'string', 'metadata', FALSE, NULL, '{"colormap": "viridis", "opacity": 0.5}'),
-    (1, 'width', 'number', 'metadata', FALSE, 'number', NULL),
-    (1, 'brightness', 'number', 'metadata', FALSE, NULL, NULL),
-    (1, 'seen_at', 'datetime', 'metadata', FALSE, NULL, NULL),
-    (1, 'box', 'object', 'metadata', FALSE, NULL, NULL),
-    (1, 'labels_x', 'list', 'native_array', TRUE, NULL, NULL),
-    (2, 'crop', 'string', 'metadata', FALSE, NULL, NULL);
-INSERT INTO mirrors (dataset_id, origin_dataset_id, feed_cursor) VALUES (2, 9, 0);
-UPDATE dataset_fields SET owner = 'primary' WHERE dataset_id = 2;
-INSERT INTO dataset_fields (dataset_id, field_name, field_type, origin) VALUES (2, '@local.weeds', 'number', 'local');
-"""
-# Everything a field had before 0035, one line per field.
-MIGRATIONS = ROOT / 'backend/db/migrations'
-TABLES = "SELECT string_agg(tablename, ',' ORDER BY tablename) FROM pg_tables WHERE schemaname = 'public'"
-COLUMNS = (
-    "SELECT string_agg(quote_ident(column_name), ', ' ORDER BY ordinal_position) FROM information_schema.columns "
-    "WHERE table_schema = 'public' AND table_name = '{table}'"
-)
-
-
-def apply_migration(psql: Any, name: str, migration: Path) -> None:
-    """One migration file as scripts/apply_migrations.sh applies it: in one transaction with its ledger row."""
-    ledger = f"INSERT INTO schema_migrations (filename) VALUES ('{migration.name}');"
-    psql(name, f'BEGIN;\n{migration.read_text()}\n{ledger}\nCOMMIT;\n')
-
-
-def apply_before(psql: Any, name: str, number: str) -> None:
-    """The migrations numbered below `number` the database doesn't record, in the runner's (byte) order."""
-    recorded = set(psql(name, 'SELECT filename FROM schema_migrations').splitlines())
-    for migration in sorted(MIGRATIONS.glob('*.sql'), key=lambda found: found.name.encode()):
-        if migration.name < number and migration.name not in recorded:
-            apply_migration(psql, name, migration)
-
-
-def rows_as_they_are(psql: Any, name: str, columns: dict[str, str]) -> dict[str, str]:
-    """Each table's rows, read on the columns it had."""
-    return {
-        table: psql(
-            name,
-            f"SELECT md5(coalesce(string_agg(r::text, E'\\n' ORDER BY r::text), '')) "
-            f'FROM (SELECT {listed} FROM {table}) r',
-        )
-        for table, listed in columns.items()
-    }
-
-
-FIELD_ROWS = """
-SELECT string_agg(concat_ws('|', id, dataset_id, field_name, field_type, origin, is_promoted,
-                            coalesce(display_type, '-'), coalesce(overlay_config::text, '-'), owner, created_at),
-                  E'\\n' ORDER BY id)
-FROM dataset_fields
-"""
-
-
-@pytest.mark.skipif(not os.getenv('FRIDGE_TEST_POSTGRES_CONTAINER'), reason='Requires disposable PostgreSQL')
-def test_0035_leaves_every_field_undescribed_and_otherwise_as_it_was(database, monkeypatch):
-    make, psql, _, migrate = database
-    old_schema = subprocess.run(
-        ['git', '-C', str(ROOT), 'show', f'{RELEASE}:backend/db/schema.sql'],
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout
-    name = make(old_schema + UPGRADE_SEED)
-    # 0035 on its own, after whatever comes before it: every row that was there, as it was.
-    apply_before(psql, name, '0035')
-    before = psql(name, FIELD_ROWS)
-    assert before.count('\n') == 8 and '|@local.weeds|' in before and '|crop|string|metadata|f|-|-|primary|' in before
-    tables = set(psql(name, TABLES).split(',')) - {'schema_migrations'}
-    columns = {table: psql(name, COLUMNS.format(table=table)) for table in tables}
-    rows = rows_as_they_are(psql, name, columns)
-    (own,) = MIGRATIONS.glob('0035_*.sql')
-    apply_migration(psql, name, own)
-    assert psql(name, FIELD_ROWS) == before
-    assert rows_as_they_are(psql, name, columns) == rows  # every table's rows, on the columns it had
-    # The rest of the way, as an upgrade runs: the app then reads the upgraded database.
-    result = migrate(name)
-    assert result.returncode == 0, f'apply_migrations.sh failed\n{result.stdout}\n{result.stderr}'
-
-    async def after() -> None:
-        dsn = urlparse(os.environ['FRIDGE_TEST_POSTGRES_DSN'])._replace(path=f'/{name}').geturl()
-        pool = await asyncpg.create_pool(dsn, min_size=1, max_size=4, init=init_connection)
-        monkeypatch.setattr(database_module.db, 'pool', pool)
-        monkeypatch.setattr(datasets, '_array_columns_cache', None)
-        try:
-            raw = secrets.token_urlsafe(32)
-            await pool.execute('UPDATE users SET must_change_password = FALSE WHERE id = $1', ADMIN)
-            await pool.execute(
-                "INSERT INTO api_tokens (user_id, token, name) VALUES ($1, $2, 'upgrade')",
-                ADMIN,
-                hash_token(raw),
-            )
-            headers = {'Authorization': f'Bearer {raw}'}
-            transport = httpx.ASGITransport(app=main.app)
-            async with httpx.AsyncClient(transport=transport, base_url='http://test') as client:
-                for dataset_id, own in ((1, ('score', 'label', 'seen_at', 'box')), (2, ('crop', '@local.weeds'))):
-                    for where, url in (
-                        ('schema', f'/api/datasets/{dataset_id}/schema'),
-                        ('field-stats', f'/api/datasets/{dataset_id}/field-stats'),
-                    ):
-                        response = await client.get(url, headers=headers)
-                        assert response.status_code == 200, response.text
-                        entries = by_name(response.json(), where)
-                        assert {'score', 'label', 'crop', '@local.weeds'} & set(own) <= set(entries), (where, entries)
-                        for field in own:
-                            if field in entries:
-                                assert four(entries[field], where) == NOTHING, (dataset_id, where, field)
-                        for field, entry in entries.items():
-                            _, unit, values_private, source = four(entry, where)
-                            assert values_private is False, (dataset_id, where, field)
-                            assert source in (None, 'default'), (dataset_id, where, field)
-                            assert unit is None, (dataset_id, where, field)  # no field has a unit by its name
-                        if dataset_id == 1:
-                            for field in ('id', 'filepath'):
-                                description, _, _, source = four(entries[field], where)
-                                assert source == 'default', (where, field)
-                                a_default(description)
-                            for field in ('width', 'brightness'):  # named as computed fields: none by their names
-                                assert four(entries[field], where) == NOTHING, (where, field)
-        finally:
-            await pool.close()
-
-    asyncio.run(after())
-    # What is stored: the columns 0035 adds, NULL, NULL and false on every existing field.
-    stored = (
-        "SELECT string_agg(concat_ws('|', field_name, description IS NULL, unit IS NULL, values_private), ',' "
-        'ORDER BY id) FROM dataset_fields'
-    )
-    assert psql(name, stored) == ','.join(
-        f'{field}|t|t|f'
-        for field in ('score', 'label', 'width', 'brightness', 'seen_at', 'box', 'labels_x', 'crop', '@local.weeds')
-    )
-    # The migration that did it is in the ledger.
-    assert '0035' in psql(name, 'SELECT string_agg(filename, \',\' ORDER BY filename) FROM schema_migrations')

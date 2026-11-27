@@ -106,15 +106,10 @@ import base64
 import json
 import os
 import re
-import secrets
-import subprocess
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
-from urllib.parse import urlparse
 
-import asyncpg
-import httpx
 import pytest
 
 from backend import backups, index_actions, index_advisor, index_jobs, job_queue, main, system_status
@@ -122,8 +117,6 @@ from backend import database as database_module
 from backend.assistant import inner, links
 from backend.assistant.api import NOT_ALLOWED_CODE, ROUTE_REFUSED_CODE
 from backend.assistant.identity import SCOPE_KEY, Identity
-from backend.crypto import hash_token
-from backend.database import init_connection
 from backend.routers import datasets
 from backend.tests import job_helpers, test_access_rule_spec, test_field_registry_postgres, test_upgrade_paths
 from backend.tests.changelog_helpers import release_heading
@@ -131,20 +124,14 @@ from backend.tests.test_access_enforcement_spec import app_routes
 from backend.tests.test_access_rule_spec import ADMIN, GUEST, OTHER_ADMIN, POWER, World
 from backend.tests.test_assistant_core import _raw
 from backend.tests.test_assistant_core_spec import (
-    COLUMNS,
     HOSTILE,
     MCP_OFF,
-    MIGRATIONS,
     NOT_LET_IN,
     SETTINGS,
     SHIPPED,
-    TABLES,
-    apply_before,
-    apply_migration,
     assistant,
     call,
     plain,
-    rows_as_they_are,
     settings,
 )
 from backend.tests.test_dataset_deletion import finish as finish_deletion
@@ -1915,96 +1902,6 @@ def test_a_role_or_the_switch_changed_while_a_tool_reads_refuses_its_next_reques
                 assert restored.status_code == 200, restored.text
 
     world(scenario)
-
-
-RELEASE_BEFORE_0040 = 'v2.13.2'
-INDEXES = "SELECT tablename || ' ' || indexdef FROM pg_indexes WHERE schemaname = 'public' ORDER BY 1"
-
-
-@pytest.mark.skipif(not os.getenv('FRIDGE_TEST_POSTGRES_CONTAINER'), reason='Requires disposable PostgreSQL')
-def test_0040_adds_the_switch_off_and_leaves_every_row_as_it_was(database, monkeypatch):
-    make, psql, _, migrate = database
-    old_schema = subprocess.run(
-        ['git', '-C', str(ROOT), 'show', f'{RELEASE_BEFORE_0040}:backend/db/schema.sql'],
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout
-    name = make(old_schema + "INSERT INTO datasets (id, name) VALUES (1, 'before'), (2, 'also-before');")
-    apply_before(psql, name, '0040')
-    psql(name, 'UPDATE assistant_settings SET mcp_enabled = TRUE, sample_fields = TRUE')
-    tables = set(psql(name, TABLES).split(',')) - {'schema_migrations'}
-    columns = {table: psql(name, COLUMNS.format(table=table)) for table in tables}
-    rows = rows_as_they_are(psql, name, columns)
-    indexes = set(psql(name, INDEXES).splitlines())
-    (own,) = MIGRATIONS.glob('0040_*.sql')
-    apply_migration(psql, name, own)
-    assert rows_as_they_are(psql, name, columns) == rows  # every table's rows, on the columns it had
-    # The column and nothing else: no table, no index, no other column.
-    assert set(psql(name, TABLES).split(',')) - {'schema_migrations'} == tables
-    grown = {table: psql(name, COLUMNS.format(table=table)) for table in tables}
-    assert {table for table in tables if grown[table] != columns[table]} == {'assistant_settings'}
-    assert len(grown['assistant_settings'].split(', ')) == len(columns['assistant_settings'].split(', ')) + 1
-    assert grown['assistant_settings'].startswith(columns['assistant_settings'])
-    assert set(psql(name, INDEXES).splitlines()) == indexes
-    outcome = migrate(name)
-    assert outcome.returncode == 0, f'apply_migrations.sh failed\n{outcome.stdout}\n{outcome.stderr}'
-
-    async def after() -> None:
-        dsn = urlparse(os.environ['FRIDGE_TEST_POSTGRES_DSN'])._replace(path=f'/{name}').geturl()
-        pool = await asyncpg.create_pool(dsn, min_size=1, max_size=4, init=init_connection)
-        monkeypatch.setattr(database_module.db, 'pool', pool)
-        monkeypatch.setattr(datasets, '_array_columns_cache', None)
-        try:
-            raw = secrets.token_urlsafe(32)
-            await pool.execute('UPDATE users SET must_change_password = FALSE WHERE id = $1', ADMIN)
-            await pool.execute(
-                "INSERT INTO api_tokens (user_id, token, name) VALUES ($1, $2, 'upgrade')",
-                ADMIN,
-                hash_token(raw),
-            )
-            transport = httpx.ASGITransport(app=main.app)
-            async with httpx.AsyncClient(transport=transport, base_url='http://test') as client:
-                state = (await client.get(SETTINGS, headers={'Authorization': f'Bearer {raw}'})).json()
-            assert state.get('admin_tools') is False, state
-            assert (state['mcp_enabled'], state['sample_fields']) == (True, True), state  # kept as they were
-            assert await listed_for(ADMIN) == THIRTEEN
-        finally:
-            await pool.close()
-
-    asyncio.run(after())
-
-
-@pytest.mark.skipif(not os.getenv('FRIDGE_TEST_POSTGRES_CONTAINER'), reason='Requires disposable PostgreSQL')
-def test_0041_adds_two_indexes_on_the_jobs_table_and_changes_no_row_and_no_column(database):
-    make, psql, _, migrate = database
-    old_schema = subprocess.run(
-        ['git', '-C', str(ROOT), 'show', f'{RELEASE_BEFORE_0040}:backend/db/schema.sql'],
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout
-    name = make(
-        old_schema + "INSERT INTO datasets (id, name) VALUES (1, 'before');"
-        "INSERT INTO jobs (id, kind, dataset_id, state) VALUES (gen_random_uuid(), 'statistics', 1, 'queued'), "
-        "(gen_random_uuid(), 'backup', NULL, 'queued');",
-    )
-    apply_before(psql, name, '0041')
-    tables = set(psql(name, TABLES).split(',')) - {'schema_migrations'}
-    columns = {table: psql(name, COLUMNS.format(table=table)) for table in tables}
-    rows = rows_as_they_are(psql, name, columns)
-    indexes = set(psql(name, INDEXES).splitlines())
-    (own,) = MIGRATIONS.glob('0041_*.sql')
-    apply_migration(psql, name, own)
-    assert rows_as_they_are(psql, name, columns) == rows  # no row changed
-    assert set(psql(name, TABLES).split(',')) - {'schema_migrations'} == tables
-    assert {table: psql(name, COLUMNS.format(table=table)) for table in tables} == columns  # no column
-    now = set(psql(name, INDEXES).splitlines())
-    assert indexes <= now, sorted(indexes - now)  # none removed or changed
-    added = sorted(now - indexes)
-    assert len(added) == 2 and all(line.startswith('jobs ') for line in added), added
-    outcome = migrate(name)
-    assert outcome.returncode == 0, f'apply_migrations.sh failed\n{outcome.stdout}\n{outcome.stderr}'
 
 
 # --- 2. How they are listed ---

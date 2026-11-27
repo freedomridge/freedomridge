@@ -212,13 +212,15 @@ the suite creates guest accounts.
 
 To change the schema:
 
-1. Add `backend/db/migrations/NNNN_short_name.sql` with the next free four-digit number (`0001_`,
-   `0002_`, ...). Files hold the changes since 1.0.0, which the ledger records as `0000_baseline.sql`.
+1. Add `backend/db/migrations/NNNN_short_name.sql` with the next free four-digit number (`0046_`,
+   `0047_`, ...). Files hold the changes since 2.14.0, whose schema the ledger records as
+   `baseline_2.14.0.sql` (3.0.0 squashed the migrations before it: [docs/UPGRADING.md](docs/UPGRADING.md#from-a-release-before-2140)).
    Never edit, renumber or delete a file that has been released: a database from any release of the
-   major version upgrades straight to the latest through all of them.
+   major version upgrades straight to the latest through all of them. Only a new major version may
+   squash them into a new baseline.
 2. Make the same change in `backend/db/schema.sql` and add the filename to its `schema_migrations`
    list. New databases are created from it. `backend/tests/test_upgrade_paths.py` upgrades a
-   database from every release of the major version with the migrations and fails unless it ends
+   database from every release since the baseline (2.14.0) with the migrations and fails unless it ends
    up identical to a fresh install from `schema.sql`, column order included: add a new column at the
    end of its `CREATE TABLE`. It reads old schemas from the release tags (`git fetch --tags`). If you
    change a function, regenerate `backend/db/functions.sql`
@@ -229,11 +231,11 @@ To change the schema:
    queues, and keep that job kind working for the rest of the major version, since a database from
    that release can upgrade straight to any later one. Migrations only go forward; going back is
    restoring the backup taken before the upgrade.
-   The one exception is `0021_embeddings_partitioned.sql`, which copies every vector into the
-   partitioned table itself: copying while the app ran would have needed every vector write and query
-   in two versions until it finished. It refuses to run while anything else is connected, checks the
-   disk and the lock table first, and its progress notices start with its number (`0021: ...`), which
-   `apply_migrations.sh` shows as they come. A migration that has to do the same follows that pattern,
+   The one exception was 2.9.0's `0021_embeddings_partitioned.sql` (in the 2.x checkouts), which copied
+   every vector into the partitioned table itself: copying while the app ran would have needed every vector
+   write and query in two versions until it finished. It refused to run while anything else was connected,
+   checked the disk and the lock table first, and its progress notices started with its number (`0021: ...`),
+   which `apply_migrations.sh` shows as they come. A migration that has to do the same follows that pattern,
    and its release's upgrade notes say to stop the app.
 4. Think about followers ([docs/FOLLOWERS.md](docs/FOLLOWERS.md)) when a migration changes rows, not only the
    schema. Statements on the tables followers read (`samples`, `embeddings`, `sample_hashes`,

@@ -20,6 +20,8 @@ const APP_SERVICES = ['backend', 'job-runner', 'frontend'];
 const PROJECT = 'freedomridge-try';
 const DEFAULT_PORT = 3000;
 const DEFAULT_API_PORT = 8000;
+// The release a database must be on before this version upgrades it (scripts/apply_migrations.sh refuses an older one).
+const UPGRADE_STOP = '2.14.0';
 
 const HELP = `Freedom Ridge ${VERSION}: run it on this machine with Docker.
 
@@ -311,6 +313,10 @@ async function start(options) {
     const runningVersion = versionOfImage(before.backend && before.backend.image);
     if (runningVersion && compareVersions(runningVersion, VERSION) > 0) {
         fail(`${dir} runs Freedom Ridge ${runningVersion}, newer than this launcher (${VERSION}). Run npx freedomridge@${runningVersion} instead.`);
+    }
+    // This major version upgrades only a database on the last release of the one before (docs/UPGRADING.md).
+    if (runningVersion && compareVersions(runningVersion, UPGRADE_STOP) < 0) {
+        fail(`${dir} runs Freedom Ridge ${runningVersion}. This version upgrades only ${UPGRADE_STOP}: run npx freedomridge@${UPGRADE_STOP} first, then this again.`);
     }
     const updates = {};
     if (options.port) updates.FRIDGE_PORT = options.port;

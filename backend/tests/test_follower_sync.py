@@ -2461,28 +2461,16 @@ def test_edits_sent_up_say_who_made_them_and_no_one_else_can(monkeypatch, regist
     registry_database(scenario)
 
 
-def test_the_0017_backfill_gives_no_identity_to_a_stopped_copy_which_is_then_never_resumed(
-    monkeypatch,
-    registry_database,
-):
+def test_a_stopped_copy_with_no_identity_is_never_resumed(monkeypatch, registry_database):
+    """A copy stopped by a primary's restore before 2.7.0's resume got no identity (a 2.14.0 database can still hold
+    one): the next copy makes a new dataset, though no newer stopped copy is there to be preferred."""
+
     async def scenario(database):
         _, link_id, _, mirror = await mirror_with_own_field(monkeypatch, database)
-        path = os.path.join(os.path.dirname(__file__), '..', 'db', 'migrations', '0017_mirror_resume.sql')
-        with open(path) as migration:
-            backfill = next(statement for statement in migration.read().split(';') if 'UPDATE mirrors' in statement)
-        # A following copy gets its link's identity.
-        await database.execute('UPDATE mirrors SET primary_identity = NULL')
-        await database.execute(backfill)
-        assert (await mirror_of(database))['primary_identity'] is not None
-        # Stopped by a restore before 0017: its link holds the restored database's identity now, which isn't the
-        # copy's, so it gets none.
         await database.execute(
             "UPDATE mirrors SET state = 'stopped', stopped_at = now(), primary_identity = NULL, last_error = $1",
             'The primary was restored into a new database: this copy stopped, and a new one started',
         )
-        await database.execute(backfill)
-        assert (await mirror_of(database))['primary_identity'] is None
-        # The next copy makes a new dataset, though no newer stopped copy is there to be preferred.
         await sync(database, link_id)
         assert await database.fetchval('SELECT count(*) FROM mirrors') == 2
         assert (await mirror_of(database))['dataset_id'] != mirror['dataset_id']

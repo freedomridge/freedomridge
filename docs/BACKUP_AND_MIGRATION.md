@@ -41,6 +41,8 @@ container; it is not the automatically named production Compose DB.
    verification. Keep the original dump untouched throughout recovery. Use a checkout at least as
    new as the dump: compare its migration files with the manifest's `schema_version`. The migration
    runner and `/api/health` refuse a database that records migrations the checkout doesn't have.
+   A dump taken before 2.14.0 is restored with the 2.14.0 checkout, then upgraded
+   ([From a release before 2.14.0](UPGRADING.md#from-a-release-before-2140)).
 2. **Start an empty database on the disk that will hold it.** Build `Dockerfile.db`, which includes
    pgvector and PostGIS. Do not mount `schema.sql`; the dump creates its own extensions. Run from
    the repository root, after creating a new empty pgdata folder on the mounted data disk.

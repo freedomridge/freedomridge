@@ -92,10 +92,16 @@ psql_() {
 export LC_ALL=C
 shopt -s nullglob
 
-# A database created from backend/db/schema.sql records this baseline (the 1.0.0 schema) plus
-# every later file; backend/db/migrations holds the changes since 1.0.0. Keep in step with
+# A database created from backend/db/schema.sql records this baseline (the 2.14.0 schema) plus
+# every later file; backend/db/migrations holds the changes since 2.14.0. Keep in step with
 # backend/schema_check.py.
-BASELINE=0000_baseline.sql
+BASELINE=baseline_2.14.0.sql
+# A 2.14.0 database records instead the 1.0.0 baseline row and the 44 migrations since, listed in
+# STOP_LEDGER, which 3.0.0 squashed into BASELINE: below, those rows are replaced by BASELINE. A
+# database from an older release is refused: it is upgraded to 2.14.0 first (docs/UPGRADING.md).
+UPGRADE_STOP=2.14.0
+STOP_LEDGER=backend/db/ledger_2.14.0.txt
+V1_BASELINE=0000_baseline.sql
 # Only stdout is the ledger: psql's stderr (its error, or a server warning such as a collation
 # version mismatch) goes straight to the terminal.
 if ! RECORDED=$(psql_ -v ON_ERROR_STOP=1 -Atc "SELECT filename FROM schema_migrations"); then
@@ -103,16 +109,37 @@ if ! RECORDED=$(psql_ -v ON_ERROR_STOP=1 -Atc "SELECT filename FROM schema_migra
     echo "  A new database is created from backend/db/schema.sql." >&2
     exit 1
 fi
+AT_STOP=""
 if ! printf '%s\n' "$RECORDED" | grep -qxF "$BASELINE"; then
-    echo "  ERROR: this database was not created from backend/db/schema.sql (its ledger has no $BASELINE); nothing was applied" >&2
-    exit 1
+    if ! printf '%s\n' "$RECORDED" | grep -qxF "$V1_BASELINE"; then
+        echo "  ERROR: this database was not created from backend/db/schema.sql (its ledger has no $BASELINE); nothing was applied" >&2
+        exit 1
+    fi
+    if grep -qvxF -f <(printf '%s\n' "$RECORDED") "$STOP_LEDGER"; then
+        echo "  ERROR: this database is from a release before $UPGRADE_STOP (its ledger lacks some of $UPGRADE_STOP's migrations); nothing was applied." >&2
+        echo "  This version upgrades only a $UPGRADE_STOP database. Check out v$UPGRADE_STOP, run its scripts/apply_migrations.sh" >&2
+        echo "  the way you ran this one, then check out this version again and run this again (docs/UPGRADING.md)." >&2
+        exit 1
+    fi
+    AT_STOP=1
 fi
-KNOWN=$(printf '%s\n' "$BASELINE"; for migration in backend/db/migrations/*.sql; do basename "$migration"; done)
+KNOWN=$(printf '%s\n' "$BASELINE"; [ -z "$AT_STOP" ] || cat "$STOP_LEDGER"
+        for migration in backend/db/migrations/*.sql; do basename "$migration"; done)
 UNKNOWN=$(printf '%s\n' "$RECORDED" | grep -vxF -f <(printf '%s\n' "$KNOWN") || true)
 if [ -n "$UNKNOWN" ]; then
     echo "  ERROR: the database records migrations this code does not have: ${UNKNOWN//$'\n'/ }" >&2
     echo "  It is newer than this code (a newer version ran against it, or a newer backup was restored); nothing was applied." >&2
     exit 1
+fi
+
+# A $UPGRADE_STOP database: its ledger rows that BASELINE stands for become that one row, in one transaction.
+if [ -n "$AT_STOP" ]; then
+    echo "Recording $BASELINE in place of the $(wc -l < "$STOP_LEDGER") ledger rows of a $UPGRADE_STOP database..."
+    { printf 'DELETE FROM schema_migrations WHERE filename IN (%s);\n' "$(sed "s/.*/'&'/" "$STOP_LEDGER" | paste -sd, -)"
+      printf "INSERT INTO schema_migrations (filename) VALUES ('%s');\n" "$BASELINE"; } \
+        | psql_ --single-transaction -v ON_ERROR_STOP=1 -q \
+        || { echo "  ERROR recording $BASELINE; the ledger is unchanged and nothing was applied" >&2; exit 1; }
+    RECORDED=$(printf '%s\n' "$BASELINE"; printf '%s\n' "$RECORDED" | grep -vxF -f "$STOP_LEDGER" || true)
 fi
 
 # A long migration's progress, as it comes: its notices that start with its own number

@@ -3969,8 +3969,8 @@ CREATE OR REPLACE TRIGGER trg_samples_field_kinds_truncate
 CREATE OR REPLACE TRIGGER trg_datasets_field_kinds
     AFTER INSERT ON datasets FOR EACH ROW EXECUTE FUNCTION field_kinds_dataset_created();
 
--- Ledger of applied migrations: the 1.0.0 baseline, then the files in backend/db/migrations/
--- (0001_..., 0002_...) that scripts/apply_migrations.sh applies to existing databases. A fresh install
+-- Ledger of applied migrations: the 2.14.0 baseline, then the files in backend/db/migrations/
+-- (0045_..., 0046_...) that scripts/apply_migrations.sh applies to existing databases. A fresh install
 -- from this file IS current: when you add a migration, make the same change here and ADD ITS
 -- FILENAME to this list (backend/tests/test_schema_check.py fails if the lists differ).
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -3978,50 +3978,6 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
     applied_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now()
 );
 INSERT INTO schema_migrations (filename) VALUES
-    ('0000_baseline.sql'),
-    ('0001_storage_config_dataset_scope.sql'),
-    ('0002_dataset_default_view.sql'),
-    ('0003_compute_worker_tokens.sql'),
-    ('0004_map_state_without_model.sql'),
-    ('0005_map_placement_history.sql'),
-    ('0006_map_placement_hold.sql'),
-    ('0007_follower_change_log.sql'),
-    ('0008_followers.sql'),
-    ('0009_mirrors.sql'),
-    ('0010_compute_launcher.sql'),
-    ('0011_compute_launcher_arm.sql'),
-    ('0012_follower_images.sql'),
-    ('0013_follower_restarts.sql'),
-    ('0014_follower_instance.sql'),
-    ('0015_follower_fields.sql'),
-    ('0016_follower_searches.sql'),
-    ('0017_mirror_resume.sql'),
-    ('0018_follower_leave.sql'),
-    ('0019_follower_truncate_guard.sql'),
-    ('0020_mirror_restores.sql'),
-    ('0021_embeddings_partitioned.sql'),
-    ('0022_local_fields.sql'),
-    ('0023_stuck_deletion_default_view.sql'),
-    ('0024_version_saved_views.sql'),
-    ('0025_version_created_by.sql'),
-    ('0026_mirror_primary_versions.sql'),
-    ('0027_map_layouts.sql'),
-    ('0028_view_updated_at.sql'),
-    ('0029_object_parent_column.sql'),
-    ('0030_object_parent_key.sql'),
-    ('0031_metadata_instant.sql'),
-    ('0032_datetime_index_rebuilds.sql'),
-    ('0033_access_levels.sql'),
-    ('0034_regions.sql'),
-    ('0035_field_descriptions.sql'),
-    ('0036_assistant.sql'),
-    ('0037_mcp_tokens_and_assistant_calls.sql'),
-    ('0038_assistant_working_views.sql'),
-    ('0039_region_sets_bundled.sql'),
-    ('0040_assistant_admin_tools.sql'),
-    ('0041_jobs_across_datasets.sql'),
-    ('0042_protected_metadata_keys.sql'),
-    ('0043_reserved_names_never_fields.sql'),
-    ('0044_field_kinds.sql'),
+    ('baseline_2.14.0.sql'),
     ('0045_list_columns_hold_never_set.sql')
 ON CONFLICT (filename) DO NOTHING;

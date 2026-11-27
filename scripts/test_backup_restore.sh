@@ -124,7 +124,7 @@ SAMPLE_CHECK="$(psql_ -d "$DST_DB" -tAc \
     "SELECT count(*) FROM samples WHERE filepath LIKE 's3://bkrt/img_%' AND metadata->>'idx' IS NOT NULL AND 'seed' = ANY(tags)" | tr -d '[:space:]')"
 [ "$SAMPLE_CHECK" = "1000" ] || fail "restored sample CONTENT is wrong (matched $SAMPLE_CHECK of 1000)"
 
-[ "$(psql_ -d "$DST_DB" -Atc "SELECT count(*) FROM schema_migrations WHERE filename = '0000_baseline.sql'")" = 1 ] \
+[ "$(psql_ -d "$DST_DB" -Atc "SELECT count(*) FROM schema_migrations WHERE filename = 'baseline_2.14.0.sql'")" = 1 ] \
     || fail "the restored ledger lost the baseline"
 BODY="$(psql_ -d "$DST_DB" -Atc "SELECT prosrc FROM pg_proc WHERE proname = 'mark_dataset_stats_stale'")"
 case "$BODY" in

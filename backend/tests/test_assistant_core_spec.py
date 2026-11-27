@@ -32,25 +32,17 @@ Where the contract is silent these tests read it this way:
   `ok` or an error, never raises.
 """
 
-import asyncio
 import importlib
 import json
 import os
-import secrets
 import subprocess
 import sys
-from pathlib import Path
 from typing import Any, Optional
-from urllib.parse import urlparse
 
 import asyncpg
-import httpx
 import pytest
 
-from backend import database as database_module
-from backend import main, statistics_measure
-from backend.crypto import hash_token
-from backend.database import init_connection
+from backend import statistics_measure
 from backend.routers import datasets
 from backend.tests import test_access_rule_spec, test_field_registry_postgres, test_upgrade_paths
 from backend.tests.statistics_helpers import run_refresh
@@ -1271,91 +1263,3 @@ def test_describe_dataset_reads_the_kept_statistics_and_never_counts_the_samples
         assert 'brand-new' not in json.dumps(field), field  # the kept statistics', not a count of the samples
 
     world(scenario)
-
-
-# --- The upgrade ---
-
-RELEASE = 'v2.13.1'
-MIGRATIONS = ROOT / 'backend/db/migrations'
-TABLES = "SELECT string_agg(tablename, ',' ORDER BY tablename) FROM pg_tables WHERE schemaname = 'public'"
-COLUMNS = (
-    "SELECT string_agg(quote_ident(column_name), ', ' ORDER BY ordinal_position) FROM information_schema.columns "
-    "WHERE table_schema = 'public' AND table_name = '{table}'"
-)
-
-
-def apply_migration(psql: Any, name: str, migration: Path) -> None:
-    """One migration file as scripts/apply_migrations.sh applies it: in one transaction with its ledger row."""
-    ledger = f"INSERT INTO schema_migrations (filename) VALUES ('{migration.name}');"
-    psql(name, f'BEGIN;\n{migration.read_text()}\n{ledger}\nCOMMIT;\n')
-
-
-def apply_before(psql: Any, name: str, number: str) -> None:
-    """The migrations numbered below `number` the database doesn't record, in the runner's (byte) order."""
-    recorded = set(psql(name, 'SELECT filename FROM schema_migrations').splitlines())
-    for migration in sorted(MIGRATIONS.glob('*.sql'), key=lambda found: found.name.encode()):
-        if migration.name < number and migration.name not in recorded:
-            apply_migration(psql, name, migration)
-
-
-def rows_as_they_are(psql: Any, name: str, columns: dict[str, str]) -> dict[str, str]:
-    """Each table's rows, read on the columns it had."""
-    return {
-        table: psql(
-            name,
-            f"SELECT md5(coalesce(string_agg(r::text, E'\\n' ORDER BY r::text), '')) "
-            f'FROM (SELECT {listed} FROM {table}) r',
-        )
-        for table, listed in columns.items()
-    }
-
-
-@pytest.mark.skipif(not os.getenv('FRIDGE_TEST_POSTGRES_CONTAINER'), reason='Requires disposable PostgreSQL')
-def test_0036_leaves_the_door_off_and_existing_datasets_open(database, monkeypatch):
-    make, psql, _, migrate = database
-    old_schema = subprocess.run(
-        ['git', '-C', str(ROOT), 'show', f'{RELEASE}:backend/db/schema.sql'],
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout
-    name = make(old_schema + "INSERT INTO datasets (id, name) VALUES (1, 'before'), (2, 'also-before');")
-    # 0036 on its own, after whatever comes before it: every row that was there, as it was.
-    apply_before(psql, name, '0036')
-    tables = set(psql(name, TABLES).split(',')) - {'schema_migrations'}
-    columns = {table: psql(name, COLUMNS.format(table=table)) for table in tables}
-    rows = rows_as_they_are(psql, name, columns)
-    (own,) = MIGRATIONS.glob('0036_*.sql')
-    apply_migration(psql, name, own)
-    assert rows_as_they_are(psql, name, columns) == rows  # every table's rows, on the columns it had
-    # The rest of the way, as an upgrade runs: the app then reads the upgraded database.
-    result_ = migrate(name)
-    assert result_.returncode == 0, f'apply_migrations.sh failed\n{result_.stdout}\n{result_.stderr}'
-
-    async def after() -> None:
-        dsn = urlparse(os.environ['FRIDGE_TEST_POSTGRES_DSN'])._replace(path=f'/{name}').geturl()
-        pool = await asyncpg.create_pool(dsn, min_size=1, max_size=4, init=init_connection)
-        monkeypatch.setattr(database_module.db, 'pool', pool)
-        monkeypatch.setattr(datasets, '_array_columns_cache', None)
-        try:
-            raw = secrets.token_urlsafe(32)
-            await pool.execute('UPDATE users SET must_change_password = FALSE WHERE id = $1', ADMIN)
-            await pool.execute(
-                "INSERT INTO api_tokens (user_id, token, name) VALUES ($1, $2, 'upgrade')",
-                ADMIN,
-                hash_token(raw),
-            )
-            headers = {'Authorization': f'Bearer {raw}'}
-            transport = httpx.ASGITransport(app=main.app)
-            async with httpx.AsyncClient(transport=transport, base_url='http://test') as client:
-                state = (await client.get(SETTINGS, headers=headers)).json()
-                assert {key: state.get(key) for key in SHIPPED} == SHIPPED, state  # 0036's settings, as shipped
-                listed = (await client.get('/api/datasets', headers=headers)).json()
-                assert {row['id']: row['assistant_closed'] for row in listed} == {1: False, 2: False}
-            assert await assistant.door_refusal(user_id=ADMIN, door='mcp') == MCP_OFF
-            answer = plain(await assistant.call_tool(user_id=ADMIN, door='mcp', name='list_datasets', arguments={}))
-            assert answer == {'ok': False, 'error': {'code': 'not_allowed', 'message': MCP_OFF, 'retryable': False}}
-        finally:
-            await pool.close()
-
-    asyncio.run(after())

@@ -6,6 +6,14 @@ it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
 
 ## Unreleased
 
+- **Upgrade from 2.14.0: the migrations before it are squashed into a new baseline**
+  ([From a release before 2.14.0](docs/UPGRADING.md#from-a-release-before-2140)). `0001` to `0044` are now one baseline
+  schema, 2.14.0's, which the ledger records as `baseline_2.14.0.sql`. On a 2.14.0 database `scripts/apply_migrations.sh`
+  first records it in place of the ledger's 45 rows (the 1.0.0 baseline and its 44 migrations), changing no table, then
+  applies the migrations since. A database from an older release is refused before anything changes, and
+  `/api/health` answers 503 saying so: upgrade it to 2.14.0 first, then to this release. A backup taken before 2.14.0 is
+  restored with the 2.14.0 checkout first. The launcher (`npx freedomridge`) upgrades a folder from 2.14.0 only and
+  otherwise says to run `npx freedomridge@2.14.0` first.
 - **A change in behaviour: a sample with no value for a field never matches a comparison of that field, and never
   matches the `NOT` of one, on every dataset and through every reader** ([FILTER_QUERY.md](docs/FILTER_QUERY.md#operators)).
   Only `is null` and `not exists` find it. Before, three places kept the samples with no value, and now show fewer

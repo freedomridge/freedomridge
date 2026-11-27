@@ -44,7 +44,6 @@ import json
 import math
 import os
 import re
-import subprocess
 from pathlib import Path
 from typing import Any, Optional
 from unittest.mock import AsyncMock
@@ -1296,27 +1295,6 @@ def test_a_relayed_follower_search_refuses_a_region_filter():
 
 # --- The upgrade ---
 
-RELEASE = 'v2.13.1'  # the last release before 0034
-UPGRADE_SEED = """
-INSERT INTO datasets (id, name, description) VALUES (1, 'farm', 'fields and plots'), (2, 'empty', NULL);
-SELECT setval(pg_get_serial_sequence('datasets', 'id'), 2);
-INSERT INTO samples (dataset_id, filepath, media_type, metadata, tags, location) VALUES
-    (1, 's3://upgrade/a.jpg', 'image', '{"plot": "a", "score": 0.5}', '{seen}',
-     ST_SetSRID(ST_MakePoint(2.5, 2.5), 4326)),
-    (1, 's3://upgrade/b.jpg', 'image', '{"plot": "b", "location": "barn"}', '{}',
-     ST_SetSRID(ST_MakePoint(-175, -5), 4326)),
-    (1, 's3://upgrade/c.jpg', 'image', '{"plot": "c"}', '{}', NULL);
-INSERT INTO dataset_fields (dataset_id, field_name, field_type, origin, is_promoted, display_type) VALUES
-    (1, 'plot', 'string', 'metadata', FALSE, NULL),
-    (1, 'score', 'number', 'metadata', TRUE, 'enum'),
-    (1, 'location', 'string', 'metadata', FALSE, NULL);
-"""
-TABLES = "SELECT string_agg(tablename, ',' ORDER BY tablename) FROM pg_tables WHERE schemaname = 'public'"
-COLUMNS = (
-    "SELECT string_agg(quote_ident(column_name), ', ' ORDER BY ordinal_position) FROM information_schema.columns "
-    "WHERE table_schema = 'public' AND table_name = '{table}'"
-)
-
 
 MIGRATIONS = ROOT / 'backend/db/migrations'
 
@@ -1333,85 +1311,3 @@ def apply_before(psql: Any, name: str, number: str) -> None:
     for migration in sorted(MIGRATIONS.glob('*.sql'), key=lambda found: found.name.encode()):
         if migration.name < number and migration.name not in recorded:
             apply_migration(psql, name, migration)
-
-
-def tables_as_they_are(psql: Any, name: str, tables: set[str]) -> dict[str, tuple[str, str]]:
-    """Each table's columns, and its rows read on those columns (the migrations' ledger aside)."""
-    found = {}
-    for table in sorted(tables - {'schema_migrations'}):
-        listed = psql(name, COLUMNS.format(table=table))
-        rows = psql(
-            name,
-            f"SELECT md5(coalesce(string_agg(r::text, E'\\n' ORDER BY r::text), '')) "
-            f'FROM (SELECT {listed} FROM {table}) r',
-        )
-        found[table] = (listed, rows)
-    return found
-
-
-@pytest.mark.skipif(not os.getenv('FRIDGE_TEST_POSTGRES_CONTAINER'), reason='Requires disposable PostgreSQL')
-def test_0034_adds_empty_region_tables_and_changes_nothing_else(database, monkeypatch):
-    make, psql, _, migrate = database
-    old_schema = subprocess.run(
-        ['git', '-C', str(ROOT), 'show', f'{RELEASE}:backend/db/schema.sql'],
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout
-    name = make(old_schema + UPGRADE_SEED)
-    seeded = psql(name, "SELECT string_agg(r::text, E'\\n' ORDER BY r::text) FROM (SELECT * FROM samples) r")
-    assert seeded.count('\n') == 2 and 'barn' in seeded
-    # 0034 on its own, after whatever comes before it: what it adds, and that it changes nothing that was there.
-    apply_before(psql, name, '0034')
-    tables_before = set(psql(name, TABLES).split(','))
-    before = tables_as_they_are(psql, name, tables_before)
-    (own,) = MIGRATIONS.glob('0034_*.sql')
-    apply_migration(psql, name, own)
-    assert tables_as_they_are(psql, name, tables_before) == before  # every table's columns and rows, as they were
-    added = set(psql(name, TABLES).split(',')) - tables_before
-    assert any('region' in table for table in added), added
-    for table in sorted(added):
-        assert psql(name, f'SELECT count(*) FROM {table}') == '0', table
-    # The rest of the way, as an upgrade runs: the app then reads the upgraded database.
-    result = migrate(name)
-    assert result.returncode == 0, f'apply_migrations.sh failed\n{result.stdout}\n{result.stderr}'
-
-    async def after() -> None:
-        url = urlparse(os.environ['FRIDGE_TEST_POSTGRES_DSN'])._replace(path=f'/{name}').geturl()
-        pool = await asyncpg.create_pool(url, min_size=1, max_size=4, init=init_connection)
-        monkeypatch.setattr(database_module.db, 'pool', pool)
-        monkeypatch.setattr(datasets, '_array_columns_cache', None)
-        try:
-            upgraded = Database()
-            upgraded.pool = pool
-            transport = httpx.ASGITransport(app=main.app)
-            async with httpx.AsyncClient(transport=transport, base_url='http://test') as client:
-                w = World(upgraded, client)
-                await w.user(ADMIN, 'admin')
-                sets = (await w.call(ADMIN, 'GET', '/api/admin/regions')).json()['sets']
-                assert [item['loaded'] for item in sets if item['name'] == SET] == [None], sets
-                assert (await w.call(ADMIN, 'GET', '/api/regions', params={'search': 'XA'})).json() == []
-                assert (await w.call(ADMIN, 'GET', '/api/regions/XA-NM')).status_code == 404
-                for node in (keep('XA-NM'), drop('XA-NM')):
-                    response = await w.call(ADMIN, 'POST', '/api/datasets/1/samples/query', json={'filters': node})
-                    message = refusal(response)
-                    assert all(word in message.lower() for word in NOT_LOADED), message
-                parsed = await w.call(
-                    ADMIN,
-                    'POST',
-                    '/api/datasets/1/filter_query/parse',
-                    json={'query': 'location within "XA-NM"', 'current': []},
-                )
-                assert parsed.status_code == 400, parsed.text
-                # The field named location reads as it did.
-                plain = await w.call(
-                    ADMIN,
-                    'POST',
-                    '/api/datasets/1/samples/query',
-                    json={'filters': {'field': 'location', 'operator': '=', 'value': 'barn'}},
-                )
-                assert plain.status_code == 200 and plain.json()['total'] == 1, plain.text
-        finally:
-            await pool.close()
-
-    asyncio.run(after())

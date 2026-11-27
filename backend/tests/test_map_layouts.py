@@ -7,7 +7,6 @@ test_follower_layouts.py). The scatter and the dataset answer the id; a map with
 import json
 import os
 import struct
-import subprocess
 import sys
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -364,36 +363,3 @@ def test_deleting_a_dataset_removes_its_layout_ids_in_bounded_units(registry_dat
         assert not await db.fetchval('SELECT 1 FROM datasets WHERE id = 1')
 
     registry_database(scenario)
-
-
-# A 2.9.0 database with a map: the upgrade writes no layout row and logs nothing for followers.
-UPGRADE_RELEASE = 'v2.9.0'
-UPGRADE_SEED = """
-INSERT INTO datasets (name, followed) VALUES ('mapped', TRUE);
-INSERT INTO samples (dataset_id, filepath, media_type) SELECT 1, 'mapped-' || g, 'image' FROM generate_series(1, 5) g;
-INSERT INTO embeddings (dataset_id, sample_id, field_name, vector)
-    SELECT 1, id, 'clip', ARRAY[id, 1]::real[]::vector FROM samples;
-INSERT INTO embedding_coordinates (sample_id, field_name, x, y) SELECT id, 'clip', id, -id FROM samples;
-"""
-
-
-def test_the_upgrade_leaves_every_map_on_the_layout_it_has(database):  # noqa: F811
-    make, psql, _, migrate = database
-    old_schema_sql = subprocess.run(
-        ['git', '-C', str(ROOT), 'show', f'{UPGRADE_RELEASE}:backend/db/schema.sql'],
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout
-    name = make(old_schema_sql + UPGRADE_SEED)
-    logged = psql(name, 'SELECT count(*) FROM dataset_changes')
-    result = migrate(name)
-    assert result.returncode == 0, f'apply_migrations.sh failed\n{result.stdout}\n{result.stderr}'
-    assert psql(name, 'SELECT count(*) FROM embedding_layouts') == '0'
-    assert psql(name, 'SELECT count(*) FROM dataset_changes') == logged
-    # The first new layout after it: a row, and the map's followers are told.
-    psql(name, "SELECT bump_map_layout(1, 'clip')")
-    assert (
-        psql(name, "SELECT count(*) FROM embedding_layouts WHERE field_name = 'clip' AND layout_id IS NOT NULL") == '1'
-    )
-    assert int(psql(name, 'SELECT count(*) FROM dataset_changes')) == int(logged) + 1

@@ -15,10 +15,10 @@ What is tested, rule by rule:
 - 1.4 and 5.2: a first value written while the clearing runs is found at once, and still after the clearing ends.
 - 1.4 c: a mark no row needs is cleared by a later clearing with no further write, also when the write that took
   the kind's last value raced the clearing before it.
-- 1.5: a dataset made before the record (by the last release's schema, then this checkout's migrations) counts every
-  field as seen on both kinds, and reads as before. So does it on a database the record's migration has not reached
-  (the migrations up to the newest on the base only), where no read fails; and the record's migration, run a second
-  time after the upgrade, changes nothing.
+- 1.5: a dataset from before the record (its rows, and nothing of it in the record: what the upgrade that brought
+  the record left) counts every field as seen on both kinds, and reads as before. The database that upgrade had not
+  reached, and its migration run a second time, went with the migration's file when 3.0.0 made the schema after it
+  the baseline.
 - 1.6: `location` and a concept's scores, written to an object for the first time, are found at once by a place and
   a concept filter (pins; the contract leaves to the implementer which of them the record covers). The place's test
   is no longer a pin: its exclusions follow the later contract g7 (one rule everywhere, rule 1.6), see its docstring.
@@ -59,33 +59,26 @@ import asyncio
 import importlib
 import json
 import os
-import subprocess
 import time
 from dataclasses import dataclass, field, replace
-from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
 from unittest.mock import AsyncMock
-from urllib.parse import urlparse
 
-import asyncpg
 import httpx
 import pytest
 
 from backend import concept_jobs, follower_sync, main
-from backend import database as database_module
 from backend.crypto import decrypt_secret, encrypt_secret
-from backend.database import PLANNING, Database, init_connection
 from backend.job_heartbeat import heartbeat_connector
 from backend.job_runner import ServerWorker
-from backend.routers import datasets, followers, versions
+from backend.routers import followers
 from backend.tests import test_regions_spec, test_upgrade_paths
-from backend.tests.test_access_rule_spec import ADMIN, ROLES
+from backend.tests.test_access_rule_spec import ADMIN
 from backend.tests.test_assistant_conversation_spec import count_statistics
 from backend.tests.test_bulk_jobs import finish
 from backend.tests.test_follower_sync import sync
 from backend.tests.test_objects_filter_reading_spec import SQUARE, Reading, Row, card, page_filter
-from backend.tests.test_regions_spec import ADMIN_USER, Regions, apply_before, nodes, post, selected
-from backend.tests.test_upgrade_paths import ROOT
+from backend.tests.test_regions_spec import ADMIN_USER, Regions, nodes, post, selected
 from scripts import copy_objects
 
 database = test_upgrade_paths.database
@@ -96,8 +89,6 @@ pytestmark = pytest.mark.skipif(
 )
 
 GRAINS = ('image', 'object')
-# The last release before the record: a database made by its schema has datasets the record has never examined.
-RELEASE_BEFORE_THE_RECORD = 'v2.13.2'
 
 
 # --- The planted dataset ---
@@ -1158,107 +1149,28 @@ def test_1_4_c_a_mark_no_row_needs_is_cleared_by_a_later_clearing_without_any_fu
 
 # --- 1.5: a dataset not yet examined ---
 
-# A dataset as the last release before the record left it: images with `colour`, objects with `label`, `source` on
-# both, registered and counted as that release registered them.
-BEFORE_THE_RECORD = """
-INSERT INTO datasets (id, name) VALUES (7, 'from-before-the-record');
-INSERT INTO samples (id, dataset_id, filepath, media_type, metadata) VALUES
-    (101, 7, 'img-1.jpg', 'image', '{"colour": "red", "source": "drone"}'),
-    (102, 7, 'img-2.jpg', 'image', '{"colour": "blue"}'),
-    (103, 7, 'img-3.jpg', 'image', '{}'),
-    (104, 7, 'car-1.jpg', 'object', '{"label": "car", "parent_id": 101}'),
-    (105, 7, 'truck-2.jpg', 'object', '{"label": "truck", "source": "tractor", "parent_id": 102}'),
-    (106, 7, 'car-3.jpg', 'object', '{"label": "car", "parent_id": 103}');
-SELECT setval(pg_get_serial_sequence('samples', 'id'), 200);
-SELECT setval(pg_get_serial_sequence('datasets', 'id'), 7);
-INSERT INTO dataset_fields (dataset_id, field_name, field_type) VALUES
-    (7, 'colour', 'string'), (7, 'source', 'string'), (7, 'label', 'string'), (7, 'parent_id', 'number');
-INSERT INTO dataset_field_stats (dataset_id, field_name, field_type, sample_count) VALUES
-    (7, 'colour', 'string', 2), (7, 'source', 'string', 2), (7, 'label', 'string', 3), (7, 'parent_id', 'number', 3);
-"""
-OLD = 7
+# Images with `colour`, objects with `label`, `source` on both.
+OLD_ROWS: dict[str, Plant] = {
+    'img-1': an_image({'colour': 'red', 'source': 'drone'}),
+    'img-2': an_image({'colour': 'blue'}),
+    'img-3': an_image({}),
+    'car-1': an_object('img-1', {'label': 'car'}),
+    'truck-2': an_object('img-2', {'label': 'truck', 'source': 'tractor'}),
+    'car-3': an_object('img-3', {'label': 'car'}),
+}
+# What the record keeps of a dataset: its marks, the notes of its writes, and the row that says it was examined.
+THE_RECORD = ('dataset_field_kinds', 'dataset_field_kinds_pending', 'dataset_field_kinds_state')
 
 
-# The newest migration on the branch these tests were written against: a later one is the record's (1.5).
-LAST_ON_THE_BASE = '0043'
-MIGRATIONS = ROOT / 'backend/db/migrations'
-
-
-def the_records_migrations() -> list[Path]:
-    """The migration files after LAST_ON_THE_BASE, in the runner's (byte) order."""
-    found = sorted(
-        (path for path in MIGRATIONS.glob('*.sql') if path.name[:4] > LAST_ON_THE_BASE),
-        key=lambda path: path.name.encode(),
-    )
-    assert found, f'no migration after {LAST_ON_THE_BASE} in backend/db/migrations: the record\'s migration is not here'
-    return found
-
-
-def from_before_the_record(database: Any, upgrade: bool) -> str:
-    """A database made by the last release's schema with BEFORE_THE_RECORD in it. Then, with `upgrade`, this
-    checkout's whole upgrade (scripts/apply_migrations.sh); without it, only the migrations up to LAST_ON_THE_BASE,
-    one by one as the runner applies them: the record's migration has not run (1.5, as when the server is started
-    before scripts/apply_migrations.sh). Its name."""
-    make, psql, _, migrate = database
-    old_schema = subprocess.run(
-        ['git', '-C', str(ROOT), 'show', f'{RELEASE_BEFORE_THE_RECORD}:backend/db/schema.sql'],
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout
-    name = make(old_schema + BEFORE_THE_RECORD)
-    if upgrade:
-        upgraded = migrate(name)
-        assert upgraded.returncode == 0, f'apply_migrations.sh failed\n{upgraded.stdout}\n{upgraded.stderr}'
-    else:
-        apply_before(psql, name, f'{int(LAST_ON_THE_BASE) + 1:04d}')
-    return name
-
-
-def serve(name: str, monkeypatch: Any, tmp_path: Path, scenario: Callable[[Regions], Awaitable[None]]) -> None:
-    """The region tests' world (test_regions_spec.regions_world) on the database `name`; no background work runs."""
-    url = urlparse(os.environ['FRIDGE_TEST_POSTGRES_DSN'])._replace(path=f'/{name}').geturl()
-    monkeypatch.setattr(database_module, 'DATABASE_URL', url)
-    monkeypatch.setenv('DATABASE_URL', url)
-    monkeypatch.setattr(datasets, '_array_columns_cache', None)
-    monkeypatch.setattr(datasets, 'require_free_space', AsyncMock())
-    monkeypatch.setattr(datasets, 'validate_embedding_dims', AsyncMock())
-    monkeypatch.setattr(versions, 'require_free_space', AsyncMock())
-    monkeypatch.setattr(versions, 'estimate_snapshot_bytes', AsyncMock(return_value=0))
-
-    async def body() -> None:
-        pool = await asyncpg.create_pool(
-            url,
-            min_size=1,
-            max_size=8,
-            init=init_connection,
-            server_settings={'statement_timeout': '30000', **PLANNING},
-        )
-        monkeypatch.setattr(database_module.db, 'pool', pool)
-        database_ = Database()
-        database_.pool = pool
-        try:
-            transport = httpx.ASGITransport(app=main.app)
-            async with httpx.AsyncClient(transport=transport, base_url='http://test') as client:
-                r = Regions(database_, client, url, tmp_path, monkeypatch)
-                for user_id, role in ROLES.items():
-                    await r.user(user_id, role)
-                await scenario(r)
-        finally:
-            await pool.close()
-
-    asyncio.run(body())
-
-
-@pytest.fixture
-def upgraded_world(database, monkeypatch, tmp_path):
-    """The region tests' world on a database made by the last release's schema with BEFORE_THE_RECORD in it, then
-    upgraded by this checkout's migrations; no background work runs."""
-
-    def run(scenario):
-        serve(from_before_the_record(database, upgrade=True), monkeypatch, tmp_path, scenario)
-
-    return run
+async def from_before_the_record(r: Regions) -> int:
+    """A dataset as the upgrade that brought the record left it: its rows, and nothing of it in the record (that
+    upgrade made the record's tables empty and examined no dataset; a database from a release before it can no longer
+    be made here, so the dataset is made through the API and what the record holds of it is taken out). No background
+    work runs. Its id."""
+    w = await plant(r, OLD_ROWS, 'from-before-the-record')
+    for table in THE_RECORD:
+        await r.database.execute(f'DELETE FROM {table} WHERE dataset_id = $1', w.dataset_id)
+    return w.dataset_id
 
 
 OLD_FORMS = [
@@ -1273,17 +1185,19 @@ OLD_FORMS = [
 ]
 
 
-def test_1_5_pin_a_dataset_from_before_the_record_reads_as_before_on_both_grids(upgraded_world):
+def test_1_5_pin_a_dataset_from_before_the_record_reads_as_before_on_both_grids(regions_world):
     async def scenario(r):
-        stages = await stages_of(r, OLD, OLD_FORMS)
-        await assert_grids_read(r, OLD, stages, await grids(r, OLD, stages))
+        old = await from_before_the_record(r)
+        stages = await stages_of(r, old, OLD_FORMS)
+        await assert_grids_read(r, old, stages, await grids(r, old, stages))
 
-    upgraded_world(scenario)
+    regions_world(scenario)
 
 
-def test_1_5_a_dataset_not_yet_examined_counts_every_field_as_seen_on_both_kinds(upgraded_world):
+def test_1_5_a_dataset_not_yet_examined_counts_every_field_as_seen_on_both_kinds(regions_world):
     async def scenario(r):
-        found = await kinds(r, OLD)
+        old = await from_before_the_record(r)
+        found = await kinds(r, old)
         assert {name: found.get(name) for name in ('colour', 'source', 'label')} == {
             'colour': (True, True),
             'source': (True, True),
@@ -1291,75 +1205,4 @@ def test_1_5_a_dataset_not_yet_examined_counts_every_field_as_seen_on_both_kinds
         }
         assert all(pair == (True, True) for pair in found.values()), found
 
-    upgraded_world(scenario)
-
-
-def test_1_5_pin_a_database_the_records_migration_has_not_run_on_reads_as_after_the_upgrade(
-    database,
-    monkeypatch,
-    tmp_path,
-):
-    """1.5 (added from the first full run): on a database the record's migration has not reached, the grids show what
-    the contract's reading shows, the same rows as after the upgrade (the pin above), and nothing fails."""
-
-    async def scenario(r: Regions) -> None:
-        stages = await stages_of(r, OLD, OLD_FORMS)
-        await assert_grids_read(r, OLD, stages, await grids(r, OLD, stages))
-
-    serve(from_before_the_record(database, upgrade=False), monkeypatch, tmp_path, scenario)
-
-
-def test_1_5_a_database_the_records_migration_has_not_run_on_counts_every_field_as_seen_on_both_kinds(
-    database,
-    monkeypatch,
-    tmp_path,
-):
-    """1.5 (added from the first full run): no read fails over the missing record, and every form of field-stats says
-    every field has been seen on both kinds."""
-
-    async def scenario(r: Regions) -> None:
-        where = f'/api/datasets/{OLD}/field-stats'
-        for form, response in (
-            ('GET', await r.call(ADMIN, 'GET', where)),
-            ('GET brief', await r.call(ADMIN, 'GET', where, params={'brief': 'true'})),
-            ('POST', await post(r, where, {})),
-            ('POST facet request', await post(r, where, {'fields': ['colour', 'source', 'label']})),
-        ):
-            found = kinds_in(await field_entries(response))
-            assert {'colour', 'source', 'label'} <= set(found), (form, found)
-            assert all(pair == (True, True) for pair in found.values()), (form, found)
-
-    serve(from_before_the_record(database, upgrade=False), monkeypatch, tmp_path, scenario)
-
-
-def test_1_5_the_records_migration_run_a_second_time_changes_nothing(database, monkeypatch, tmp_path):
-    """1.5 (added from the first full run): after the upgrade, the record's migration files run again, each in one
-    transaction as the runner runs it, succeed and change nothing: the schema, the members of a dataset not yet
-    examined (from before the record) and of one examined from the start (made after the upgrade), and what the
-    grids show on both."""
-    migrations = the_records_migrations()
-    _, psql, schema, _ = database
-    name = from_before_the_record(database, upgrade=True)
-
-    async def scenario(r: Regions) -> None:
-        w = await plant(r)
-        stages = {
-            OLD: await stages_of(r, OLD, OLD_FORMS),
-            w.dataset_id: await stages_of(r, w.dataset_id, FORMS['colour']),
-        }
-
-        async def state() -> tuple[Any, ...]:
-            members = {dataset: await kinds(r, dataset) for dataset in stages}
-            shown = {dataset: await grids(r, dataset, stages[dataset]) for dataset in stages}
-            return members, shown, schema(name)
-
-        before = await state()
-        assert before[0][w.dataset_id]['colour'] == (True, False), before[0]
-        for migration in migrations:
-            await asyncio.to_thread(psql, name, f'BEGIN;\n{migration.read_text()}\nCOMMIT;\n')
-        after = await state()
-        assert after[0] == before[0], ('members', before[0], after[0])
-        assert after[1] == before[1], 'what the grids show'
-        assert after[2] == before[2], 'the schema'
-
-    serve(name, monkeypatch, tmp_path, scenario)
+    regions_world(scenario)

@@ -3,7 +3,6 @@ and local_tags, which a write under fridge.mirror_local may change and nothing e
 each field, and the sync keeps this instance's own."""
 
 import os
-from pathlib import Path
 
 import asyncpg
 import pytest
@@ -177,18 +176,6 @@ def test_the_local_columns_are_never_an_array_field(registry_database):
                 await datasets.create_array_field(1, datasets.CreateArrayFieldRequest(field_name=name), user=USER)
             assert refused.value.status_code == 400 and 'reserved' in refused.value.detail
         assert await database.fetchval("SELECT count(*) FROM sample_array_columns WHERE column_name LIKE 'local%'") == 0
-
-    registry_database(scenario)
-
-
-def test_the_migration_names_what_is_in_its_way(registry_database):
-    """Its first statement refuses a database that already has either column; this schema has both."""
-    sql = (Path(datasets.__file__).parents[1] / 'db/migrations/0022_local_fields.sql').read_text()
-    check = sql[sql.index('DO $$') : sql.index('$$;') + 3]
-
-    async def scenario(database):
-        with pytest.raises(asyncpg.RaiseError, match='samples already has a column named local_'):
-            await database.execute(check)
 
     registry_database(scenario)
 
