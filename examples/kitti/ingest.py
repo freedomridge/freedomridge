@@ -7,7 +7,6 @@ import math
 import os
 import re
 import sys
-from collections import Counter
 from contextlib import ExitStack
 from http.client import HTTPException
 from pathlib import Path
@@ -43,6 +42,8 @@ from examples.kitti.kitti_raw_oxts import (  # noqa: E402
 
 LICENSE = 'CC BY-NC-SA 3.0'
 ATTRIBUTION = KITTI_ATTRIBUTION
+# KITTI's occlusion state, a number in the label files, as a word (a DontCare region has none).
+OCCLUSION = {0: 'none', 1: 'partly', 2: 'largely', 3: 'unknown'}
 
 
 def build_parser():
@@ -99,18 +100,16 @@ def parse_labels(text, image_size, frame_id):
 
 
 def label_summary(detections, cuboids):
-    summary = {'num_cuboids': len(cuboids), 'num_dontcare': sum(d['label'] == 'DontCare' for d in detections)}
-    difficulties = Counter(box['attributes']['difficulty'] for box in cuboids)
-    summary.update({f'num_{name}': difficulties[name] for name in ('easy', 'moderate', 'hard', 'unrated')})
-    occlusions = Counter(box['occluded'] for box in cuboids)
-    summary.update({f'num_occluded_{level}': occlusions[level] for level in range(4)})
-    if cuboids:
-        summary.update(
-            occlusion_max=max(box['occluded'] for box in cuboids),
-            truncation_mean=sum(box['truncated'] for box in cuboids) / len(cuboids),
-            truncation_max=max(box['truncated'] for box in cuboids),
-        )
-    return summary
+    """The frame's counts that its object rows don't give: a cuboid's difficulty, occlusion and truncation are its
+    object row's own fields (an image filter reads through to them), but a cuboid outside the image has no row and a
+    DontCare region is no object."""
+    return {'num_cuboids': len(cuboids), 'num_dontcare': sum(d['label'] == 'DontCare' for d in detections)}
+
+
+def occlusion_words(boxes):
+    """The boxes' KITTI occlusion numbers as words, once nothing reads the numbers any more."""
+    for box in boxes:
+        box['occluded'] = OCCLUSION.get(box['occluded'])
 
 
 def bbox_iou(a, b):
@@ -193,7 +192,8 @@ def make_sample(archives, root, split, frame, mapping, caches):
     if split == 'training':
         raw = mapping[frame]
         gps = frame_gps(caches.get(raw.drive), raw)
-        raw_metadata = {'drive': raw.drive, 'date': raw.date, 'raw_frame': raw.frame, 'gps_available': bool(gps)}
+        # The drive's name holds its date; whether the frame has GPS is whether it has a location.
+        raw_metadata = {'drive': raw.drive, 'raw_frame': raw.frame}
     location, heading = gps.pop('location', None), gps.pop('heading', None)
     metadata = {
         'frame_id': frame,
@@ -220,42 +220,15 @@ def make_sample(archives, root, split, frame, mapping, caches):
             'attribution': ATTRIBUTION,
         }
     if split == 'training':
-        metadata.update(ground_truth=detections, ground_truth_3d=cuboids, **label_summary(detections, cuboids))
-    return Sample(str(path), tags=[split], metadata=metadata, location=location, heading=heading)
+        metadata.update(**label_summary(detections, cuboids), ground_truth=detections, ground_truth_3d=cuboids)
+        occlusion_words(detections + cuboids)
+    return Sample(str(path), metadata=metadata, location=location, heading=heading)
 
 
 def make_objects(parent, parent_id, assets):
-    rows = cuboid_object_samples(parent, parent_id, assets, 'ground_truth_3d')
-    for row in rows:
-        row.tags = parent.tags
-        row.metadata.update(
-            {
-                key: value
-                for key, value in parent.metadata.items()
-                if key
-                in (
-                    'license',
-                    'attribution',
-                    'frame_id',
-                    'split',
-                    'drive',
-                    'date',
-                    'raw_frame',
-                    'captured_at',
-                    'oxts_timestamp_raw',
-                    'timestamp_timezone',
-                    'speed_kmh',
-                    'altitude_m',
-                    'gps_available',
-                )
-            },
-        )
-    return rows
-
-
-def finish_dataset(client, dataset):
-    if any(field['name'] == 'occluded' for field in dataset.get_schema()):
-        client.set_field_display_type(dataset._id, 'occluded', 'enum')
+    """The frame's cuboids as object rows, with only their own fields: the frame's (its drive, time, speed, license)
+    stay on the frame, where a filter on an object grid reads them through the object's image."""
+    return cuboid_object_samples(parent, parent_id, assets, 'ground_truth_3d')
 
 
 def run(args, encoder_factory=None):
@@ -335,7 +308,6 @@ def run(args, encoder_factory=None):
             object_factory=make_objects,
             persisted_parents=True,
             encoder_factory=encoder_factory,
-            dataset_finish=finish_dataset,
             recover_reduction=True,
         )
 

@@ -36,7 +36,6 @@ def source_samples(tmp_path):
         samples.append(
             inat.map_image(
                 image,
-                dict(id=index),
                 dict(id=42, name="Lumbricus terrestris"),
                 dict(name="Attribution License", url="https://example.invalid/license"),
                 tmp_path,
@@ -131,8 +130,8 @@ def test_attribution(csv_row, tmp_path, source_samples, creator):
     assert creator in attribution
     assert "Mapillary" in attribution and "OSV-5M" in attribution
     assert "https://www.mapillary.com/app/?pKey=123456789" in attribution
-    for sample in source_samples:
-        assert sample.metadata["rights_holder"] in sample.metadata["attribution"]
+    for index, sample in enumerate(source_samples):
+        assert f"Photographer {index}" in sample.metadata["attribution"]
         assert sample.metadata["license_url"] in sample.metadata["attribution"]
 
 

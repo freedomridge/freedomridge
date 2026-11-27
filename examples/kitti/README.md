@@ -75,7 +75,7 @@ Credential environment files are supported by the runner's `--env-file` option.
 
 Fetch the GPS cache first, before any import. It needs the downloaded ZIPs
 (`data_object_image_2.zip` and `devkit_object.zip`) and outbound HTTPS. Without the
-cache, frames import with `gps_available=false` and no map location; the importer
+cache, frames import with no map location; the importer
 prints `N frames lack cached GPS` but still succeeds, and so does the runner.
 
 ```bash
@@ -103,7 +103,7 @@ embedding batches; `--no-reduce` retains vectors without computing UMAP.
 `--on-duplicate skip` is the default. Resume checks existing rows before loading
 CLIP, repairs missing media, and creates missing objects from the **persisted**
 parent annotations and GPS. Existing crops are not re-rendered on a no-op rerun.
-Every run refreshes stats and restores the `occluded` enum display. A rerun also
+Every run refreshes stats. A rerun also
 recovers UMAP when at least five embeddings exist and some lack coordinates,
 even after a crash following the last upload. Completed reductions are reused
 when no rows were written. `--on-duplicate update` rewrites both grains and
@@ -131,20 +131,26 @@ regardless of whether embeddings were enabled, and report `objects_without_exten
   `lidar->camera` transform and raw rectification/sensor transforms.
 - Object rows use projected crops under `derived/objects/<parent-id>/`, with
   parent/cuboid/field links, `crop_bbox`, `bbox_2d`, class, difficulty, occlusion,
-  truncation, dimensions, distance and yaw. They inherit GPS, heading, capture
-  time, speed, altitude and attribution. `num_lidar_points` is present with LiDAR.
+  truncation, dimensions, distance and yaw. They share the frame's map location and
+  heading; the frame's other fields (drive, capture time, speed, altitude, license)
+  stay on the frame, where a filter on an object grid reads them through the object's
+  image. No tags on either grain (`split` says the split). `num_lidar_points` is
+  present with LiDAR.
+- `occluded` is a word: `none`, `partly`, `largely` or `unknown` (KITTI's 0–3; a
+  DontCare region has none).
   Boxes fully outside the image stay on the parent and are counted/reported;
   they cannot have a visible crop or object row.
-- Image summaries include `num_cuboids`, `num_dontcare`, `num_easy`,
-  `num_moderate`, `num_hard`, `num_unrated`, `num_occluded_0` through
-  `num_occluded_3`, `occlusion_max`, `truncation_mean` and `truncation_max`.
+- Images count what their object rows don't give: `num_cuboids` (a cuboid outside
+  the image has no row) and `num_dontcare`. Per-difficulty and per-occlusion counts
+  are not kept: an image filter on the objects' `difficulty` or `occluded` finds
+  those frames.
   Difficulty follows the **devkit evaluator's strict height thresholds**:
   easy >40 px, occlusion ≤0, truncation ≤0.15; moderate >25 px, ≤1, ≤0.3;
   hard >25 px, ≤2, ≤0.5. Levels are **exclusive**, assigned to the easiest
   qualifying level. The benchmark Moderate set includes Easy; filtering only
   `difficulty=moderate` does not reproduce that benchmark set.
-- GPS includes `drive`, `date`, `raw_frame`, `gps_available`, `captured_at`,
-  `oxts_timestamp_raw`, `timestamp_timezone`, `speed_kmh` and `altitude_m`.
+- GPS includes `drive` (its name holds the date), `raw_frame`, `captured_at`,
+  `speed_kmh` and `altitude_m`; a frame without GPS has no location.
   Location is longitude/latitude; compass heading is `(90 - yaw_degrees) % 360`.
 - Embeddings use `clip` (or `--field-name`) and `clip_obj`, each reduced separately.
   `lidar` contains an absolute path, float32 x/y/z/intensity format, point count,
@@ -184,15 +190,13 @@ Each completed drive is atomically saved in
 Valid cached drives make zero requests. Corrupt or old-version cache entries
 are refetched; failed fetches preserve completed caches and return failure so a
 rerun can retry. Ordinary import never fetches: missing/invalid GPS leaves frames
-present with `gps_available=false`. Copy `oxts-cache` to import offline.
+present with no location. Copy `oxts-cache` to import offline.
 
 **Time is CEST / Europe/Berlin local time**, corroborated by sun position in a
 reviewed frame. The source text has no timezone; `captured_at` attaches
 `+02:00` for KITTI recording dates and truncates nanoseconds to microseconds
-without rounding. `oxts_timestamp_raw` preserves
-all nine fractional digits followed by ` (Europe/Berlin local)`, keeping it a
-string instead of allowing backend datetime detection to reinterpret it as UTC.
-The cache retains the exact original timestamp lines.
+without rounding (a frame is 100 ms). The cache retains the exact original
+timestamp lines.
 
 ## Attribution and license
 

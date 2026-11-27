@@ -143,7 +143,7 @@ def test_co9_mask_links_boxes(oi):
 def test_co9_captions_plain(coco):
     sample, image = mapped_coco(coco)
     image.close()
-    assert all(isinstance(x, str) for x in sample.metadata['captions'])
+    assert isinstance(sample.metadata['captions'], str) and 'caption_text' not in sample.metadata
     assert not sample.metadata.get('caption_annotations')
 
 
@@ -154,9 +154,8 @@ def test_co9_narratives_and_html(oi):
     )
     sample, image = mapped_oi(oi)
     image.close()
-    assert sample.metadata['Author'] == 'snowpea&bokchoi'
-    assert sample.metadata['Title'] == 'A "café"'
-    assert all(isinstance(x, str) for x in sample.metadata['narratives'])
+    assert sample.metadata['attribution'] == '“A "café"” by snowpea&bokchoi'
+    assert isinstance(sample.metadata['captions'], str) and 'narratives' not in sample.metadata
 
 
 def test_co9_attribute_names_and_lean_labels(oi):
@@ -340,7 +339,7 @@ def test_co6_objects_parent_ids_crowds_and_resume(backend, coco, monkeypatch):
         assert row['metadata']['parent_id'] == parents[0]['id']
         assert row['metadata']['crop_bbox'] == [0.25, 0, 0.5, 2 / 3]
         assert row['metadata']['annotation_id'] in (7, 8)
-        assert row['tags'] == ['person']
+        assert row['tags'] == []
         assert list(row['embeddings']) == ['clip_obj']
         with Image.open(row['filepath']) as crop:
             assert crop.format == 'JPEG' and crop.size == (2, 2)
@@ -386,7 +385,7 @@ def test_co6_rotated_group_crop(backend, oi):
     row = objects[0]
     assert row['metadata']['crop_bbox'] == pytest.approx([0.2, 0.3, 0.6, 0.6])
     assert row['metadata']['is_group_of'] is True
-    assert row['tags'] == ['Dog'] and 'clip_obj' in row['embeddings']
+    assert row['tags'] == [] and row['metadata']['label'] == 'Dog' and 'clip_obj' in row['embeddings']
     with Image.open(row['filepath']) as crop:
         assert crop.size == (3, 4)
 

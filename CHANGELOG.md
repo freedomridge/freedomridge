@@ -75,6 +75,33 @@ it needs more than the standard steps in [Upgrading](docs/UPGRADING.md).
   width over its height in worlds (measured at the least zoom: 0.7 in the map's panel of a 1920 x 1080 window; 11.5
   only with the map alone in a 3840 x 600 one, at a zoom reached by code). A saved view, link or script with a polygon
   wider than 10 turns now gets the 400.
+- **The demo importers write one field per fact, under Freedom Ridge's names** (`examples/`: COCO, Open Images,
+  iNaturalist, KITTI). They copied the source's own columns beside the fields made from them, so a dataset showed the
+  same fact twice or three times: COCO's 0/1 `iscrowd` beside the boolean `is_crowd`, its license number twice, Open
+  Images' five flags as 0/1 numbers and its class codes (`/m/0k4j`) beside the class names, its whole image list
+  (`OriginalURL`, `Thumbnail300KURL`, `OriginalMD5`, ...), iNaturalist's latitude and longitude beside the map
+  location, KITTI's frame fields copied onto every object. Now:
+  - flags are booleans: COCO's `is_crowd`; Open Images' `is_occluded`, `is_truncated`, `is_group_of`, `is_depiction`,
+    `is_inside` (the source's -1, unknown, is no value); KITTI's `occluded` is a word (`none`, `partly`, `largely`,
+    `unknown`);
+  - classes go by their names only, and a list's items keep their own facts (a COCO pose: its joint names and which
+    are seen; an outline: the `annotation_id` of its detection), not the source's whole record;
+  - captions are one searchable text, a caption per line, in `captions` (no `caption_text` or `narratives`); an
+    image's classes are the native list columns `class_names` (and COCO's `supercategory_names`), no longer repeated
+    as the metadata lists `classes` and `supercategories`;
+  - an image's credit is `attribution` (where the source names an author), `license`, `license_url` and `source_url`;
+    the source's file names, its own numbers for an image's license, annotation and category, and its paths are not
+    copied;
+  - an object holds its own fields only (its image's are read through it by an image filter), and no tags: the
+    importers tagged each image with its split and each object with its label, which `split` and `label` hold;
+  - image totals that recount the objects (Open Images' `IsGroupOf_count` and the like; KITTI's `num_easy`,
+    `num_occluded_0`, `truncation_mean`, ...) are gone; KITTI keeps `num_cuboids` and `num_dontcare`, which no object
+    row gives.
+
+  The masks are unchanged here (`instance_mask_000` and the rest, one per field). A dataset imported before keeps its
+  fields until it is imported again; saved views of it that name a field that's gone find nothing for that field.
+  iNaturalist keeps `scientific_name` beside the `species` label: a single classification's label can't be filtered
+  for an exact value or typed ahead in the sidebar, a string can.
 
 ## 2.14.0 (2026-11-25)
 
