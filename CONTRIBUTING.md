@@ -113,9 +113,11 @@ tests fail rather than skip when the test settings are missing.
 
 CI splits the suite into four shards that run side by side, each against its own database:
 `FRIDGE_TEST_SHARD=K/4` runs shard K, a set of whole test files balanced by
-`backend/tests/shard_timings.json`. `scripts/ci_local.sh` runs the four the same way. After adding
-slow tests, refresh the timings from a full run (`python -m pytest -q --junitxml=<file>`, then
-`python -m scripts.backend_test_shards <file>`); stale timings only unbalance the shards.
+`backend/tests/shard_timings.json`. `scripts/ci_local.sh` runs the four the same way, or more of them
+with `CI_LOCAL_SHARDS` where there are cores to spare (the same test files, in other groups). After
+adding slow tests, refresh the timings from a full run (`python -m pytest -q --junitxml=<file>`, then
+`python -m scripts.backend_test_shards <file>`; a run of `scripts/ci_local.sh` leaves one report for
+each shard beside its logs, and the command takes them all); stale timings only unbalance the shards.
 
 Then run the SDK integration suites against a backend on that database. They create and delete
 their own datasets.

@@ -28,9 +28,13 @@ USER = {'id': 1, 'role': 'admin'}
 async def bulk_setup(database):
     """A connection for a test's bulk setup, planned as before database.PLANNING. Re-planning the row triggers and
     foreign-key checks for every row doubles a 150,000-row insert, past the fixture's statement timeout when the
-    machine is loaded. What a test checks still runs with the app's planning."""
+    machine is loaded. For the same reason its statements run under a statement timeout of their own: setup is not
+    what a test checks, and an update of 150,000 rows that takes 8.5 s idle ran into the fixture's 10 s in a whole run
+    of eight shards. Both settings end with the transaction (SET LOCAL): what a test checks still runs with the app's
+    planning, under the fixture's statement timeout."""
     async with database.pool.acquire() as connection, connection.transaction():
         await connection.execute('SET LOCAL plan_cache_mode = auto')
+        await connection.execute("SET LOCAL statement_timeout = '5min'")
         yield connection
 
 

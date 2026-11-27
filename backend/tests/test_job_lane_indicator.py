@@ -124,8 +124,9 @@ def test_owner_lookup_uses_its_partial_index_not_waiting_or_terminal_history(reg
     async def scenario(database):
         monkeypatch.setattr(jobs, 'db', database)
         monkeypatch.setattr(access, 'db', database)
-        await database.execute("""INSERT INTO jobs(id,kind,dataset_id,state)
-            SELECT gen_random_uuid(),'history',1,'succeeded' FROM generate_series(1,100000)""")
+        async with test_field_registry_postgres.bulk_setup(database) as connection:
+            await connection.execute("""INSERT INTO jobs(id,kind,dataset_id,state)
+                SELECT gen_random_uuid(),'history',1,'succeeded' FROM generate_series(1,100000)""")
         owner = await job_queue.enqueue_job(database.pool, 'owner', dataset_id=1)
         active = await claimed(database.pool, 'owner')
         await job_queue.defer_job(database.pool, owner['id'], active['lease_token'], {}, delay_seconds=300)

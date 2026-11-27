@@ -13,14 +13,19 @@
 #                    with its environments and node_modules takes about 3 GB; delete it once you have
 #                    read the logs.
 #   CI_LOCAL_PORT    two digits NN: the run's database, API and frontend listen on loopback ports 554NN,
-#                    80NN and 30NN, and backend-tests' shards 2-4 their databases on 562NN-564NN (default 93).
+#                    80NN and 30NN, and backend-tests' shards from the second on their databases on 562NN,
+#                    563NN and so on, 56KNN for shard K (default 93).
 #                    Give runs at the same time different values.
 #   NODE_BIN         a directory to put first on PATH, for the Node major version that ci.yml sets up.
 #   MAPBOX_ENV_FILE  an .env file with NEXT_PUBLIC_MAPBOX_TOKEN, so the map e2e test runs instead of
 #                    skipping itself. The token goes only into this run's frontend build. Its URL
 #                    restrictions must allow localhost; an e2e run checks a map tile first.
 #   BACKEND_TESTS    pytest arguments to run instead of the whole backend suite (skips the SDK suites). Without
-#                    it, the suite runs as ci.yml's four shards, side by side, each with its own database.
+#                    it, the suite runs in shards, side by side, each with its own database.
+#   CI_LOCAL_SHARDS  how many shards that is, 1 to 9 (default 4, as ci.yml). The same test files run either
+#                    way, in other groups (scripts/backend_test_shards.py); more shards finish sooner where
+#                    there are cores to spare. Each shard leaves a JUnit report beside its log, which
+#                    refreshes the timings the split balances by (CONTRIBUTING.md).
 #   E2E_SPECS        Playwright spec files (a :line is fine) to run instead of the whole e2e suite: the ordinary ones
 #                    named, then the *.fits.spec.ts ones named (playwright.config.ts), without the rest of the suite.
 #
@@ -43,8 +48,11 @@ JOBS=${2:-lint,example-tests,backend-tests,db-recovery,frontend,quality,e2e}
 P=${CI_LOCAL_PORT:-93}
 [[ $P =~ ^[0-9][0-9]$ ]] || { echo "CI_LOCAL_PORT must be two digits" >&2; exit 2; }
 DBPORT=554$P APIPORT=80$P FEPORT=30$P
-# Backend-test shards 2-4 get their own databases on 562NN-564NN (shard 1 uses the run's database).
-SHARDS="1 2 3 4" SHARD_PORTS="562$P 563$P 564$P"
+# Backend-test shards from the second on get their own databases on 56KNN (shard 1 uses the run's database).
+NSHARDS=${CI_LOCAL_SHARDS:-4}
+[[ $NSHARDS =~ ^[1-9]$ ]] || { echo "CI_LOCAL_SHARDS must be 1 to 9" >&2; exit 2; }
+SHARDS=$(seq -s ' ' 1 "$NSHARDS") SHARD_PORTS=
+for k in $(seq 2 "$NSHARDS"); do SHARD_PORTS+="56$k$P "; done
 for port in "$DBPORT" "$APIPORT" "$FEPORT" $SHARD_PORTS; do
   if (exec 3<> "/dev/tcp/127.0.0.1/$port") 2> /dev/null; then
     echo "Port $port is in use; choose another CI_LOCAL_PORT" >&2
@@ -73,7 +81,8 @@ fi
 
 W=$CI_LOCAL_CLONE
 L=$W-logs
-DB=fr-ci-${W##*/}
+DB=fr-ci-${W##*/} SHARD_DBS=
+for k in $(seq 2 "$NSHARDS"); do SHARD_DBS+="$DB-s$k "; done
 cd "$W" || exit 1
 mkdir -p "$L" "$W/data"
 : > "$L/summary"
@@ -133,7 +142,8 @@ stop_group() { # stop_group <process group leader>
 cleanup() {
   stop_group "$BACKEND"
   stop_group "$FRONTEND"
-  docker rm -fv "$DB" "$DB-s2" "$DB-s3" "$DB-s4" > /dev/null 2>&1
+  # shellcheck disable=SC2086  # the names are split on purpose
+  docker rm -fv "$DB" $SHARD_DBS > /dev/null 2>&1
 }
 trap cleanup EXIT
 trap 'exit 1' INT TERM HUP
@@ -147,15 +157,32 @@ start_db() { # start_db [container] [port]: a fresh database from schema.sql, as
     timeout 90 bash -c "until docker exec -e PGPASSWORD=password $name psql -h 127.0.0.1 -U freedomridge -d freedomridge -c 'SELECT 1' >/dev/null 2>&1; do sleep 1; done" &&
     docker exec -i "$name" psql -U freedomridge -d freedomridge -v ON_ERROR_STOP=1 -q < backend/db/schema.sql
 }
+# A server's readiness loop takes any answer on its port. A process that took the port after the run's own check
+# (another run's server) answers in place of this run's server, which can't bind the port and exits, and the run
+# would test a server of another commit. So a server starts only on a port nothing holds, and once its port answers,
+# the server this run started must still be running.
+port_free() { # port_free <port>
+  if (exec 3<> "/dev/tcp/127.0.0.1/$1") 2> /dev/null; then
+    echo "Port $1 is in use by another process, so this run's server can't listen on it" >&2
+    return 1
+  fi
+}
+still_running() { # still_running <pid> <port>
+  kill -0 "$1" 2> /dev/null && return 0
+  echo "This run's server for port $2 (pid $1) has exited: another process answered on the port" >&2
+  return 1
+}
 start_backend() { # start_backend <log name> <environment bin directory> [VAR=value ...]
   local name=$1 bin=$2
   shift 2
+  port_free "$APIPORT" || return 1
   env "$@" SESSION_COOKIE_SECURE=false STORAGE_ENCRYPTION_KEY=ci-only-not-a-secret \
     ALLOWED_ORIGINS="http://localhost:$FEPORT,http://127.0.0.1:$FEPORT" \
     setsid "$bin/python" -m backend.launch -- "$bin/python" -m uvicorn backend.main:app \
     --host 127.0.0.1 --port "$APIPORT" > "$L/$name-backend.log" 2>&1 &
   BACKEND=$!
-  timeout 60 bash -c "until curl -sf http://127.0.0.1:$APIPORT/api/datasets >/dev/null; do sleep 1; done"
+  timeout 60 bash -c "until curl -sf http://127.0.0.1:$APIPORT/api/datasets >/dev/null; do sleep 1; done" &&
+    still_running "$BACKEND" "$APIPORT"
 }
 sync_env() { # sync_env <name> <uv sync arguments>
   local name=$1
@@ -208,8 +235,8 @@ if want backend-tests && [ -n "${BACKEND_TESTS:-}" ]; then
     "$LEAN/python" -m pytest -q -p no:cacheprovider ${BACKEND_TESTS:-} > "$L/backend-tests.log" 2>&1
   result "backend-tests pytest" $? "$(tail -1 "$L/backend-tests.log")"
 elif want backend-tests; then
-  # ci.yml's four shards, side by side: each its own database and data folder. Shard 1 uses the run's
-  # database, and the SDK suites run on it afterwards, as in ci.yml.
+  # The suite's shards (ci.yml's four, or CI_LOCAL_SHARDS of them), side by side: each its own database and data
+  # folder. Shard 1 uses the run's database, and the SDK suites run on it afterwards, as in ci.yml.
   pids=()
   for k in $SHARDS; do
     name=$DB port=$DBPORT data=$W/data
@@ -218,19 +245,20 @@ elif want backend-tests; then
     (
       start_db "$name" "$port" > "$L/backend-tests-db-s$k.log" 2>&1 || { echo "shard $k: its database didn't start"; exit 2; }
       dsn=postgres://freedomridge:password@127.0.0.1:$port/freedomridge
-      FRIDGE_TEST_SHARD=$k/4 FRIDGE_TEST_POSTGRES_DSN=$dsn FRIDGE_TEST_POSTGRES_CONTAINER=$name \
+      FRIDGE_TEST_SHARD=$k/$NSHARDS FRIDGE_TEST_POSTGRES_DSN=$dsn FRIDGE_TEST_POSTGRES_CONTAINER=$name \
         FRIDGE_DB_CONTAINER=$name DATABASE_URL=$dsn FRIDGE_DATA_ROOT=$data \
-        "$LEAN/python" -m pytest -q -p no:cacheprovider
+        "$LEAN/python" -m pytest -q -p no:cacheprovider --junitxml="$L/backend-tests-s$k.xml"
     ) > "$L/backend-tests-s$k.log" 2>&1 &
     pids+=($!)
   done
   i=0
   for k in $SHARDS; do
     wait "${pids[$i]}"
-    result "backend-tests pytest shard $k/4" $? "$(tail -1 "$L/backend-tests-s$k.log")"
+    result "backend-tests pytest shard $k/$NSHARDS" $? "$(tail -1 "$L/backend-tests-s$k.log")"
     i=$((i + 1))
   done
-  docker rm -fv "$DB-s2" "$DB-s3" "$DB-s4" > /dev/null 2>&1
+  # shellcheck disable=SC2086  # the names are split on purpose
+  [ -z "$SHARD_DBS" ] || docker rm -fv $SHARD_DBS > /dev/null 2>&1
   start_backend sdk "$LEAN"
   result "backend-tests backend start" $?
   docker exec "$DB" psql -U freedomridge -d freedomridge -qc \
@@ -348,10 +376,13 @@ if want e2e; then
   result "e2e backend start" $?
   cd "$W/frontend" || exit 1
   npx playwright install chromium > "$L/playwright-install.log" 2>&1
-  FRIDGE_BACKEND_URL=http://127.0.0.1:$APIPORT setsid npx next start -p "$FEPORT" --keepAliveTimeout 600000 \
-    > "$L/next.log" 2>&1 &
-  FRONTEND=$!
-  timeout 60 bash -c "until curl -sf -o /dev/null http://localhost:$FEPORT/login; do sleep 1; done"
+  port_free "$FEPORT" && {
+    FRIDGE_BACKEND_URL=http://127.0.0.1:$APIPORT setsid npx next start -p "$FEPORT" --keepAliveTimeout 600000 \
+      > "$L/next.log" 2>&1 &
+    FRONTEND=$!
+    timeout 60 bash -c "until curl -sf -o /dev/null http://localhost:$FEPORT/login; do sleep 1; done" &&
+      still_running "$FRONTEND" "$FEPORT"
+  }
   result "e2e frontend start" $?
   # Playwright finds the server on E2E_BASE_URL and reuses it instead of starting `next dev`. This run's database is
   # thrown away, so the region specs may load their boundary fixture into it (ci.yml sets the same).

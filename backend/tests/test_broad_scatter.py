@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from backend.routers import embeddings
+from backend.tests import test_field_registry_postgres
 from backend.tests.test_layout_coordinates import registry_database, seed
 
 __all__ = ['registry_database']
@@ -23,6 +24,12 @@ def conjunction(*nodes):
 
 async def populate(db, n=20):
     await seed(db, n)
+    async with test_field_registry_postgres.bulk_setup(db) as connection:
+        await points_tags_and_scores(connection, n)
+
+
+async def points_tags_and_scores(db, n):
+    """populate's map points, tags, concepts, scores and duplicates, written in its bulk setup."""
     await db.execute(
         "INSERT INTO embedding_coordinates SELECT i,'clip',i,i/3.0 FROM generate_series(1,$1::int) i",
         n - 1,
